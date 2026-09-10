@@ -37,16 +37,52 @@ al modo sintético.
 mtf-lab doctor [--config CONFIG] [--check-network]
 mtf-lab demo [--seed N] [--config CONFIG] [--db PATH]
 mtf-lab import DATA.{csv,jsonl} [--db PATH]
-mtf-lab watch [--instrument BTC/USD] [--duration SECONDS] [--offline-demo]
-mtf-lab replay --input DATA [--db PATH]
-mtf-lab backtest --db PATH [--session ID] [--config CONFIG] [--report REPORT]
+mtf-lab watch [--instrument BTC/USD] [--duration SECONDS] [--max-events N] [--session ID] [--checkpoint-every N] [--offline-demo]
+mtf-lab replay --input DATA [--db PATH] [--checkpoint-every N] [--no-resume]
+mtf-lab backtest --db PATH [--session ID] [--config CONFIG] [--partition all|exploration|evaluation] [--boundary UTC] [--report REPORT]
 mtf-lab report [--db PATH] [--latest]
 mtf-lab ui [--host 127.0.0.1] [--port 8765] [--db PATH]
 ```
 
 Todos los comandos muestran si el modo es `SINTÉTICO`, `REPLAY` u
-`OBSERVACIÓN_EN_DIRECTO`, la procedencia, la calidad y el estado de
+`OBSERVACIÓN EN DIRECTO`, la procedencia, la calidad y el estado de
 calentamiento. `watch` tiene duración acotada para pruebas; no ejecuta órdenes.
+
+`watch` y `replay` pasan por `RuntimeCoordinator`: el mismo procesador
+incremental conserva buckets abiertos, indicadores, episodios y simulaciones
+`PENDING`, persiste checkpoints periódicos y reanuda por identidad sin duplicar
+la captura. `replay` acepta velas nativas o eventos, deriva sólo temporalidades
+compatibles y da precedencia a una vela nativa sobre su OHLC derivada. En un
+replay completo, un horizonte sin precio admisible queda `INDETERMINATE`; en
+observación continua permanece `PENDING` hasta que expire la tolerancia.
+
+Para reanudar una observación acotada, conserva el `session_id` que devuelve
+`watch` y vuelve a ejecutar `mtf-lab watch --session ID --resume` (el valor
+predeterminado ya es reanudable), o usa `--no-resume` para iniciar otro estado
+incremental. Los checkpoints incluyen el hash de configuración, el cursor,
+la identidad del último registro y el estado serializable de agregadores,
+indicadores, episodios y liquidaciones pendientes.
+
+## Comparación y trazabilidad
+
+`backtest` genera la referencia `m1_trigger_reference` con el mismo disparador
+M1 y la estrategia `trend_pullback_v1` con contexto M15/preparación M5, sobre
+la misma captura, base de precio y contrato virtual. La referencia no es un
+subconjunto de las señales MTF y se conserva aun cuando MTF emita cero. Cada
+corrida identifica `dataset_hash`, `analysis_id`, hash de configuración,
+variante, partición cronológica y hash del contrato; cambiar cualquiera de
+ellos crea una identidad de análisis separada, mientras que repetir exactamente
+la misma corrida es idempotente. `--partition exploration|evaluation` y
+`--boundary UTC` excluyen señales cuyo ingreso o liquidación cruza la frontera.
+
+Los informes segmentan por análisis, variante, instrumento, horizonte,
+partición y contrato. En `status`, `counts.signals` es el detector MTF
+primario para compatibilidad terminal y `counts.signals_total` incluye también
+la referencia M1; el informe conserva ambos linajes y no mezcla sus resultados.
+Los resultados son simulaciones virtuales y no son
+órdenes, rentabilidad demostrada ni recomendación; `independent_sample_count`
+es una agrupación temporal conservadora, no una prueba de independencia
+estadística.
 
 ## Configuración
 
@@ -84,6 +120,14 @@ cuerpo. BTC/USD es el símbolo inicial; se registra el mapeo a nombres internos.
 El REST devuelve como máximo 720 entradas y la última está sin comprometer,
 por lo que se excluye del conjunto cerrado hasta su cierre. Una reconexión no
 se considera recuperación completa sin conciliación explícita.
+
+## UI local de observación
+
+`mtf-lab ui` sirve un visor de sólo lectura en `127.0.0.1` con paginación y
+rangos UTC, revisiones, huecos, decisiones, condiciones, descartes y
+simulaciones. Incluye sondeo acotado, gráficos SVG de close/EMA/RSI/ATR usando
+los valores persistidos y tarjetas de conexión, cobertura, calentamiento,
+calidad y resultados pendientes; el frontend no recalcula reglas financieras.
 
 ## Extender proveedores
 
@@ -177,3 +221,8 @@ true ranges (el primero usa `high-low`). Una pérdida media cero da RSI 100
 (si la ganancia es positiva) o 50 (serie constante), ganancia media cero da 0,
 y ATR cero permanece cero. Valores ausentes, velas abiertas y huecos reinician
 calentamiento y no alimentan señales.
+
+## Fuentes públicas consultadas
+
+El contrato de integración Kraken se contrastó con la documentación vigente:
+[Trades Spot WebSocket v2](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade), [Candles (OHLC) Spot WebSocket v2](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ohlc) y [Get OHLC Data Spot REST](https://docs.kraken.com/api/docs/rest-api/get-ohlc-data). La documentación confirma que `trade` puede agrupar varias operaciones, que el snapshot refleja las últimas 50, que `ohlc` se actualiza con operaciones y que REST devuelve hasta 720 entradas dejando la última como intervalo no comprometido; el adaptador conserva esas limitaciones en procedencia y no afirma recuperación completa sólo por reconectar.

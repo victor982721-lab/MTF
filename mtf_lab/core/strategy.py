@@ -718,7 +718,7 @@ class TrendPullbackStrategy:
         signal: Signal | None = None
         next_active = active_for_eval
         if decision is DecisionKind.SIGNAL and active_for_eval is not None and context is not None and direction is not None:
-            payload = f"{self.VERSION}|{instrument}|{active_for_eval.episode_id}|{point.start.isoformat()}"
+            payload = f"{self.VERSION}|{instrument}|{active_for_eval.episode_id}|{point.start.isoformat()}|indicators={self.config.indicators.ema_fast},{self.config.indicators.ema_slow},{self.config.indicators.rsi_period},{self.config.indicators.atr_period}"
             signal_id = "sig_" + hashlib.sha256(payload.encode()).hexdigest()[:32]
             signal = Signal(
                 signal_id=signal_id,
@@ -826,7 +826,20 @@ class TrendPullbackStrategy:
                     self._condition("signal", ConditionState.UNKNOWN, None, "all mandatory conditions", "trigger_not_available"),
                     self._condition("news_filter", ConditionState.DISABLED, None, "not configured", "not_configured", mandatory=False),
                 )
-                evaluations.append(Evaluation(evaluation_time, instrument, "trigger", DecisionKind.BLOCKED, None, conditions, {}, ("trigger_not_available",), config.mode, trigger_point.quality, None))
+                evaluations.append(Evaluation(
+                    timestamp=evaluation_time,
+                    instrument=instrument,
+                    stage="trigger",
+                    decision=DecisionKind.BLOCKED,
+                    direction=None,
+                    conditions=conditions,
+                    values={},
+                    reasons=("trigger_not_available",),
+                    episode_id=None,
+                    mode=config.mode,
+                    quality=trigger_point.quality,
+                    available_at=None,
+                ))
                 continue
             if invalidation_reason and active is None and not any(condition.reason == invalidation_reason for condition in ()):  # keep explicit below
                 # La razón se incorporará a la condición de la evaluación si

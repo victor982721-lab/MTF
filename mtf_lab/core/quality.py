@@ -215,6 +215,9 @@ def validate_event(event: "MarketEvent") -> ValidationResult:
         )
     if getattr(event, "quantity", None) is not None and event.quantity < 0:
         issues.append(QualityIssue("quantity_negative", "quantity no puede ser negativa", record_id=event_id))
+    quality = getattr(event, "quality", None)
+    if quality is not None and getattr(quality, "flags", frozenset()) & _BLOCKING_FLAGS:
+        issues.append(QualityIssue("quality_blocked", ",".join(sorted(flag.value for flag in quality.flags)), record_id=event_id))
     if issues:
         return ValidationResult(False, tuple(issues), DataQuality(frozenset({QualityFlag.INVALID}), tuple(issue.code for issue in issues)))
     return ValidationResult(True, (), event.quality)

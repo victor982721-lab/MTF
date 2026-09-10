@@ -33,6 +33,8 @@ class ColumnMapping:
     ask: str | None = "ask"
     mid: str | None = "mid"
     event_id: str | None = "event_id"
+    received_at: str | None = "received_at"
+    available_at: str | None = "available_at"
 
     @classmethod
     def from_text(cls, text: str | None) -> "ColumnMapping":
@@ -97,18 +99,24 @@ class ImportResult:
         }
 
 
-def _parse_ts(value: Any, timezone: str | None) -> datetime:
+def _parse_ts(value: Any, timezone: str | None, unit: str = "iso8601") -> datetime:
     if value is None or str(value).strip() == "":
         raise ValueError("timestamp vacío")
-    if isinstance(value, (int, float)):
-        # Numeric epoch seconds are accepted only as an explicit unit by the
-        # CLI; this function receives no implicit milliseconds conversion.
-        dt = datetime.fromtimestamp(float(value), UTC)
-    else:
-        text = str(value).strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        dt = datetime.fromisoformat(text)
+    unit = str(unit).lower()
+    try:
+        if unit == "iso8601":
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                raise ValueError("timestamp numérico requiere --timestamp-unit explícito")
+            text = str(value).strip()
+            if text.endswith(("Z", "z")):
+                text = text[:-1] + "+00:00"
+            dt = datetime.fromisoformat(text)
+        else:
+            numeric = float(value)
+            scale = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}[unit]
+            dt = datetime.fromtimestamp(numeric * scale, UTC)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise ValueError(f"timestamp inválido ({unit}): {value!r}") from exc
     if dt.tzinfo is None:
         if not timezone:
             raise ValueError("timestamp sin zona; indique --timezone")
@@ -129,6 +137,17 @@ def _float(row: Mapping[str, Any], column: str | None, *, name: str) -> float | 
     return value
 
 
+def _strict_bool(value: Any, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "si", "sí"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    raise ValueError(f"{name} debe ser true/false")
+
+
 class LocalImporter:
     def __init__(
         self,
@@ -138,8 +157,10 @@ class LocalImporter:
         price_base: str,
         mapping: ColumnMapping | None = None,
         timezone: str | None = None,
+        timestamp_unit: str = "iso8601",
         interval_seconds: float | None = None,
         strict: bool = True,
+        source: str | None = None,
         allow_out_of_order: bool = False,
         allow_duplicates: bool = False,
     ):
@@ -148,8 +169,12 @@ class LocalImporter:
         self.price_base = price_base.lower()
         self.mapping = mapping or ColumnMapping()
         self.timezone = timezone
+        self.timestamp_unit = str(timestamp_unit).lower()
+        if self.timestamp_unit not in {"iso8601", "s", "ms", "us", "ns"}:
+            raise ValueError("timestamp_unit must be iso8601, s, ms, us or ns")
         self.interval_seconds = float(interval_seconds) if interval_seconds is not None else self._interval_from_timeframe(timeframe)
         self.strict = strict
+        self.source = str(source).strip() if source else None
         self.allow_out_of_order = allow_out_of_order
         self.allow_duplicates = allow_duplicates
         if self.price_base not in {"trade", "close", "mid", "bid", "ask"}:
@@ -193,9 +218,9 @@ class LocalImporter:
         for row_number, source in enumerate(rows, 1):
             try:
                 ts_col = mapping.event_timestamp if (source.get("kind") or source.get("type")) and mapping.event_timestamp else mapping.timestamp
-                timestamp = _parse_ts(source.get(ts_col), self.timezone)
+                timestamp = _parse_ts(source.get(ts_col), self.timezone, self.timestamp_unit)
                 end_value = source.get(mapping.end_timestamp) if mapping.end_timestamp else None
-                end = _parse_ts(end_value, self.timezone) if end_value not in {None, ""} else (timestamp + timedelta(seconds=self.interval_seconds) if self.interval_seconds else None)
+                end = _parse_ts(end_value, self.timezone, self.timestamp_unit) if end_value not in {None, ""} else (timestamp + timedelta(seconds=self.interval_seconds) if self.interval_seconds else None)
                 if end is None or end <= timestamp:
                     raise ValueError("intervalo final ausente o no positivo")
                 if previous is not None and timestamp < previous:
@@ -203,7 +228,11 @@ class LocalImporter:
                     issues.append(issue)
                     if self.strict and not self.allow_out_of_order: raise ImportValidationError([issue])
                 previous = timestamp
-                key = (self.instrument, _iso(timestamp))
+                # Trades distintos pueden compartir timestamp; para velas,
+                # el intervalo sigue siendo la identidad lógica.
+                supplied_id = source.get(mapping.event_id) if mapping.event_id else None
+                key_token = (str(supplied_id) if supplied_id not in {None, ""} and not all(source.get(column) not in {None, ""} for column in (mapping.open, mapping.high, mapping.low, mapping.close)) else _iso(timestamp))
+                key = (self.instrument, key_token)
                 if key in seen:
                     issue = ImportIssue(row_number, "DUPLICATE", "timestamp duplicado para el instrumento")
                     issues.append(issue)
@@ -214,11 +243,24 @@ class LocalImporter:
                 low_value = _float(source, mapping.low, name="low")
                 close_value = _float(source, mapping.close, name="close")
                 volume = _float(source, mapping.volume, name="volume")
+                if volume is not None and volume < 0:
+                    raise ValueError("volume no puede ser negativo")
                 event_price = _float(source, mapping.price, name="price")
                 bid = _float(source, mapping.bid, name="bid")
                 ask = _float(source, mapping.ask, name="ask")
                 mid = _float(source, mapping.mid, name="mid")
+                received_raw = source.get(mapping.received_at) if mapping.received_at else None
+                available_raw = source.get(mapping.available_at) if mapping.available_at else None
+                received_at = _parse_ts(received_raw, self.timezone, self.timestamp_unit) if received_raw not in {None, ""} else None
+                available_at = _parse_ts(available_raw, self.timezone, self.timestamp_unit) if available_raw not in {None, ""} else None
+                if received_at is not None and received_at < timestamp:
+                    raise ValueError("received_at no puede preceder al timestamp del registro")
+                if available_at is not None and available_at < timestamp:
+                    raise ValueError("available_at no puede preceder al timestamp del registro")
                 is_candle = all(x is not None for x in (open_value, high_value, low_value, close_value))
+                closed_flag = _strict_bool(source.get("closed", True), name="closed")
+                if is_candle and available_at is not None and closed_flag and available_at < end:
+                    raise ValueError("available_at no puede preceder al cierre de una vela cerrada")
                 if is_candle:
                     if not (low_value <= open_value <= high_value and low_value <= close_value <= high_value):
                         raise ValueError("OHLC incoherente: low <= open/close <= high requerido")
@@ -228,9 +270,9 @@ class LocalImporter:
                         "candle_id": str(source.get(mapping.event_id)) if mapping.event_id and source.get(mapping.event_id) else f"local:{row_number}:{_iso(timestamp)}",
                         "instrument": self.instrument, "timeframe": self.timeframe, "start_ts": _iso(timestamp), "end_ts": _iso(end),
                         "open": open_value, "high": high_value, "low": low_value, "close": close_value, "volume": volume,
-                        "closed": bool(source.get("closed", True)), "source": f"local:{path.name}", "price_base": "close", "quality": "VALIDATED_LOCAL",
+                        "closed": closed_flag, "source": self.source or f"local:{path.name}", "price_base": "close", "quality": "VALIDATED_LOCAL", "received_ts": _iso(received_at) if received_at is not None else None, "available_ts": _iso(available_at) if available_at is not None else None,
                         "source_ordinal": row_number,
-                        "provenance": {"path": str(path), "format": file_format, "row": row_number, "mapping": dataclasses.asdict(mapping), "timezone": self.timezone, "synthetic": False},
+                        "provenance": {"path": str(path), "format": file_format, "row": row_number, "mapping": dataclasses.asdict(mapping), "timezone": self.timezone, "timestamp_unit": self.timestamp_unit, "synthetic": False},
                     }
                 else:
                     choices = {"trade": event_price, "bid": bid, "ask": ask, "mid": mid, "close": close_value}
@@ -239,10 +281,10 @@ class LocalImporter:
                         raise ValueError(f"falta columna de precio explícita para base {self.price_base}")
                     record = {
                         "event_id": str(source.get(mapping.event_id)) if mapping.event_id and source.get(mapping.event_id) else f"local:{row_number}:{_iso(timestamp)}",
-                        "instrument": self.instrument, "event_ts": _iso(timestamp), "received_ts": _iso(timestamp), "kind": str(source.get("kind", "trade")),
-                        "price": selected, "price_base": self.price_base, "source": f"local:{path.name}", "source_ordinal": row_number,
+                        "instrument": self.instrument, "event_ts": _iso(timestamp), "received_ts": _iso(received_at) if received_at is not None else None, "available_ts": _iso(available_at) if available_at is not None else None, "kind": str(source.get("kind", "trade")),
+                        "price": selected, "bid": bid, "ask": ask, "mid": mid, "price_base": self.price_base, "source": self.source or f"local:{path.name}", "source_ordinal": row_number,
                         "quality": "VALIDATED_LOCAL", "resolution": self.timeframe,
-                        "provenance": {"path": str(path), "format": file_format, "row": row_number, "mapping": dataclasses.asdict(mapping), "timezone": self.timezone, "synthetic": False},
+                        "provenance": {"path": str(path), "format": file_format, "row": row_number, "mapping": dataclasses.asdict(mapping), "timezone": self.timezone, "timestamp_unit": self.timestamp_unit, "synthetic": False},
                     }
                 records.append(record)
             except ImportValidationError:
@@ -253,8 +295,9 @@ class LocalImporter:
                 if self.strict:
                     raise ImportValidationError([issue]) from exc
         if records:
-            times = [datetime.fromisoformat(str(row.get("start_ts", row.get("event_ts"))).replace("Z", "+00:00")) for row in records]
-            coverage_start, coverage_end = _iso(min(times)), _iso(max(times))
+            starts = [datetime.fromisoformat(str(row.get("start_ts", row.get("event_ts"))).replace("Z", "+00:00")) for row in records]
+            ends = [datetime.fromisoformat(str(row.get("end_ts", row.get("event_ts"))).replace("Z", "+00:00")) for row in records]
+            coverage_start, coverage_end = _iso(min(starts)), _iso(max(ends))
         else:
             coverage_start = coverage_end = None
         return ImportResult(records, issues, file_format, self.instrument, self.timeframe, self.price_base, coverage_start, coverage_end, str(path))

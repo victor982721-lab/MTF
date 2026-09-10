@@ -32,7 +32,8 @@ class OpsTests(unittest.TestCase):
                 store.save_checkpoint(sid, "replay", cursor={"row": 2}, events_processed=2, last_event_id="e2", state={"warm": False})
                 self.assertEqual(len(store.list_candles(sid)), 2)
                 self.assertEqual(store.get_checkpoint(sid, "replay")["cursor"]["row"], 2)
-                self.assertEqual(store.schema_version, 1)
+                # The lineage/analysis migration is applied on first open.
+                self.assertEqual(store.schema_version, 2)
 
     def test_contract_outcomes_and_break_even(self) -> None:
         start = datetime(2025, 1, 1, tzinfo=UTC)

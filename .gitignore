@@ -4,9 +4,14 @@ __pycache__/
 .pytest_cache/
 *.sqlite3
 *.db
-runtime/
+/runtime/
 reports/generated/
 logs/
 
 
 *.sqlite
+
+# Derivados locales de ejecuciones (el paquete mtf_lab/runtime sí se versiona)
+/data/*.sqlite3
+/data/*.db
+/data/*.jsonl

@@ -112,11 +112,17 @@ class Event:
     def __post_init__(self) -> None:
         if not self.instrument or not self.instrument.strip():
             raise ValueError("instrument must not be empty")
-        object.__setattr__(self, "event_time", ensure_utc(self.event_time, field_name="event_time"))
+        event_time = ensure_utc(self.event_time, field_name="event_time")
+        object.__setattr__(self, "event_time", event_time)
         if self.received_at is not None:
             object.__setattr__(self, "received_at", ensure_utc(self.received_at, field_name="received_at"))
         if self.available_at is not None:
-            object.__setattr__(self, "available_at", ensure_utc(self.available_at, field_name="available_at"))
+            available = ensure_utc(self.available_at, field_name="available_at")
+            if available < event_time:
+                raise ValueError("available_at must not precede event_time")
+            object.__setattr__(self, "available_at", available)
+        if self.received_at is not None and self.received_at < event_time:
+            raise ValueError("received_at must not precede event_time")
         if self.price_basis not in {"traded", "bid", "ask", "mid"}:
             raise ValueError(f"unsupported price_basis: {self.price_basis!r}")
         object.__setattr__(self, "price", _finite(self.price, "price", allow_zero=False))
@@ -246,9 +252,15 @@ class Bar:
         object.__setattr__(self, "interval_start", start)
         object.__setattr__(self, "interval_end", end)
         if self.received_at is not None:
-            object.__setattr__(self, "received_at", ensure_utc(self.received_at, field_name="received_at"))
+            received = ensure_utc(self.received_at, field_name="received_at")
+            if received < start:
+                raise ValueError("received_at must not precede interval_start")
+            object.__setattr__(self, "received_at", received)
         if self.available_at is not None:
-            object.__setattr__(self, "available_at", ensure_utc(self.available_at, field_name="available_at"))
+            available = ensure_utc(self.available_at, field_name="available_at")
+            if available < start or (self.closed and available < end):
+                raise ValueError("available_at must not precede interval_start/end for a closed bar")
+            object.__setattr__(self, "available_at", available)
         if self.price_basis not in {"traded", "bid", "ask", "mid"}:
             raise ValueError(f"unsupported price_basis: {self.price_basis!r}")
         values = {

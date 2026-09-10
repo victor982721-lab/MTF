@@ -1,45 +1,49 @@
 # MTF Lab — informe de ejecución
 
-- Generado: `2026-09-10T04:29:56Z`
+- Generado: `2026-09-10T20:06:00Z`
 - Modo: **SYNTHETIC** (`SINTETICO`)
 - Proveedor: `synthetic`
-- Instrumento: `SYNTH/USD`
+- Instrumento de sesión: `SYNTH/USD`
 - Estado de sesión: `COMPLETED`
 
 ## Conteos persistidos
 
 | Señales | Descartes | Simulaciones | Velas |
 |---:|---:|---:|---:|
-| 14 | 2837 | 321 | 3040 |
+| 96 | 5548 | 288 | 3040 |
 
-## Resultados por horizonte
+## Agregado de simulaciones
 
-| Horizonte (s) | Resultados | Neto virtual |
-|---:|---|---:|
-| 180.0 | `{"LOSS": 63, "WIN": 44}` | -27.8 |
-| 300.0 | `{"LOSS": 61, "WIN": 46}` | -24.2 |
-| 60.0 | `{"LOSS": 64, "WIN": 43}` | -29.6 |
+- Resultado neto virtual: `-8`
+- Resueltos: `287`; indeterminados/pending: `1` (PENDING: `0`)
+- Caída máxima de la secuencia registrada: `22.799999999999994`
 
-## Variantes controladas
+## Segmentos controlados
 
-| Variante | Resultados | Neto virtual | Hash de configuración |
-|---|---|---:|---|
-| `m1_trigger_reference` | `{"LOSS": 163, "WIN": 116}` | -70.2 | `1a9728a0821117e49f67004867b86a0beb26e4eb8c4ee98ca19adb0e90a0234c` |
-| `trend_pullback_v1` | `{"LOSS": 25, "WIN": 17}` | -11.4 | `cacc8626bbefbf0ca224de069c682f812819968a7db6283515b106a9422a382c` |
+| Análisis | Variante | Instrumento | Horizonte s | Partición | Contrato | N | W/L/T/I/P | Neto | DD |
+|---|---|---|---:|---|---|---:|---|---:|---:|
+| `m1_trigger_reference` | `m1_trigger_reference` | `SYNTH/USD` | 180 | `all` | `VIRTUAL_CONTRACT` | 89 | 46/43/0/0/0 | -6.2 | 10.2 |
+| `m1_trigger_reference` | `m1_trigger_reference` | `SYNTH/USD` | 300 | `all` | `VIRTUAL_CONTRACT` | 89 | 46/42/0/1/0 | -5.2 | 8 |
+| `m1_trigger_reference` | `m1_trigger_reference` | `SYNTH/USD` | 60 | `all` | `VIRTUAL_CONTRACT` | 89 | 51/38/0/0/0 | 2.8 | 11 |
+| `trend_pullback_v1` | `trend_pullback_v1` | `SYNTH/USD` | 180 | `all` | `VIRTUAL_CONTRACT` | 7 | 4/3/0/0/0 | 0.2 | 1 |
+| `trend_pullback_v1` | `trend_pullback_v1` | `SYNTH/USD` | 300 | `all` | `VIRTUAL_CONTRACT` | 7 | 4/3/0/0/0 | 0.2 | 2 |
+| `trend_pullback_v1` | `trend_pullback_v1` | `SYNTH/USD` | 60 | `all` | `VIRTUAL_CONTRACT` | 7 | 4/3/0/0/0 | 0.2 | 2.2 |
 
 ## Motivos de descarte
 
-- `context_indicator_not_ready`: 936
-- `context_invalidated`: 270
+- `context_indicator_not_ready`: 921
+- `context_invalidated`: 182
 - `context_neutral`: 54
-- `context_not_available`: 16
-- `directional_pullback_failed`: 147
-- `distance_exceeded`: 92
-- `no_directional_cross`: 135
-- `preparation_expired`: 335
-- `preparation_not_registered`: 726
-- `rsi_threshold_failed`: 1
-- `signal_duplicate`: 125
+- `direction_not_known`: 372
+- `directional_pullback_failed`: 535
+- `distance_exceeded`: 552
+- `no_directional_cross`: 446
+- `preparation_lookback_insufficient`: 632
+- `preparation_not_registered`: 899
+- `rsi_not_ready`: 372
+- `rsi_threshold_failed`: 317
+- `signal_duplicate`: 28
+- `trigger_previous_bar_unavailable`: 238
 
 ## Calidad y límites
 
@@ -47,5 +51,7 @@
 - Resoluciones: `{"M1": 2400, "M15": 160, "M5": 480}`
 - Los resultados son simulaciones virtuales y no constituyen órdenes ni recomendación.
 - La tasa de acierto no es una probabilidad de éxito; señales cercanas pueden depender entre sí.
+- La muestra bruta y las particiones no eliminan dependencia entre señales cercanas.
 - Las velas no permiten inferir movimientos intrabar que no estén observados.
 - La ausencia de una fuente de noticias o de un bróker no se interpreta como comprobación.
+- Una simulación INDETERMINATE o PENDING no se cuenta como ganancia, pérdida ni operación resuelta.

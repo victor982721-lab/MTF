@@ -27,7 +27,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+class IdempotencyConflict(RuntimeError):
+    """Misma identidad persistente con contenido/configuración distinta."""
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -182,6 +186,15 @@ class SQLiteStore:
                 )
             if version < 1:
                 self._create_v1()
+                version = 1
+                self.conn.execute(
+                    "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (str(version),),
+                )
+                self.conn.commit()
+            if version < 2:
+                self._migrate_v2()
                 self.conn.execute(
                     "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -342,8 +355,43 @@ class SQLiteStore:
             """
         )
 
+
+    def _migrate_v2(self) -> None:
+        """Add analysis/variant lineage without rewriting existing captures."""
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS analyses (
+                analysis_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                dataset_hash TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                code_version TEXT,
+                variant TEXT NOT NULL,
+                contract_hash TEXT,
+                partition TEXT NOT NULL DEFAULT 'all',
+                status TEXT NOT NULL DEFAULT 'COMPLETED',
+                created_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL,
+                UNIQUE(session_id,dataset_hash,config_hash,variant,contract_hash,partition)
+            );
+            CREATE INDEX IF NOT EXISTS analyses_session ON analyses(session_id,created_at);
+            """
+        )
+        existing_candles = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(candles)")}
+        if "payload_json" not in existing_candles:
+            self.conn.execute("ALTER TABLE candles ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'")
+        for table in ("decisions", "discards", "signals", "simulations"):
+            existing = {str(row[1]) for row in self.conn.execute(f"PRAGMA table_info({table})")}
+            for column in ("analysis_id", "variant", "analysis_config_hash", "contract_hash", "partition"):
+                if column not in existing:
+                    self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
+            self.conn.execute(f"CREATE INDEX IF NOT EXISTS {table}_analysis ON {table}(session_id,analysis_id)")
+        self.conn.commit()
+
     @property
     def schema_version(self) -> int:
+        if not self._table_exists("schema_meta"):
+            return 0
         row = self.conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
         return int(row[0]) if row else 0
 
@@ -413,6 +461,66 @@ class SQLiteStore:
             explicit = f"generated:{ordinal if ordinal is not None else record.get('source_ordinal', '')}:{payload_hash(record)}"
         return str(explicit), record
 
+
+    def _check_idempotency(self, table: str, identity_columns: tuple[str, ...], identity_values: tuple[Any, ...], payload: str) -> bool:
+        where = " AND ".join(f"{column}=?" for column in identity_columns)
+        row = self.conn.execute(f"SELECT payload_json FROM {table} WHERE {where}", identity_values).fetchone()
+        if row is None:
+            return False
+        if str(row[0]) != payload:
+            raise IdempotencyConflict(f"conflicto de idempotencia en {table}: identidad={identity_values!r} ya tiene contenido distinto")
+        return True
+
+    def create_analysis(
+        self,
+        session_id: str,
+        *,
+        dataset_hash: str,
+        config_hash: str,
+        variant: str,
+        contract_hash: str | None = None,
+        partition: str = "all",
+        code_version: str | None = None,
+        metadata: Mapping[str, Any] | None = None,
+        analysis_id: str | None = None,
+        status: str = "COMPLETED",
+    ) -> str:
+        """Create/reuse one immutable analysis identity for a capture."""
+        if not dataset_hash or not config_hash or not variant:
+            raise ValueError("dataset_hash, config_hash y variant son obligatorios")
+        partition = str(partition or "all")
+        identity = {"session_id": session_id, "dataset_hash": str(dataset_hash), "config_hash": str(config_hash), "variant": str(variant), "contract_hash": str(contract_hash or ""), "partition": partition}
+        analysis_id = analysis_id or "an_" + payload_hash(identity)[:32]
+        metadata_text = canonical_json(metadata or {})
+        with self.transaction(immediate=True) as conn:
+            existing = conn.execute("SELECT session_id,dataset_hash,config_hash,variant,contract_hash,partition,metadata_json FROM analyses WHERE analysis_id=?", (analysis_id,)).fetchone()
+            if existing is not None:
+                expected = (session_id, str(dataset_hash), str(config_hash), str(variant), contract_hash, partition)
+                actual = tuple(existing[:6])
+                if actual != expected:
+                    raise IdempotencyConflict(f"analysis_id {analysis_id} ya existe con identidad distinta")
+                return analysis_id
+            conn.execute("""INSERT INTO analyses(analysis_id,session_id,dataset_hash,config_hash,code_version,variant,contract_hash,partition,status,created_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (analysis_id, session_id, str(dataset_hash), str(config_hash), code_version, str(variant), contract_hash, partition, status, utc_iso(), metadata_text))
+        return analysis_id
+
+    def get_analysis(self, analysis_id: str) -> dict[str, Any] | None:
+        if not self._table_exists("analyses"):
+            return None
+        rows = self._rows("SELECT * FROM analyses WHERE analysis_id=?", (analysis_id,))
+        if not rows: return None
+        row = rows[0]; row["metadata"] = _json_load(row.pop("metadata_json"), {}); return row
+
+    def analyses(self, session_id: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
+        if not self._table_exists("analyses"):
+            return []
+        if session_id is None:
+            rows = self._rows("SELECT * FROM analyses ORDER BY created_at DESC LIMIT ?", (int(limit),))
+        else:
+            rows = self._rows("SELECT * FROM analyses WHERE session_id=? ORDER BY created_at DESC LIMIT ?", (session_id, int(limit)))
+        for row in rows:
+            row["metadata"] = _json_load(row.pop("metadata_json", None), {})
+        return rows
+
     def save_event(self, session_id: str, event: Any, *, ordinal: int | None = None) -> bool:
         event_id, record = self._event_identity(event, ordinal=ordinal)
         payload = canonical_json(record)
@@ -430,6 +538,8 @@ class SQLiteStore:
             int(bool(_get(record, "is_correction", "correction", default=False))),
         )
         with self.transaction() as conn:
+            if self._check_idempotency("events", ("session_id", "event_id"), (session_id, event_id), payload):
+                return False
             cur = conn.execute(
                 """INSERT INTO events(
                 session_id,event_id,source,instrument,event_ts,received_ts,available_ts,
@@ -471,20 +581,29 @@ class SQLiteStore:
             str(_get(record, "quality", "data_quality", default="UNKNOWN")),
             revision,
             canonical_json(_get(record, "provenance", "provenance_json", default=record)),
+            canonical_json(record),
         )
+        payload = canonical_json(record)
         with self.transaction() as conn:
+            if self._check_idempotency("candles", ("session_id", "candle_id"), (session_id, str(explicit)), payload):
+                return False
             cur = conn.execute(
                 """INSERT INTO candles(
                 session_id,candle_id,instrument,timeframe,start_ts,end_ts,available_ts,
-                open,high,low,close,volume,closed,source,price_base,quality,revision,provenance_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                open,high,low,close,volume,closed,source,price_base,quality,revision,provenance_json,payload_json
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(session_id,candle_id) DO NOTHING""",
                 values,
             )
         return cur.rowcount == 1
 
-    def save_decision(self, session_id: str, decision: Any, *, ordinal: int | None = None) -> bool:
+    def save_decision(self, session_id: str, decision: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
         record = _mapping(decision)
+        analysis_id = analysis_id or _get(record, "analysis_id")
+        variant = variant or _get(record, "variant", "variant_name")
+        analysis_config_hash = analysis_config_hash or _get(record, "analysis_config_hash", "config_hash")
+        contract_hash = contract_hash or _get(record, "contract_hash")
+        partition = partition or _get(record, "partition")
         decision_id = _get(record, "decision_id", "id", "uid")
         if decision_id is None:
             decision_id = f"decision:{_get(record,'observed_ts','timestamp','ts')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
@@ -495,16 +614,24 @@ class SQLiteStore:
             str(_get(record, "kind", "type", "stage", default="strategy_evaluation")),
             str(_get(record, "status", "decision", default="UNKNOWN")), canonical_json(record),
         )
+        payload = canonical_json(record)
         with self.transaction() as conn:
+            if self._check_idempotency("decisions", ("session_id", "decision_id"), (session_id, str(decision_id)), payload):
+                return False
             cur = conn.execute(
-                """INSERT INTO decisions(session_id,decision_id,observed_ts,available_ts,kind,status,payload_json)
-                VALUES(?,?,?,?,?,?,?) ON CONFLICT(session_id,decision_id) DO NOTHING""",
-                values,
+                """INSERT INTO decisions(session_id,decision_id,observed_ts,available_ts,kind,status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (*values, analysis_id, variant, analysis_config_hash, contract_hash, partition),
             )
         return cur.rowcount == 1
 
-    def save_signal(self, session_id: str, signal: Any, *, ordinal: int | None = None) -> bool:
+    def save_signal(self, session_id: str, signal: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
         record = _mapping(signal)
+        analysis_id = analysis_id or _get(record, "analysis_id")
+        variant = variant or _get(record, "variant", "variant_name")
+        analysis_config_hash = analysis_config_hash or _get(record, "analysis_config_hash", "config_hash")
+        contract_hash = contract_hash or _get(record, "contract_hash")
+        partition = partition or _get(record, "partition")
         signal_id = _get(record, "signal_id", "id", "uid")
         if signal_id is None:
             signal_id = f"signal:{_get(record,'detected_ts','detected_at','timestamp','ts')}:{_get(record,'direction','side',default='UNKNOWN')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
@@ -516,16 +643,24 @@ class SQLiteStore:
             str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
             str(_get(record, "status", default="VALID")), canonical_json(record),
         )
+        payload = canonical_json(record)
         with self.transaction() as conn:
+            if self._check_idempotency("signals", ("session_id", "signal_id"), (session_id, str(signal_id)), payload):
+                return False
             cur = conn.execute(
-                """INSERT INTO signals(session_id,signal_id,episode_id,detected_ts,available_ts,instrument,direction,status,payload_json)
-                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,signal_id) DO NOTHING""",
-                values,
+                """INSERT INTO signals(session_id,signal_id,episode_id,detected_ts,available_ts,instrument,direction,status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (*values, analysis_id, variant, analysis_config_hash, contract_hash, partition),
             )
         return cur.rowcount == 1
 
-    def save_discard(self, session_id: str, discard: Any, *, ordinal: int | None = None) -> bool:
+    def save_discard(self, session_id: str, discard: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
         record = _mapping(discard)
+        analysis_id = analysis_id or _get(record, "analysis_id")
+        variant = variant or _get(record, "variant", "variant_name")
+        analysis_config_hash = analysis_config_hash or _get(record, "analysis_config_hash", "config_hash")
+        contract_hash = contract_hash or _get(record, "contract_hash")
+        partition = partition or _get(record, "partition")
         discard_id = _get(record, "discard_id", "id", "uid")
         if discard_id is None:
             discard_id = f"discard:{_get(record,'observed_ts','timestamp','ts')}:{_get(record,'reason_code','reason',default='UNKNOWN')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
@@ -537,21 +672,29 @@ class SQLiteStore:
             str(_get(record, "condition_status", "status", default="UNSATISFIED")),
             canonical_json(record),
         )
+        payload = canonical_json(record)
         with self.transaction() as conn:
+            if self._check_idempotency("discards", ("session_id", "discard_id"), (session_id, str(discard_id)), payload):
+                return False
             cur = conn.execute(
-                """INSERT INTO discards(session_id,discard_id,decision_id,observed_ts,reason_code,required,condition_status,payload_json)
-                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id,discard_id) DO NOTHING""",
-                values,
+                """INSERT INTO discards(session_id,discard_id,decision_id,observed_ts,reason_code,required,condition_status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (*values, analysis_id, variant, analysis_config_hash, contract_hash, partition),
             )
         return cur.rowcount == 1
 
-    def save_simulation(self, session_id: str, simulation: Any, *, ordinal: int | None = None) -> bool:
+    def save_simulation(self, session_id: str, simulation: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None, allow_update: bool = False) -> bool:
         record = _mapping(simulation)
+        analysis_id = analysis_id or _get(record, "analysis_id")
+        variant = variant or _get(record, "variant", "variant_name")
+        analysis_config_hash = analysis_config_hash or _get(record, "analysis_config_hash", "config_hash", "variant_config_hash")
+        contract_hash = contract_hash or _get(record, "contract_hash")
+        partition = partition or _get(record, "partition")
         sim_id = _get(record, "simulation_id", "id", "uid")
         if sim_id is None:
             sim_id = f"simulation:{_get(record,'signal_id',default='none')}:{_get(record,'horizon_seconds','horizon',default=0)}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
         detected = utc_iso(_get(record, "detected_ts", "detected_at", "timestamp", "ts"))
-        expiry = utc_iso(_get(record, "expiry_ts", "expires_at", "expiry", default=detected))
+        expiry = utc_iso(_get(record, "expiry_ts", "expiry_at", "expires_at", "expiry", default=detected))
         values = (
             session_id, str(sim_id), _get(record, "signal_id"), str(_get(record, "simulation_type", "type", default="DIRECTIONAL")),
             float(_get(record, "horizon_seconds", "horizon", default=0)), str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
@@ -563,15 +706,30 @@ class SQLiteStore:
             str(_get(record, "price_base", "base_price", default="unknown")), str(_get(record, "quality", default="UNKNOWN")),
             str(_get(record, "resolution", default="UNKNOWN")), canonical_json(_get(record, "assumptions", "assumptions_json", default={})), canonical_json(record),
         )
+        payload = canonical_json(record)
         with self.transaction() as conn:
+            existing = conn.execute("SELECT payload_json FROM simulations WHERE session_id=? AND simulation_id=?", (session_id, str(sim_id))).fetchone()
+            if existing is not None:
+                if str(existing[0]) == payload:
+                    return False
+                if not allow_update:
+                    raise IdempotencyConflict(f"conflicto de idempotencia en simulations: identidad={(session_id, str(sim_id))!r} ya tiene contenido distinto")
+                (_sid, _sim_id, signal_id, simulation_type, horizon, direction, detected_ts, entry_ts, expiry_ts, entry_price, final_price, outcome, stake, net_result, price_base, quality, resolution, assumptions_json, payload_json) = values
+                conn.execute("""UPDATE simulations SET signal_id=?,simulation_type=?,horizon_seconds=?,direction=?,detected_ts=?,entry_ts=?,expiry_ts=?,entry_price=?,final_price=?,outcome=?,stake=?,net_result=?,price_base=?,quality=?,resolution=?,assumptions_json=?,payload_json=?,analysis_id=?,variant=?,analysis_config_hash=?,contract_hash=?,partition=? WHERE session_id=? AND simulation_id=?""", (signal_id, simulation_type, horizon, direction, detected_ts, entry_ts, expiry_ts, entry_price, final_price, outcome, stake, net_result, price_base, quality, resolution, assumptions_json, payload_json, analysis_id, variant, analysis_config_hash, contract_hash, partition, session_id, str(sim_id)))
+                return True
             cur = conn.execute(
                 """INSERT INTO simulations(
                 session_id,simulation_id,signal_id,simulation_type,horizon_seconds,direction,detected_ts,entry_ts,expiry_ts,
-                entry_price,final_price,outcome,stake,net_result,price_base,quality,resolution,assumptions_json,payload_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id,simulation_id) DO NOTHING""",
-                values,
+                entry_price,final_price,outcome,stake,net_result,price_base,quality,resolution,assumptions_json,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (*values, analysis_id, variant, analysis_config_hash, contract_hash, partition),
             )
         return cur.rowcount == 1
+
+    def update_simulation(self, session_id: str, simulation: Any, **kwargs: Any) -> bool:
+        """Actualiza el ciclo de vida PENDING -> resuelto de una simulación."""
+        kwargs["allow_update"] = True
+        return self.save_simulation(session_id, simulation, **kwargs)
 
     def save_checkpoint(
         self,
@@ -606,6 +764,10 @@ class SQLiteStore:
     def _rows(self, sql: str, params: Iterable[Any] = ()) -> list[dict[str, Any]]:
         rows = self.conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
+
+    def _table_exists(self, table: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+        return row is not None
 
     def get_session(self, session_id: str) -> dict[str, Any] | None:
         rows = self._rows("SELECT * FROM sessions WHERE session_id=?", (session_id,))
@@ -679,9 +841,20 @@ class SQLiteStore:
     def status(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id) or {"session_id": session_id, "status": "UNKNOWN"}
         counts = {}
-        for table in ("events", "candles", "decisions", "signals", "discards", "simulations"):
+        for table in ("events", "candles", "decisions", "signals", "discards", "simulations", "analyses"):
+            if not self._table_exists(table):
+                counts[table] = 0
+                continue
             row = self.conn.execute(f"SELECT COUNT(*) FROM {table} WHERE session_id=?", (session_id,)).fetchone()
             counts[table] = int(row[0])
+        # ``counts.signals`` is the primary MTF detector count for terminal
+        # compatibility; the complete capture count (including the independent
+        # M1 reference variant) remains explicit as ``signals_total``.
+        if self._table_exists("signals") and "variant" in {str(row[1]) for row in self.conn.execute("PRAGMA table_info(signals)")}:
+            total_signals = counts.get("signals", 0)
+            primary = self.conn.execute("SELECT COUNT(*) FROM signals WHERE session_id=? AND (variant IS NULL OR variant <> 'm1_trigger_reference')", (session_id,)).fetchone()[0]
+            counts["signals_total"] = total_signals
+            counts["signals"] = int(primary)
         latest = self.conn.execute(
             "SELECT MAX(event_ts) FROM events WHERE session_id=?", (session_id,)
         ).fetchone()[0]

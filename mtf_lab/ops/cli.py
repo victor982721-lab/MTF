@@ -1,25 +1,34 @@
-"""Command line entry points for the local MTF Lab operational layer."""
+"""Command line entry points for the local MTF Lab operational layer.
 
+The CLI is deliberately thin: ``RuntimeCoordinator`` is the shared path for
+replay and observation, while reporting/UI consume only persisted read models.
+There is no order, account or execution connector in this module.
+"""
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable, Mapping
+from dataclasses import replace
+from datetime import UTC, datetime
 import importlib
 import json
 import os
-import socket
 import sys
-import tempfile
-import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 from .. import __version__
+from ..configuration import ConfigError, EffectiveConfig, load_config, normalize_simulation_mapping
+from ..core import assess_freshness, compute_indicators
+from ..pipeline import m1_reference_signals, points_from_candles
+from ..runtime import RuntimeCoordinator, capture_hash
+from ..runtime.state import to_core_candle
 from .backtest import BacktestRunner, VariantSpec
 from .demo import run_demo
 from .importer import ColumnMapping, ImportValidationError, LocalImporter
-from .logging_state import JsonlLogger, OperationTelemetry
-from .persistence import SQLiteStore
+from .logging_state import OperationTelemetry
+from .persistence import IdempotencyConflict, SQLiteStore, payload_hash
 from .reporting import ReportBuilder
 from .simulation import EvaluationSpec, VirtualContractSimulator
 from .ui import serve
@@ -40,112 +49,178 @@ def default_config() -> Path:
     return PROJECT_ROOT / "config" / "default.toml"
 
 
+def default_watch_config() -> Path:
+    candidate = PROJECT_ROOT / "config" / "kraken.toml"
+    return candidate if candidate.exists() else default_config()
+
+
+def effective_config(path: str | Path | None = None) -> EffectiveConfig:
+    """Carga y normaliza la única configuración efectiva del proyecto."""
+    return load_config(path or default_config())
+
+
+def _config_for(args: argparse.Namespace, *, watch: bool = False) -> EffectiveConfig:
+    path = getattr(args, "config", None)
+    return effective_config(path or (default_watch_config() if watch else default_config()))
+
+
+def _db_for(args: argparse.Namespace, config: EffectiveConfig | None = None) -> Path:
+    value = getattr(args, "db", None)
+    if value is not None:
+        return Path(value).expanduser()
+    if config is not None and config.storage_db:
+        return Path(config.storage_db).expanduser()
+    return default_db()
+
+
+def _log_for(args: argparse.Namespace, db: Path, config: EffectiveConfig | None = None) -> Path:
+    value = getattr(args, "log", None)
+    if value is not None:
+        return Path(value).expanduser()
+    if getattr(args, "db", None) is not None:
+        return default_logs(db)
+    if config is not None and config.storage_logs:
+        return Path(config.storage_logs).expanduser()
+    return default_logs(db)
+
+
+def _canonical_base(value: Any) -> str:
+    text = str(value or "traded").strip().lower()
+    return "traded" if text in {"trade", "traded", "close"} else text
+
+
+def _override_config(config: EffectiveConfig, *, instrument: str | None = None, price_base: str | None = None, mode: str | None = None) -> EffectiveConfig:
+    """Adapt capture metadata without changing strategy or simulation rules."""
+    values: dict[str, Any] = {}
+    if instrument:
+        values["instrument"] = str(instrument)
+    if price_base:
+        values["price_base"] = _canonical_base(price_base)
+    if mode:
+        values["mode"] = str(mode).upper()
+    if values:
+        data = dict(config.data)
+        if instrument:
+            data["instrument"] = str(instrument)
+        if price_base:
+            data["price_base"] = _canonical_base(price_base)
+        if mode:
+            data["mode"] = str(mode).upper()
+        values["data"] = data
+    return replace(config, **values) if values else config
+
+
 def _load_toml(path: str | Path | None) -> dict[str, Any]:
+    """Compatibilidad de lectura para integradores; CLI usa EffectiveConfig."""
     if path is None:
         return {}
     import tomllib
 
-    target = Path(path).expanduser()
-    with target.open("rb") as stream:
+    with Path(path).expanduser().open("rb") as stream:
         value = tomllib.load(stream)
     if not isinstance(value, dict):
-        raise ValueError("la configuración TOML debe ser una tabla")
+        raise ConfigError("la configuración TOML debe ser una tabla")
     return value
 
 
-def _validate_config(config: dict[str, Any]) -> list[str]:
-    """Validate project TOML strictly enough to catch spelling mistakes."""
-    allowed_sections = {"project", "storage", "data", "instrument", "timeframes", "indicators", "strategy", "quality", "simulation", "provider", "ui"}
-    allowed: dict[str, set[str]] = {
-        "project": {"name", "version", "mode"},
-        "storage": {"db", "logs"},
-        "data": {"provider", "instrument", "resolution", "source", "path", "price_base", "mode"},
-        "instrument": {"symbol", "price_base"},
-        "timeframes": {"base", "values", "closed_only"},
-        "indicators": {"ema_fast", "ema_slow", "rsi_period", "atr_period", "wilder"},
-        "strategy": {"name", "context_timeframe", "preparation_timeframe", "trigger_timeframe", "setup_timeframe", "context_lookback", "preparation_lookback", "lookback", "max_distance_atr", "setup_max_atr", "rsi_threshold", "preparation_ttl_bars", "preparation_ttl_minutes", "require_closed", "optional_filters", "indicators", "timeframes", "lookbacks", "conditions", "mode", "one_signal_per_episode"},
-        "quality": {"max_feed_age_seconds", "max_closed_candle_age_seconds", "max_gap_minutes", "require_warmup"},
-        "simulation": {"horizons_seconds", "horizons_minutes", "entry_latency_seconds", "stake", "max_price_age_seconds", "payout_net", "net_payout", "loss_amount", "tie_net", "tie_return", "costs", "tie_tolerance", "requested_base_price", "require_closed", "entry_rule", "exit_rule"},
-        "provider": {"name", "rest_url", "websocket_url", "rest_max_records", "exclude_last_uncommitted", "trade_channel", "ohlc_channel"},
-        "ui": {"host", "port"},
+def _sim_spec(config: EffectiveConfig | Mapping[str, Any] | None = None) -> EvaluationSpec:
+    """Construye ``EvaluationSpec`` desde la normalización central."""
+    return EvaluationSpec(**normalize_simulation_mapping(config))
+
+def _build_importer(args: argparse.Namespace, config: EffectiveConfig | None = None) -> LocalImporter:
+    instrument = getattr(args, "instrument", None) or (config.instrument if config else "UNKNOWN")
+    timeframe = getattr(args, "timeframe", None) or (config.timeframes[0].name if config else "M1")
+    base = getattr(args, "price_base", None) or (config.price_base if config else "close")
+    # LocalImporter uses ``trade`` for its user-facing alias while core uses
+    # ``traded`` internally; both mean the same explicitly declared base.
+    if _canonical_base(base) == "traded":
+        base = "trade"
+    interval = getattr(args, "interval_seconds", None)
+    mapping = ColumnMapping.from_text(getattr(args, "mapping", None))
+    return LocalImporter(
+        instrument=str(instrument), timeframe=str(timeframe), price_base=str(base), mapping=mapping,
+        timezone=getattr(args, "timezone", None), timestamp_unit=getattr(args, "timestamp_unit", "iso8601"), interval_seconds=float(interval) if interval is not None else None,
+        strict=not bool(getattr(args, "allow_issues", False)),
+        source=(str(config.data.get("source")) if config is not None and config.data.get("source") else None),
+        allow_out_of_order=bool(getattr(args, "allow_out_of_order", False)),
+        allow_duplicates=bool(getattr(args, "allow_duplicates", False)),
+    )
+
+
+def _persist_import(
+    db: Path,
+    imported: Any,
+    *,
+    mode: str = "REPLAY",
+    provider: str = "local-file",
+    log_path: Path | None = None,
+    session_id: str | None = None,
+    config: EffectiveConfig | None = None,
+    finish: bool = True,
+) -> tuple[str, dict[str, Any]]:
+    session_config = config.to_dict() if config is not None else {}
+    session_config["import"] = imported.to_dict()
+    session_config["capture_hash"] = _capture_hash(imported.records)
+    metadata = {"import": imported.to_dict(), "capture_hash": session_config["capture_hash"], "log_path": str(log_path) if log_path else None}
+    with SQLiteStore(db) as store:
+        sid = store.create_session(
+            session_id=session_id, mode=mode, provider=provider, instrument=imported.instrument,
+            code_version=__version__, dataset_ref=imported.source_path, config=session_config, metadata=metadata,
+        )
+        for ordinal, record in enumerate(imported.records):
+            if "open" in record:
+                store.save_candle(sid, record, ordinal=ordinal)
+            else:
+                store.save_event(sid, record, ordinal=ordinal)
+        store.save_checkpoint(
+            sid, "import", cursor={"source_path": imported.source_path, "last_row": len(imported.records)},
+            events_processed=len(imported.records), state={"coverage_start": imported.coverage_start, "coverage_end": imported.coverage_end, "capture_hash": session_config["capture_hash"]},
+        )
+        if finish:
+            store.finish_session(sid, status="COMPLETED")
+    return sid, {
+        "session_id": sid, "records": len(imported.records), "issues": [x.to_dict() for x in imported.issues],
+        "coverage_start": imported.coverage_start, "coverage_end": imported.coverage_end, "db": str(db), "mode": mode, "provider": provider,
     }
-    errors: list[str] = []
-    errors.extend(f"clave desconocida: {x}" for x in sorted(set(config) - allowed_sections))
-    for section, value in config.items():
-        if section in allowed and isinstance(value, dict):
-            errors.extend(f"{section}.clave desconocida: {x}" for x in sorted(set(value) - allowed[section]))
-        elif section in allowed and section not in {"timeframes"} and not isinstance(value, dict):
-            errors.append(f"{section} debe ser tabla")
-    if isinstance(config.get("timeframes"), (dict, list)) is False and "timeframes" in config:
-        errors.append("timeframes debe ser tabla o lista")
-    if isinstance(config.get("strategy"), dict):
-        tf = config["strategy"].get("timeframes")
-        if tf is not None and not isinstance(tf, (dict, list)):
-            errors.append("strategy.timeframes debe ser tabla o lista")
-    return errors
 
-
-def _sim_spec(config: dict[str, Any] | None = None) -> EvaluationSpec:
-    """Translate the human-friendly TOML aliases to EvaluationSpec."""
-    raw = dict((config or {}).get("simulation", {}))
-    if "horizons_seconds" not in raw and "horizons_minutes" in raw:
-        raw["horizons_seconds"] = tuple(float(x) * 60.0 for x in raw.pop("horizons_minutes"))
-    else:
-        raw.pop("horizons_minutes", None)
-    if "payout_net" not in raw and "net_payout" in raw:
-        raw["payout_net"] = raw.pop("net_payout")
-    else:
-        raw.pop("net_payout", None)
-    if "tie_net" not in raw and "tie_return" in raw:
-        raw["tie_net"] = raw.pop("tie_return")
-    else:
-        raw.pop("tie_return", None)
-    # entry/exit labels document assumptions but are not constructor fields.
-    raw.pop("entry_rule", None); raw.pop("exit_rule", None)
-    allowed = {"horizons_seconds", "entry_latency_seconds", "stake", "max_price_age_seconds", "payout_net", "loss_amount", "tie_net", "costs", "tie_tolerance", "requested_base_price", "require_closed", "horizon_from"}
-    unknown = set(raw) - allowed
-    if unknown:
-        raise ValueError(f"simulation.clave desconocida: {sorted(unknown)}")
-    return EvaluationSpec(**raw)
 
 def cmd_doctor(args: argparse.Namespace) -> int:
     print("MTF Lab doctor")
     print(f"python: {sys.version.split()[0]} ({sys.executable})")
     print(f"sqlite: {__import__('sqlite3').sqlite_version}")
     print(f"proyecto: {PROJECT_ROOT}")
-    # Comprobación de dependencias efectivamente importables, sin instalar ni
-    # tocar el entorno. Las opcionales sólo se reportan como tales.
     import importlib.util
+
     errors: list[str] = []
-    required_modules = {"tomllib": "stdlib", "sqlite3": "stdlib", "mtf_lab.core": "núcleo", "mtf_lab.data": "datos", "mtf_lab.ops": "operaciones"}
-    optional_modules = {"websockets": "Kraken WebSocket", "requests": "HTTP opcional", "rich": "salida enriquecida"}
-    for module_name, label in required_modules.items():
-        available = importlib.util.find_spec(module_name) is not None
-        print(f"dependencia {label}: {'OK' if available else 'FALTA'} ({module_name})")
-        if not available:
-            errors.append(f"dependencia requerida ausente: {module_name}")
-    for module_name, label in optional_modules.items():
-        print(f"opcional {label}: {'OK' if importlib.util.find_spec(module_name) is not None else 'omitido'} ({module_name})")
+    required = {"tomllib": "stdlib", "sqlite3": "stdlib", "mtf_lab.core": "núcleo", "mtf_lab.data": "datos", "mtf_lab.ops": "operaciones"}
+    optional = {"websockets": "Kraken WebSocket", "requests": "HTTP opcional", "rich": "salida enriquecida"}
+    for module, label in required.items():
+        ok = importlib.util.find_spec(module) is not None
+        print(f"dependencia {label}: {'OK' if ok else 'FALTA'} ({module})")
+        if not ok:
+            errors.append(f"dependencia requerida ausente: {module}")
+    for module, label in optional.items():
+        print(f"opcional {label}: {'OK' if importlib.util.find_spec(module) is not None else 'omitido'} ({module})")
     if sys.version_info < (3, 11):
         errors.append("Python >= 3.11 requerido")
+    config: EffectiveConfig | None = None
     try:
-        config_path = args.config or (default_config() if default_config().exists() else None)
-        config = _load_toml(config_path)
-        errors.extend(_validate_config(config))
-        print(f"configuración: {'OK' if not errors else 'con errores'}")
+        config = _config_for(args)
+        print(f"configuración: OK hash={config.config_hash}")
+        print(json.dumps({"effective_config": config.to_dict()}, ensure_ascii=False, sort_keys=True, default=str))
     except Exception as exc:
+        print(f"configuración: ERROR {type(exc).__name__}: {exc}")
         errors.append(f"configuración: {exc}")
-    db = Path(args.db or default_db()).expanduser()
+    db = _db_for(args, config)
     try:
         db.parent.mkdir(parents=True, exist_ok=True)
         with SQLiteStore(db) as store:
             print(f"storage: OK {db} schema={store.schema_version}")
     except Exception as exc:
         errors.append(f"storage: {exc}")
-    if args.connectivity:
-        url = "https://api.kraken.com/0/public/Time"
+    if getattr(args, "connectivity", False):
         try:
-            with urllib.request.urlopen(url, timeout=float(args.timeout)) as response:
+            with urllib.request.urlopen("https://api.kraken.com/0/public/Time", timeout=float(args.timeout)) as response:
                 body = response.read(4096).decode("utf-8", "replace")
             print(f"conectividad Kraken REST: OK ({response.status}) cuerpo={body[:160]}")
         except Exception as exc:
@@ -153,47 +228,26 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             errors.append("conectividad opcional no disponible")
     else:
         print("conectividad: omitida (use --connectivity explícitamente)")
-    if errors:
-        for error in errors: print(f"ERROR: {error}")
-        return 2
-    return 0
+    for error in errors:
+        print(f"ERROR: {error}")
+    return 2 if errors else 0
 
 
 def cmd_demo(args: argparse.Namespace) -> int:
-    db = Path(args.db or default_db()).expanduser()
-    config_path = getattr(args, "config", None) or (default_config() if default_config().exists() else None)
-    config = _load_toml(config_path) if config_path else None
-    config_errors = _validate_config(config or {})
-    if config_errors:
-        raise ValueError("configuración inválida: " + "; ".join(config_errors))
-    result = run_demo(db, seed=int(args.seed), minutes=int(args.minutes), report_path=args.report, log_path=args.log, config=config)
+    config = _config_for(args)
+    db = _db_for(args, config)
+    result = run_demo(db, seed=int(args.seed), minutes=int(args.minutes), report_path=args.report, log_path=_log_for(args, db, config), config=config)
     print(json.dumps({"ok": True, **{key: result[key] for key in ("session_id", "db_path", "report_path", "log_path", "dataset", "results")}}, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
-def _build_importer(args: argparse.Namespace) -> LocalImporter:
-    interval = float(args.interval_seconds) if args.interval_seconds is not None else None
-    mapping = ColumnMapping.from_text(args.mapping)
-    return LocalImporter(instrument=args.instrument, timeframe=args.timeframe, price_base=args.price_base, mapping=mapping, timezone=args.timezone, interval_seconds=interval, strict=not args.allow_issues, allow_out_of_order=args.allow_out_of_order, allow_duplicates=args.allow_duplicates)
-
-
-def _persist_import(db: Path, imported: Any, *, mode: str = "REPLAY", provider: str = "local-file", log_path: Path | None = None, session_id: str | None = None) -> tuple[str, dict[str, Any]]:
-    with SQLiteStore(db) as store:
-        sid = store.create_session(session_id=session_id, mode=mode, provider=provider, instrument=imported.instrument, code_version=__version__, dataset_ref=imported.source_path, config={"timeframe": imported.timeframe, "price_base": imported.price_base, "import": imported.to_dict()}, metadata={"import": imported.to_dict()})
-        for ordinal, record in enumerate(imported.records):
-            if "open" in record:
-                store.save_candle(sid, record, ordinal=ordinal)
-            else:
-                store.save_event(sid, record, ordinal=ordinal)
-        store.save_checkpoint(sid, "import", cursor={"source_path": imported.source_path, "last_row": len(imported.records)}, events_processed=len(imported.records), last_event_id=None, state={"coverage_start": imported.coverage_start, "coverage_end": imported.coverage_end})
-        store.finish_session(sid, status="COMPLETED")
-        return sid, {"session_id": sid, "records": len(imported.records), "issues": [x.to_dict() for x in imported.issues], "coverage_start": imported.coverage_start, "coverage_end": imported.coverage_end, "db": str(db), "mode": mode, "provider": provider}
-
-
 def cmd_import(args: argparse.Namespace) -> int:
+    config = effective_config(args.config) if getattr(args, "config", None) else None
     try:
-        imported = _build_importer(args).read(args.input, fmt=args.format)
-        sid, result = _persist_import(Path(args.db or default_db()).expanduser(), imported)
+        imported = _build_importer(args, config).read(args.input, fmt=args.format)
+        db = _db_for(args, config)
+        provider = str(config.data.get("provider") or "local-file") if config is not None else "local-file"
+        sid, result = _persist_import(db, imported, mode="REPLAY", provider=provider, log_path=_log_for(args, db, config), config=config)
     except ImportValidationError as exc:
         print(json.dumps({"ok": False, "error": str(exc), "issues": [x.to_dict() for x in exc.issues]}, ensure_ascii=False, indent=2), file=sys.stderr)
         return 2
@@ -201,299 +255,529 @@ def cmd_import(args: argparse.Namespace) -> int:
     return 0
 
 
-def _discover_engine(config: dict[str, Any] | None = None) -> Any | None:
-    """Discover the provider-neutral core strategy without duplicating rules."""
-    config = config or {}
-    strategy_config = config.get("strategy", config)
-    candidates = ["mtf_lab.core.engine", "mtf_lab.core.strategy", "mtf_lab.strategy", "mtf_lab.core"]
-    for module_name in candidates:
+def _discover_engine(config: EffectiveConfig | Mapping[str, Any] | None = None) -> Any:
+    """Factoría única y explícita del detector, sin fallback especulativo."""
+    from ..core.strategy import TrendPullbackStrategy
+    if isinstance(config, EffectiveConfig):
+        return TrendPullbackStrategy(config.strategy)
+    if isinstance(config, Mapping):
+        value = config.get("strategy", config)
+        return TrendPullbackStrategy(value)
+    return TrendPullbackStrategy()
+
+
+def _stored_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    value = row.get("payload")
+    if isinstance(value, Mapping):
+        return dict(value)
+    raw = row.get("payload_json")
+    if raw:
         try:
-            module = importlib.import_module(module_name)
-        except ImportError:
-            continue
-        for name in ("create_engine", "Engine", "StrategyEngine", "TrendPullbackStrategy"):
-            factory = getattr(module, name, None)
-            if factory is None:
-                continue
-            try:
-                return factory(strategy_config) if callable(factory) else factory
-            except TypeError:
-                try:
-                    return factory()
-                except Exception:
-                    continue
-    return None
+            parsed = json.loads(str(raw))
+            if isinstance(parsed, Mapping):
+                return dict(parsed)
+        except (TypeError, json.JSONDecodeError):
+            pass
+    return {}
 
 
-def _core_candle(row: dict[str, Any], *, mode: str = "REPLAY") -> Any:
-    """Convert a stored row back to the canonical core Candle model."""
-    from datetime import datetime
-    from mtf_lab.core.models import Candle, DataQuality, OperationMode, PriceBase
-
-    def dt(value: Any) -> datetime:
-        text = str(value).replace("Z", "+00:00")
-        parsed = datetime.fromisoformat(text)
-        return parsed
-
-    quality = DataQuality.good(synthetic=mode.upper() == "SYNTHETIC")
-    declared_base = str(row.get("price_base", "traded")).lower()
-    # Una vela con columna ``close`` representa el cierre de la base declarada
-    # por el importador; el modelo Candle usa ``traded`` como alias numérico
-    # para el cierre, sin convertir bid/ask/mid entre sí.
-    core_base = declared_base if declared_base in {"traded", "bid", "ask", "mid"} else "traded"
-    return Candle(
-        instrument=str(row["instrument"]),
-        timeframe=str(row["timeframe"]),
-        start=dt(row["start_ts"]),
-        end=dt(row["end_ts"]),
-        open=float(row["open"]),
-        high=float(row["high"]),
-        low=float(row["low"]),
-        close=float(row["close"]),
-        volume=float(row.get("volume") or 0.0),
-        event_count=int(row.get("event_count") or 0),
-        source=str(row.get("source") or "persisted"),
-        mode=OperationMode.SYNTHETIC if mode.upper() == "SYNTHETIC" else OperationMode.REPLAY,
-        price_base=PriceBase(core_base),
-        closed=bool(row.get("closed", True)),
-        available_at=dt(row["available_ts"]) if row.get("available_ts") else None,
-        received_at=dt(row["available_ts"]) if row.get("available_ts") else None,
-        quality=quality,
-        candle_id=str(row.get("candle_id") or row.get("source_record_id") or ""),
-        origin="persisted",
-        metadata={"persisted": True, "quality": row.get("quality", "UNKNOWN"), "declared_price_base": declared_base},
-    )
+def _stored_records(store: SQLiteStore, session_id: str) -> list[dict[str, Any]]:
+    """Recover the original capture contract, not derived decisions."""
+    session = store.get_session(session_id) or {}
+    mode = str(session.get("mode", "REPLAY"))
+    records: list[dict[str, Any]] = []
+    for row in store.list_events(session_id):
+        data = _stored_payload(row)
+        data.setdefault("event_id", row.get("event_id"))
+        data.setdefault("source_event_id", row.get("event_id"))
+        data.setdefault("source", row.get("source", "persisted"))
+        data.setdefault("instrument", row.get("instrument", session.get("instrument", "unknown")))
+        data.setdefault("event_ts", row.get("event_ts"))
+        data.setdefault("received_ts", row.get("received_ts"))
+        data.setdefault("available_ts", row.get("available_ts"))
+        data.setdefault("kind", row.get("kind", "trade"))
+        data.setdefault("price_base", row.get("price_base", "traded"))
+        data.setdefault("mode", mode)
+        data["_persisted_capture"] = True
+        records.append(data)
+    for row in store.list_candles(session_id):
+        data = _stored_payload(row)
+        data.update({
+            "candle_id": row.get("candle_id"), "instrument": row.get("instrument", session.get("instrument", "unknown")),
+            "timeframe": row.get("timeframe", "M1"), "start_ts": row.get("start_ts"), "end_ts": row.get("end_ts"),
+            "available_ts": data.get("available_ts", row.get("available_ts")), "open": row.get("open"), "high": row.get("high"),
+            "low": row.get("low"), "close": row.get("close"), "volume": row.get("volume"), "closed": bool(row.get("closed", True)),
+            "source": row.get("source", "persisted"), "price_base": row.get("price_base", "traded"), "quality": row.get("quality", "UNKNOWN"),
+            "revision": row.get("revision", 0), "mode": mode,
+        })
+        data["_persisted_capture"] = True
+        records.append(data)
+    return records
 
 
-def _persist_core_result(store: SQLiteStore, sid: str, strategy_result: Any) -> tuple[list[Any], int]:
-    signals = list(getattr(strategy_result, "signals", ()))
-    evaluations = list(getattr(strategy_result, "evaluations", ()))
-    for ordinal, evaluation in enumerate(evaluations):
-        data = evaluation.as_dict() if hasattr(evaluation, "as_dict") else dict(evaluation)
-        observed = data.get("timestamp") or data.get("available_at")
-        stage = str(data.get("stage", "evaluation"))
-        stable = f"decision:{stage}:{observed}"
-        data["decision_id"] = stable
-        store.save_decision(sid, data, ordinal=ordinal)
-        decision = str(data.get("decision", data.get("status", ""))).lower()
-        if decision in {"discarded", "blocked"}:
-            reasons = data.get("reasons") or ["mandatory_condition_not_met"]
-            reason = str(reasons[0])
-            store.save_discard(
-                sid,
-                {
-                    "discard_id": f"{sid}:discard:{stage}:{observed}:{reason}",
-                    "decision_id": stable,
-                    "observed_ts": observed,
-                    "reason_code": reason,
-                    "required": True,
-                    "condition_status": decision.upper(),
-                    "payload": data,
-                },
-                ordinal=ordinal,
-            )
-    for ordinal, signal in enumerate(signals):
-        data = signal.as_dict() if hasattr(signal, "as_dict") else dict(signal)
-        store.save_signal(sid, data, ordinal=ordinal)
-    return signals, len(evaluations)
+def _latest_candles(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in rows:
+        key = (str(row.get("instrument", "unknown")), str(row.get("timeframe", "M1")), str(row.get("start_ts")))
+        candidate = dict(row)
+        if key not in latest or int(candidate.get("revision", 0) or 0) >= int(latest[key].get("revision", 0) or 0):
+            latest[key] = candidate
+    return sorted(latest.values(), key=lambda item: (str(item.get("start_ts", "")), str(item.get("timeframe", ""))))
 
 
-def _evaluate_core_strategy(store: SQLiteStore, sid: str, engine: Any, *, mode: str = "REPLAY") -> tuple[list[Any], int]:
-    streams: dict[str, list[Any]] = {}
-    for timeframe in ("M1", "M5", "M15"):
-        rows = store.list_candles(sid, timeframe=timeframe, closed_only=False)
-        streams[timeframe] = [_core_candle(row, mode=mode) for row in rows]
-    if not callable(getattr(engine, "evaluate", None)):
-        raise TypeError("core strategy must expose evaluate(streams)")
-    result = engine.evaluate(streams)
-    return _persist_core_result(store, sid, result)
+def _core_candle(row: Mapping[str, Any], *, mode: str = "REPLAY") -> Any:
+    """Decode persisted candles while retaining quality/availability metadata."""
+    data = _stored_payload(row)
+    data.update({
+        "instrument": row.get("instrument", data.get("instrument", "unknown")), "timeframe": row.get("timeframe", data.get("timeframe", "M1")),
+        "start_ts": row.get("start_ts", data.get("start_ts", data.get("start"))), "end_ts": row.get("end_ts", data.get("end_ts", data.get("end"))),
+        "open": row.get("open", data.get("open")), "high": row.get("high", data.get("high")), "low": row.get("low", data.get("low")),
+        "close": row.get("close", data.get("close")), "volume": row.get("volume", data.get("volume", 0.0)), "closed": bool(row.get("closed", data.get("closed", True))),
+        "source": row.get("source", data.get("source", "persisted")), "price_base": row.get("price_base", data.get("price_base", "traded")),
+        "quality": row.get("quality", data.get("quality", "UNKNOWN")), "candle_id": row.get("candle_id", data.get("candle_id")),
+        "available_at": row.get("available_ts", data.get("available_at", data.get("available_ts"))), "received_at": data.get("received_at", row.get("available_ts")),
+        "mode": mode,
+    })
+    normalized_mode = str(mode).upper()
+    if normalized_mode not in {"LIVE", "REPLAY", "SYNTHETIC"}:
+        normalized_mode = "REPLAY"
+    return to_core_candle(data, mode=normalized_mode)
+
+
+def _capture_hash(records: Iterable[Any]) -> str:
+    """Hash captures without internal read-model sentinels."""
+    cleaned: list[Any] = []
+    for record in records:
+        if isinstance(record, Mapping):
+            cleaned.append({key: value for key, value in record.items() if key != "_persisted_capture"})
+        else:
+            cleaned.append(record)
+    return capture_hash(cleaned)
+
+
+def _contract_hash(config: EffectiveConfig) -> str:
+    from ..runtime.integration import runtime_simulation_config
+    return payload_hash(runtime_simulation_config(config).to_dict())
+
+
+def _analysis_for(store: SQLiteStore, session_id: str, *, dataset_hash: str, config: EffectiveConfig, variant: str, partition: str, metadata: Mapping[str, Any] | None = None) -> str:
+    return store.create_analysis(session_id, dataset_hash=dataset_hash, config_hash=config.config_hash, variant=variant, contract_hash=_contract_hash(config), partition=partition, code_version=config.version, metadata=metadata or {})
+
+
+def _signal_variant(row: Mapping[str, Any]) -> str:
+    value = row.get("variant")
+    if value:
+        return str(value)
+    payload = row.get("payload")
+    if isinstance(payload, Mapping):
+        return str(payload.get("variant") or payload.get("strategy") or "")
+    return ""
+
+
+def _persist_reference(store: SQLiteStore, session_id: str, config: EffectiveConfig, candles: list[Mapping[str, Any]], *, dataset_hash: str, partition: str = "all", mode: str = "REPLAY") -> tuple[list[dict[str, Any]], str]:
+    core_rows = [_core_candle(row, mode=mode) for row in _latest_candles(candles) if str(row.get("timeframe", "")).upper() == config.strategy.trigger_timeframe.name]
+    if not core_rows:
+        analysis_id = _analysis_for(store, session_id, dataset_hash=dataset_hash, config=config, variant="m1_trigger_reference", partition=partition, metadata={"strategy": "m1_trigger_reference", "coverage": 0})
+        return [], analysis_id
+    series = compute_indicators(core_rows, config.indicators)
+    refs = m1_reference_signals(series, rsi_threshold=config.strategy.rsi_threshold, mode=mode, identity_salt=config.config_hash)
+    analysis_id = _analysis_for(store, session_id, dataset_hash=dataset_hash, config=config, variant="m1_trigger_reference", partition=partition, metadata={"strategy": "m1_trigger_reference", "coverage": len(core_rows)})
+    for ordinal, signal in enumerate(refs):
+        store.save_signal(session_id, signal, ordinal=ordinal, analysis_id=analysis_id, variant="m1_trigger_reference", analysis_config_hash=config.config_hash, contract_hash=_contract_hash(config), partition=partition)
+    return refs, analysis_id
 
 
 def cmd_replay(args: argparse.Namespace) -> int:
-    db = Path(args.db or default_db()).expanduser()
-    config_path = args.config or (default_config() if default_config().exists() else None)
-    config = _load_toml(config_path)
-    config_errors = _validate_config(config)
-    if config_errors:
-        raise ValueError("configuración inválida: " + "; ".join(config_errors))
-    if args.input:
+    config = _config_for(args)
+    db = _db_for(args, config)
+    result: dict[str, Any]
+    records: list[Any]
+    capture_hash_hint: str | None = None
+    if getattr(args, "input", None):
         try:
-            imported = _build_importer(args).read(args.input, fmt=args.format)
-            sid, result = _persist_import(db, imported, mode="REPLAY", provider="local-file")
+            imported = _build_importer(args, config).read(args.input, fmt=args.format)
         except ImportValidationError as exc:
-            print(json.dumps({"ok": False, "error": str(exc), "issues": [x.to_dict() for x in exc.issues]}, ensure_ascii=False, indent=2), file=sys.stderr); return 2
+            print(json.dumps({"ok": False, "error": str(exc), "issues": [x.to_dict() for x in exc.issues]}, ensure_ascii=False, indent=2), file=sys.stderr)
+            return 2
+        config = _override_config(config, instrument=imported.instrument, price_base=imported.price_base, mode="REPLAY")
+        sid, result = _persist_import(db, imported, mode="REPLAY", provider="local-file", log_path=_log_for(args, db, config), config=config)
+        # The capture was already stored by import; mark the in-memory copy so
+        # the runtime cannot rewrite its payload merely to attach indicators.
+        records = [{**record, "_persisted_capture": True} for record in imported.records]
     else:
         with SQLiteStore(db) as store:
             sessions = store.sessions(limit=100)
             if not sessions:
-                print("No hay sesión para replay; indique --input.", file=sys.stderr); return 2
-            sid = args.session or sessions[0]["session_id"]; result = {"session_id": sid, "reused": True}
+                print("No hay sesión para replay; indique --input.", file=sys.stderr)
+                return 2
+            sid = args.session or sessions[0]["session_id"]
+            session = store.get_session(sid)
+            if session is None:
+                print(f"Sesión no encontrada: {sid}", file=sys.stderr)
+                return 2
+            records = _stored_records(store, sid)
+            stored_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
+            capture_hash_hint = str(stored_config.get("capture_hash")) if stored_config.get("capture_hash") else None
+            capture_base = next((record.get("price_base") for record in records if isinstance(record, Mapping) and record.get("price_base")), None)
+            config = _override_config(config, instrument=str(session.get("instrument") or config.instrument), price_base=str(capture_base) if capture_base else None, mode="REPLAY")
+            result = {"session_id": sid, "reused": True, "records": len(records)}
+    dataset_hash = capture_hash_hint or _capture_hash(records)
     with SQLiteStore(db) as store:
-        events = store.list_events(sid)
-        points = store.list_candles(sid, timeframe=args.timeframe, closed_only=True)
-        engine = _discover_engine(config)
-        if engine is None:
-            print(json.dumps({"ok": True, "mode": "REPLAY", **result, "events": len(events), "candles": len(points), "signals": 0, "message": "núcleo de estrategia no disponible; no se inventaron señales"}, ensure_ascii=False, indent=2)); return 0
-        signals_raw, evaluations_count = _evaluate_core_strategy(store, sid, engine, mode="REPLAY")
-        signals_count = len(signals_raw) if not isinstance(signals_raw, int) else signals_raw
-        sim = VirtualContractSimulator(spec=_sim_spec(config))
-        runner = BacktestRunner(simulator=sim, store=store, session_id=sid)
-        results = runner.run(store.list_signals(sid), points, variants=[VariantSpec("trend_pullback_v1", "Estrategia del núcleo")])
-        print(json.dumps({"ok": True, "mode": "REPLAY", **result, "events": len(events), "candles": len(points), "signals": signals_count, "evaluations": evaluations_count, "results": [x.to_dict(include_simulations=False) for x in results]}, ensure_ascii=False, indent=2, default=str)); return 0
+        coordinator = RuntimeCoordinator(
+            store, sid, config, mode="REPLAY", dataset_hash=dataset_hash, variant="trend_pullback_v1", partition=args.partition,
+            checkpoint_name=args.checkpoint, checkpoint_every=args.checkpoint_every, source="replay", max_candles=args.max_candles, resume=args.resume,
+        )
+        replay_result = coordinator.replay(records, sort=not args.preserve_order, bootstrap=False, complete=True)
+        refs, reference_id = coordinator.reference_signals()
+        coordinator.finish(status="COMPLETED")
+        status = coordinator.status()
+        payload = {
+            "ok": True, "mode": "REPLAY", **result, "capture_hash": dataset_hash, "analysis_id": coordinator.analysis_id,
+            "reference_analysis_id": reference_id, "reference_signals": len(refs), "runtime": replay_result.to_dict(),
+            "status": {"connection": status.connection, "analysis_enabled": status.analysis_enabled, "blocked_reasons": status.analysis_blocked_reasons, "pending_simulations": status.pending_simulations, "completed_simulations": status.completed_simulations},
+            "persisted": store.status(sid)["counts"],
+        }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
 
 
 def cmd_backtest(args: argparse.Namespace) -> int:
-    db = Path(args.db or default_db()).expanduser()
+    config = _config_for(args)
+    db = _db_for(args, config)
     with SQLiteStore(db) as store:
         sessions = store.sessions(limit=100)
         sid = args.session or (sessions[0]["session_id"] if sessions else None)
-        if not sid: print("No hay sesiones persistidas.", file=sys.stderr); return 2
-        signals = store.list_signals(sid)
-        candles = store.list_candles(sid, timeframe=args.timeframe, closed_only=True)
-        if not signals:
-            print(json.dumps({"ok": True, "session_id": sid, "message": "No hay señales persistidas; no se fabricaron señales.", "signals": 0}, ensure_ascii=False, indent=2)); return 0
-        cfg_path = args.config or (default_config() if default_config().exists() else None)
-        cfg = _load_toml(cfg_path)
-        config_errors = _validate_config(cfg)
-        if config_errors:
-            raise ValueError("configuración inválida: " + "; ".join(config_errors))
-        sim = VirtualContractSimulator(_sim_spec(cfg))
-        runner = BacktestRunner(simulator=sim, store=store, session_id=sid)
-        variants = [
-            VariantSpec("m1_trigger_reference", "Referencia M1; misma muestra y simulación", {"context": False, "preparation": False}, mode="M1_REFERENCE"),
-            VariantSpec("trend_pullback_v1", "Contexto M15 + preparación M5 + disparador M1", {"context": True, "preparation": True}, mode="MULTITIMEFRAME"),
-        ]
-        results = runner.run(signals, candles, variants=variants, data_quality="PERSISTED", resolution=args.timeframe)
-        # Las simulaciones ya quedaron persistidas por BacktestRunner; no se
-        # agregan de nuevo al resumen.
-        report = ReportBuilder(store, sid).summary()
-        target = Path(args.report or db.with_name(f"{db.stem}-backtest.md")); ReportBuilder(store, sid).write(target, format=args.format, data=report)
-        print(json.dumps({"ok": True, "session_id": sid, "report": str(target), "results": [x.to_dict(include_simulations=False) for x in results]}, ensure_ascii=False, indent=2, default=str)); return 0
+        if not sid:
+            print("No hay sesiones persistidas.", file=sys.stderr)
+            return 2
+        session = store.get_session(sid) or {}
+        config = _override_config(config, instrument=str(session.get("instrument") or config.instrument))
+        all_candle_rows = store.list_candles(sid, closed_only=False)
+        candle_rows = _latest_candles(all_candle_rows)
+        records = _stored_records(store, sid)
+        session_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
+        dataset_hash = str(session_config.get("capture_hash")) if session_config.get("capture_hash") else _capture_hash(records or candle_rows)
+        mode = str(session.get("mode", "REPLAY"))
+        config = _override_config(config, mode=mode)
+        refs, reference_id = _persist_reference(store, sid, config, candle_rows, dataset_hash=dataset_hash, partition=args.partition, mode=mode)
+        stored_signals = store.list_signals(sid)
+        primary = [row for row in stored_signals if _signal_variant(row) in {"", "trend_pullback_v1", "MULTITIMEFRAME"}]
+        # Prefer only the current effective config when lineage is present; an
+        # old v1 capture without lineage remains usable and visible.
+        lineaged_primary = [row for row in primary if row.get("analysis_config_hash")]
+        if lineaged_primary:
+            session_config_hash = session_config.get("config_hash")
+            if session_config_hash and str(session_config_hash) == str(config.config_hash):
+                # The capture was produced by this exact effective profile;
+                # pipeline lineage may include the run-level seed/dataset hash.
+                primary = lineaged_primary
+            else:
+                primary = [row for row in lineaged_primary if str(row.get("analysis_config_hash")) == str(config.config_hash)]
+        primary_analysis = _analysis_for(store, sid, dataset_hash=dataset_hash, config=config, variant="trend_pullback_v1", partition=args.partition, metadata={"strategy": "trend_pullback_v1", "source_signal_count": len(primary)})
+        # Las señales capturadas son inmutables y pueden pertenecer a un
+        # análisis anterior; no se copian bajo otra identidad (la simulación
+        # conserva su analysis_id propio y el payload referencia la señal).
+        point_tf = str(args.timeframe or config.strategy.trigger_timeframe.name).upper()
+        core_m1 = [_core_candle(row, mode=mode) for row in candle_rows if str(row.get("timeframe", "")).upper() == point_tf and bool(row.get("closed", True))]
+        points = points_from_candles(core_m1)
+        simulator = VirtualContractSimulator(spec=_sim_spec(config))
+        runner = BacktestRunner(simulator=simulator, store=store, session_id=sid)
+        boundary = args.boundary
+        baseline_results = runner.run(refs, points, variants=[VariantSpec("m1_trigger_reference", "Referencia sólo M1", {"context": False, "preparation": False}, mode="M1_REFERENCE")], boundary=boundary, partition=args.partition, data_quality=mode, resolution=point_tf, analysis_id=reference_id, analysis_name="m1_trigger_reference", analysis_config_hash=config.config_hash, contract_hash=_contract_hash(config))
+        mtf_results = runner.run(primary, points, variants=[VariantSpec("trend_pullback_v1", "Contexto M15 + preparación M5 + disparador M1", {"context": True, "preparation": True}, mode="MULTITIMEFRAME")], boundary=boundary, partition=args.partition, data_quality=mode, resolution=point_tf, analysis_id=primary_analysis, analysis_name="trend_pullback_v1", analysis_config_hash=config.config_hash, contract_hash=_contract_hash(config))
+        results = baseline_results + mtf_results
+        for item in results:
+            store.save_metric(sid, f"backtest:{item.variant}:{args.partition}", {"variant": item.variant, "partition": args.partition, "config_hash": config.config_hash}, item.net_result, item.to_dict(include_simulations=False))
+        report_data = ReportBuilder(store, sid).summary()
+        target = Path(args.report or db.with_name(f"{db.stem}-backtest.md")).expanduser()
+        ReportBuilder(store, sid).write(target, format=args.format, data=report_data)
+        payload = {
+            "ok": True, "mode": "BACKTEST", "session_id": sid, "capture_hash": dataset_hash,
+            "partition": args.partition, "boundary": args.boundary, "reference_signals": len(refs), "mtf_signals": len(primary),
+            "reference_analysis_id": reference_id, "mtf_analysis_id": primary_analysis, "report": str(target),
+            "results": [item.to_dict(include_simulations=False) for item in results], "persisted": store.status(sid)["counts"],
+        }
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    return 0
 
 
 def cmd_report(args: argparse.Namespace) -> int:
-    db = Path(args.db or default_db()).expanduser()
+    config = _config_for(args)
+    db = _db_for(args, config)
     with SQLiteStore(db, read_only=True) as store:
-        sessions = store.sessions(limit=100); sid = args.session or (sessions[0]["session_id"] if sessions else None)
-        if not sid: print("No hay sesiones persistidas.", file=sys.stderr); return 2
-        builder = ReportBuilder(store, sid); data = builder.summary()
+        sessions = store.sessions(limit=100)
+        sid = args.session or (sessions[0]["session_id"] if sessions else None)
+        if not sid:
+            print("No hay sesiones persistidas.", file=sys.stderr)
+            return 2
+        builder = ReportBuilder(store, sid)
+        data = builder.summary()
         if args.output:
-            target = builder.write(args.output, format=args.format, data=data); print(str(target))
-        elif args.format == "json": print(builder.to_json(data))
-        elif args.format == "html": print(builder.to_html(data))
-        else: print(builder.to_markdown(data))
+            target = builder.write(args.output, format=args.format, data=data)
+            print(str(target))
+        elif args.format == "json":
+            print(builder.to_json(data))
+        elif args.format == "html":
+            print(builder.to_html(data))
+        else:
+            print(builder.to_markdown(data))
     return 0
-
 
 
 def _kraken_bar_row(bar: Any, provenance: Any) -> dict[str, Any]:
-    """Map a Kraken Bar to the storage candle contract explicitly."""
     raw = bar.to_dict() if hasattr(bar, "to_dict") else dict(bar)
-    start = raw.get("interval_start", raw.get("start_ts", raw.get("start")));
-    end = raw.get("interval_end", raw.get("end_ts", raw.get("end")))
-    timeframe = raw.get("resolution", raw.get("timeframe", raw.get("resolution_seconds")))
-    data_id = raw.get("data_id", raw.get("candle_id", raw.get("source_record_id")))
     return {
-        "candle_id": data_id,
-        "instrument": raw.get("instrument", "BTC/USD"),
-        "timeframe": timeframe,
-        "start_ts": start, "end_ts": end,
-        "available_ts": raw.get("available_at", raw.get("received_at")),
-        "open": raw.get("open"), "high": raw.get("high"), "low": raw.get("low"), "close": raw.get("close"),
-        "volume": raw.get("volume"), "closed": bool(raw.get("closed", True)),
-        "source": raw.get("source", "kraken"), "price_base": raw.get("price_basis", "traded"),
-        "quality": "PUBLIC_PROVIDER_CLOSED" if raw.get("closed", True) else "PUBLIC_PROVIDER_OPEN",
-        "revision": raw.get("revision", 0),
+        "candle_id": raw.get("data_id", raw.get("candle_id", raw.get("source_record_id"))),
+        "instrument": raw.get("instrument", "BTC/USD"), "timeframe": raw.get("resolution", raw.get("timeframe", raw.get("resolution_seconds"))),
+        "start_ts": raw.get("interval_start", raw.get("start_ts", raw.get("start"))), "end_ts": raw.get("interval_end", raw.get("end_ts", raw.get("end"))),
+        "available_ts": raw.get("available_at", raw.get("received_at")), "received_ts": raw.get("received_at"),
+        "open": raw.get("open"), "high": raw.get("high"), "low": raw.get("low"), "close": raw.get("close"), "volume": raw.get("volume"),
+        "closed": bool(raw.get("closed", True)), "source": raw.get("source", "kraken"), "price_base": raw.get("price_basis", "traded"),
+        "quality": "PUBLIC_PROVIDER_CLOSED" if raw.get("closed", True) else "PUBLIC_PROVIDER_OPEN", "revision": raw.get("revision", 0),
+        "source_record_id": raw.get("source_record_id"), "metadata": raw.get("metadata", {}),
         "provenance": provenance.to_dict() if hasattr(provenance, "to_dict") else provenance,
     }
 
+
+def _freshness_state(config: EffectiveConfig, coordinator: RuntimeCoordinator, last_received_at: datetime | None) -> tuple[str, list[str], Any]:
+    closed_ends = [candle.end for values in coordinator.processor.candles.values() for candle in values if candle.closed]
+    last_closed_end = max(closed_ends, default=None)
+    assessment = assess_freshness(
+        now=datetime.now(UTC), last_received_at=last_received_at, last_closed_end=last_closed_end,
+        max_feed_age_seconds=config.quality.max_feed_age_seconds,
+        max_closed_candle_age_seconds=config.quality.max_closed_candle_age_seconds,
+    )
+    blocked: list[str] = []
+    if assessment.quality.has("stale"):
+        blocked.append("feed_stale")
+    if assessment.quality.has("late"):
+        blocked.append("closed_candle_late")
+    return assessment.quality.status, blocked, assessment
+
+
+def _save_open_bar(store: SQLiteStore, session_id: str, row: Mapping[str, Any], *, ordinal: int) -> None:
+    """Persist a changing provider-open candle as an explicit revision."""
+    try:
+        store.save_candle(session_id, row, ordinal=ordinal)
+        return
+    except IdempotencyConflict:
+        pass
+    existing = [item for item in store.list_candles(session_id, timeframe=str(row.get("timeframe", "M1"))) if item.get("start_ts") == str(row.get("start_ts")) and not bool(item.get("closed", True))]
+    revision = max((int(item.get("revision", 0) or 0) for item in existing), default=0) + 1
+    updated = dict(row)
+    base_id = str(updated.get("candle_id") or "open")
+    updated["candle_id"] = f"{base_id}:r{revision}"
+    updated["revision"] = revision
+    store.save_candle(session_id, updated, ordinal=ordinal)
+
+
+def _watch_intervals(config: EffectiveConfig) -> tuple[int, ...]:
+    intervals: list[int] = []
+    for tf in config.timeframes:
+        if tf.seconds % 60 == 0 and tf.seconds // 60 in {1, 5, 15, 30, 60, 240, 1440, 10080, 21600}:
+            intervals.append(tf.seconds // 60)
+    return tuple(dict.fromkeys(intervals or (1, 5, 15)))
+
+
 def cmd_watch(args: argparse.Namespace) -> int:
-    # A watch without a provider is intentionally not replaced by synthetic
-    # data.  Only the public, unauthenticated Kraken adapter is discovered.
     if args.offline_demo:
-        return cmd_demo(argparse.Namespace(db=args.db, seed=args.seed, minutes=max(60, int(args.duration or 60)), config=None, report=args.report, log=args.log))
+        # Keep the explicit config path when supplied; the demo itself still
+        # records SYNTHETIC provenance and never opens the provider.
+        demo_args = argparse.Namespace(db=args.db, seed=args.seed, minutes=max(60, int(args.duration or 60)), config=getattr(args, "config", None) or default_config(), report=args.report, log=args.log)
+        return cmd_demo(demo_args)
+    config = _config_for(args, watch=True)
+    if config.mode != "LIVE":
+        # A public watch is explicitly live even if a caller supplied the
+        # offline profile; the effective hash records this adaptation.
+        config = _override_config(config, mode="LIVE")
+    instrument = str(args.instrument or config.instrument)
+    config = _override_config(config, instrument=instrument, mode="LIVE")
+    db = _db_for(args, config)
+    # A resumed session is authoritative for instrument identity unless the
+    # caller explicitly supplied a different one (which would be a mismatch).
+    if getattr(args, "session", None) and not getattr(args, "instrument", None):
+        try:
+            with SQLiteStore(db, read_only=True) as existing_store:
+                existing_session = existing_store.get_session(args.session)
+            if existing_session and existing_session.get("instrument"):
+                instrument = str(existing_session["instrument"])
+                config = _override_config(config, instrument=instrument, mode="LIVE")
+        except Exception as exc:
+            print(f"No se pudo leer la sesión de reanudación: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
+    log_path = _log_for(args, db, config)
     try:
         module = importlib.import_module("mtf_lab.data.kraken")
-    except ImportError as exc:
-        print(f"No se encontró adaptador público Kraken: {exc}. Use --offline-demo para una prueba sintética explícita.", file=sys.stderr); return 2
-    factory = getattr(module, "KrakenAdapter", None) or getattr(module, "KrakenPublicAdapter", None)
-    if factory is None:
-        print("El adaptador Kraken no expone KrakenAdapter/KrakenPublicAdapter.", file=sys.stderr); return 2
-    db = Path(args.db or default_db()).expanduser()
+        factory = getattr(module, "KrakenAdapter", None) or getattr(module, "KrakenPublicAdapter", None)
+        if factory is None:
+            raise RuntimeError("el adaptador Kraken no expone KrakenAdapter/KrakenPublicAdapter")
+        provider_cfg = dict(config.provider)
+        adapter_kwargs = {"rest_endpoint": provider_cfg.get("rest_url"), "websocket_endpoint": provider_cfg.get("websocket_url")}
+        adapter_kwargs = {key: value for key, value in adapter_kwargs.items() if value}
+        try:
+            adapter = factory(instrument=instrument, **adapter_kwargs) if getattr(factory, "__name__", "") == "KrakenAdapter" else factory(pair=instrument, **adapter_kwargs)
+        except TypeError:
+            # A test/different provider may expose only the pair argument; the
+            # explicit configuration remains recorded in the session.
+            adapter = factory(instrument=instrument) if getattr(factory, "__name__", "") == "KrakenAdapter" else factory(pair=instrument)
+    except Exception as exc:
+        print(f"No se pudo inicializar adaptador público Kraken: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    session_id = args.session
     try:
-        adapter = factory(instrument=args.instrument) if getattr(factory, "__name__", "") == "KrakenAdapter" else factory(pair=args.instrument)
         with SQLiteStore(db) as store:
-            sid = store.create_session(mode="LIVE", provider="kraken-public-rest+websocket-v2", instrument=getattr(adapter, "pair", args.instrument), code_version=__version__, config={"channels": ["trade", "ohlc"], "rest_intervals": [1, 5, 15], "snapshot": not args.no_snapshot, "rest_max_records": 720, "exclude_last_uncommitted": True}, metadata={"public_only": True, "synthetic": False, "ws_endpoint": getattr(adapter, "websocket_endpoint", None), "rest_endpoint": getattr(adapter, "rest_endpoint", None)})
-            log_path = Path(args.log or default_logs(db))
-            telemetry = OperationTelemetry(log_path=log_path, mode="LIVE", session_id=sid, instrument=getattr(adapter, "pair", args.instrument))
-            telemetry.state.update(connection="CONNECTING", data_quality="PUBLIC_PROVIDER", continuity="UNKNOWN", warmup_pending={"M1": "pending", "M5": "pending", "M15": "pending"})
-            # REST es el arranque y la recuperación explícitos. La última fila
-            # abierta queda separada; nunca se usa como vela cerrada.
-            rest_records = 0
-            rest_errors: list[dict[str, str]] = []
-            rest_counts: dict[str, int] = {}
-            for interval in (1, 5, 15):
+            if session_id:
+                session = store.get_session(session_id)
+                if session is None:
+                    print(f"Sesión no encontrada: {session_id}", file=sys.stderr)
+                    return 2
+                if str(session.get("mode", "")).upper() != "LIVE":
+                    print("La sesión de reanudación no es LIVE; no se reutiliza.", file=sys.stderr)
+                    return 2
+                if str(session.get("instrument", "")).upper() != instrument.upper():
+                    print(f"Instrumento incompatible con la sesión: {session.get('instrument')} != {instrument}", file=sys.stderr)
+                    return 2
+            else:
+                session_id = store.create_session(
+                    mode="LIVE", provider="kraken-public-rest+websocket-v2", instrument=instrument, code_version=__version__,
+                    config={**config.to_dict(), "watch": {"checkpoint_every": args.checkpoint_every, "max_candles": args.max_candles}},
+                    metadata={"public_only": True, "synthetic": False, "ws_endpoint": getattr(adapter, "websocket_endpoint", None), "rest_endpoint": getattr(adapter, "rest_endpoint", None)},
+                )
+            coordinator = RuntimeCoordinator(
+                store, session_id, config, mode="LIVE", dataset_hash=f"live:{session_id}", variant="trend_pullback_v1", partition="all",
+                checkpoint_name=args.checkpoint, checkpoint_every=args.checkpoint_every, source="kraken-public", max_candles=args.max_candles, resume=args.resume,
+            )
+            telemetry = OperationTelemetry(log_path=log_path, mode="LIVE", session_id=session_id, instrument=instrument)
+            telemetry.state.update(connection="CONNECTING", data_quality="PUBLIC_PROVIDER", continuity="UNKNOWN", warmup_pending=coordinator.processor.status["warmup_pending"], reconciliation="PENDING")
+            telemetry.event("watch_started", provider="kraken-public-rest+websocket-v2", intervals=list(_watch_intervals(config)), resume=args.resume)
+            rest_counts: dict[str, int] = {}; rest_errors: list[dict[str, Any]] = []; rest_records = 0
+            last_received_at: datetime | None = None
+            intervals = _watch_intervals(config)
+            fetched_by_interval: dict[int, Any] = {}
+            # First retain all native snapshots, then feed them from the
+            # largest timeframe down. This gives native M15/M5 precedence over
+            # any lower-timeframe OHLC derived by the runtime.
+            for interval in intervals:
                 try:
                     fetched = adapter.fetch_ohlc(interval=interval, include_open=False)
-                    rows = list(fetched.bars)
-                    if fetched.open_bar is not None:
-                        rows.append(fetched.open_bar)
-                    inserted_interval = 0
-                    for ordinal, bar in enumerate(rows):
-                        inserted_interval += int(store.save_candle(sid, _kraken_bar_row(bar, fetched.provenance), ordinal=interval * 1000 + ordinal))
+                    fetched_by_interval[interval] = fetched
                     rest_counts[f"M{interval}"] = len(fetched.bars)
-                    rest_records += inserted_interval
                     telemetry.state.merge_nested("coverage", {f"M{interval}": {"closed": len(fetched.bars), "open": int(fetched.open_bar is not None), "last": str(fetched.last_timestamp) if fetched.last_timestamp else None}})
                 except Exception as exc:
-                    detail = {"interval": f"M{interval}", "type": type(exc).__name__, "error": str(exc)}
-                    rest_errors.append(detail)
-                    telemetry.logger.warning("rest_warmup_error", **detail)
-            telemetry.state.update(warmup_pending={f"M{i}": (0 if f"M{i}" in rest_counts and rest_counts[f"M{i}"] > 0 else "blocked") for i in (1, 5, 15)}, rest_records=rest_records)
+                    detail = {"interval": interval, "type": type(exc).__name__, "error": str(exc)}
+                    rest_errors.append(detail); telemetry.logger.warning("rest_warmup_error", **detail)
+            for interval in sorted(fetched_by_interval, reverse=True):
+                fetched = fetched_by_interval[interval]
+                for bar in sorted(fetched.bars, key=lambda item: item.interval_start):
+                    coordinator.process(bar, bootstrap=True)
+                    observed_received = getattr(bar, "received_at", None) or getattr(bar, "available_at", None)
+                    if observed_received is not None:
+                        last_received_at = observed_received if last_received_at is None else max(last_received_at, observed_received)
+                    rest_records += 1
+                # The provider's last row is explicitly open; retain it for
+                # the viewer but never feed it into indicators/strategy.
+                if fetched.open_bar is not None:
+                    _save_open_bar(store, session_id, _kraken_bar_row(fetched.open_bar, fetched.provenance), ordinal=interval * 1_000_000)
+            warmup = coordinator.processor.status["warmup_pending"]
+            bootstrap_ok = not rest_errors and all(warmup.get(tf.name, 1) == 0 for tf in config.timeframes if tf.name in {config.strategy.context_timeframe.name, config.strategy.preparation_timeframe.name, config.strategy.trigger_timeframe.name})
+            freshness_label, freshness_blocked, freshness = _freshness_state(config, coordinator, last_received_at)
+            bootstrap_blocked = () if bootstrap_ok else ("bootstrap_incomplete",)
+            coordinator.update_feed_state(connection="CONNECTED", reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED", blocked_reasons=tuple(dict.fromkeys((*bootstrap_blocked, *freshness_blocked))))
+            telemetry.state.update(connection="CONNECTED", warmup_pending=warmup, reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED", continuity="CONTINUOUS" if bootstrap_ok else "UNKNOWN", data_quality=freshness_label, rest_records=rest_records, feed_age_seconds=freshness.feed_age_seconds, closed_candle_age_seconds=freshness.closed_candle_age_seconds)
+            telemetry.event("bootstrap_complete", rest_counts=rest_counts, rest_errors=rest_errors, warmup_pending=warmup)
             count = 0
+            iterator = adapter.iter_trades(duration_seconds=args.duration, max_events=args.max_events, include_snapshot=not args.no_snapshot)
             try:
-                iterator = adapter.iter_trades(duration_seconds=args.duration, max_events=args.max_events, include_snapshot=not args.no_snapshot)
-                for ordinal, event in enumerate(iterator):
-                    if hasattr(event, "as_dict"):
-                        data = event.as_dict()
-                    elif hasattr(event, "to_dict"):
-                        data = event.to_dict()
-                    elif isinstance(event, dict):
-                        data = dict(event)
+                for event in iterator:
+                    is_snapshot = bool(getattr(event, "is_snapshot", False))
+                    if is_snapshot:
+                        # Last-50 snapshot trades are capture evidence only;
+                        # feeding them would falsely replay history before the
+                        # REST watermark and could create duplicates.
+                        coordinator.capture_only(event)
                     else:
-                        data = vars(event)
-                    # Adapt provider-neutral names to the storage contract.
-                    if "event_time" in data and "event_ts" not in data:
-                        data["event_ts"] = data["event_time"]
-                    if "price_basis" in data and "price_base" not in data:
-                        data["price_base"] = data["price_basis"]
-                    if "source_event_id" in data and "event_id" not in data:
-                        data["event_id"] = data["source_event_id"]
-                    inserted = store.save_event(sid, data, ordinal=ordinal)
-                    count += int(inserted)
-                    telemetry.state.update(connection=getattr(getattr(adapter, "status", None), "state", "CONNECTED"), last_received_ts=data.get("received_at"), last_available_ts=data.get("available_at"), continuity="NEEDS_RECONCILIATION" if getattr(getattr(adapter, "status", None), "needs_reconciliation", False) else "CONTINUOUS", data_quality="PUBLIC_PROVIDER")
-                    telemetry.state.update(events_processed=count)
+                        coordinator.process(event)
+                    count += 1
+                    adapter_status = getattr(adapter, "status", None)
+                    needs = bool(getattr(adapter_status, "needs_reconciliation", False))
+                    state = str(getattr(adapter_status, "state", "CONNECTED"))
+                    event_received = getattr(event, "received_at", None) or getattr(event, "available_at", None)
+                    if event_received is not None:
+                        last_received_at = event_received if last_received_at is None else max(last_received_at, event_received)
+                    freshness_label, freshness_blocked, freshness = _freshness_state(config, coordinator, last_received_at)
+                    dynamic_blocked = ("feed_discontinuity",) if needs else ()
+                    coordinator.update_feed_state(connection=state, reconciliation="NEEDS_RECONCILIATION" if needs else coordinator.reconciliation_state, blocked_reasons=tuple(dict.fromkeys((*dynamic_blocked, *freshness_blocked))))
+                    proc = coordinator.processor.status
+                    telemetry.state.update(connection=state, last_received_ts=getattr(event, "received_at", None), last_available_ts=getattr(event, "available_at", None), events_processed=proc["events_processed"], candles_processed=proc["candles_processed"], signals=proc["signals"], errors=proc["errors"], warmup_pending=proc["warmup_pending"], reconciliation=coordinator.reconciliation_state, data_quality=freshness_label, feed_age_seconds=freshness.feed_age_seconds, closed_candle_age_seconds=freshness.closed_candle_age_seconds)
+                    telemetry.state.update(feed_delay_ms=None)  # no false network-latency claim
                     telemetry.reporter.emit()
-                telemetry.state.update(connection=getattr(getattr(adapter, "status", None), "state", "STOPPED"), events_processed=count)
-                telemetry.event("watch_complete", events=count, rest_records=rest_records, rest_errors=rest_errors, provider="kraken-public-rest+websocket-v2", synthetic=False)
-                telemetry.close()
-                store.save_checkpoint(sid, "watch", cursor={"last_event_count": count}, events_processed=count, state=telemetry.state.snapshot())
-                store.finish_session(sid, status="COMPLETED")
-            except Exception as exc:
-                telemetry.state.increment("errors")
-                telemetry.event("watch_error", level="ERROR", error_type=type(exc).__name__, error=str(exc), progress=False)
-                telemetry.close()
-                store.finish_session(sid, status="ERROR")
-                raise
-        print(json.dumps({"ok": True, "mode": "LIVE", "session_id": sid, "events": count, "rest_records": rest_records, "rest_counts": rest_counts, "rest_errors": rest_errors, "db": str(db), "provider": "kraken-public-rest+websocket-v2", "status": getattr(getattr(adapter, "status", None), "to_dict", lambda: {})()}, ensure_ascii=False, indent=2, default=str)); return 0
+            finally:
+                # A finite iterator can stop while old virtual horizons are
+                # still pending. Advance by observed wall-clock availability,
+                # but do not mark a live capture complete or invent a price.
+                coordinator.advance(datetime.now(UTC), complete=False)
+            status_obj = getattr(adapter, "status", None)
+            if bool(getattr(status_obj, "needs_reconciliation", False)):
+                recovery_errors: list[dict[str, Any]] = []
+                for interval in intervals:
+                    try:
+                        since = coordinator.processor.last_event_time or datetime.now(UTC)
+                        fetched = adapter.recover_ohlc(interval=interval, since=since, include_open=False)
+                        for bar in fetched.bars:
+                            coordinator.process(bar, bootstrap=True)
+                    except Exception as exc:
+                        recovery_errors.append({"interval": interval, "type": type(exc).__name__, "error": str(exc)})
+                if recovery_errors:
+                    coordinator.update_feed_state(reconciliation="BLOCKED", blocked_reasons=("reconciliation_failed",))
+                else:
+                    # Bounded OHLC overlap is useful evidence, but it is not a
+                    # claim that every missed trade was recovered.
+                    coordinator.update_feed_state(reconciliation="RECOVERED_BOUNDED", blocked_reasons=())
+                telemetry.event("reconciliation_complete", errors=recovery_errors, verified=False)
+            freshness_label, freshness_blocked, freshness = _freshness_state(config, coordinator, last_received_at)
+            final_state = str(getattr(status_obj, "state", "STOPPED")).upper()
+            if final_state in {"DISCONNECTED", "ERROR"}:
+                coordinator.update_feed_state(connection=final_state, blocked_reasons=tuple(dict.fromkeys(("feed_disconnected", *freshness_blocked))))
+            else:
+                coordinator.update_feed_state(connection=final_state, blocked_reasons=tuple(freshness_blocked))
+            final_status = coordinator.status()
+            telemetry.state.update(connection=final_state, warmup_pending=coordinator.processor.status["warmup_pending"], signals=len(coordinator.processor.signals), reconciliation=coordinator.reconciliation_state)
+            telemetry.event("watch_complete", events=count, rest_records=rest_records, rest_errors=rest_errors, analysis_enabled=final_status.analysis_enabled, blocked_reasons=final_status.analysis_blocked_reasons, pending_simulations=final_status.pending_simulations)
+            telemetry.close()
+            coordinator.finish(status="COMPLETED")
+            output = {"ok": True, "mode": "LIVE", "session_id": session_id, "events": count, "rest_records": rest_records, "rest_counts": rest_counts, "rest_errors": rest_errors, "db": str(db), "log": str(log_path), "provider": "kraken-public-rest+websocket-v2", "analysis_id": coordinator.analysis_id, "analysis_enabled": final_status.analysis_enabled, "blocked_reasons": final_status.analysis_blocked_reasons, "pending_simulations": final_status.pending_simulations, "warmup_pending": coordinator.processor.status["warmup_pending"], "data_quality": freshness_label, "feed_age_seconds": freshness.feed_age_seconds, "closed_candle_age_seconds": freshness.closed_candle_age_seconds, "status": getattr(status_obj, "to_dict", lambda: {})()}
+        print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        return 0
     except Exception as exc:
-        print(f"watch Kraken error: {type(exc).__name__}: {exc}", file=sys.stderr); return 2
+        print(f"watch Kraken error: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
-    db = Path(args.db or default_db()).expanduser()
+    config = _config_for(args)
+    db = _db_for(args, config)
     print(f"UI local: http://{args.host}:{args.port}/ (sólo lectura)", flush=True)
     serve(db, host=args.host, port=args.port, session_id=args.session, duration=args.duration)
     return 0
+
+
+def _add_input_options(parser: argparse.ArgumentParser, *, optional: bool = False) -> None:
+    if optional:
+        parser.add_argument("--input", type=Path)
+    else:
+        parser.add_argument("input", type=Path)
+    parser.add_argument("--format", choices=["csv", "jsonl", "json"])
+    parser.add_argument("--instrument")
+    parser.add_argument("--timeframe")
+    parser.add_argument("--price-base", choices=["trade", "traded", "close", "mid", "bid", "ask"])
+    parser.add_argument("--mapping", help="timestamp=ts,open=o,high=h,low=l,close=c,volume=v")
+    parser.add_argument("--timezone", help="zona para timestamps sin offset")
+    parser.add_argument("--timestamp-unit", choices=["iso8601", "s", "ms", "us", "ns"], default="iso8601", help="unidad explícita para timestamps numéricos")
+    parser.add_argument("--interval-seconds", type=float)
+    parser.add_argument("--allow-issues", action="store_true")
+    parser.add_argument("--allow-out-of-order", action="store_true")
+    parser.add_argument("--allow-duplicates", action="store_true")
+    parser.add_argument("--db", type=Path)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -503,14 +787,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--connectivity", "--check-network", dest="connectivity", action="store_true"); p.add_argument("--timeout", type=float, default=5); p.set_defaults(func=cmd_doctor)
     p = subs.add_parser("demo", help="recorrido offline sintético reproducible")
     p.add_argument("--db", type=Path); p.add_argument("--seed", type=int, default=42); p.add_argument("--minutes", type=int, default=720); p.add_argument("--config", type=Path); p.add_argument("--report", type=Path); p.add_argument("--log", type=Path); p.set_defaults(func=cmd_demo)
-    def add_input_options(p: argparse.ArgumentParser) -> None:
-        p.add_argument("input", type=Path); p.add_argument("--format", choices=["csv", "jsonl", "json"]); p.add_argument("--instrument", default="UNKNOWN"); p.add_argument("--timeframe", default="M1"); p.add_argument("--price-base", choices=["trade", "close", "mid", "bid", "ask"], default="close"); p.add_argument("--mapping", help="timestamp=ts,open=o,high=h,low=l,close=c,volume=v"); p.add_argument("--timezone", help="zona para timestamps sin offset"); p.add_argument("--interval-seconds", type=float); p.add_argument("--allow-issues", action="store_true"); p.add_argument("--allow-out-of-order", action="store_true"); p.add_argument("--allow-duplicates", action="store_true"); p.add_argument("--db", type=Path)
-    p = subs.add_parser("import", help="importa CSV/JSONL local con validación explícita"); add_input_options(p); p.set_defaults(func=cmd_import)
-    p = subs.add_parser("replay", help="reproduce una fuente local sin fabricar señales"); p.add_argument("--input", type=Path); p.add_argument("--session"); p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--format", choices=["csv", "jsonl", "json"]); p.add_argument("--instrument", default="UNKNOWN"); p.add_argument("--timeframe", default="M1"); p.add_argument("--price-base", choices=["trade", "close", "mid", "bid", "ask"], default="close"); p.add_argument("--mapping"); p.add_argument("--timezone"); p.add_argument("--interval-seconds", type=float); p.add_argument("--allow-issues", action="store_true"); p.add_argument("--allow-out-of-order", action="store_true"); p.add_argument("--allow-duplicates", action="store_true"); p.set_defaults(func=cmd_replay)
-    p = subs.add_parser("backtest", help="evalúa señales persistidas con simulación virtual"); p.add_argument("--session"); p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--timeframe", default="M1"); p.add_argument("--format", choices=["markdown", "json", "html"], default="markdown"); p.add_argument("--report", type=Path); p.set_defaults(func=cmd_backtest)
-    p = subs.add_parser("report", help="genera o imprime informe de una sesión"); p.add_argument("--session"); p.add_argument("--latest", action="store_true", help="selecciona la sesión más reciente"); p.add_argument("--db", type=Path); p.add_argument("--format", choices=["markdown", "json", "html"], default="markdown"); p.add_argument("--output", type=Path); p.set_defaults(func=cmd_report)
-    p = subs.add_parser("watch", help="observación acotada/continua; no sustituye feed real por sintético"); p.add_argument("--db", type=Path); p.add_argument("--instrument", default="BTC/USD"); p.add_argument("--duration", type=float); p.add_argument("--max-events", type=int); p.add_argument("--no-snapshot", action="store_true"); p.add_argument("--offline-demo", action="store_true"); p.add_argument("--seed", type=int, default=42); p.add_argument("--report", type=Path); p.add_argument("--log", type=Path); p.set_defaults(func=cmd_watch)
-    p = subs.add_parser("ui", help="sirve interfaz local de sólo lectura"); p.add_argument("--db", type=Path); p.add_argument("--session"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765); p.add_argument("--duration", type=float); p.set_defaults(func=cmd_ui)
+    p = subs.add_parser("import", help="importa CSV/JSONL local con validación explícita"); _add_input_options(p); p.add_argument("--config", type=Path); p.set_defaults(func=cmd_import)
+    p = subs.add_parser("replay", help="reproduce una fuente local con agregación/indicadores incrementales"); _add_input_options(p, optional=True); p.add_argument("--session"); p.add_argument("--config", type=Path); p.add_argument("--checkpoint", default="runtime"); p.add_argument("--checkpoint-every", type=int, default=100); p.add_argument("--max-candles", type=int, default=5000); p.add_argument("--partition", choices=["all", "exploration", "evaluation"], default="all"); p.add_argument("--preserve-order", action="store_true"); p.add_argument("--no-resume", dest="resume", action="store_false"); p.set_defaults(resume=True, func=cmd_replay)
+    p = subs.add_parser("backtest", help="compara referencia M1 y estrategia MTF con simulación virtual"); p.add_argument("--session"); p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--timeframe"); p.add_argument("--format", choices=["markdown", "json", "html"], default="markdown"); p.add_argument("--report", type=Path); p.add_argument("--partition", choices=["all", "exploration", "evaluation"], default="all"); p.add_argument("--boundary", help="timestamp UTC de frontera cronológica"); p.set_defaults(func=cmd_backtest)
+    p = subs.add_parser("report", help="genera o imprime informe de una sesión"); p.add_argument("--session"); p.add_argument("--latest", action="store_true", help="selecciona la sesión más reciente"); p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--format", choices=["markdown", "json", "html"], default="markdown"); p.add_argument("--output", type=Path); p.set_defaults(func=cmd_report)
+    p = subs.add_parser("watch", help="observación pública acotada/continua; no ejecuta órdenes"); p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--instrument"); p.add_argument("--session"); p.add_argument("--duration", type=float); p.add_argument("--max-events", type=int); p.add_argument("--no-snapshot", action="store_true"); p.add_argument("--offline-demo", action="store_true"); p.add_argument("--seed", type=int, default=42); p.add_argument("--report", type=Path); p.add_argument("--log", type=Path); p.add_argument("--checkpoint", default="runtime"); p.add_argument("--checkpoint-every", type=int, default=100); p.add_argument("--max-candles", type=int, default=5000); p.add_argument("--no-resume", dest="resume", action="store_false"); p.set_defaults(resume=True, func=cmd_watch)
+    p = subs.add_parser("ui", help="sirve interfaz local de sólo lectura"); p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--session"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765); p.add_argument("--duration", type=float); p.set_defaults(func=cmd_ui)
     return parser
 
 

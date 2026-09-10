@@ -192,7 +192,10 @@ def parse_timestamp(value: Any, *, unit: str, assume_timezone: str | None = None
     else:
         numeric = _parse_number(value, name="timestamp")
         scale = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "ns": 1e-9}[unit]
-        parsed = datetime.fromtimestamp(numeric * scale, tz=UTC)
+        try:
+            parsed = datetime.fromtimestamp(numeric * scale, tz=UTC)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise ValueError(f"timestamp fuera de rango: {value!r}") from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         if not assume_timezone:
             raise ValueError("timestamp has no timezone; set assume_timezone explicitly")

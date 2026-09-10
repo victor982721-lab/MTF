@@ -97,6 +97,10 @@ class BacktestResult:
         return self.outcomes.get(Outcome.WIN.value, 0) + self.outcomes.get(Outcome.LOSS.value, 0) + self.outcomes.get(Outcome.TIE.value, 0)
 
     @property
+    def pending_count(self) -> int:
+        return self.outcomes.get(Outcome.PENDING.value, 0)
+
+    @property
     def win_rate_on_resolved(self) -> float | None:
         return self.outcomes.get(Outcome.WIN.value, 0) / self.resolved_count if self.resolved_count else None
 
@@ -113,6 +117,7 @@ class BacktestResult:
             "outcomes": dict(self.outcomes),
             "resolved_count": self.resolved_count,
             "unresolved_count": self.unresolved_count,
+            "pending_count": self.pending_count,
             "net_result": self.net_result,
             "gross_wins": self.gross_wins,
             "gross_losses": self.gross_losses,
@@ -130,7 +135,8 @@ class BacktestResult:
 def _fingerprint_points(points: Sequence[PricePoint]) -> str:
     h = hashlib.sha256()
     for p in points:
-        h.update(f"{p.timestamp.isoformat()}|{p.price:.17g}|{p.base_price}|{p.source_ordinal}\n".encode())
+        h.update(json.dumps({"timestamp": p.timestamp.isoformat(), "available_at": p.available_ts.isoformat(), "price": p.price, "base": p.base_price, "quality": p.quality, "resolution": p.resolution, "closed": p.closed, "source_ordinal": p.source_ordinal, "point_id": p.identity, "instrument": p.instrument}, sort_keys=True, separators=(",", ":")).encode())
+        h.update(b"\n")
     return h.hexdigest()
 
 
@@ -174,39 +180,40 @@ class BacktestRunner:
         dependency_window_seconds: float | None = None,
         logger: Any | None = None,
     ):
-        self.spec = spec or EvaluationSpec()
+        simulator_spec = getattr(simulator, "spec", None) if simulator is not None else None
+        if spec is not None and simulator_spec is not None and spec != simulator_spec:
+            raise ValueError("BacktestRunner spec y simulator.spec no son equivalentes")
+        self.spec = spec or simulator_spec or EvaluationSpec()
         self.simulator = simulator or DirectionalEvaluator(self.spec)
         self.store = store
         self.session_id = session_id
         self.dependency_window_seconds = float(dependency_window_seconds if dependency_window_seconds is not None else max(self.spec.horizons_seconds))
         self.logger = logger
 
-    def _simulate(self, signal: Any, points: Sequence[Any], *, horizon: float, simulation_id: str) -> SimulationResult:
-        return self.simulator.evaluate(signal, points, horizon_seconds=horizon, simulation_id=simulation_id)
+    def _simulate(self, signal: Any, points: Sequence[Any], *, horizon: float, simulation_id: str, data_complete: bool = True, as_of: datetime | None = None) -> SimulationResult:
+        evaluator = getattr(self.simulator, "evaluate_prepared", None)
+        if callable(evaluator) and points and isinstance(points[0], PricePoint):
+            return evaluator(signal, points, horizon_seconds=horizon, simulation_id=simulation_id, data_complete=data_complete, as_of=as_of)
+        return self.simulator.evaluate(signal, points, horizon_seconds=horizon, simulation_id=simulation_id, data_complete=data_complete, as_of=as_of)
 
-    @staticmethod
-    def _boundary_filter(signals: Sequence[Any], boundary: datetime | None, *, partition: str, horizons: Sequence[float], latency: float) -> tuple[list[Any], int]:
+    def _boundary_filter(self, signals: Sequence[Any], boundary: datetime | None, *, partition: str, points: Sequence[PricePoint], max_horizon: float) -> tuple[list[Any], int]:
         if boundary is None:
             return list(signals), 0
-        selected: list[Any] = []
-        excluded = 0
-        max_horizon = max(horizons)
+        selected: list[Any] = []; excluded = 0
         for signal in signals:
             detected = _signal_ts(signal)
-            # Exploration must finish before the boundary, including the
-            # largest outcome horizon. Evaluation starts at/after boundary.
-            if partition == "exploration":
-                if detected + timedelta(seconds=latency + max_horizon) <= boundary:
-                    selected.append(signal)
-                else:
-                    excluded += 1
-            elif partition == "evaluation":
-                if detected >= boundary:
-                    selected.append(signal)
-                else:
-                    excluded += 1
+            if partition == "evaluation":
+                keep = detected >= boundary
+            elif partition == "exploration":
+                # Ejecuta el mismo contrato para conocer entrada/vencimiento
+                # efectivos; no filtra sólo con detected+teoría.
+                probe = self._simulate(signal, points, horizon=max_horizon, simulation_id=f"boundary:{detected.isoformat()}", data_complete=True)
+                final_available = parse_ts(probe.final_available_ts) if probe.final_available_ts else None
+                keep = bool(probe.entry_ts and probe.expiry_ts and parse_ts(probe.expiry_ts) <= boundary and (final_available is None or final_available <= boundary))
             else:
                 raise ValueError("partition must be exploration, evaluation, or all")
+            if keep: selected.append(signal)
+            else: excluded += 1
         return selected, excluded
 
     def run(
@@ -221,6 +228,10 @@ class BacktestRunner:
         data_quality: str = "UNKNOWN",
         resolution: str = "UNKNOWN",
         persist: bool = True,
+        analysis_id: str | None = None,
+        analysis_name: str | None = None,
+        analysis_config_hash: str | None = None,
+        contract_hash: str | None = None,
     ) -> list[BacktestResult]:
         signal_rows = list(signals)
         point_rows = normalize_points(points)
@@ -229,7 +240,7 @@ class BacktestRunner:
         all_results: list[BacktestResult] = []
         for variant in variants:
             filtered = [signal for signal in signal_rows if variant.accepts(signal)]
-            selected, excluded = self._boundary_filter(filtered, boundary_dt, partition=partition, horizons=self.spec.horizons_seconds, latency=self.spec.entry_latency_seconds)
+            selected, excluded = self._boundary_filter(filtered, boundary_dt, partition=partition, points=point_rows, max_horizon=max(self.spec.horizons_seconds))
             results: list[SimulationResult] = []
             for ordinal, signal in enumerate(sorted(selected, key=_signal_ts)):
                 row = _row(signal)
@@ -237,7 +248,11 @@ class BacktestRunner:
                 # Each variant gets an isolated simulation identity, allowing
                 # the same source signal to be compared without collisions.
                 for horizon in self.spec.horizons_seconds:
-                    result = self._simulate(row, point_rows, horizon=horizon, simulation_id=f"{variant.name}:{base_id}:{horizon:g}")
+                    # El análisis forma parte de la identidad de la
+                    # simulación: un nuevo contrato/configuración no puede
+                    # colisionar con una liquidación anterior de la misma señal.
+                    analysis_token = str(analysis_id or "adhoc")[:32]
+                    result = self._simulate(row, point_rows, horizon=horizon, simulation_id=f"{analysis_token}:{variant.name}:{base_id}:{horizon:g}", data_complete=True)
                     results.append(result)
                     if self.store is not None and self.session_id and persist:
                         sim_row = result.to_dict()
@@ -246,7 +261,10 @@ class BacktestRunner:
                         # nombre de un archivo de reporte.
                         sim_row["variant"] = variant.name
                         sim_row["variant_config_hash"] = variant.config_hash
-                        self.store.save_simulation(self.session_id, sim_row)
+                        sim_row["analysis"] = analysis_name or "backtest"
+                        sim_row["partition"] = partition
+                        sim_row["contract"] = result.simulation_type
+                        self.store.save_simulation(self.session_id, sim_row, analysis_id=analysis_id, variant=variant.name, analysis_config_hash=analysis_config_hash or variant.config_hash, contract_hash=contract_hash, partition=partition)
             counts = Counter(result.outcome.value for result in results)
             equity = 0.0; peak = 0.0; drawdown = 0.0
             for result in sorted((r for r in results if r.net_result is not None), key=lambda x: x.detected_ts):
@@ -278,12 +296,12 @@ class BacktestRunner:
                 signal_count=len(selected),
                 discarded_count=int(discarded_count) + excluded,
                 coverage_count=len(point_rows),
-                outcomes={key: counts.get(key, 0) for key in ("WIN", "LOSS", "TIE", "INDETERMINATE")},
+                outcomes={key: counts.get(key, 0) for key in ("WIN", "LOSS", "TIE", "INDETERMINATE", "PENDING")},
                 net_result=equity,
                 gross_wins=sum(max(0.0, float(r.net_result or 0)) for r in results),
                 gross_losses=sum(min(0.0, float(r.net_result or 0)) for r in results),
                 max_drawdown=drawdown if results else None,
-                unresolved_count=counts.get("INDETERMINATE", 0),
+                unresolved_count=counts.get("INDETERMINATE", 0) + counts.get("PENDING", 0),
                 independent_sample_count=len(groups),
                 dependency_window_seconds=self.dependency_window_seconds,
                 simulations=results,
@@ -304,11 +322,12 @@ class BacktestRunner:
         initial_balance: float = 0.0,
         max_positions: int = 1,
     ) -> PortfolioResult:
-        """Liquida una posición por señal con saldo fijo y solapamiento explícito.
+        """Libro virtual cronológico con solapamiento y liquidación explícitos.
 
-        Esta cartera es sólo virtual; una señal que se solapa con el máximo de
-        posiciones se cuenta como ``skipped_overlap`` y no se convierte en
-        pérdida/ganancia. La evaluación independiente de :meth:`run` no cambia.
+        Las posiciones se aceptan en orden de entrada, se mantienen hasta su
+        vencimiento y sólo entonces afectan al saldo. Esto no pretende modelar
+        capital real: es una cartera virtual separada de las evaluaciones
+        independientes de :meth:`run`.
         """
         if max_positions < 1:
             raise ValueError("max_positions must be positive")
@@ -316,25 +335,53 @@ class BacktestRunner:
         if not math.isfinite(balance):
             raise ValueError("initial_balance must be finite")
         normalized_points = normalize_points(points)
-        active: list[datetime] = []
+        active: list[tuple[datetime, SimulationResult]] = []
         accepted: list[SimulationResult] = []
         skipped = 0
         peak = balance
         drawdown = 0.0
+
+        def settle_until(cutoff: datetime) -> None:
+            nonlocal balance, peak, drawdown, active
+            due = [item for item in active if item[0] <= cutoff]
+            active = [item for item in active if item[0] > cutoff]
+            for _expiry, item in sorted(due, key=lambda pair: (pair[0], pair[1].detected_ts)):
+                if item.net_result is not None:
+                    balance += float(item.net_result)
+                    peak = max(peak, balance)
+                    drawdown = max(drawdown, peak - balance)
+
         for ordinal, signal in enumerate(sorted(list(signals), key=_signal_ts)):
-            result = self._simulate(signal, normalized_points, horizon=horizon_seconds if horizon_seconds is not None else self.spec.horizons_seconds[0], simulation_id=f"portfolio:{ordinal}")
+            result = self._simulate(
+                signal,
+                normalized_points,
+                horizon=horizon_seconds if horizon_seconds is not None else self.spec.horizons_seconds[0],
+                simulation_id=f"portfolio:{ordinal}",
+            )
             entry = parse_ts(result.entry_ts) if result.entry_ts else _signal_ts(signal)
-            active = [expiry for expiry in active if expiry > entry]
-            if len(active) >= max_positions:
+            settle_until(entry)
+            if result.entry_ts is not None and len(active) >= max_positions:
                 skipped += 1
                 continue
             accepted.append(result)
-            if result.net_result is not None:
+            if result.entry_ts is not None:
+                active.append((parse_ts(result.expiry_ts), result))
+            elif result.net_result is not None:
+                # No effective entry means this is not a position, but keep the
+                # accounting deterministic for custom evaluators that return a
+                # settled result without entry metadata.
                 balance += float(result.net_result)
                 peak = max(peak, balance)
                 drawdown = max(drawdown, peak - balance)
-            active.append(parse_ts(result.expiry_ts))
-        return PortfolioResult("VIRTUAL_PORTFOLIO", max_positions, len(accepted), skipped, balance, drawdown, accepted, ["saldo y stake fijos; sin martingala", "las señales solapadas se omiten explícitamente", "no es ejecución ni conexión a broker"])
+        for expiry, item in sorted(active, key=lambda pair: (pair[0], pair[1].detected_ts)):
+            if item.net_result is not None:
+                balance += float(item.net_result)
+                peak = max(peak, balance)
+                drawdown = max(drawdown, peak - balance)
+        return PortfolioResult(
+            "VIRTUAL_PORTFOLIO", max_positions, len(accepted), skipped, balance, drawdown, accepted,
+            ["saldo se actualiza al vencimiento, no al detectar la señal", "stake/capital son supuestos virtuales fijos; sin martingala", "las señales solapadas se omiten explícitamente", "no es ejecución ni conexión a broker"],
+        )
 
     def run_from_engine(
         self,

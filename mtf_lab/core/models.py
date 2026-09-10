@@ -219,6 +219,10 @@ class MarketEvent:
         event_time = normalize_utc(self.event_time, "event_time")
         received_at = normalize_utc(self.received_at, "received_at") if self.received_at else None
         available_at = normalize_utc(self.available_at, "available_at") if self.available_at else None
+        if received_at is not None and received_at < event_time:
+            raise ValueError("received_at no puede preceder a event_time")
+        if available_at is not None and available_at < event_time:
+            raise ValueError("available_at no puede preceder a event_time")
         object.__setattr__(self, "event_time", event_time)
         object.__setattr__(self, "received_at", received_at)
         object.__setattr__(self, "available_at", available_at)
@@ -335,7 +339,7 @@ class Candle:
         if available_at is not None and self.closed and available_at < end:
             # Una vela cerrada no puede estar disponible antes del cierre de su
             # intervalo; eventos tardíos pueden moverla después, nunca antes.
-            available_at = end
+            raise ValueError("available_at no puede preceder al cierre de una vela cerrada")
         object.__setattr__(self, "instrument", instrument)
         object.__setattr__(self, "timeframe", timeframe)
         object.__setattr__(self, "start", start)
