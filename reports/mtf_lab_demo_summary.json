@@ -1,0 +1,322 @@
+{
+  "by_horizon": {
+    "180.0": {
+      "net_result": -27.799999999999976,
+      "outcomes": {
+        "LOSS": 63,
+        "WIN": 44
+      }
+    },
+    "300.0": {
+      "net_result": -24.199999999999985,
+      "outcomes": {
+        "LOSS": 61,
+        "WIN": 46
+      }
+    },
+    "60.0": {
+      "net_result": -29.59999999999997,
+      "outcomes": {
+        "LOSS": 64,
+        "WIN": 43
+      }
+    }
+  },
+  "by_variant": {
+    "m1_trigger_reference": {
+      "config_hash": "1a9728a0821117e49f67004867b86a0beb26e4eb8c4ee98ca19adb0e90a0234c",
+      "net_result": -70.20000000000017,
+      "outcomes": {
+        "LOSS": 163,
+        "WIN": 116
+      }
+    },
+    "trend_pullback_v1": {
+      "config_hash": "cacc8626bbefbf0ca224de069c682f812819968a7db6283515b106a9422a382c",
+      "net_result": -11.400000000000002,
+      "outcomes": {
+        "LOSS": 25,
+        "WIN": 17
+      }
+    }
+  },
+  "counts": {
+    "candles": 3040,
+    "discards": 2837,
+    "signals": 14,
+    "simulations": 321
+  },
+  "data_quality": {
+    "synthetic": 3040
+  },
+  "discard_reasons": {
+    "context_indicator_not_ready": 936,
+    "context_invalidated": 270,
+    "context_neutral": 54,
+    "context_not_available": 16,
+    "directional_pullback_failed": 147,
+    "distance_exceeded": 92,
+    "no_directional_cross": 135,
+    "preparation_expired": 335,
+    "preparation_not_registered": 726,
+    "rsi_threshold_failed": 1,
+    "signal_duplicate": 125
+  },
+  "generated_at": "2026-09-10T04:29:56Z",
+  "instrument": "SYNTH/USD",
+  "limitations": [
+    "Los resultados son simulaciones virtuales y no constituyen órdenes ni recomendación.",
+    "La tasa de acierto no es una probabilidad de éxito; señales cercanas pueden depender entre sí.",
+    "Las velas no permiten inferir movimientos intrabar que no estén observados.",
+    "La ausencia de una fuente de noticias o de un bróker no se interpreta como comprobación."
+  ],
+  "mode": "SYNTHETIC",
+  "mode_label": "SINTETICO",
+  "outcomes": {
+    "LOSS": 188,
+    "WIN": 133
+  },
+  "provider": "synthetic",
+  "resolutions": {
+    "M1": 2400,
+    "M15": 160,
+    "M5": 480
+  },
+  "schema": "mtf-lab.report.v1",
+  "session": {
+    "code_version": "0.1.0",
+    "config": {
+      "dataset_hash": "064bee16d2e59af886044c4920388bd4732a457ae4f05dceb9a5ceac53092bf3",
+      "gaps": {
+        "M15": [],
+        "M5": []
+      },
+      "indicators": {
+        "atr_period": 14,
+        "ema_fast": 20,
+        "ema_slow": 50,
+        "rsi_period": 14,
+        "wilder": true
+      },
+      "instrument": {
+        "price_base": "trade",
+        "symbol": "SYNTH/USD"
+      },
+      "mode": "SYNTHETIC",
+      "project": {
+        "mode": "offline",
+        "name": "MTF Lab",
+        "version": "0.1.0"
+      },
+      "quality": {
+        "max_closed_candle_age_seconds": 900,
+        "max_feed_age_seconds": 90,
+        "max_gap_minutes": 3,
+        "require_warmup": true
+      },
+      "seed": 42,
+      "simulation": {
+        "costs": 0.0,
+        "entry_latency_seconds": 5,
+        "entry_rule": "first_observation_at_or_after",
+        "exit_rule": "last_observation_at_or_before",
+        "horizons_minutes": [
+          1,
+          3,
+          5
+        ],
+        "max_price_age_seconds": 90,
+        "net_payout": 0.8,
+        "stake": 1.0,
+        "tie_return": 0.0
+      },
+      "strategy": {
+        "context_timeframe": "15m",
+        "lookback": 3,
+        "name": "trend_pullback_v1",
+        "one_signal_per_episode": true,
+        "preparation_ttl_minutes": 15,
+        "rsi_threshold": 50.0,
+        "setup_max_atr": 0.5,
+        "setup_timeframe": "5m",
+        "trigger_timeframe": "1m"
+      },
+      "synthetic": true,
+      "timeframes": {
+        "base": "1m",
+        "closed_only": true,
+        "values": [
+          "1m",
+          "5m",
+          "15m"
+        ]
+      }
+    },
+    "config_hash": "ec21aeb0ba410f48c74fd89bc7d143ba5c23145aff3298d1075abf4fd32ec4a6",
+    "created_at": "2026-09-10T04:29:49.922890Z",
+    "dataset_ref": "synthetic://scenarios?seed=42",
+    "ended_at": "2026-09-10T04:29:55.944837Z",
+    "instrument": "SYNTH/USD",
+    "metadata": {
+      "provenance": {
+        "coverage_end": "2024-01-03T16:00:00Z",
+        "coverage_start": "2024-01-02T00:00:00Z",
+        "generated_seed": 42,
+        "instrument": "SYNTH/USD",
+        "mode": "SYNTHETIC",
+        "notes": [
+          "SINTETICO: conjunto compuesto para pruebas; no son cotizaciones reales"
+        ],
+        "price_basis": "traded",
+        "provider": "synthetic",
+        "resolutions": [
+          "M1"
+        ],
+        "retrieved_at": null,
+        "source_hash": null,
+        "source_uri": "synthetic://scenarios?seed=42",
+        "synthetic": true
+      },
+      "quality": {
+        "coverage_end": "2024-01-03T16:00:00Z",
+        "coverage_start": "2024-01-02T00:00:00Z",
+        "duplicate_count": 0,
+        "gap_count": 0,
+        "invalid_count": 0,
+        "notes": [],
+        "out_of_order_count": 0,
+        "record_count": 2400,
+        "valid": true
+      }
+    },
+    "mode": "SYNTHETIC",
+    "provider": "synthetic",
+    "seed": 42,
+    "session_id": "d7613259-0f72-4a44-8667-b30e22be27b8",
+    "started_at": "2026-09-10T04:29:49.922890Z",
+    "status": "COMPLETED"
+  },
+  "status": {
+    "code_version": "0.1.0",
+    "config": {
+      "dataset_hash": "064bee16d2e59af886044c4920388bd4732a457ae4f05dceb9a5ceac53092bf3",
+      "gaps": {
+        "M15": [],
+        "M5": []
+      },
+      "indicators": {
+        "atr_period": 14,
+        "ema_fast": 20,
+        "ema_slow": 50,
+        "rsi_period": 14,
+        "wilder": true
+      },
+      "instrument": {
+        "price_base": "trade",
+        "symbol": "SYNTH/USD"
+      },
+      "mode": "SYNTHETIC",
+      "project": {
+        "mode": "offline",
+        "name": "MTF Lab",
+        "version": "0.1.0"
+      },
+      "quality": {
+        "max_closed_candle_age_seconds": 900,
+        "max_feed_age_seconds": 90,
+        "max_gap_minutes": 3,
+        "require_warmup": true
+      },
+      "seed": 42,
+      "simulation": {
+        "costs": 0.0,
+        "entry_latency_seconds": 5,
+        "entry_rule": "first_observation_at_or_after",
+        "exit_rule": "last_observation_at_or_before",
+        "horizons_minutes": [
+          1,
+          3,
+          5
+        ],
+        "max_price_age_seconds": 90,
+        "net_payout": 0.8,
+        "stake": 1.0,
+        "tie_return": 0.0
+      },
+      "strategy": {
+        "context_timeframe": "15m",
+        "lookback": 3,
+        "name": "trend_pullback_v1",
+        "one_signal_per_episode": true,
+        "preparation_ttl_minutes": 15,
+        "rsi_threshold": 50.0,
+        "setup_max_atr": 0.5,
+        "setup_timeframe": "5m",
+        "trigger_timeframe": "1m"
+      },
+      "synthetic": true,
+      "timeframes": {
+        "base": "1m",
+        "closed_only": true,
+        "values": [
+          "1m",
+          "5m",
+          "15m"
+        ]
+      }
+    },
+    "config_hash": "ec21aeb0ba410f48c74fd89bc7d143ba5c23145aff3298d1075abf4fd32ec4a6",
+    "counts": {
+      "candles": 3040,
+      "decisions": 2880,
+      "discards": 2837,
+      "events": 2400,
+      "signals": 14,
+      "simulations": 321
+    },
+    "created_at": "2026-09-10T04:29:49.922890Z",
+    "dataset_ref": "synthetic://scenarios?seed=42",
+    "ended_at": "2026-09-10T04:29:55.944837Z",
+    "instrument": "SYNTH/USD",
+    "last_event_ts": "2024-01-03T16:00:00.000000Z",
+    "metadata": {
+      "provenance": {
+        "coverage_end": "2024-01-03T16:00:00Z",
+        "coverage_start": "2024-01-02T00:00:00Z",
+        "generated_seed": 42,
+        "instrument": "SYNTH/USD",
+        "mode": "SYNTHETIC",
+        "notes": [
+          "SINTETICO: conjunto compuesto para pruebas; no son cotizaciones reales"
+        ],
+        "price_basis": "traded",
+        "provider": "synthetic",
+        "resolutions": [
+          "M1"
+        ],
+        "retrieved_at": null,
+        "source_hash": null,
+        "source_uri": "synthetic://scenarios?seed=42",
+        "synthetic": true
+      },
+      "quality": {
+        "coverage_end": "2024-01-03T16:00:00Z",
+        "coverage_start": "2024-01-02T00:00:00Z",
+        "duplicate_count": 0,
+        "gap_count": 0,
+        "invalid_count": 0,
+        "notes": [],
+        "out_of_order_count": 0,
+        "record_count": 2400,
+        "valid": true
+      }
+    },
+    "mode": "SYNTHETIC",
+    "provider": "synthetic",
+    "schema_version": 1,
+    "seed": 42,
+    "session_id": "d7613259-0f72-4a44-8667-b30e22be27b8",
+    "started_at": "2026-09-10T04:29:49.922890Z",
+    "status": "COMPLETED"
+  }
+}

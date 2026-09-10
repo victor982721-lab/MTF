@@ -1,0 +1,309 @@
+"""Agregación causal de eventos a velas de intervalos fijos."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import math
+from typing import Iterable, Sequence
+
+from .models import Candle, MarketEvent, OperationMode, PriceBase, Timeframe, normalize_utc, parse_timeframe
+from .quality import DataQuality, QualityFlag, QualityIssue, QualityReport, ValidationResult, merge_quality, validate_event
+
+
+UTC = timezone.utc
+
+
+def interval_start(timestamp: datetime, timeframe: Timeframe | str) -> datetime:
+    """Devuelve el inicio de ``[inicio, fin)`` anclado a Unix epoch UTC."""
+
+    timestamp = normalize_utc(timestamp, "timestamp")
+    tf = parse_timeframe(timeframe)
+    seconds = timestamp.timestamp()
+    start_epoch = math.floor(seconds / tf.seconds) * tf.seconds
+    return datetime.fromtimestamp(start_epoch, tz=UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class AggregationResult:
+    """Salida de una inserción incremental."""
+
+    emitted: tuple[Candle, ...] = ()
+    accepted: bool = True
+    issues: tuple[QualityIssue, ...] = ()
+
+    @property
+    def candles(self) -> tuple[Candle, ...]:
+        return self.emitted
+
+
+@dataclass(slots=True)
+class _Bucket:
+    start: datetime
+    end: datetime
+    events: list[MarketEvent] = field(default_factory=list)
+
+
+class CandleAggregator:
+    """Agregador de una temporalidad para un instrumento/base de precio.
+
+    En modo incremental los eventos deben llegar en orden causal. Un evento
+    que cae en un intervalo ya cerrado se rechaza y queda registrado como
+    ``out_of_order``/``unreconciled``: no se reescribe retrospectivamente una
+    observación ya emitida. El backfill puede procesarse en otra sesión o
+    generar revisiones separadas.
+    """
+
+    def __init__(
+        self,
+        timeframe: Timeframe | str,
+        *,
+        instrument: str | None = None,
+        price_base: PriceBase | str = PriceBase.TRADED,
+        source: str = "aggregated",
+        mode: OperationMode | str = OperationMode.REPLAY,
+        reject_out_of_order: bool = True,
+    ) -> None:
+        self.timeframe = parse_timeframe(timeframe)
+        self.instrument = instrument.strip() if instrument else None
+        if self.instrument == "":
+            self.instrument = None
+        self.price_base = price_base if isinstance(price_base, PriceBase) else PriceBase(str(price_base).lower())
+        self.source = str(source).strip() or "aggregated"
+        self.mode = mode if isinstance(mode, OperationMode) else OperationMode(str(mode).upper())
+        self.reject_out_of_order = reject_out_of_order
+        self._bucket: _Bucket | None = None
+        self._closed_through: datetime | None = None
+        self._seen_event_ids: set[str] = set()
+        self._last_order_key: tuple | None = None
+        self._issues: list[QualityIssue] = []
+        self._last_event_time: datetime | None = None
+
+    @property
+    def issues(self) -> tuple[QualityIssue, ...]:
+        return tuple(self._issues)
+
+    @property
+    def last_event_time(self) -> datetime | None:
+        return self._last_event_time
+
+    def _event_order_key(self, event: MarketEvent) -> tuple:
+        received = event.received_at or event.event_time
+        available = event.available_at or received
+        sequence = event.sequence
+        # Mezcla tipos no comparables convirtiendo sólo la clave de orden, no
+        # la identidad persistida. event_id es el desempate final estable.
+        seq_key = (0, sequence) if isinstance(sequence, (int, float)) and not isinstance(sequence, bool) else (1, str(sequence or ""))
+        return event.event_time, available, received, seq_key, event.event_id or ""
+
+    def _new_issue(self, code: str, message: str, event: MarketEvent | None = None) -> QualityIssue:
+        issue = QualityIssue(code, message, record_id=event.event_id if event else None, timestamp=event.event_time if event else None)
+        self._issues.append(issue)
+        return issue
+
+    def add(self, event: MarketEvent) -> AggregationResult:
+        """Añade un evento y emite cualquier vela anterior ya cerrada."""
+
+        if not isinstance(event, MarketEvent):
+            raise TypeError("CandleAggregator.add requiere MarketEvent")
+        validation = validate_event(event)
+        if not validation.accepted:
+            issue = self._new_issue("invalid_event", "; ".join(item.message for item in validation.issues), event)
+            return AggregationResult((), False, (issue,))
+        if self.instrument is None:
+            self.instrument = event.instrument
+        if event.instrument != self.instrument:
+            issue = self._new_issue("instrument_mismatch", f"Se esperaba {self.instrument}, llegó {event.instrument}", event)
+            return AggregationResult((), False, (issue,))
+        if event.price_base is not self.price_base:
+            issue = self._new_issue("price_base_mismatch", f"Se esperaba {self.price_base.value}, llegó {event.price_base.value}", event)
+            return AggregationResult((), False, (issue,))
+        if event.event_id in self._seen_event_ids:
+            issue = self._new_issue("duplicate_event", f"Evento duplicado: {event.event_id}", event)
+            return AggregationResult((), False, (issue,))
+        order_key = self._event_order_key(event)
+        if self._last_order_key is not None and order_key < self._last_order_key:
+            issue = self._new_issue("out_of_order", f"Evento fuera de orden: {event.event_id}", event)
+            if self.reject_out_of_order:
+                return AggregationResult((), False, (issue,))
+        self._seen_event_ids.add(event.event_id)
+        self._last_order_key = max(self._last_order_key, order_key) if self._last_order_key is not None else order_key
+        self._last_event_time = max(self._last_event_time, event.event_time) if self._last_event_time else event.event_time
+
+        start = interval_start(event.event_time, self.timeframe)
+        end = start + self.timeframe.delta
+        emitted: list[Candle] = []
+        if self._closed_through is not None and start < self._closed_through:
+            issue = self._new_issue("late_closed_interval", "El evento pertenece a un intervalo ya cerrado", event)
+            # No se integra en la observación original, aunque conserva el
+            # event_id como visto para que un retry no duplique más evidencia.
+            return AggregationResult((), False, (issue,))
+        if self._bucket is None:
+            self._bucket = _Bucket(start, end)
+        elif start < self._bucket.start:
+            issue = self._new_issue("out_of_order_interval", "El intervalo retrocede respecto al bucket activo", event)
+            return AggregationResult((), False, (issue,))
+        elif start > self._bucket.start:
+            emitted.append(self._build_candle(self._bucket, closed=True))
+            self._closed_through = self._bucket.end
+            self._bucket = _Bucket(start, end)
+        self._bucket.events.append(event)
+        return AggregationResult(tuple(emitted), True, ())
+
+    def close_until(self, watermark: datetime, *, include_current: bool = True) -> AggregationResult:
+        """Cierra buckets cuyo ``end`` no supera el watermark.
+
+        No crea velas vacías: los intervalos sin eventos permanecen como
+        cobertura ausente, no como precios inventados. ``include_current`` se
+        mantiene por compatibilidad de API y sólo afecta al bucket activo.
+        """
+
+        watermark = normalize_utc(watermark, "watermark")
+        if self._bucket is None or not include_current or watermark < self._bucket.end:
+            return AggregationResult()
+        candle = self._build_candle(self._bucket, closed=True)
+        self._closed_through = self._bucket.end
+        self._bucket = None
+        return AggregationResult((candle,), True, ())
+
+    def flush(self, *, close_final: bool = True) -> AggregationResult:
+        """Finaliza el bucket activo al terminar una sesión de replay."""
+
+        if self._bucket is None:
+            return AggregationResult()
+        candle = self._build_candle(self._bucket, closed=close_final)
+        if close_final:
+            self._closed_through = self._bucket.end
+            self._bucket = None
+        return AggregationResult((candle,), True, ())
+
+    def _build_candle(self, bucket: _Bucket, *, closed: bool) -> Candle:
+        events = sorted(bucket.events, key=self._event_order_key)
+        prices = [event.selected_price for event in events]
+        if not prices or any(price is None for price in prices):
+            raise ValueError("No hay precios compatibles con la base solicitada")
+        values = [float(price) for price in prices if price is not None]
+        quality = merge_quality(*(event.quality for event in events), source=self.source)
+        if self.mode is OperationMode.SYNTHETIC:
+            quality = quality.with_flags(QualityFlag.SYNTHETIC)
+        latest_availability = max(event.effective_available_at for event in events)
+        available_at = max(bucket.end, latest_availability) if closed else latest_availability
+        latest_received = max((event.received_at or event.event_time for event in events), default=None)
+        return Candle(
+            instrument=self.instrument or events[0].instrument,
+            timeframe=self.timeframe,
+            start=bucket.start,
+            end=bucket.end,
+            open=values[0],
+            high=max(values),
+            low=min(values),
+            close=values[-1],
+            volume=sum(event.quantity or 0.0 for event in events),
+            event_count=len(events),
+            source=self.source,
+            mode=self.mode,
+            price_base=self.price_base,
+            closed=closed,
+            available_at=available_at,
+            received_at=latest_received,
+            quality=quality,
+            origin="aggregated",
+        )
+
+
+def _event_sort_key(event: MarketEvent) -> tuple:
+    received = event.received_at or event.event_time
+    available = event.available_at or received
+    sequence = event.sequence
+    seq_key = (0, sequence) if isinstance(sequence, (int, float)) and not isinstance(sequence, bool) else (1, str(sequence or ""))
+    return event.event_time, available, received, seq_key, event.event_id or ""
+
+
+def aggregate_events(
+    events: Iterable[MarketEvent],
+    timeframe: Timeframe | str,
+    *,
+    instrument: str | None = None,
+    price_base: PriceBase | str = PriceBase.TRADED,
+    source: str = "aggregated",
+    mode: OperationMode | str = OperationMode.REPLAY,
+    close_final: bool = True,
+    reject_invalid: bool = True,
+    return_report: bool = False,
+) -> list[Candle] | tuple[list[Candle], QualityReport]:
+    """Agrega un lote en orden determinista y devuelve velas sin huecos ficticios.
+
+    Por defecto el lote histórico cierra su último intervalo para facilitar
+    importación/backtest, pero la disponibilidad queda en ``end`` (o después
+    si hubo recepción tardía), por lo que una evaluación en mitad del
+    intervalo no puede usar ese cierre. Para observar una sesión parcial use
+    ``close_final=False``.
+    """
+
+    raw_events = list(events)
+    issues: list[QualityIssue] = []
+    valid_events: list[MarketEvent] = []
+    for event in raw_events:
+        if not isinstance(event, MarketEvent):
+            issues.append(QualityIssue("event_type", "Se esperaba MarketEvent"))
+            continue
+        validation = validate_event(event)
+        if not validation.accepted:
+            issues.extend(validation.issues)
+            continue
+        valid_events.append(event)
+    # Conserva evidencia de que la fuente llegó fuera de orden antes de
+    # aplicar el orden determinista de reproducción. No se descarta por
+    # sorpresa en lote: ``reject_invalid`` controla sólo la inserción.
+    input_keys = [_event_sort_key(event) for event in valid_events]
+    if any(right < left for left, right in zip(input_keys, input_keys[1:])):
+        issues.append(QualityIssue("out_of_order", "La entrada contenía eventos fuera de orden"))
+    valid_events.sort(key=_event_sort_key)
+    unique: list[MarketEvent] = []
+    seen: set[str] = set()
+    duplicates = 0
+    for event in valid_events:
+        if event.event_id in seen:
+            duplicates += 1
+            issues.append(QualityIssue("duplicate_event", f"Evento duplicado: {event.event_id}", record_id=event.event_id, timestamp=event.event_time))
+            continue
+        seen.add(event.event_id)
+        unique.append(event)
+    aggregator = CandleAggregator(
+        timeframe,
+        instrument=instrument,
+        price_base=price_base,
+        source=source,
+        mode=mode,
+        reject_out_of_order=reject_invalid,
+    )
+    candles: list[Candle] = []
+    for event in unique:
+        result = aggregator.add(event)
+        candles.extend(result.emitted)
+        issues.extend(result.issues)
+    final = aggregator.flush(close_final=close_final)
+    candles.extend(final.emitted)
+    issues.extend(final.issues)
+    if return_report:
+        report = QualityReport(
+            accepted=len(unique),
+            rejected=len(raw_events) - len(unique),
+            duplicates=duplicates,
+            out_of_order=sum(1 for issue in issues if issue.code.startswith("out_of_order")),
+            invalid=sum(1 for issue in issues if issue.code in {"invalid_event", "non_finite", "timestamp_invalid"}),
+            gaps=sum(1 for issue in issues if issue.code == "gap"),
+            coverage_start=min((event.event_time for event in unique), default=None),
+            coverage_end=max((event.event_time for event in unique), default=None),
+            issues=tuple(issues),
+        )
+        return candles, report
+    return candles
+
+
+__all__ = [
+    "AggregationResult",
+    "CandleAggregator",
+    "aggregate_events",
+    "interval_start",
+]

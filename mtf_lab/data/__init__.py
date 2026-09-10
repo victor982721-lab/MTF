@@ -1,0 +1,87 @@
+from .provider import MarketDataProvider, provider_name
+"""Data providers and normalized records for MTF Lab.
+
+The public surface intentionally exposes provider-neutral ``Event`` and
+``Bar`` records.  Consumers should use those types rather than Kraken wire
+payloads; another provider can then implement the same adapter contract.
+"""
+
+from .models import (
+    Bar,
+    Candle,
+    DataMode,
+    DataQuality,
+    DataSet,
+    DataValidationError,
+    Event,
+    PriceBasis,
+    Provenance,
+    ValidationIssue,
+    ensure_utc,
+    infer_quality,
+    isoformat_utc,
+    resolution_name,
+    resolution_to_seconds,
+)
+from .importer import (
+    ColumnMapping,
+    ImportConfig,
+    ImportConfigurationError,
+    import_csv,
+    import_jsonl,
+    load_csv,
+    load_jsonl,
+    parse_timestamp,
+)
+from .synthetic import SyntheticConfig, SyntheticDataGenerator, SyntheticGenerator
+from .kraken import (
+    KrakenAdapter,
+    KrakenAPIError,
+    KrakenConfigurationError,
+    KrakenError,
+    KrakenFetchResult,
+    KrakenPublicAdapter,
+    KrakenStreamStatus,
+    KrakenTransportError,
+    normalize_pair,
+)
+
+__all__ = [
+    "Bar",
+    "MarketDataProvider",
+    "Candle",
+    "ColumnMapping",
+    "DataMode",
+    "DataQuality",
+    "DataSet",
+    "DataValidationError",
+    "Event",
+    "ImportConfig",
+    "ImportConfigurationError",
+    "KrakenAPIError",
+    "KrakenAdapter",
+    "KrakenConfigurationError",
+    "KrakenError",
+    "KrakenFetchResult",
+    "KrakenPublicAdapter",
+    "KrakenStreamStatus",
+    "KrakenTransportError",
+    "PriceBasis",
+    "Provenance",
+    "SyntheticConfig",
+    "SyntheticDataGenerator",
+    "SyntheticGenerator",
+    "ValidationIssue",
+    "ensure_utc",
+    "import_csv",
+    "import_jsonl",
+    "infer_quality",
+    "isoformat_utc",
+    "load_csv",
+    "load_jsonl",
+    "normalize_pair",
+    "parse_timestamp",
+    "provider_name",
+    "resolution_name",
+    "resolution_to_seconds",
+]

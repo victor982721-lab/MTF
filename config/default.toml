@@ -1,0 +1,48 @@
+[project]
+name = "MTF Lab"
+version = "0.1.0"
+mode = "offline"
+
+[instrument]
+symbol = "SYNTH/USD"
+price_base = "trade"
+
+[timeframes]
+base = "1m"
+values = ["1m", "5m", "15m"]
+closed_only = true
+
+[indicators]
+ema_fast = 20
+ema_slow = 50
+rsi_period = 14
+atr_period = 14
+wilder = true
+
+[strategy]
+name = "trend_pullback_v1"
+context_timeframe = "15m"
+setup_timeframe = "5m"
+trigger_timeframe = "1m"
+lookback = 3
+setup_max_atr = 0.5
+rsi_threshold = 50.0
+preparation_ttl_minutes = 15
+one_signal_per_episode = true
+
+[quality]
+max_feed_age_seconds = 90
+max_closed_candle_age_seconds = 900
+max_gap_minutes = 3
+require_warmup = true
+
+[simulation]
+horizons_minutes = [1, 3, 5]
+entry_latency_seconds = 5
+entry_rule = "first_observation_at_or_after"
+exit_rule = "last_observation_at_or_before"
+max_price_age_seconds = 90
+stake = 1.0
+net_payout = 0.80
+tie_return = 0.0
+costs = 0.0

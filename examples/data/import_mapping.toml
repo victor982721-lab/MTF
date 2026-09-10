@@ -1,0 +1,19 @@
+# Mapeo explícito para examples/data/synthetic_m1.csv.
+[import]
+record_kind = "candle"
+timestamp_unit = "iso8601"
+price_basis = "traded"
+strict = true
+reorder = false
+drop_duplicates = false
+
+[columns]
+timestamp = "timestamp"
+instrument = "instrument"
+resolution = "resolution"
+open = "open"
+high = "high"
+low = "low"
+close = "close"
+volume = "volume"
+trade_count = "trade_count"

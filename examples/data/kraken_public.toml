@@ -1,0 +1,9 @@
+# Configuración informativa del adaptador público; no contiene claves.
+[kraken]
+pair = "BTC/USD"
+rest_endpoint = "https://api.kraken.com/0/public/OHLC"
+websocket_endpoint = "wss://ws.kraken.com/v2"
+intervals_minutes = [1, 5, 15]
+include_open = false
+# El endpoint REST limita la respuesta a 720 entradas e incluye una última
+# vela no comprometida, que MTF Lab conserva separada.
