@@ -339,14 +339,20 @@ def _candle_row(c: Candle, point: Any | None = None) -> dict[str, Any]:
 
 def persist_pipeline(result: PipelineResult, db_path: str | Path, *, seed: int, config: Mapping[str, Any] | None = None, log_path: str | Path | None = None, run_backtest: bool = True) -> PipelineResult:
     db = Path(db_path).expanduser()
-    config_effective = _config_mapping(config)
+    config_input = _config_mapping(config)
+    # The analysis namespace is the effective financial/strategy profile, not
+    # the capture seed, dataset hash or runtime telemetry. Those belong to
+    # dataset/provenance fields and must not fork signal identities.
+    declared_hash = config_input.get("config_hash")
+    analysis_config_hash = str(declared_hash) if declared_hash else payload_hash(config_input)
+    config_effective = dict(config_input)
     config_effective.setdefault("seed", seed)
     config_effective.setdefault("mode", "SYNTHETIC")
     dataset_hash = hashlib.sha256(json.dumps([row.to_dict() for row in result.dataset.bars], sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")).hexdigest()
     config_effective.setdefault("dataset_hash", dataset_hash)
     strategy_map = config_effective.get("strategy", {}) if isinstance(config_effective.get("strategy", {}), Mapping) else {}
     trigger_name = str(strategy_map.get("trigger_timeframe", "M1")).upper()
-    baseline_signals = m1_reference_signals(result.indicators[trigger_name], rsi_threshold=float(strategy_map.get("rsi_threshold", 50.0)), mode="SYNTHETIC", identity_salt=payload_hash(config_effective)) if trigger_name in result.indicators else []
+    baseline_signals = m1_reference_signals(result.indicators[trigger_name], rsi_threshold=float(strategy_map.get("rsi_threshold", 50.0)), mode="SYNTHETIC", identity_salt=analysis_config_hash) if trigger_name in result.indicators else []
     with SQLiteStore(db) as store:
         sid = store.create_session(mode="SYNTHETIC", provider=result.dataset.provenance.provider, instrument=result.dataset.provenance.instrument,
                                   code_version=__version__, seed=seed, dataset_ref=result.dataset.provenance.source_uri,
@@ -355,8 +361,8 @@ def persist_pipeline(result: PipelineResult, db_path: str | Path, *, seed: int, 
         spec = evaluation_spec_from_config(config_effective)
         contract_payload = {"stake": spec.stake, "payout_net": spec.payout_net, "loss_amount": spec.loss_amount, "tie_net": spec.tie_net, "costs": spec.costs, "tie_tolerance": spec.tie_tolerance, "entry_rule": spec.entry_rule, "exit_rule": spec.exit_rule, "horizon_from": spec.horizon_from, "requested_base_price": spec.requested_base_price}
         contract_hash = hashlib.sha256(json.dumps(contract_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-        mtf_analysis_id = store.create_analysis(sid, dataset_hash=dataset_hash, config_hash=payload_hash(config_effective), variant="trend_pullback_v1", contract_hash=contract_hash, code_version=__version__, metadata={"strategy": "trend_pullback_v1"})
-        baseline_analysis_id = store.create_analysis(sid, dataset_hash=dataset_hash, config_hash=payload_hash(config_effective), variant="m1_trigger_reference", contract_hash=contract_hash, code_version=__version__, metadata={"strategy": "m1_trigger_reference"})
+        mtf_analysis_id = store.create_analysis(sid, dataset_hash=dataset_hash, config_hash=analysis_config_hash, variant="trend_pullback_v1", contract_hash=contract_hash, code_version=__version__, metadata={"strategy": "trend_pullback_v1"})
+        baseline_analysis_id = store.create_analysis(sid, dataset_hash=dataset_hash, config_hash=analysis_config_hash, variant="m1_trigger_reference", contract_hash=contract_hash, code_version=__version__, metadata={"strategy": "m1_trigger_reference"})
         telemetry = OperationTelemetry(log_path=log_path or db.with_suffix(".jsonl"), mode="SYNTHETIC", session_id=sid, instrument=result.dataset.provenance.instrument)
         gap_map = config_effective.get("gaps", {}) if isinstance(config_effective.get("gaps", {}), Mapping) else {}
         has_gaps = any(bool(values) for values in gap_map.values() if isinstance(values, (list, tuple)))
@@ -379,7 +385,7 @@ def persist_pipeline(result: PipelineResult, db_path: str | Path, *, seed: int, 
             base_row = evaluation.as_dict()
             decision_fingerprint = payload_hash(base_row)[:16]
             row = dict(base_row); row.update({"decision_id": f"decision:{evaluation.stage}:{stable_ts}:{decision_fingerprint}", "observed_ts": evaluation.timestamp, "available_ts": evaluation.available_at, "kind": evaluation.stage, "status": evaluation.decision.value})
-            store.save_decision(sid, row, ordinal=i, analysis_id=mtf_analysis_id, variant="trend_pullback_v1", analysis_config_hash=payload_hash(config_effective), contract_hash=contract_hash, partition="all")
+            store.save_decision(sid, row, ordinal=i, analysis_id=mtf_analysis_id, variant="trend_pullback_v1", analysis_config_hash=analysis_config_hash, contract_hash=contract_hash, partition="all")
             if evaluation.decision.value in {"discarded", "blocked"}:
                 blocking = [condition for condition in evaluation.conditions if condition.mandatory and condition.state.value in {"failed", "unknown"}]
                 if not blocking:
@@ -387,11 +393,11 @@ def persist_pipeline(result: PipelineResult, db_path: str | Path, *, seed: int, 
                 for condition_ordinal, condition in enumerate(blocking):
                     reason = (condition.reason if condition is not None else None) or (condition.state.value if condition is not None else None) or (evaluation.reasons[0] if evaluation.reasons else evaluation.decision.value)
                     payload = {"condition": condition.as_dict() if condition is not None else None, "decision": row}
-                    store.save_discard(sid, {"discard_id": f"{sid}:discard:{row["decision_id"]}:{condition_ordinal}:{reason}", "decision_id": row["decision_id"], "observed_ts": evaluation.timestamp, "reason_code": reason, "required": True, "condition_status": condition.state.value if condition is not None else evaluation.decision.value, "payload": payload}, ordinal=i * 100 + condition_ordinal, analysis_id=mtf_analysis_id, variant="trend_pullback_v1", analysis_config_hash=payload_hash(config_effective), contract_hash=contract_hash, partition="all")
+                    store.save_discard(sid, {"discard_id": f"{sid}:discard:{row["decision_id"]}:{condition_ordinal}:{reason}", "decision_id": row["decision_id"], "observed_ts": evaluation.timestamp, "reason_code": reason, "required": True, "condition_status": condition.state.value if condition is not None else evaluation.decision.value, "payload": payload}, ordinal=i * 100 + condition_ordinal, analysis_id=mtf_analysis_id, variant="trend_pullback_v1", analysis_config_hash=analysis_config_hash, contract_hash=contract_hash, partition="all")
         for i, signal in enumerate(result.strategy.signals):
-            store.save_signal(sid, signal.as_dict(), ordinal=i, analysis_id=mtf_analysis_id, variant="trend_pullback_v1", analysis_config_hash=payload_hash(config_effective), contract_hash=contract_hash, partition="all")
+            store.save_signal(sid, signal.as_dict(), ordinal=i, analysis_id=mtf_analysis_id, variant="trend_pullback_v1", analysis_config_hash=analysis_config_hash, contract_hash=contract_hash, partition="all")
         for i, signal in enumerate(baseline_signals):
-            store.save_signal(sid, signal, ordinal=i, analysis_id=baseline_analysis_id, variant="m1_trigger_reference", analysis_config_hash=payload_hash(config_effective), contract_hash=contract_hash, partition="all")
+            store.save_signal(sid, signal, ordinal=i, analysis_id=baseline_analysis_id, variant="m1_trigger_reference", analysis_config_hash=analysis_config_hash, contract_hash=contract_hash, partition="all")
         telemetry.state.update(events_processed=len(result.streams.get("M1", [])), candles_processed=sum(map(len, result.streams.values())), signals=len(result.strategy.signals) + len(baseline_signals), discards=sum(e.decision.value in {"discarded", "blocked"} for e in result.strategy.evaluations), last_received_ts=max((c.end for c in result.streams.get("M1", [])), default=None), last_available_ts=max((c.available_at or c.end for c in result.streams.get("M1", [])), default=None))
         simulations: list[dict[str, Any]] = []
         if run_backtest:
@@ -399,8 +405,8 @@ def persist_pipeline(result: PipelineResult, db_path: str | Path, *, seed: int, 
             simulator = VirtualContractSimulator(spec=spec)
             runner = BacktestRunner(simulator=simulator, store=store, session_id=sid, logger=telemetry.logger)
             variants = [VariantSpec("m1_trigger_reference", "Referencia controlada: sólo disparador M1", {"context": False, "preparation": False}, mode="M1_REFERENCE"), VariantSpec("trend_pullback_v1", "Contexto M15 + preparación M5 + disparador M1", {"context": True, "preparation": True}, mode="MULTITIMEFRAME")]
-            bt = runner.run(baseline_signals, points, variants=[variants[0]], data_quality="SYNTHETIC", resolution=trigger_name, analysis_id=baseline_analysis_id, analysis_name="m1_trigger_reference", analysis_config_hash=payload_hash(config_effective), contract_hash=contract_hash)
-            bt += runner.run([s.as_dict() for s in result.strategy.signals], points, variants=[variants[1]], data_quality="SYNTHETIC", resolution=trigger_name, analysis_id=mtf_analysis_id, analysis_name="trend_pullback_v1", analysis_config_hash=payload_hash(config_effective), contract_hash=contract_hash)
+            bt = runner.run(baseline_signals, points, variants=[variants[0]], data_quality="SYNTHETIC", resolution=trigger_name, analysis_id=baseline_analysis_id, analysis_name="m1_trigger_reference", analysis_config_hash=analysis_config_hash, contract_hash=contract_hash)
+            bt += runner.run([s.as_dict() for s in result.strategy.signals], points, variants=[variants[1]], data_quality="SYNTHETIC", resolution=trigger_name, analysis_id=mtf_analysis_id, analysis_name="trend_pullback_v1", analysis_config_hash=analysis_config_hash, contract_hash=contract_hash)
             simulations = [x.to_dict(include_simulations=False) for x in bt]
             for x in bt:
                 store.save_metric(sid, f"backtest:{x.variant}", {"variant": x.variant, "config_hash": x.config_hash}, x.net_result, x.to_dict(include_simulations=False))

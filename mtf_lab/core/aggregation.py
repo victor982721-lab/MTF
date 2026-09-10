@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections import deque
 from datetime import datetime, timezone
 import math
 from typing import Iterable, Sequence
@@ -36,12 +37,24 @@ class AggregationResult:
     def candles(self) -> tuple[Candle, ...]:
         return self.emitted
 
+    @property
+    def partial(self) -> bool:
+        return any(candle.quality.has(QualityFlag.PARTIAL) or bool(candle.metadata.get("partial")) for candle in self.emitted)
+
 
 @dataclass(slots=True)
 class _Bucket:
     start: datetime
     end: datetime
     events: list[MarketEvent] = field(default_factory=list)
+    # True when the source began after the interval start. It is intentionally
+    # distinct from temporal ``closed``: an elapsed interval can still have
+    # incomplete source coverage and must not be presented as a complete bar.
+    partial: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.partial is None:
+            self.partial = bool(self.events and min(event.event_time for event in self.events) > self.start)
 
 
 class CandleAggregator:
@@ -63,6 +76,8 @@ class CandleAggregator:
         source: str = "aggregated",
         mode: OperationMode | str = OperationMode.REPLAY,
         reject_out_of_order: bool = True,
+        max_seen_event_ids: int | None = None,
+        max_issues: int | None = None,
     ) -> None:
         self.timeframe = parse_timeframe(timeframe)
         self.instrument = instrument.strip() if instrument else None
@@ -72,11 +87,18 @@ class CandleAggregator:
         self.source = str(source).strip() or "aggregated"
         self.mode = mode if isinstance(mode, OperationMode) else OperationMode(str(mode).upper())
         self.reject_out_of_order = reject_out_of_order
+        if max_seen_event_ids is not None and (isinstance(max_seen_event_ids, bool) or int(max_seen_event_ids) <= 0):
+            raise ValueError("max_seen_event_ids debe ser entero positivo")
+        if max_issues is not None and (isinstance(max_issues, bool) or int(max_issues) <= 0):
+            raise ValueError("max_issues debe ser entero positivo")
+        self.max_seen_event_ids = int(max_seen_event_ids) if max_seen_event_ids is not None else None
+        self.max_issues = int(max_issues) if max_issues is not None else (self.max_seen_event_ids if self.max_seen_event_ids is not None else None)
         self._bucket: _Bucket | None = None
         self._closed_through: datetime | None = None
         self._seen_event_ids: set[str] = set()
+        self._seen_event_order: deque[str] = deque()
         self._last_order_key: tuple | None = None
-        self._issues: list[QualityIssue] = []
+        self._issues = deque(maxlen=self.max_issues) if self.max_issues is not None else []
         self._last_event_time: datetime | None = None
 
     @property
@@ -127,6 +149,11 @@ class CandleAggregator:
             if self.reject_out_of_order:
                 return AggregationResult((), False, (issue,))
         self._seen_event_ids.add(event.event_id)
+        self._seen_event_order.append(event.event_id)
+        if self.max_seen_event_ids is not None:
+            while len(self._seen_event_order) > self.max_seen_event_ids:
+                evicted_id = self._seen_event_order.popleft()
+                self._seen_event_ids.discard(evicted_id)
         self._last_order_key = max(self._last_order_key, order_key) if self._last_order_key is not None else order_key
         self._last_event_time = max(self._last_event_time, event.event_time) if self._last_event_time else event.event_time
 
@@ -139,14 +166,27 @@ class CandleAggregator:
             # event_id como visto para que un retry no duplique más evidencia.
             return AggregationResult((), False, (issue,))
         if self._bucket is None:
-            self._bucket = _Bucket(start, end)
+            self._bucket = _Bucket(start, end, partial=event.event_time > start)
+            if event.event_time > start:
+                issue = self._new_issue("partial_bucket", "El arranque ocurrió a mitad de intervalo; la cobertura no es completa", event)
+                self._bucket.events.append(event)
+                return AggregationResult((), True, (issue,))
         elif start < self._bucket.start:
             issue = self._new_issue("out_of_order_interval", "El intervalo retrocede respecto al bucket activo", event)
             return AggregationResult((), False, (issue,))
         elif start > self._bucket.start:
-            emitted.append(self._build_candle(self._bucket, closed=True))
+            emitted.append(self._build_candle(self._bucket, closed=True, emitted_at=event.effective_available_at))
             self._closed_through = self._bucket.end
-            self._bucket = _Bucket(start, end)
+            gap_issue: QualityIssue | None = None
+            if start > self._bucket.end:
+                gap_issue = self._new_issue("gap", f"Sin eventos entre {self._bucket.end.isoformat()} y {start.isoformat()}", event)
+            partial = event.event_time > start
+            self._bucket = _Bucket(start, end, partial=partial)
+            self._bucket.events.append(event)
+            if partial:
+                partial_issue = self._new_issue("partial_bucket", "El nuevo intervalo comenzó a mitad de intervalo", event)
+                return AggregationResult(tuple(emitted), True, tuple(item for item in (gap_issue, partial_issue) if item is not None))
+            return AggregationResult(tuple(emitted), True, (gap_issue,) if gap_issue is not None else ())
         self._bucket.events.append(event)
         return AggregationResult(tuple(emitted), True, ())
 
@@ -161,7 +201,7 @@ class CandleAggregator:
         watermark = normalize_utc(watermark, "watermark")
         if self._bucket is None or not include_current or watermark < self._bucket.end:
             return AggregationResult()
-        candle = self._build_candle(self._bucket, closed=True)
+        candle = self._build_candle(self._bucket, closed=True, emitted_at=watermark)
         self._closed_through = self._bucket.end
         self._bucket = None
         return AggregationResult((candle,), True, ())
@@ -171,13 +211,16 @@ class CandleAggregator:
 
         if self._bucket is None:
             return AggregationResult()
-        candle = self._build_candle(self._bucket, closed=close_final)
+        # A final bucket that began mid-interval is emitted as an explicit
+        # partial/open record, never as a complete closed candle.
+        closed = bool(close_final and not self._bucket.partial)
+        candle = self._build_candle(self._bucket, closed=closed, emitted_at=(self._bucket.end if closed else None))
         if close_final:
             self._closed_through = self._bucket.end
             self._bucket = None
         return AggregationResult((candle,), True, ())
 
-    def _build_candle(self, bucket: _Bucket, *, closed: bool) -> Candle:
+    def _build_candle(self, bucket: _Bucket, *, closed: bool, emitted_at: datetime | None = None) -> Candle:
         events = sorted(bucket.events, key=self._event_order_key)
         prices = [event.selected_price for event in events]
         if not prices or any(price is None for price in prices):
@@ -186,9 +229,30 @@ class CandleAggregator:
         quality = merge_quality(*(event.quality for event in events), source=self.source)
         if self.mode is OperationMode.SYNTHETIC:
             quality = quality.with_flags(QualityFlag.SYNTHETIC)
+        first_event = events[0]
+        last_event = events[-1]
+        partial = bool(bucket.partial)
+        if partial:
+            quality = quality.with_flags(QualityFlag.PARTIAL, reason="coverage_started_mid_interval")
         latest_availability = max(event.effective_available_at for event in events)
-        available_at = max(bucket.end, latest_availability) if closed else latest_availability
+        knowledge_at = emitted_at or latest_availability
+        if knowledge_at.tzinfo is None:
+            knowledge_at = knowledge_at.replace(tzinfo=UTC)
+        # ``available_at`` is the first known/emitted moment, never the nominal
+        # end of an interval when a later boundary event revealed the close.
+        # Candle validation still enforces >= end for temporally closed bars.
+        available_at = max(knowledge_at, latest_availability)
+        if closed:
+            available_at = max(bucket.end, available_at)
         latest_received = max((event.received_at or event.event_time for event in events), default=None)
+        metadata = {
+            "interval": "[start,end)",
+            "partial": partial,
+            "coverage_start": first_event.event_time.isoformat(),
+            "coverage_end": last_event.event_time.isoformat(),
+            "knowledge_at": knowledge_at.isoformat(),
+            "emitted_at": emitted_at.isoformat() if emitted_at is not None else None,
+        }
         return Candle(
             instrument=self.instrument or events[0].instrument,
             timeframe=self.timeframe,
@@ -208,6 +272,7 @@ class CandleAggregator:
             received_at=latest_received,
             quality=quality,
             origin="aggregated",
+            metadata=metadata,
         )
 
 

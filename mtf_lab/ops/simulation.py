@@ -24,6 +24,139 @@ class Outcome(str, enum.Enum):
     INDETERMINATE = "INDETERMINATE"
 
 
+# One canonical vocabulary is shared with runtime/state.  ``trade`` and
+# ``close`` are explicit compatibility aliases for ``traded``; no other value
+# is silently converted.
+PRICE_BASE_ALIASES = {
+    "trade": "traded",
+    "traded": "traded",
+    "close": "traded",
+    "bid": "bid",
+    "ask": "ask",
+    "mid": "mid",
+}
+VALID_PRICE_BASES = frozenset({"traded", "bid", "ask", "mid"})
+QUALITY_ALLOWED_LABELS = frozenset({
+    "VALID", "VALIDATED", "OK", "GOOD", "SYNTHETIC", "SYNTHETIC_VALID",
+    "SYNTHETIC_VALIDATED", "VALID_DATA", "DATA_QUALITY_VALIDATED",
+    "VALIDATED_LOCAL", "PUBLIC_PROVIDER_CLOSED", "CLOSED_VALID",
+})
+QUALITY_BLOCKED_TOKENS = (
+    "INVALID", "UNKNOWN", "DISCONNECTED", "STALE", "GAP", "PARTIAL",
+    "OPEN", "UNRECONCILED", "OUT_OF_ORDER", "DUPLICATE", "LATE",
+    "INSUFFICIENT", "PENDING", "ANOM",
+)
+
+
+def normalize_price_base(
+    value: Any,
+    *,
+    default: str | None = None,
+    allow_none: bool = True,
+) -> str | None:
+    """Normalize an explicit price base for evaluator and runtime book.
+
+    ``None`` means wildcard only when ``allow_none`` is true.  Unknown values
+    raise instead of becoming ``traded``.
+    """
+
+    if value is None:
+        if default is not None:
+            value = default
+        elif allow_none:
+            return None
+        else:
+            raise ValueError("price base is required")
+    raw = value.value if hasattr(value, "value") else value
+    if not isinstance(raw, str):
+        raise ValueError(f"price base must be text/enum, got {value!r}")
+    text = raw.strip().lower()
+    try:
+        return PRICE_BASE_ALIASES[text]
+    except KeyError as exc:
+        raise ValueError(f"unknown price base: {value!r}; expected traded/bid/ask/mid") from exc
+
+
+def price_bases_match(actual: Any, requested: Any | None) -> bool:
+    """Compare bases after explicit alias normalization."""
+
+    actual_base = normalize_price_base(actual, allow_none=False)
+    requested_base = normalize_price_base(requested, allow_none=True)
+    return requested_base is None or actual_base == requested_base
+
+
+def normalize_completion(
+    data_complete: bool | None = True,
+    *,
+    capture_complete: bool | None = None,
+) -> bool:
+    """Resolve the legacy ``data_complete`` name and new capture state.
+
+    Completeness is deliberately separate from ``as_of``: an open capture may
+    have a current watermark, while a complete replay may mark an unresolved
+    horizon ``INDETERMINATE``.
+    """
+
+    if data_complete is not None and not isinstance(data_complete, bool):
+        raise ValueError("data_complete must be bool or None")
+    if capture_complete is not None and not isinstance(capture_complete, bool):
+        raise ValueError("capture_complete must be bool or None")
+    if capture_complete is not None:
+        if data_complete not in (None, True) and data_complete != capture_complete:
+            raise ValueError("data_complete and capture_complete disagree")
+        return capture_complete
+    return True if data_complete is None else data_complete
+
+
+def outcome_for_missing_price(
+    *,
+    capture_complete: bool,
+    reason: str,
+) -> tuple[Outcome, str]:
+    """Use one missing-data transition for batch evaluator and runtime state."""
+
+    return (Outcome.INDETERMINATE if capture_complete else Outcome.PENDING, reason)
+
+
+def quality_label_is_usable(value: Any) -> bool:
+    """Strict shared quality gate for price observations."""
+
+    if isinstance(value, Mapping):
+        value = value.get("status", value.get("quality", "UNKNOWN"))
+    elif hasattr(value, "status") and not isinstance(value, (str, bytes)):
+        value = getattr(value, "status")
+    label = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
+    if not label or any(token in label for token in QUALITY_BLOCKED_TOKENS):
+        return False
+    return label in QUALITY_ALLOWED_LABELS or label.startswith("VALID_") or label.startswith("SYNTHETIC_VALID")
+
+
+def parse_bool(value: Any, *, default: bool | None = None, name: str = "boolean") -> bool:
+    """Parse persisted booleans without Python truthiness surprises."""
+
+    if value is None and default is not None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y", "on"}:
+            return True
+        if text in {"false", "0", "no", "n", "off"}:
+            return False
+    raise ValueError(f"{name} must be boolean, got {value!r}")
+
+
+def normalize_observation_times(timestamp: Any, available_at: Any | None = None) -> tuple[datetime, datetime]:
+    """Return market and availability times, rejecting availability in the past."""
+
+    market = parse_ts(timestamp)
+    available = parse_ts(available_at) if available_at is not None else market
+    if available < market:
+        raise ValueError("available_at cannot precede market timestamp")
+    return market, available
+
+
 def _record(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -61,7 +194,8 @@ def iso_ts(value: datetime | None) -> str | None:
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class PricePoint:
-    """Precio observado, con tiempo de mercado y disponibilidad separados."""
+    """A price observation with distinct market and availability times."""
+
     timestamp: datetime
     price: float
     available_at: datetime | None = None
@@ -75,23 +209,39 @@ class PricePoint:
     instrument: str = "UNKNOWN"
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "timestamp", parse_ts(self.timestamp))
-        if self.available_at is not None:
-            object.__setattr__(self, "available_at", parse_ts(self.available_at))
+        market = parse_ts(self.timestamp)
+        available = parse_ts(self.available_at) if self.available_at is not None else market
+        quality = str(self.quality or "UNKNOWN")
+        if available < market:
+            quality = f"INVALID:availability_before_market:{quality}"
+        try:
+            base = normalize_price_base(self.base_price, allow_none=False)
+        except ValueError:
+            base = str(self.base_price or "unknown").strip().lower() or "unknown"
+            quality = f"INVALID:unknown_price_base:{base}:{quality}"
         if not math.isfinite(float(self.price)):
             raise ValueError("price must be finite")
-        if self.available_at is not None and self.available_at < self.timestamp:
-            # Una recepción anterior al evento es una inconsistencia de fuente;
-            # se conserva como dato no admisible, no se corrige silenciosamente.
-            object.__setattr__(self, "quality", f"INVALID:availability_before_event:{self.quality}")
-        base = str(self.base_price).lower()
-        if base == "trade":
-            base = "traded"
-        object.__setattr__(self, "base_price", base)
-        object.__setattr__(self, "source", str(self.source))
-        object.__setattr__(self, "quality", str(self.quality))
-        object.__setattr__(self, "resolution", str(self.resolution))
-        object.__setattr__(self, "instrument", str(self.instrument or "UNKNOWN"))
+        closed = parse_bool(self.closed, name="closed")
+        instrument = str(self.instrument or "UNKNOWN").strip() or "UNKNOWN"
+        source = str(self.source or "unknown").strip() or "unknown"
+        resolution = str(self.resolution or "UNKNOWN")
+        point_id = None if self.point_id is None else str(self.point_id).strip() or None
+        object.__setattr__(self, "timestamp", market)
+        object.__setattr__(self, "available_at", available)
+        object.__setattr__(self, "base_price", base or "unknown")
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "quality", quality)
+        object.__setattr__(self, "resolution", resolution)
+        object.__setattr__(self, "closed", closed)
+        object.__setattr__(self, "instrument", instrument)
+        object.__setattr__(self, "point_id", point_id)
+        if isinstance(self.source_ordinal, bool) or int(self.source_ordinal) != self.source_ordinal:
+            raise ValueError("source_ordinal must be integer")
+        object.__setattr__(self, "source_ordinal", int(self.source_ordinal))
+
+    @property
+    def market_time(self) -> datetime:
+        return self.timestamp
 
     @property
     def available_ts(self) -> datetime:
@@ -99,12 +249,21 @@ class PricePoint:
 
     @property
     def identity(self) -> str:
-        return str(self.point_id or f"{self.source}:{self.timestamp.isoformat()}:{self.source_ordinal}")
+        return str(self.point_id or f"{self.source}:{self.instrument}:{self.timestamp.isoformat()}:{self.source_ordinal}")
+
+    @property
+    def observation_id(self) -> str:
+        return self.identity
+
+    def usable_as_of(self, as_of: datetime | None) -> bool:
+        return as_of is None or self.available_ts <= parse_ts(as_of)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "point_id": self.point_id,
+            "observation_id": self.identity,
             "timestamp": iso_ts(self.timestamp),
+            "market_time": iso_ts(self.timestamp),
             "price": float(self.price),
             "available_at": iso_ts(self.available_ts),
             "source": self.source,
@@ -147,12 +306,12 @@ def _extract_point(value: Any, ordinal: int) -> PricePoint:
     elif hasattr(quality, "status"):
         quality = getattr(quality, "status")
     resolution = _enum_value(row.get("resolution", row.get("timeframe", row.get("interval", "UNKNOWN"))))
-    point_id = row.get("point_id", row.get("candle_id", row.get("data_id", row.get("event_id", row.get("source_event_id")))))
+    point_id = row.get("observation_id", row.get("point_id", row.get("candle_id", row.get("data_id", row.get("event_id", row.get("source_event_id"))))))
     return PricePoint(
         timestamp=parse_ts(timestamp_value), price=float(price),
         available_at=parse_ts(available_value) if available_value is not None else None,
         source=str(row.get("source", row.get("provider", "unknown"))), base_price=base or "unknown",
-        quality=str(quality), resolution=str(resolution), closed=bool(row.get("closed", row.get("is_closed", True))),
+        quality=str(quality), resolution=str(resolution), closed=parse_bool(row.get("closed", row.get("is_closed", True)), name="closed"),
         source_ordinal=int(row.get("source_ordinal", row.get("ordinal", ordinal))), point_id=str(point_id) if point_id is not None else None,
         instrument=str(row.get("instrument", row.get("symbol", "UNKNOWN")) or "UNKNOWN"),
     )
@@ -203,13 +362,11 @@ class EvaluationSpec:
             raise ValueError("horizon_from must be entry or detection")
         if not isinstance(self.require_closed, bool):
             raise ValueError("require_closed must be boolean")
-        if self.requested_base_price is not None:
-            base = str(self.requested_base_price).lower()
-            if base == "trade":
-                base = "traded"
-            if base not in {"traded", "close", "bid", "ask", "mid"}:
-                raise ValueError(f"unsupported requested_base_price: {self.requested_base_price!r}")
-            object.__setattr__(self, "requested_base_price", base)
+        object.__setattr__(
+            self,
+            "requested_base_price",
+            normalize_price_base(self.requested_base_price, allow_none=True),
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
@@ -262,29 +419,110 @@ def break_even_probability(*, payout_net: float = 0.80, loss_amount: float = 1.0
     return (stake * loss_amount + costs) / denominator if denominator > 0 else math.inf
 
 
-_BLOCKED_QUALITY = {"invalid", "stale", "disconnected", "unreconciled", "gap", "duplicate", "out_of_order", "partial", "open", "late", "insufficient", "pending"}
+_BLOCKED_QUALITY = frozenset(token.lower() for token in QUALITY_BLOCKED_TOKENS)
 
 
-def _quality_admissible(value: PricePoint) -> bool:
-    text = str(value.quality or "").strip().upper().replace("-", "_").replace(" ", "_")
-    if not text or any(token.upper() in text for token in _BLOCKED_QUALITY):
-        return False
-    allowed = {"VALID", "VALIDATED", "OK", "GOOD", "SYNTHETIC", "SYNTHETIC_VALID", "SYNTHETIC_VALIDATED", "VALID_DATA", "DATA_QUALITY_VALIDATED", "VALIDATED_LOCAL", "PUBLIC_PROVIDER_CLOSED", "CLOSED_VALID"}
-    return text in allowed or text.startswith("VALID_") or text.startswith("SYNTHETIC_VALID")
+def _quality_admissible(value: PricePoint | Any) -> bool:
+    if isinstance(value, PricePoint) or hasattr(value, "quality"):
+        return quality_label_is_usable(getattr(value, "quality"))
+    return quality_label_is_usable(value)
 
 
 def _base_matches(point: PricePoint, wanted: str | None) -> bool:
-    if wanted is None:
-        return True
-    wanted = wanted.lower().replace("trade", "traded")
-    actual = point.base_price.lower().replace("trade", "traded")
-    return actual == wanted or (wanted == "traded" and actual == "close") or (wanted == "close" and actual == "traded")
+    try:
+        return price_bases_match(point.base_price, wanted)
+    except ValueError:
+        return False
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class _Selection:
+class Selection:
     point: PricePoint
     use_time: datetime
+
+
+_Selection = Selection
+
+
+def observation_age_seconds(point: PricePoint, target: datetime, *, rule: str) -> float:
+    """Conservative age: market distance plus any availability delay."""
+
+    target_dt = parse_ts(target)
+    if rule == "first_observation_at_or_after":
+        market_distance = (point.timestamp - target_dt).total_seconds()
+    elif rule == "last_observation_at_or_before":
+        market_distance = (target_dt - point.timestamp).total_seconds()
+    else:
+        raise ValueError(f"unsupported selection rule: {rule!r}")
+    availability_delay = max(0.0, (point.available_ts - target_dt).total_seconds())
+    return max(0.0, market_distance, availability_delay)
+
+
+def select_price_point(
+    points: Sequence[PricePoint],
+    target: datetime,
+    *,
+    rule: str,
+    requested_base_price: str | None = None,
+    require_closed: bool = True,
+    max_price_age_seconds: float = math.inf,
+    as_of: datetime | None = None,
+    exclude_identity: str | None = None,
+    exclude_market_time: datetime | None = None,
+    instrument: str | None = None,
+) -> tuple[Selection | None, str | None]:
+    """Shared deterministic selection policy for batch and runtime callers.
+
+    A price is usable only after its ``available_ts``. For a final ``before``
+    rule without an explicit as-of watermark, the implicit cutoff is the
+    target plus the configured grace period; this prevents a complete replay
+    from selecting a future correction without making the grace explicit.
+    """
+
+    target_dt = parse_ts(target)
+    if as_of is not None:
+        cutoff = parse_ts(as_of)
+    elif rule == "last_observation_at_or_before" and math.isfinite(float(max_price_age_seconds)):
+        cutoff = target_dt + timedelta(seconds=float(max_price_age_seconds))
+    else:
+        cutoff = None
+    eligible: list[PricePoint] = []
+    for point in points:
+        try:
+            if require_closed and not point.closed:
+                continue
+            if not _quality_admissible(point):
+                continue
+            # Unknown base labels remain unavailable; they never fall back.
+            normalize_price_base(point.base_price, allow_none=False)
+            if not _base_matches(point, requested_base_price):
+                continue
+            if point.identity == exclude_identity:
+                continue
+            if exclude_market_time is not None and point.timestamp <= parse_ts(exclude_market_time):
+                continue
+            if cutoff is not None and point.available_ts > cutoff:
+                continue
+            if instrument and point.instrument.upper() not in {"", "UNKNOWN"} and point.instrument.upper() != str(instrument).upper():
+                continue
+            eligible.append(point)
+        except (TypeError, ValueError):
+            continue
+    if rule == "first_observation_at_or_after":
+        candidates = [point for point in eligible if point.timestamp >= target_dt]
+        candidates.sort(key=lambda point: (point.timestamp, point.available_ts, point.source_ordinal, point.identity))
+    elif rule == "last_observation_at_or_before":
+        candidates = [point for point in eligible if point.timestamp <= target_dt]
+        candidates.sort(key=lambda point: (point.timestamp, point.available_ts, point.source_ordinal, point.identity), reverse=True)
+    else:
+        raise ValueError(f"unsupported selection rule: {rule!r}")
+    for point in candidates:
+        age = observation_age_seconds(point, target_dt, rule=rule)
+        if age > float(max_price_age_seconds):
+            return None, "MAX_PRICE_AGE_EXCEEDED"
+        use_time = max(target_dt, point.available_ts) if rule == "first_observation_at_or_after" else point.available_ts
+        return Selection(point, use_time), None
+    return None, "PRICE_NOT_AVAILABLE" if rule == "first_observation_at_or_after" else "PRICE_NOT_AVAILABLE_BY_CUTOFF"
 
 
 class DirectionalEvaluator:
@@ -302,42 +540,19 @@ class DirectionalEvaluator:
         exclude_point_id: str | None = None,
         exclude_market_time: datetime | None = None,
         instrument: str | None = None,
-    ) -> tuple[_Selection | None, str | None]:
-        cutoff = as_of.astimezone(UTC) if as_of is not None else None
-        eligible = [
-            point for point in points
-            if (not self.spec.require_closed or point.closed)
-            and _quality_admissible(point)
-            and point.base_price in {"traded", "bid", "ask", "mid", "close"}
-            and _base_matches(point, self.spec.requested_base_price)
-            and point.identity != exclude_point_id
-            and (exclude_market_time is None or point.timestamp > exclude_market_time)
-            and (cutoff is None or point.available_ts <= cutoff)
-            and (instrument is None or point.instrument.upper() in {"UNKNOWN", ""} or point.instrument.upper() == str(instrument).upper())
-        ]
-        if rule == "first_observation_at_or_after":
-            candidates = [point for point in eligible if point.timestamp >= target]
-            candidates.sort(key=lambda p: (p.timestamp, p.available_ts, p.source_ordinal, p.identity))
-            for point in candidates:
-                use_time = max(target, point.available_ts)
-                age = (use_time - target).total_seconds()
-                if age > self.spec.max_price_age_seconds:
-                    return None, "MAX_PRICE_AGE_EXCEEDED"
-                return _Selection(point, use_time), None
-            return None, "PRICE_NOT_AVAILABLE"
-        if rule == "last_observation_at_or_before":
-            # La observación puede recibirse después del instante de mercado;
-            # ``as_of``/max_price_age gobiernan cuándo quedó utilizable, sin
-            # convertir una recepción tardía en un dato anticipado.
-            candidates = [point for point in eligible if point.timestamp <= target]
-            candidates.sort(key=lambda p: (p.timestamp, p.available_ts, p.source_ordinal, p.identity), reverse=True)
-            for point in candidates:
-                age = (target - point.timestamp).total_seconds()
-                if age > self.spec.max_price_age_seconds:
-                    return None, "MAX_PRICE_AGE_EXCEEDED"
-                return _Selection(point, point.available_ts), None
-            return None, "PRICE_NOT_AVAILABLE_BY_CUTOFF"
-        raise ValueError(f"unsupported selection rule: {rule!r}")
+    ) -> tuple[Selection | None, str | None]:
+        return select_price_point(
+            points,
+            target,
+            rule=rule,
+            requested_base_price=self.spec.requested_base_price,
+            require_closed=self.spec.require_closed,
+            max_price_age_seconds=self.spec.max_price_age_seconds,
+            as_of=as_of,
+            exclude_identity=exclude_point_id,
+            exclude_market_time=exclude_market_time,
+            instrument=instrument,
+        )
 
     @staticmethod
     def _direction(signal_row: Mapping[str, Any]) -> str | None:
@@ -371,9 +586,11 @@ class DirectionalEvaluator:
     def evaluate_prepared(
         self, signal: Any, points: Sequence[PricePoint], *, horizon_seconds: float | None = None,
         simulation_id: str | None = None, simulation_type: str = "DIRECTIONAL",
-        data_complete: bool = True, as_of: datetime | None = None,
+        data_complete: bool | None = True, as_of: datetime | None = None,
+        capture_complete: bool | None = None,
     ) -> SimulationResult:
         signal_row = _record(signal)
+        complete = normalize_completion(data_complete, capture_complete=capture_complete)
         horizon = float(horizon_seconds if horizon_seconds is not None else self.spec.horizons_seconds[0])
         if horizon <= 0 or not math.isfinite(horizon):
             raise ValueError("horizon_seconds must be positive and finite")
@@ -390,7 +607,8 @@ class DirectionalEvaluator:
             "selection_rule_entry": self.spec.entry_rule,
             "selection_rule_exit": self.spec.exit_rule,
             "target_entry_ts": iso_ts(entry_target),
-            "data_complete": bool(data_complete),
+            "data_complete": complete,
+            "capture_complete": complete,
             "as_of": iso_ts(parse_ts(as_of)) if as_of is not None else None,
             "no_favorable_lookahead": True,
         }
@@ -400,7 +618,7 @@ class DirectionalEvaluator:
             return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction="UNKNOWN", detected=detected, expiry=expiry, entry=None, final=None, outcome=Outcome.INDETERMINATE, reason="INVALID_DIRECTION", assumptions=assumptions, net=None)
         if not points:
             expiry = entry_target + timedelta(seconds=horizon)
-            outcome = Outcome.INDETERMINATE if data_complete else Outcome.PENDING
+            outcome = Outcome.INDETERMINATE if complete else Outcome.PENDING
             return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=None, final=None, outcome=outcome, reason="NO_PRICE_POINTS", assumptions=assumptions, net=None)
         point_instruments = {point.instrument.upper() for point in points if point.instrument.upper() not in {"", "UNKNOWN"}}
         signal_instrument = str(signal_row.get("instrument", "")).upper()
@@ -410,12 +628,22 @@ class DirectionalEvaluator:
         entry, entry_reason = self._select(points, entry_target, rule=self.spec.entry_rule, as_of=as_of, instrument=signal_instrument or None)
         if entry is None:
             expiry = entry_target + timedelta(seconds=horizon)
-            outcome = Outcome.PENDING if not data_complete else Outcome.INDETERMINATE
+            outcome = Outcome.PENDING if not complete else Outcome.INDETERMINATE
             assumptions["target_expiry_ts"] = iso_ts(expiry)
             return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=None, final=None, outcome=outcome, reason=entry_reason, assumptions=assumptions, net=None)
         entry_time = entry.use_time
         expiry = (entry_time if self.spec.horizon_from == "entry" else detected) + timedelta(seconds=horizon)
         assumptions.update({"target_expiry_ts": iso_ts(expiry), "effective_entry_ts": iso_ts(entry_time), "entry_market_ts": iso_ts(entry.point.timestamp), "entry_point_id": entry.point.identity})
+        # A prefix that has not reached the declared expiry cannot make a
+        # before-observation terminal, even if an early candidate is present.
+        if not complete and (as_of is None or parse_ts(as_of) < expiry):
+            return self._result(
+                sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None,
+                simulation_type=simulation_type, horizon=horizon, direction=direction,
+                detected=detected, expiry=expiry, entry=entry, final=None,
+                outcome=Outcome.PENDING, reason="FINAL_PRICE_NOT_YET_DUE",
+                assumptions=assumptions, net=None,
+            )
         # No se permite liquidar contra la misma observación ni contra una
         # marca de mercado anterior a la entrada efectiva.
         final_as_of = as_of
@@ -428,7 +656,7 @@ class DirectionalEvaluator:
             # trabajo pendiente; en replay completo queda indeterminado.
             latest_available = max((point.available_ts for point in points), default=None)
             pending_reason = final_reason or "FINAL_PRICE_NOT_AVAILABLE"
-            if not data_complete and (latest_available is None or latest_available < expiry or pending_reason in {"PRICE_NOT_AVAILABLE", "PRICE_NOT_AVAILABLE_BY_CUTOFF", "PRICE_AVAILABILITY_INVALID"}):
+            if not complete and (latest_available is None or latest_available < expiry or pending_reason in {"PRICE_NOT_AVAILABLE", "PRICE_NOT_AVAILABLE_BY_CUTOFF", "PRICE_AVAILABILITY_INVALID"}):
                 outcome = Outcome.PENDING
             else:
                 outcome = Outcome.INDETERMINATE
@@ -444,8 +672,8 @@ class DirectionalEvaluator:
             outcome = Outcome.LOSS
         return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=entry, final=final, outcome=outcome, reason=None, assumptions=assumptions, net=self.net_result(outcome))
 
-    def evaluate(self, signal: Any, points: Iterable[Any], *, horizon_seconds: float | None = None, simulation_id: str | None = None, simulation_type: str = "DIRECTIONAL", data_complete: bool = True, as_of: datetime | None = None) -> SimulationResult:
-        return self.evaluate_prepared(signal, normalize_points(points), horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type=simulation_type, data_complete=data_complete, as_of=as_of)
+    def evaluate(self, signal: Any, points: Iterable[Any], *, horizon_seconds: float | None = None, simulation_id: str | None = None, simulation_type: str = "DIRECTIONAL", data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> SimulationResult:
+        return self.evaluate_prepared(signal, normalize_points(points), horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type=simulation_type, data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)
 
     def net_result(self, outcome: Outcome) -> float | None:
         if outcome in {Outcome.INDETERMINATE, Outcome.PENDING}:
@@ -456,11 +684,11 @@ class DirectionalEvaluator:
             return -self.spec.stake * self.spec.loss_amount - self.spec.costs
         return self.spec.tie_net - self.spec.costs
 
-    def evaluate_all(self, signal: Any, points: Iterable[Any], *, signal_id_prefix: str | None = None, simulation_type: str = "DIRECTIONAL", data_complete: bool = True, as_of: datetime | None = None) -> list[SimulationResult]:
+    def evaluate_all(self, signal: Any, points: Iterable[Any], *, signal_id_prefix: str | None = None, simulation_type: str = "DIRECTIONAL", data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> list[SimulationResult]:
         prepared = normalize_points(points)
         row = _record(signal)
         prefix = signal_id_prefix or str(row.get("signal_id", row.get("id", "signal")))
-        return [self.evaluate_prepared(row, prepared, horizon_seconds=horizon, simulation_id=f"{prefix}:{horizon:g}:{simulation_type}", simulation_type=simulation_type, data_complete=data_complete, as_of=as_of) for horizon in self.spec.horizons_seconds]
+        return [self.evaluate_prepared(row, prepared, horizon_seconds=horizon, simulation_id=f"{prefix}:{horizon:g}:{simulation_type}", simulation_type=simulation_type, data_complete=data_complete, as_of=as_of, capture_complete=capture_complete) for horizon in self.spec.horizons_seconds]
 
 
 class VirtualContract:
@@ -505,17 +733,25 @@ class VirtualContractSimulator:
                 raise ValueError("VirtualContract y EvaluationSpec no son equivalentes")
         self.evaluator = DirectionalEvaluator(self.spec)
 
-    def evaluate(self, signal: Any, points: Iterable[Any], *, horizon_seconds: float | None = None, simulation_id: str | None = None, data_complete: bool = True, as_of: datetime | None = None) -> SimulationResult:
-        result = self.evaluator.evaluate(signal, points, horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of)
+    def evaluate(self, signal: Any, points: Iterable[Any], *, horizon_seconds: float | None = None, simulation_id: str | None = None, data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> SimulationResult:
+        result = self.evaluator.evaluate(signal, points, horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)
         return self.contract.settle(result)
 
-    def evaluate_prepared(self, signal: Any, points: Sequence[PricePoint], *, horizon_seconds: float | None = None, simulation_id: str | None = None, data_complete: bool = True, as_of: datetime | None = None) -> SimulationResult:
-        result = self.evaluator.evaluate_prepared(signal, points, horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of)
+    def evaluate_prepared(self, signal: Any, points: Sequence[PricePoint], *, horizon_seconds: float | None = None, simulation_id: str | None = None, data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> SimulationResult:
+        result = self.evaluator.evaluate_prepared(signal, points, horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)
         return self.contract.settle(result)
 
-    def evaluate_all(self, signal: Any, points: Iterable[Any], *, data_complete: bool = True, as_of: datetime | None = None) -> list[SimulationResult]:
+    def evaluate_all(self, signal: Any, points: Iterable[Any], *, data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> list[SimulationResult]:
         prepared = normalize_points(points)
-        return [self.contract.settle(result) for result in self.evaluator.evaluate_all(signal, prepared, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of)]
+        return [self.contract.settle(result) for result in self.evaluator.evaluate_all(signal, prepared, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)]
 
 
-__all__ = ["DirectionalEvaluator", "EvaluationSpec", "Outcome", "PricePoint", "SimulationResult", "VirtualContract", "VirtualContractSimulator", "break_even_probability", "iso_ts", "normalize_points", "parse_ts"]
+__all__ = [
+    "DirectionalEvaluator", "EvaluationSpec", "Outcome", "PricePoint", "Selection",
+    "SimulationResult", "VirtualContract", "VirtualContractSimulator",
+    "PRICE_BASE_ALIASES", "VALID_PRICE_BASES", "normalize_price_base",
+    "price_bases_match", "normalize_completion", "outcome_for_missing_price",
+    "normalize_observation_times", "observation_age_seconds",
+    "quality_label_is_usable", "select_price_point",
+    "break_even_probability", "iso_ts", "normalize_points", "parse_ts",
+]

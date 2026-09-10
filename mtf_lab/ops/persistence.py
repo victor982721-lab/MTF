@@ -27,7 +27,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+TERMINAL_SIMULATION_OUTCOMES = frozenset({"WIN", "LOSS", "TIE", "INDETERMINATE"})
 
 
 class IdempotencyConflict(RuntimeError):
@@ -195,6 +197,15 @@ class SQLiteStore:
                 self.conn.commit()
             if version < 2:
                 self._migrate_v2()
+                self.conn.execute(
+                    "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    ("2",),
+                )
+                self.conn.commit()
+                version = 2
+            if version < 3:
+                self._migrate_v3()
                 self.conn.execute(
                     "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -388,6 +399,70 @@ class SQLiteStore:
             self.conn.execute(f"CREATE INDEX IF NOT EXISTS {table}_analysis ON {table}(session_id,analysis_id)")
         self.conn.commit()
 
+    def _migrate_v3(self) -> None:
+        """Namespace checkpoints by analysis and preserve receipt time.
+
+        SQLite cannot add a column to a composite primary key in place.  The
+        legacy checkpoint table is therefore copied into a v3 table, deriving
+        the old row's analysis id from its cursor/state when available.  A
+        blank id is the explicit legacy/capture namespace and is never
+        confused with a real analysis id.
+        """
+        self.conn.execute("ALTER TABLE checkpoints RENAME TO checkpoints_v2_legacy")
+        self.conn.executescript(
+            """
+            CREATE TABLE checkpoints (
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                checkpoint_name TEXT NOT NULL,
+                analysis_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                cursor_json TEXT NOT NULL,
+                events_processed INTEGER NOT NULL DEFAULT 0,
+                last_event_id TEXT,
+                state_json TEXT NOT NULL,
+                PRIMARY KEY(session_id, checkpoint_name, analysis_id)
+            );
+            CREATE INDEX checkpoints_session_name ON checkpoints(session_id, checkpoint_name, updated_at);
+            """
+        )
+        legacy = self.conn.execute("SELECT session_id,checkpoint_name,updated_at,cursor_json,events_processed,last_event_id,state_json FROM checkpoints_v2_legacy").fetchall()
+        for row in legacy:
+            cursor = _json_load(row[3], {}) or {}
+            state = _json_load(row[6], {}) or {}
+            analysis_id = cursor.get("analysis_id") or state.get("analysis_id")
+            if not analysis_id and isinstance(state.get("processor"), Mapping):
+                analysis_id = state["processor"].get("analysis_id")
+            self.conn.execute(
+                """INSERT INTO checkpoints(session_id,checkpoint_name,analysis_id,updated_at,cursor_json,events_processed,last_event_id,state_json)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id,checkpoint_name,analysis_id) DO UPDATE SET
+                updated_at=excluded.updated_at,cursor_json=excluded.cursor_json,events_processed=excluded.events_processed,
+                last_event_id=excluded.last_event_id,state_json=excluded.state_json""",
+                (row[0], row[1], str(analysis_id or ""), row[2], row[3], row[4], row[5], row[6]),
+            )
+        self.conn.execute("DROP TABLE checkpoints_v2_legacy")
+        existing_candles = {str(row[1]) for row in self.conn.execute("PRAGMA table_info(candles)")}
+        if "received_ts" not in existing_candles:
+            self.conn.execute("ALTER TABLE candles ADD COLUMN received_ts TEXT")
+        self.conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS signal_analysis_membership (
+                membership_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(session_id),
+                signal_id TEXT NOT NULL,
+                analysis_id TEXT NOT NULL,
+                variant TEXT,
+                analysis_config_hash TEXT,
+                contract_hash TEXT,
+                partition TEXT,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                UNIQUE(session_id, signal_id, analysis_id)
+            );
+            CREATE INDEX IF NOT EXISTS signal_membership_session_analysis ON signal_analysis_membership(session_id, analysis_id);
+            CREATE INDEX IF NOT EXISTS signal_membership_session_signal ON signal_analysis_membership(session_id, signal_id);
+            """
+        )
+
     @property
     def schema_version(self) -> int:
         if not self._table_exists("schema_meta"):
@@ -482,6 +557,7 @@ class SQLiteStore:
         partition: str = "all",
         code_version: str | None = None,
         metadata: Mapping[str, Any] | None = None,
+        identity_extra: Mapping[str, Any] | None = None,
         analysis_id: str | None = None,
         status: str = "COMPLETED",
     ) -> str:
@@ -489,7 +565,7 @@ class SQLiteStore:
         if not dataset_hash or not config_hash or not variant:
             raise ValueError("dataset_hash, config_hash y variant son obligatorios")
         partition = str(partition or "all")
-        identity = {"session_id": session_id, "dataset_hash": str(dataset_hash), "config_hash": str(config_hash), "variant": str(variant), "contract_hash": str(contract_hash or ""), "partition": partition}
+        identity = {"session_id": session_id, "dataset_hash": str(dataset_hash), "config_hash": str(config_hash), "variant": str(variant), "contract_hash": str(contract_hash or ""), "partition": partition, "code_version": str(code_version or ""), "identity_extra": dict(identity_extra or {})}
         analysis_id = analysis_id or "an_" + payload_hash(identity)[:32]
         metadata_text = canonical_json(metadata or {})
         with self.transaction(immediate=True) as conn:
@@ -530,7 +606,7 @@ class SQLiteStore:
             str(_get(record, "source", "provider", default="unknown")),
             str(_get(record, "instrument", "symbol", default="unknown")),
             utc_iso(_get(record, "event_ts", "event_time", "timestamp", "ts", "time")),
-            utc_iso(_get(record, "received_ts", "received_at", default=None)) if _get(record, "received_ts", "received_at") is not None else None,
+            utc_iso(_get(record, "received_ts", "received_at", "receipt_ts", "receipt_at", default=None)) if _get(record, "received_ts", "received_at", "receipt_ts", "receipt_at") is not None else None,
             utc_iso(_get(record, "available_ts", "available_at", default=None)) if _get(record, "available_ts", "available_at") is not None else None,
             str(_get(record, "kind", "event_kind", "type", default="event")),
             str(_get(record, "price_base", "price_basis", "price_type", "base_price", default="unknown")),
@@ -570,6 +646,7 @@ class SQLiteStore:
             start,
             end,
             utc_iso(_get(record, "available_ts", "available_at")) if _get(record, "available_ts", "available_at") is not None else None,
+            utc_iso(_get(record, "received_ts", "received_at", "receipt_ts", "receipt_at")) if _get(record, "received_ts", "received_at", "receipt_ts", "receipt_at") is not None else None,
             float(_get(record, "open", "o")),
             float(_get(record, "high", "h")),
             float(_get(record, "low", "l")),
@@ -589,9 +666,9 @@ class SQLiteStore:
                 return False
             cur = conn.execute(
                 """INSERT INTO candles(
-                session_id,candle_id,instrument,timeframe,start_ts,end_ts,available_ts,
+                session_id,candle_id,instrument,timeframe,start_ts,end_ts,available_ts,received_ts,
                 open,high,low,close,volume,closed,source,price_base,quality,revision,provenance_json,payload_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(session_id,candle_id) DO NOTHING""",
                 values,
             )
@@ -626,8 +703,17 @@ class SQLiteStore:
         return cur.rowcount == 1
 
     def save_signal(self, session_id: str, signal: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
+        """Persist a signal and its analysis membership independently.
+
+        ``signals`` remains the capture-level canonical row for backwards
+        compatible queries.  ``signal_analysis_membership`` is the lineage
+        relation: the same source signal id may belong to multiple analyses
+        without a false idempotency conflict, while a changed payload inside
+        one analysis is still rejected.
+        """
         record = _mapping(signal)
         analysis_id = analysis_id or _get(record, "analysis_id")
+        analysis_id = str(analysis_id) if analysis_id is not None else None
         variant = variant or _get(record, "variant", "variant_name")
         analysis_config_hash = analysis_config_hash or _get(record, "analysis_config_hash", "config_hash")
         contract_hash = contract_hash or _get(record, "contract_hash")
@@ -635,24 +721,65 @@ class SQLiteStore:
         signal_id = _get(record, "signal_id", "id", "uid")
         if signal_id is None:
             signal_id = f"signal:{_get(record,'detected_ts','detected_at','timestamp','ts')}:{_get(record,'direction','side',default='UNKNOWN')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
+        signal_id = str(signal_id)
         detected = utc_iso(_get(record, "detected_ts", "detected_at", "timestamp", "ts"))
         values = (
-            session_id, str(signal_id), _get(record, "episode_id", "episode"), detected,
+            session_id, signal_id, _get(record, "episode_id", "episode"), detected,
             utc_iso(_get(record, "available_ts", "available_at")) if _get(record, "available_ts", "available_at") is not None else None,
             str(_get(record, "instrument", "symbol", default="unknown")),
             str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
             str(_get(record, "status", default="VALID")), canonical_json(record),
         )
         payload = canonical_json(record)
+        inserted_signal = False
+        inserted_membership = False
+        membership_analysis = analysis_id or ""
         with self.transaction() as conn:
-            if self._check_idempotency("signals", ("session_id", "signal_id"), (session_id, str(signal_id)), payload):
-                return False
-            cur = conn.execute(
-                """INSERT INTO signals(session_id,signal_id,episode_id,detected_ts,available_ts,instrument,direction,status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (*values, analysis_id, variant, analysis_config_hash, contract_hash, partition),
-            )
-        return cur.rowcount == 1
+            existing = conn.execute("SELECT payload_json,analysis_id FROM signals WHERE session_id=? AND signal_id=?", (session_id, signal_id)).fetchone()
+            if existing is None:
+                cur = conn.execute(
+                    """INSERT INTO signals(session_id,signal_id,episode_id,detected_ts,available_ts,instrument,direction,status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (*values, analysis_id, variant, analysis_config_hash, contract_hash, partition),
+                )
+                inserted_signal = cur.rowcount == 1
+            elif str(existing[0]) != payload:
+                # Different analyses may intentionally emit the same signal id
+                # with distinct annotations/configuration.  The membership row
+                # is the lineage-specific payload; only one analysis may revise
+                # its own identity.
+                existing_analysis = str(existing[1] or "")
+                if not membership_analysis or existing_analysis == membership_analysis:
+                    raise IdempotencyConflict(f"conflicto de idempotencia en signals: identidad={(session_id, signal_id)!r} ya tiene contenido distinto dentro del mismo namespace")
+            if membership_analysis:
+                membership_id = "sm_" + payload_hash({"session_id": session_id, "signal_id": signal_id, "analysis_id": membership_analysis})[:32]
+                member = conn.execute("SELECT payload_json,variant,analysis_config_hash,contract_hash,partition FROM signal_analysis_membership WHERE session_id=? AND signal_id=? AND analysis_id=?", (session_id, signal_id, membership_analysis)).fetchone()
+                if member is not None:
+                    expected_meta = (variant, analysis_config_hash, contract_hash, partition)
+                    actual_meta = tuple(member[index] for index in range(1, 5))
+                    if str(member[0]) != payload or actual_meta != expected_meta:
+                        raise IdempotencyConflict(f"conflicto de idempotencia en signal membership: identidad={(session_id, signal_id, membership_analysis)!r} ya tiene contenido distinto")
+                else:
+                    conn.execute(
+                        """INSERT INTO signal_analysis_membership(membership_id,session_id,signal_id,analysis_id,variant,analysis_config_hash,contract_hash,partition,created_at,payload_json)
+                        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (membership_id, session_id, signal_id, membership_analysis, variant, analysis_config_hash, contract_hash, partition, utc_iso(), payload),
+                    )
+                    inserted_membership = True
+        return inserted_signal or inserted_membership
+
+    def list_signal_memberships(self, session_id: str, *, signal_id: str | None = None, analysis_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return lineage memberships, preserving capture signal rows."""
+        clauses = ["session_id=?"]; params: list[Any] = [session_id]
+        if signal_id is not None:
+            clauses.append("signal_id=?"); params.append(str(signal_id))
+        if analysis_id is not None:
+            clauses.append("analysis_id=?"); params.append(str(analysis_id))
+        lim = f" LIMIT {int(limit)}" if limit is not None else ""
+        rows = self._rows(f"SELECT * FROM signal_analysis_membership WHERE {' AND '.join(clauses)} ORDER BY created_at,membership_id{lim}", params)
+        for row in rows:
+            row["payload"] = _json_load(row.pop("payload_json"), {})
+        return rows
 
     def save_discard(self, session_id: str, discard: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
         record = _mapping(discard)
@@ -683,7 +810,7 @@ class SQLiteStore:
             )
         return cur.rowcount == 1
 
-    def save_simulation(self, session_id: str, simulation: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None, allow_update: bool = False) -> bool:
+    def save_simulation(self, session_id: str, simulation: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None, allow_update: bool = False, ignore_pending_terminal: bool = False) -> bool:
         record = _mapping(simulation)
         analysis_id = analysis_id or _get(record, "analysis_id")
         variant = variant or _get(record, "variant", "variant_name")
@@ -701,17 +828,42 @@ class SQLiteStore:
             detected, utc_iso(_get(record, "entry_ts", "entry_at")) if _get(record, "entry_ts", "entry_at") is not None else None,
             expiry, float(_get(record, "entry_price")) if _get(record, "entry_price") is not None else None,
             float(_get(record, "final_price")) if _get(record, "final_price") is not None else None,
-            str(_get(record, "outcome", default="INDETERMINATE")).upper(), float(_get(record, "stake", default=0)),
+            str((getattr(_get(record, "outcome", default="INDETERMINATE"), "value", _get(record, "outcome", default="INDETERMINATE")))).upper(), float(_get(record, "stake", default=0)),
             float(_get(record, "net_result")) if _get(record, "net_result") is not None else None,
             str(_get(record, "price_base", "base_price", default="unknown")), str(_get(record, "quality", default="UNKNOWN")),
             str(_get(record, "resolution", default="UNKNOWN")), canonical_json(_get(record, "assumptions", "assumptions_json", default={})), canonical_json(record),
         )
         payload = canonical_json(record)
+        incoming_outcome = str(values[11]).upper()
+        if incoming_outcome not in TERMINAL_SIMULATION_OUTCOMES and incoming_outcome != "PENDING":
+            raise ValueError(f"outcome de simulación no soportado: {incoming_outcome!r}")
         with self.transaction() as conn:
-            existing = conn.execute("SELECT payload_json FROM simulations WHERE session_id=? AND simulation_id=?", (session_id, str(sim_id))).fetchone()
+            existing = conn.execute("SELECT payload_json,outcome,signal_id,simulation_type,horizon_seconds,direction,detected_ts,entry_ts,expiry_ts,entry_price,final_price,stake,net_result,price_base,resolution FROM simulations WHERE session_id=? AND simulation_id=?", (session_id, str(sim_id))).fetchone()
             if existing is not None:
                 if str(existing[0]) == payload:
                     return False
+                existing_outcome = str(existing[1]).upper()
+                if existing_outcome in TERMINAL_SIMULATION_OUTCOMES:
+                    # A replay may revisit an already terminal identity before
+                    # its later observations arrive. Never downgrade durable
+                    # terminal state to an intermediate PENDING row.
+                    if incoming_outcome == "PENDING":
+                        if ignore_pending_terminal:
+                            return False
+                        raise IdempotencyConflict(f"simulación terminal inmutable: identidad={(session_id, str(sim_id))!r} no admite volver a PENDING")
+                    incoming_semantic = (
+                        incoming_outcome, _get(record, "signal_id"), str(_get(record, "simulation_type", "type", default="DIRECTIONAL")),
+                        float(_get(record, "horizon_seconds", "horizon", default=0)), str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
+                        detected, utc_iso(_get(record, "entry_ts", "entry_at")) if _get(record, "entry_ts", "entry_at") is not None else None,
+                        expiry, float(_get(record, "entry_price")) if _get(record, "entry_price") is not None else None,
+                        float(_get(record, "final_price")) if _get(record, "final_price") is not None else None,
+                        float(_get(record, "stake", default=0)), float(_get(record, "net_result")) if _get(record, "net_result") is not None else None,
+                        str(_get(record, "price_base", "base_price", default="unknown")), str(_get(record, "resolution", default="UNKNOWN")),
+                    )
+                    existing_semantic = (existing_outcome, *tuple(existing[index] for index in range(2, 15)))
+                    if existing_semantic == incoming_semantic:
+                        return False
+                    raise IdempotencyConflict(f"simulación terminal inmutable: identidad={(session_id, str(sim_id))!r} ya está en {existing_outcome}")
                 if not allow_update:
                     raise IdempotencyConflict(f"conflicto de idempotencia en simulations: identidad={(session_id, str(sim_id))!r} ya tiene contenido distinto")
                 (_sid, _sim_id, signal_id, simulation_type, horizon, direction, detected_ts, entry_ts, expiry_ts, entry_price, final_price, outcome, stake, net_result, price_base, quality, resolution, assumptions_json, payload_json) = values
@@ -740,14 +892,30 @@ class SQLiteStore:
         events_processed: int = 0,
         last_event_id: str | None = None,
         state: Mapping[str, Any] | None = None,
+        analysis_id: str | None = None,
     ) -> None:
+        """Atomically save a checkpoint in an analysis-specific namespace.
+
+        Existing callers may omit ``analysis_id``: the value is recovered from
+        ``cursor.analysis_id`` or ``state.analysis_id`` (including the nested
+        processor state used by :class:`RuntimeCoordinator`).  A blank id is a
+        deliberate capture/legacy namespace, not an accidental wildcard.
+        """
+        cursor_payload = dict(cursor or {})
+        state_payload = dict(state or {})
+        resolved_analysis = analysis_id or cursor_payload.get("analysis_id") or state_payload.get("analysis_id")
+        if not resolved_analysis and isinstance(state_payload.get("processor"), Mapping):
+            resolved_analysis = state_payload["processor"].get("analysis_id")
+        resolved_analysis = str(resolved_analysis or "")
+        if resolved_analysis:
+            cursor_payload.setdefault("analysis_id", resolved_analysis)
         with self.transaction(immediate=True) as conn:
             conn.execute(
-                """INSERT INTO checkpoints(session_id,checkpoint_name,updated_at,cursor_json,events_processed,last_event_id,state_json)
-                VALUES(?,?,?,?,?,?,?) ON CONFLICT(session_id,checkpoint_name) DO UPDATE SET
+                """INSERT INTO checkpoints(session_id,checkpoint_name,analysis_id,updated_at,cursor_json,events_processed,last_event_id,state_json)
+                VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id,checkpoint_name,analysis_id) DO UPDATE SET
                 updated_at=excluded.updated_at,cursor_json=excluded.cursor_json,events_processed=excluded.events_processed,
                 last_event_id=excluded.last_event_id,state_json=excluded.state_json""",
-                (session_id, checkpoint_name, utc_iso(), canonical_json(cursor or {}), int(events_processed), last_event_id, canonical_json(state or {})),
+                (session_id, str(checkpoint_name), resolved_analysis, utc_iso(), canonical_json(cursor_payload), int(events_processed), last_event_id, canonical_json(state_payload)),
             )
 
     def save_metric(
@@ -778,14 +946,63 @@ class SQLiteStore:
         row["metadata"] = _json_load(row.pop("metadata_json"), {})
         return row
 
-    def get_checkpoint(self, session_id: str, checkpoint_name: str = "default") -> dict[str, Any] | None:
-        rows = self._rows("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=?", (session_id, checkpoint_name))
-        if not rows:
-            return None
-        row = rows[0]
-        row["cursor"] = _json_load(row.pop("cursor_json"), {})
-        row["state"] = _json_load(row.pop("state_json"), {})
-        return row
+    @staticmethod
+    def _decode_checkpoint(row: sqlite3.Row, *, requested_analysis_id: str | None = None) -> dict[str, Any]:
+        result = dict(row)
+        stored_analysis = str(result.get("analysis_id") or "")
+        result["analysis_id"] = stored_analysis or None
+        result["cursor"] = _json_load(result.pop("cursor_json", None), {}) or {}
+        result["state"] = _json_load(result.pop("state_json", None), {}) or {}
+        inferred = stored_analysis or result["cursor"].get("analysis_id") or result["state"].get("analysis_id")
+        if not inferred and isinstance(result["state"].get("processor"), Mapping):
+            inferred = result["state"]["processor"].get("analysis_id")
+        result["analysis_id"] = str(inferred) if inferred else None
+        if requested_analysis_id is not None:
+            result["requested_analysis_id"] = str(requested_analysis_id)
+            result["is_alternate"] = bool(result["analysis_id"] and result["analysis_id"] != str(requested_analysis_id))
+        else:
+            result["is_alternate"] = False
+        return result
+
+    def get_checkpoint(self, session_id: str, checkpoint_name: str = "default", *, analysis_id: str | None = None, allow_alternate: bool = True) -> dict[str, Any] | None:
+        """Load a checkpoint, preferring an exact analysis namespace.
+
+        If an exact namespace is absent and ``allow_alternate`` is true, the
+        newest checkpoint for the same logical name is returned with
+        ``is_alternate=True`` and ``requested_analysis_id`` metadata.  This
+        makes a resume decision explicit instead of silently loading another
+        analysis's state.
+        """
+        logical_name = str(checkpoint_name)
+        requested = str(analysis_id) if analysis_id is not None else None
+        if requested is not None:
+            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id=?", (session_id, logical_name, requested)).fetchone()
+            if row is not None:
+                return self._decode_checkpoint(row, requested_analysis_id=requested)
+            if not allow_alternate:
+                return None
+            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id<>'' ORDER BY updated_at DESC, analysis_id DESC LIMIT 1", (session_id, logical_name)).fetchone()
+            return self._decode_checkpoint(row, requested_analysis_id=requested) if row is not None else None
+        if allow_alternate:
+            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? ORDER BY (analysis_id='') ASC, updated_at DESC, analysis_id DESC LIMIT 1", (session_id, logical_name)).fetchone()
+        else:
+            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id='' ORDER BY updated_at DESC LIMIT 1", (session_id, logical_name)).fetchone()
+        return self._decode_checkpoint(row) if row is not None else None
+
+    def load_alternate_checkpoint(self, session_id: str, checkpoint_name: str = "default", *, analysis_id: str) -> dict[str, Any] | None:
+        """Load the newest *other* analysis checkpoint explicitly."""
+        target = str(analysis_id)
+        row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id<>'' AND analysis_id<>? ORDER BY updated_at DESC, analysis_id DESC LIMIT 1", (session_id, str(checkpoint_name), target)).fetchone()
+        return self._decode_checkpoint(row, requested_analysis_id=target) if row is not None else None
+
+    def list_checkpoints(self, session_id: str, checkpoint_name: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
+        params: list[Any] = [session_id]
+        where = "session_id=?"
+        if checkpoint_name is not None:
+            where += " AND checkpoint_name=?"; params.append(str(checkpoint_name))
+        params.append(max(1, int(limit)))
+        rows = self.conn.execute(f"SELECT * FROM checkpoints WHERE {where} ORDER BY updated_at DESC, checkpoint_name, analysis_id LIMIT ?", tuple(params)).fetchall()
+        return [self._decode_checkpoint(row) for row in rows]
 
     def list_candles(self, session_id: str, *, instrument: str | None = None, timeframe: str | None = None, closed_only: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
         clauses = ["session_id=?"]
@@ -847,6 +1064,8 @@ class SQLiteStore:
                 continue
             row = self.conn.execute(f"SELECT COUNT(*) FROM {table} WHERE session_id=?", (session_id,)).fetchone()
             counts[table] = int(row[0])
+        if self._table_exists("signal_analysis_membership"):
+            counts["signal_memberships"] = int(self.conn.execute("SELECT COUNT(*) FROM signal_analysis_membership WHERE session_id=?", (session_id,)).fetchone()[0])
         # ``counts.signals`` is the primary MTF detector count for terminal
         # compatibility; the complete capture count (including the independent
         # M1 reference variant) remains explicit as ``signals_total``.

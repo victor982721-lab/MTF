@@ -210,6 +210,8 @@ class BacktestRunner:
                 probe = self._simulate(signal, points, horizon=max_horizon, simulation_id=f"boundary:{detected.isoformat()}", data_complete=True)
                 final_available = parse_ts(probe.final_available_ts) if probe.final_available_ts else None
                 keep = bool(probe.entry_ts and probe.expiry_ts and parse_ts(probe.expiry_ts) <= boundary and (final_available is None or final_available <= boundary))
+            elif partition == "all":
+                keep = True
             else:
                 raise ValueError("partition must be exploration, evaluation, or all")
             if keep: selected.append(signal)

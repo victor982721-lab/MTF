@@ -51,7 +51,10 @@ calentamiento. `watch` tiene duración acotada para pruebas; no ejecuta órdenes
 `watch` y `replay` pasan por `RuntimeCoordinator`: el mismo procesador
 incremental conserva buckets abiertos, indicadores, episodios y simulaciones
 `PENDING`, persiste checkpoints periódicos y reanuda por identidad sin duplicar
-la captura. `replay` acepta velas nativas o eventos, deriva sólo temporalidades
+la captura. El gate de análisis separa conexión, reconciliación, frescura y
+continuidad; una reconexión o un hueco no se convierten en salud por etiqueta.
+La captura parcial se conserva con calidad `PARTIAL` y nunca se presenta como
+cobertura completa. `replay` acepta velas nativas o eventos, deriva sólo temporalidades
 compatibles y da precedencia a una vela nativa sobre su OHLC derivada. En un
 replay completo, un horizonte sin precio admisible queda `INDETERMINATE`; en
 observación continua permanece `PENDING` hasta que expire la tolerancia.
@@ -75,7 +78,9 @@ ellos crea una identidad de análisis separada, mientras que repetir exactamente
 la misma corrida es idempotente. `--partition exploration|evaluation` y
 `--boundary UTC` excluyen señales cuyo ingreso o liquidación cruza la frontera.
 
-Los informes segmentan por análisis, variante, instrumento, horizonte,
+La persistencia SQLite usa schema v3: los checkpoints están separados por
+`analysis_id`, las señales conservan memberships por análisis y `received_at`
+permanece separado de `available_at`. Los informes segmentan por análisis, variante, instrumento, horizonte,
 partición y contrato. En `status`, `counts.signals` es el detector MTF
 primario para compatibilidad terminal y `counts.signals_total` incluye también
 la referencia M1; el informe conserva ambos linajes y no mezcla sus resultados.

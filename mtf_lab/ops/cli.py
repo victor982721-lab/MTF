@@ -288,6 +288,9 @@ def _stored_records(store: SQLiteStore, session_id: str) -> list[dict[str, Any]]
     records: list[dict[str, Any]] = []
     for row in store.list_events(session_id):
         data = _stored_payload(row)
+        # Derived candle-close rows are read-model evidence, not source input.
+        if bool(data.get("derived_from_candle")):
+            continue
         data.setdefault("event_id", row.get("event_id"))
         data.setdefault("source_event_id", row.get("event_id"))
         data.setdefault("source", row.get("source", "persisted"))
@@ -302,6 +305,11 @@ def _stored_records(store: SQLiteStore, session_id: str) -> list[dict[str, Any]]
         records.append(data)
     for row in store.list_candles(session_id):
         data = _stored_payload(row)
+        provenance = data.get("provenance") if isinstance(data.get("provenance"), Mapping) else {}
+        origin = str(data.get("origin", provenance.get("origin", "native"))).lower()
+        source = str(row.get("source", data.get("source", ""))).lower()
+        if origin in {"aggregated", "derived", "resampled_ohlc", "runtime_aggregate"} or "aggregated" in source or "resampled" in source:
+            continue
         data.update({
             "candle_id": row.get("candle_id"), "instrument": row.get("instrument", session.get("instrument", "unknown")),
             "timeframe": row.get("timeframe", "M1"), "start_ts": row.get("start_ts"), "end_ts": row.get("end_ts"),
@@ -360,8 +368,8 @@ def _contract_hash(config: EffectiveConfig) -> str:
     return payload_hash(runtime_simulation_config(config).to_dict())
 
 
-def _analysis_for(store: SQLiteStore, session_id: str, *, dataset_hash: str, config: EffectiveConfig, variant: str, partition: str, metadata: Mapping[str, Any] | None = None) -> str:
-    return store.create_analysis(session_id, dataset_hash=dataset_hash, config_hash=config.config_hash, variant=variant, contract_hash=_contract_hash(config), partition=partition, code_version=config.version, metadata=metadata or {})
+def _analysis_for(store: SQLiteStore, session_id: str, *, dataset_hash: str, config: EffectiveConfig, variant: str, partition: str, metadata: Mapping[str, Any] | None = None, identity_extra: Mapping[str, Any] | None = None) -> str:
+    return store.create_analysis(session_id, dataset_hash=dataset_hash, config_hash=config.config_hash, variant=variant, contract_hash=_contract_hash(config), partition=partition, code_version=config.version, metadata=metadata or {}, identity_extra=identity_extra or {})
 
 
 def _signal_variant(row: Mapping[str, Any]) -> str:
@@ -374,14 +382,14 @@ def _signal_variant(row: Mapping[str, Any]) -> str:
     return ""
 
 
-def _persist_reference(store: SQLiteStore, session_id: str, config: EffectiveConfig, candles: list[Mapping[str, Any]], *, dataset_hash: str, partition: str = "all", mode: str = "REPLAY") -> tuple[list[dict[str, Any]], str]:
+def _persist_reference(store: SQLiteStore, session_id: str, config: EffectiveConfig, candles: list[Mapping[str, Any]], *, dataset_hash: str, partition: str = "all", mode: str = "REPLAY", identity_extra: Mapping[str, Any] | None = None) -> tuple[list[dict[str, Any]], str]:
     core_rows = [_core_candle(row, mode=mode) for row in _latest_candles(candles) if str(row.get("timeframe", "")).upper() == config.strategy.trigger_timeframe.name]
     if not core_rows:
-        analysis_id = _analysis_for(store, session_id, dataset_hash=dataset_hash, config=config, variant="m1_trigger_reference", partition=partition, metadata={"strategy": "m1_trigger_reference", "coverage": 0})
+        analysis_id = _analysis_for(store, session_id, dataset_hash=dataset_hash, config=config, variant="m1_trigger_reference", partition=partition, metadata={"strategy": "m1_trigger_reference", "coverage": 0}, identity_extra=identity_extra)
         return [], analysis_id
     series = compute_indicators(core_rows, config.indicators)
     refs = m1_reference_signals(series, rsi_threshold=config.strategy.rsi_threshold, mode=mode, identity_salt=config.config_hash)
-    analysis_id = _analysis_for(store, session_id, dataset_hash=dataset_hash, config=config, variant="m1_trigger_reference", partition=partition, metadata={"strategy": "m1_trigger_reference", "coverage": len(core_rows)})
+    analysis_id = _analysis_for(store, session_id, dataset_hash=dataset_hash, config=config, variant="m1_trigger_reference", partition=partition, metadata={"strategy": "m1_trigger_reference", "coverage": len(core_rows)}, identity_extra=identity_extra)
     for ordinal, signal in enumerate(refs):
         store.save_signal(session_id, signal, ordinal=ordinal, analysis_id=analysis_id, variant="m1_trigger_reference", analysis_config_hash=config.config_hash, contract_hash=_contract_hash(config), partition=partition)
     return refs, analysis_id
@@ -393,6 +401,7 @@ def cmd_replay(args: argparse.Namespace) -> int:
     result: dict[str, Any]
     records: list[Any]
     capture_hash_hint: str | None = None
+    replay_mode = "REPLAY"
     if getattr(args, "input", None):
         try:
             imported = _build_importer(args, config).read(args.input, fmt=args.format)
@@ -419,12 +428,12 @@ def cmd_replay(args: argparse.Namespace) -> int:
             stored_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
             capture_hash_hint = str(stored_config.get("capture_hash")) if stored_config.get("capture_hash") else None
             capture_base = next((record.get("price_base") for record in records if isinstance(record, Mapping) and record.get("price_base")), None)
-            config = _override_config(config, instrument=str(session.get("instrument") or config.instrument), price_base=str(capture_base) if capture_base else None, mode="REPLAY")
+            config = _override_config(config, instrument=str(session.get("instrument") or config.instrument), price_base=str(capture_base) if capture_base else None, mode=(replay_mode := str(session.get("mode", "REPLAY")).upper()))
             result = {"session_id": sid, "reused": True, "records": len(records)}
     dataset_hash = capture_hash_hint or _capture_hash(records)
     with SQLiteStore(db) as store:
         coordinator = RuntimeCoordinator(
-            store, sid, config, mode="REPLAY", dataset_hash=dataset_hash, variant="trend_pullback_v1", partition=args.partition,
+            store, sid, config, mode=replay_mode, dataset_hash=dataset_hash, variant="trend_pullback_v1", partition=args.partition,
             checkpoint_name=args.checkpoint, checkpoint_every=args.checkpoint_every, source="replay", max_candles=args.max_candles, resume=args.resume,
         )
         replay_result = coordinator.replay(records, sort=not args.preserve_order, bootstrap=False, complete=True)
@@ -459,7 +468,7 @@ def cmd_backtest(args: argparse.Namespace) -> int:
         dataset_hash = str(session_config.get("capture_hash")) if session_config.get("capture_hash") else _capture_hash(records or candle_rows)
         mode = str(session.get("mode", "REPLAY"))
         config = _override_config(config, mode=mode)
-        refs, reference_id = _persist_reference(store, sid, config, candle_rows, dataset_hash=dataset_hash, partition=args.partition, mode=mode)
+        refs, reference_id = _persist_reference(store, sid, config, candle_rows, dataset_hash=dataset_hash, partition=args.partition, mode=mode, identity_extra={"boundary": args.boundary or ""})
         stored_signals = store.list_signals(sid)
         primary = [row for row in stored_signals if _signal_variant(row) in {"", "trend_pullback_v1", "MULTITIMEFRAME"}]
         # Prefer only the current effective config when lineage is present; an
@@ -473,7 +482,24 @@ def cmd_backtest(args: argparse.Namespace) -> int:
                 primary = lineaged_primary
             else:
                 primary = [row for row in lineaged_primary if str(row.get("analysis_config_hash")) == str(config.config_hash)]
-        primary_analysis = _analysis_for(store, sid, dataset_hash=dataset_hash, config=config, variant="trend_pullback_v1", partition=args.partition, metadata={"strategy": "trend_pullback_v1", "source_signal_count": len(primary)})
+        primary_analysis: str
+        if not primary:
+            # No presentar ausencia de linaje como cero señales: ejecutar la
+            # variante MTF solicitada sobre esta misma captura congelada.
+            runtime = RuntimeCoordinator(
+                store, sid, config, mode=mode, dataset_hash=dataset_hash,
+                variant="trend_pullback_v1", partition=args.partition,
+                checkpoint_name=f"backtest:{args.partition}:{args.boundary or 'none'}",
+                checkpoint_every=max(1, min(500, len(records) or 1)),
+                source="backtest-replay", max_candles=5000, resume=False, identity_extra={"boundary": args.boundary or ""},
+            )
+            runtime.replay(records, sort=True, bootstrap=False, complete=True)
+            primary_analysis = runtime.analysis_id
+            # Use the just-computed immutable signal objects, not the capture
+            # level ``signals`` table (which may retain another membership).
+            primary = [signal.as_dict() for signal in runtime.processor.signals]
+        else:
+            primary_analysis = _analysis_for(store, sid, dataset_hash=dataset_hash, config=config, variant="trend_pullback_v1", partition=args.partition, metadata={"strategy": "trend_pullback_v1", "source_signal_count": len(primary)}, identity_extra={"boundary": args.boundary or ""})
         # Las señales capturadas son inmutables y pueden pertenecer a un
         # análisis anterior; no se copian bajo otra identidad (la simulación
         # conserva su analysis_id propio y el payload referencia la señal).
@@ -682,11 +708,76 @@ def cmd_watch(args: argparse.Namespace) -> int:
             bootstrap_ok = not rest_errors and all(warmup.get(tf.name, 1) == 0 for tf in config.timeframes if tf.name in {config.strategy.context_timeframe.name, config.strategy.preparation_timeframe.name, config.strategy.trigger_timeframe.name})
             freshness_label, freshness_blocked, freshness = _freshness_state(config, coordinator, last_received_at)
             bootstrap_blocked = () if bootstrap_ok else ("bootstrap_incomplete",)
-            coordinator.update_feed_state(connection="CONNECTED", reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED", blocked_reasons=tuple(dict.fromkeys((*bootstrap_blocked, *freshness_blocked))))
+            coordinator.update_feed_state(
+                connection="CONNECTED",
+                reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED",
+                freshness=freshness_label,
+                continuity="CONTINUOUS" if bootstrap_ok else "UNVERIFIED",
+                blocked_reasons=tuple(dict.fromkeys((*bootstrap_blocked, *freshness_blocked))),
+            )
             telemetry.state.update(connection="CONNECTED", warmup_pending=warmup, reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED", continuity="CONTINUOUS" if bootstrap_ok else "UNKNOWN", data_quality=freshness_label, rest_records=rest_records, feed_age_seconds=freshness.feed_age_seconds, closed_candle_age_seconds=freshness.closed_candle_age_seconds)
             telemetry.event("bootstrap_complete", rest_counts=rest_counts, rest_errors=rest_errors, warmup_pending=warmup)
             count = 0
-            iterator = adapter.iter_trades(duration_seconds=args.duration, max_events=args.max_events, include_snapshot=not args.no_snapshot)
+            recovery_in_progress = False
+            last_recovery_count = -1
+
+            def _recover_bounded(stream_status: Any) -> None:
+                nonlocal recovery_in_progress, last_recovery_count, last_received_at
+                reconnect_count = int(getattr(stream_status, "reconnect_count", 0) or 0)
+                if recovery_in_progress or reconnect_count <= last_recovery_count:
+                    return
+                recovery_in_progress = True
+                errors: list[dict[str, Any]] = []
+                try:
+                    since = coordinator.processor.last_event_time or datetime.now(UTC)
+                    for interval in intervals:
+                        try:
+                            fetched = adapter.recover_ohlc(interval=interval, since=since, include_open=False)
+                            for bar in fetched.bars:
+                                coordinator.process(bar, bootstrap=True)
+                                observed = getattr(bar, "received_at", None) or getattr(bar, "available_at", None)
+                                if observed is not None:
+                                    last_received_at = observed if last_received_at is None else max(last_received_at, observed)
+                        except Exception as exc:
+                            errors.append({"interval": interval, "type": type(exc).__name__, "error": str(exc)})
+                    last_recovery_count = reconnect_count
+                    if errors:
+                        coordinator.update_feed_state(reconciliation="BLOCKED", blocked_reasons=("reconciliation_failed",))
+                    else:
+                        coordinator.update_feed_state(reconciliation="RECOVERED_BOUNDED", continuity="RECOVERED_BOUNDED", blocked_reasons=())
+                    telemetry.event("reconciliation_cycle", reconnect_count=reconnect_count, errors=errors, verified=False)
+                finally:
+                    recovery_in_progress = False
+
+            def _on_transport_status(stream_status: Any) -> None:
+                state = str(getattr(stream_status, "state", "UNKNOWN")).upper()
+                needs_reconciliation = bool(getattr(stream_status, "needs_reconciliation", False))
+                if needs_reconciliation and int(getattr(stream_status, "reconnect_count", 0) or 0) > last_recovery_count:
+                    _recover_bounded(stream_status)
+                reasons = ("feed_discontinuity",) if needs_reconciliation else ()
+                current_reconciliation = coordinator.reconciliation_state
+                if needs_reconciliation and current_reconciliation != "RECOVERED_BOUNDED":
+                    current_reconciliation = "NEEDS_RECONCILIATION"
+                coordinator.update_feed_state(
+                    connection=state,
+                    reconciliation=current_reconciliation,
+                    blocked_reasons=tuple(dict.fromkeys((*coordinator.external_blocked_reasons, *reasons))),
+                    heartbeat_at=getattr(stream_status, "last_message_at", None),
+                )
+
+            def _on_transport_heartbeat(now: datetime) -> None:
+                if coordinator.connection_state not in {"DISCONNECTED", "ERROR"}:
+                    coordinator.heartbeat(now)
+
+            try:
+                iterator = adapter.iter_trades(
+                    duration_seconds=args.duration, max_events=args.max_events,
+                    include_snapshot=not args.no_snapshot,
+                    status_callback=_on_transport_status, heartbeat_callback=_on_transport_heartbeat,
+                )
+            except TypeError:
+                # Compatibility seam for test adapters that predate callbacks.
+                iterator = adapter.iter_trades(duration_seconds=args.duration, max_events=args.max_events, include_snapshot=not args.no_snapshot)
             try:
                 for event in iterator:
                     is_snapshot = bool(getattr(event, "is_snapshot", False))
@@ -706,7 +797,12 @@ def cmd_watch(args: argparse.Namespace) -> int:
                         last_received_at = event_received if last_received_at is None else max(last_received_at, event_received)
                     freshness_label, freshness_blocked, freshness = _freshness_state(config, coordinator, last_received_at)
                     dynamic_blocked = ("feed_discontinuity",) if needs else ()
-                    coordinator.update_feed_state(connection=state, reconciliation="NEEDS_RECONCILIATION" if needs else coordinator.reconciliation_state, blocked_reasons=tuple(dict.fromkeys((*dynamic_blocked, *freshness_blocked))))
+                    coordinator.update_feed_state(
+                        connection=state,
+                        reconciliation=("NEEDS_RECONCILIATION" if needs and coordinator.reconciliation_state != "RECOVERED_BOUNDED" else coordinator.reconciliation_state),
+                        freshness=freshness_label,
+                        blocked_reasons=tuple(dict.fromkeys((*dynamic_blocked, *freshness_blocked))),
+                    )
                     proc = coordinator.processor.status
                     telemetry.state.update(connection=state, last_received_ts=getattr(event, "received_at", None), last_available_ts=getattr(event, "available_at", None), events_processed=proc["events_processed"], candles_processed=proc["candles_processed"], signals=proc["signals"], errors=proc["errors"], warmup_pending=proc["warmup_pending"], reconciliation=coordinator.reconciliation_state, data_quality=freshness_label, feed_age_seconds=freshness.feed_age_seconds, closed_candle_age_seconds=freshness.closed_candle_age_seconds)
                     telemetry.state.update(feed_delay_ms=None)  # no false network-latency claim
@@ -737,9 +833,9 @@ def cmd_watch(args: argparse.Namespace) -> int:
             freshness_label, freshness_blocked, freshness = _freshness_state(config, coordinator, last_received_at)
             final_state = str(getattr(status_obj, "state", "STOPPED")).upper()
             if final_state in {"DISCONNECTED", "ERROR"}:
-                coordinator.update_feed_state(connection=final_state, blocked_reasons=tuple(dict.fromkeys(("feed_disconnected", *freshness_blocked))))
+                coordinator.update_feed_state(connection=final_state, freshness=freshness_label, blocked_reasons=tuple(dict.fromkeys(("feed_disconnected", *freshness_blocked))))
             else:
-                coordinator.update_feed_state(connection=final_state, blocked_reasons=tuple(freshness_blocked))
+                coordinator.update_feed_state(connection=final_state, freshness=freshness_label, blocked_reasons=tuple(freshness_blocked))
             final_status = coordinator.status()
             telemetry.state.update(connection=final_state, warmup_pending=coordinator.processor.status["warmup_pending"], signals=len(coordinator.processor.signals), reconciliation=coordinator.reconciliation_state)
             telemetry.event("watch_complete", events=count, rest_records=rest_records, rest_errors=rest_errors, analysis_enabled=final_status.analysis_enabled, blocked_reasons=final_status.analysis_blocked_reasons, pending_simulations=final_status.pending_simulations)

@@ -36,28 +36,27 @@ from ..core import (
     parse_timeframe,
 )
 from ..core.aggregation import _Bucket  # type: ignore[attr-defined]
+from ..ops.simulation import (
+    normalize_price_base,
+    normalize_observation_times,
+    parse_bool,
+    parse_ts as simulation_parse_ts,
+    iso_ts as simulation_iso_ts,
+    quality_label_is_usable as shared_quality_label_is_usable,
+)
 
 
 UTC = timezone.utc
 
 
 def utc(value: datetime | str | None) -> datetime | None:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        result = value
-    else:
-        text = str(value).strip()
-        if text.endswith("Z"):
-            text = text[:-1] + "+00:00"
-        result = datetime.fromisoformat(text)
-    if result.tzinfo is None or result.utcoffset() is None:
-        raise ValueError("Los timestamps del runtime deben incluir zona horaria")
-    return result.astimezone(UTC)
+    """Parse one timestamp through the shared simulation policy."""
+
+    return simulation_parse_ts(value) if value is not None else None
 
 
 def iso(value: datetime | None) -> str | None:
-    return utc(value).isoformat().replace("+00:00", "Z") if value is not None else None
+    return simulation_iso_ts(value)
 
 
 def _attr(record: Any, *names: str, default: Any = None) -> Any:
@@ -74,18 +73,22 @@ def _attr(record: Any, *names: str, default: Any = None) -> Any:
 
 
 def mode_from(value: Any, *, synthetic: bool = False) -> OperationMode:
+    """Normalize execution mode without defaulting unknown text to replay."""
+
+    if synthetic:
+        return OperationMode.SYNTHETIC
+    if value is None:
+        return OperationMode.REPLAY
     if isinstance(value, OperationMode):
         return value
-    if value is None or str(value).strip() == "":
-        return OperationMode.SYNTHETIC if synthetic else OperationMode.REPLAY
     text = str(value).strip().upper()
     if text in {"LIVE", "OBSERVATION_EN_DIRECTO", "OBSERVACIÓN EN DIRECTO", "OBSERVACION_EN_DIRECTO"}:
         return OperationMode.LIVE
-    if text in {"SYNTHETIC", "SINTETICO", "SINTÉTICO"}:
+    if text in {"SYNTHETIC", "SINTETICO", "SINTÉTICO", "OFFLINE"}:
         return OperationMode.SYNTHETIC
     if text == "REPLAY":
         return OperationMode.REPLAY
-    raise ValueError(f"modo desconocido: {value!r}")
+    raise ValueError(f"unknown operation mode: {value!r}")
 
 
 def quality_from(value: Any, *, synthetic: bool = False) -> DataQuality:
@@ -129,40 +132,17 @@ def quality_from(value: Any, *, synthetic: bool = False) -> DataQuality:
 
 
 def quality_label_is_usable(value: Any) -> bool:
-    """Return whether a public quality label is safe for virtual evaluation.
+    """Compatibility wrapper over the shared quality gate."""
 
-    Adapters commonly expose labels such as ``VALID``,
-    ``SYNTHETIC_VALIDATED`` or ``DATA_QUALITY_VALIDATED``. Unknown labels,
-    gaps, stale/disconnected states and anomaly labels remain blocked rather
-    than being accepted because they happen to contain the word ``valid``.
-    """
-
-    if isinstance(value, DataQuality):
-        return bool(value.valid)
-    if hasattr(value, "valid") and not isinstance(value, (str, bytes, Mapping)):
-        return bool(getattr(value, "valid"))
-    label = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
-    if not label:
-        return False
-    blocked_tokens = ("INVALID", "UNKNOWN", "DISCONNECTED", "STALE", "GAP", "PARTIAL", "OPEN", "UNRECONCILED", "OUT_OF_ORDER", "DUPLICATE", "LATE", "ANOM")
-    if any(token in label for token in blocked_tokens):
-        return False
-    return label in {
-        "VALID", "VALIDATED", "OK", "GOOD", "SYNTHETIC", "SYNTHETIC_VALID", "SYNTHETIC_VALIDATED", "VALID_DATA", "DATA_QUALITY_VALIDATED", "CLOSED_VALID",
-    } or label.startswith("VALID_") or label.startswith("SYNTHETIC_VALID")
+    return shared_quality_label_is_usable(value)
 
 
 def _price_base(value: Any, default: PriceBase | None = None) -> PriceBase:
-    if isinstance(value, PriceBase):
-        return value
-    if value is None or str(value).strip() == "":
-        if default is None:
-            raise ValueError("base de precio ausente")
-        return default
-    text = str(value).strip().lower()
-    if text in {"trade", "traded", "close"}:
-        return PriceBase.TRADED
-    return PriceBase(text)
+    fallback = default.value if isinstance(default, PriceBase) else None
+    canonical = normalize_price_base(value, default=fallback, allow_none=default is not None)
+    if canonical is None:
+        raise ValueError("base de precio ausente")
+    return PriceBase(canonical)
 
 
 def _event_kind(value: Any) -> EventKind:
@@ -225,8 +205,24 @@ def to_core_event(record: Any, *, mode: OperationMode | str = OperationMode.REPL
         raise ValueError("evento ASK sin ask explícito")
     if basis is PriceBase.MID and (mid is None or bid is None or ask is None):
         raise ValueError("evento MID requiere mid, bid y ask explícitos")
+    if basis is PriceBase.MID and not math.isclose(float(mid), (float(bid) + float(ask)) / 2.0, rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("mid no coincide con el promedio explícito de bid y ask")
+    selected = {PriceBase.TRADED: raw_price, PriceBase.BID: bid, PriceBase.ASK: ask, PriceBase.MID: mid}[basis]
+    if selected is None:
+        raise ValueError(f"falta precio explícito para la base {basis.value}")
+    if raw_price is not None and basis is not PriceBase.TRADED and not math.isclose(float(raw_price), float(selected), rel_tol=1e-12, abs_tol=1e-12):
+        raise ValueError("price no coincide con la base explícita")
     metadata = _attr(record, "metadata", default={}) or {}
+    if not isinstance(metadata, Mapping):
+        raise ValueError("metadata debe ser mapping")
+    metadata = dict(metadata)
+    if basis is PriceBase.MID:
+        metadata.setdefault("mid", float(mid))
     synthetic = _strict_bool(_attr(record, "synthetic", "is_synthetic", default=False), default=False)
+    received_at = utc(_attr(record, "received_at", "received_ts", default=None))
+    available_at = utc(_attr(record, "available_at", "available_ts", default=None))
+    if available_at is not None and available_at < event_time:
+        raise ValueError("available_at no puede preceder a event_time")
     event_id = _attr(record, "event_id", "data_id", default=None)
     if callable(event_id):
         event_id = event_id()
@@ -237,8 +233,8 @@ def to_core_event(record: Any, *, mode: OperationMode | str = OperationMode.REPL
         quantity=_attr(record, "quantity", default=None),
         bid=bid,
         ask=ask,
-        received_at=utc(_attr(record, "received_at", "received_ts", default=None)),
-        available_at=utc(_attr(record, "available_at", "available_ts", default=None)),
+        received_at=received_at,
+        available_at=available_at,
         source=str(_attr(record, "source", "provider", default="unknown")),
         mode=mode_from(_attr(record, "mode", default=mode), synthetic=synthetic),
         price_base=basis,
@@ -483,6 +479,16 @@ class SimulationConfig:
                 raw[target] = raw.pop(alias)
         return cls(**raw)
 
+    @property
+    def canonical_price_base(self) -> str:
+        return self.requested_base_price
+
+    def missing_outcome(self, reason: str, *, capture_complete: bool) -> tuple[str, str]:
+        """Shared completeness transition for runtime callers."""
+        if not isinstance(capture_complete, bool):
+            raise ValueError("capture_complete debe ser booleano")
+        return ("INDETERMINATE" if capture_complete else "PENDING", reason)
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "horizons_seconds": list(self.horizons_seconds),
@@ -504,6 +510,14 @@ class SimulationConfig:
 
 @dataclass(frozen=True, slots=True)
 class PriceObservation:
+    """One market observation with explicit availability and identity.
+
+    ``timestamp`` is market time; ``available_at`` is the first time the
+    observation may be consumed by the detector.  An availability timestamp
+    earlier than market time is retained as an ``INVALID`` quality label so
+    the runtime book blocks it instead of correcting it silently.
+    """
+
     timestamp: datetime
     available_at: datetime
     price: float
@@ -512,16 +526,69 @@ class PriceObservation:
     resolution: str
     closed: bool = True
     quality: str = "valid"
+    instrument: str = "UNKNOWN"
+    observation_id: str | None = None
+    source_ordinal: int = 0
+    source_sequence: int | str | None = None
 
     def __post_init__(self) -> None:
-        if self.timestamp.tzinfo is None or self.available_at.tzinfo is None:
-            raise ValueError("PriceObservation requiere timestamps conscientes")
+        market = simulation_parse_ts(self.timestamp)
+        available = simulation_parse_ts(self.available_at)
+        quality = str(self.quality or "UNKNOWN")
+        if available < market:
+            quality = f"INVALID:availability_before_market:{quality}"
+        try:
+            base = normalize_price_base(self.base_price, allow_none=False)
+        except ValueError:
+            base = str(self.base_price or "unknown").strip().lower() or "unknown"
+            quality = f"INVALID:unknown_price_base:{base}:{quality}"
         if not math.isfinite(float(self.price)):
             raise ValueError("PriceObservation.price debe ser finito")
+        closed = parse_bool(self.closed, name="closed")
+        source = str(self.source or "unknown").strip() or "unknown"
+        resolution = str(self.resolution or "UNKNOWN").strip() or "UNKNOWN"
+        instrument = str(self.instrument or "UNKNOWN").strip() or "UNKNOWN"
+        observation_id = None if self.observation_id is None else str(self.observation_id).strip() or None
+        if isinstance(self.source_ordinal, bool) or int(self.source_ordinal) != self.source_ordinal:
+            raise ValueError("source_ordinal debe ser entero")
+        object.__setattr__(self, "timestamp", market)
+        object.__setattr__(self, "available_at", available)
+        object.__setattr__(self, "base_price", base or "unknown")
+        object.__setattr__(self, "quality", quality)
+        object.__setattr__(self, "closed", closed)
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "resolution", resolution)
+        object.__setattr__(self, "instrument", instrument)
+        object.__setattr__(self, "observation_id", observation_id)
+        object.__setattr__(self, "source_ordinal", int(self.source_ordinal))
+
+    @property
+    def market_time(self) -> datetime:
+        return self.timestamp
+
+    @property
+    def available_ts(self) -> datetime:
+        return self.available_at
+
+    @property
+    def effective_available_at(self) -> datetime:
+        return self.available_at
+
+    @property
+    def identity(self) -> str:
+        return str(self.observation_id or f"{self.source}:{self.instrument}:{self.timestamp.isoformat()}:{self.source_ordinal}:{self.base_price}")
+
+    @property
+    def point_id(self) -> str:
+        return self.identity
+
+    def usable_as_of(self, as_of: datetime | None) -> bool:
+        return quality_label_is_usable(self.quality) and (as_of is None or self.available_at <= simulation_parse_ts(as_of))
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "timestamp": iso(self.timestamp),
+            "market_time": iso(self.timestamp),
             "available_at": iso(self.available_at),
             "price": self.price,
             "base_price": self.base_price,
@@ -529,24 +596,43 @@ class PriceObservation:
             "resolution": self.resolution,
             "closed": self.closed,
             "quality": self.quality,
+            "instrument": self.instrument,
+            "observation_id": self.observation_id,
+            "identity": self.identity,
+            "point_id": self.observation_id,
+            "source_ordinal": self.source_ordinal,
+            "source_sequence": self.source_sequence,
         }
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any]) -> "PriceObservation":
+        timestamp = value.get("timestamp", value.get("market_time"))
+        available = value.get("available_at", value.get("available_ts", timestamp))
         return cls(
-            timestamp=utc(value["timestamp"]) or datetime.fromtimestamp(0, UTC),
-            available_at=utc(value["available_at"]) or datetime.fromtimestamp(0, UTC),
+            timestamp=simulation_parse_ts(timestamp),
+            available_at=simulation_parse_ts(available),
             price=float(value["price"]),
-            base_price=str(value.get("base_price", "traded")),
+            base_price=str(value.get("base_price", value.get("price_base", "traded"))),
             source=str(value.get("source", "unknown")),
             resolution=str(value.get("resolution", "unknown")),
-            closed=bool(value.get("closed", True)),
+            closed=parse_bool(value.get("closed", True), name="closed"),
             quality=str(value.get("quality", "valid")),
+            instrument=str(value.get("instrument", value.get("symbol", "UNKNOWN"))),
+            observation_id=(str(value["observation_id"]) if value.get("observation_id") is not None else (str(value["point_id"]) if value.get("point_id") is not None else None)),
+            source_ordinal=int(value.get("source_ordinal", value.get("ordinal", 0))),
+            source_sequence=value.get("source_sequence", value.get("sequence")),
         )
 
 
 @dataclass(frozen=True, slots=True)
 class PendingSimulation:
+    """Lifecycle record for one signal/horizon virtual evaluation.
+
+    Market times and availability are kept separate, and ``capture_complete``
+    is an explicit transition input: an open capture remains ``PENDING`` when
+    data is absent; a complete replay may become ``INDETERMINATE``.
+    """
+
     simulation_id: str
     signal_id: str
     instrument: str
@@ -569,6 +655,98 @@ class PendingSimulation:
     quality: str = "valid"
     reason: str | None = None
     final_observation: PriceObservation | None = None
+    capture_complete: bool = False
+    detection_available_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("simulation_id", "signal_id", "instrument", "direction"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"{name} debe ser texto no vacío")
+            object.__setattr__(self, name, value.strip())
+        horizon = float(self.horizon_seconds)
+        if not math.isfinite(horizon) or horizon <= 0:
+            raise ValueError("horizon_seconds debe ser positivo y finito")
+        object.__setattr__(self, "horizon_seconds", horizon)
+        detected = simulation_parse_ts(self.detected_at)
+        entry_due = simulation_parse_ts(self.entry_due_at)
+        expiry = simulation_parse_ts(self.expiry_at)
+        if entry_due < detected:
+            raise ValueError("entry_due_at no puede preceder detected_at")
+        if expiry < entry_due:
+            raise ValueError("expiry_at no puede preceder entry_due_at")
+        object.__setattr__(self, "detected_at", detected)
+        object.__setattr__(self, "entry_due_at", entry_due)
+        object.__setattr__(self, "expiry_at", expiry)
+        for name in ("entry_at", "final_at", "detection_available_at"):
+            value = getattr(self, name)
+            if value is not None:
+                parsed = simulation_parse_ts(value)
+                if name == "detection_available_at" and parsed < detected:
+                    raise ValueError("detection_available_at no puede preceder detected_at")
+                object.__setattr__(self, name, parsed)
+        if self.entry_price is not None and not math.isfinite(float(self.entry_price)):
+            raise ValueError("entry_price debe ser finito")
+        if self.final_price is not None and not math.isfinite(float(self.final_price)):
+            raise ValueError("final_price debe ser finito")
+        if self.net_result is not None and not math.isfinite(float(self.net_result)):
+            raise ValueError("net_result debe ser finito")
+        object.__setattr__(self, "entry_price", float(self.entry_price) if self.entry_price is not None else None)
+        object.__setattr__(self, "final_price", float(self.final_price) if self.final_price is not None else None)
+        object.__setattr__(self, "net_result", float(self.net_result) if self.net_result is not None else None)
+        status = str(self.status).strip().upper()
+        if status not in {"PENDING", "RESOLVED", "INDETERMINATE"}:
+            raise ValueError(f"status de simulación desconocido: {self.status!r}")
+        object.__setattr__(self, "status", status)
+        if self.outcome is not None:
+            outcome = str(self.outcome).strip().upper()
+            if outcome not in {"WIN", "LOSS", "TIE", "PENDING", "INDETERMINATE"}:
+                raise ValueError(f"outcome de simulación desconocido: {self.outcome!r}")
+            object.__setattr__(self, "outcome", outcome)
+        if not isinstance(self.capture_complete, bool):
+            raise ValueError("capture_complete debe ser booleano")
+        object.__setattr__(self, "price_base", _price_base(self.price_base).value)
+        resolution = str(self.resolution).strip()
+        if not resolution:
+            raise ValueError("resolution no puede estar vacía")
+        object.__setattr__(self, "resolution", resolution)
+        object.__setattr__(self, "quality", str(self.quality or "UNKNOWN"))
+        if self.final_observation is not None and not isinstance(self.final_observation, PriceObservation):
+            raise ValueError("final_observation debe ser PriceObservation")
+
+    @property
+    def identity(self) -> str:
+        return self.simulation_id
+
+    @property
+    def signal_identity(self) -> str:
+        return self.signal_id
+
+    @property
+    def detected_market_at(self) -> datetime:
+        return self.detected_at
+
+    @property
+    def entry_market_due_at(self) -> datetime:
+        return self.entry_due_at
+
+    @property
+    def expiry_market_at(self) -> datetime:
+        return self.expiry_at
+
+    @property
+    def is_pending(self) -> bool:
+        return self.status == "PENDING"
+
+    @property
+    def is_complete(self) -> bool:
+        return self.status in {"RESOLVED", "INDETERMINATE"}
+
+    def missing_outcome(self, reason: str, *, capture_complete: bool | None = None) -> tuple[str, str]:
+        complete = self.capture_complete if capture_complete is None else capture_complete
+        if not isinstance(complete, bool):
+            raise ValueError("capture_complete debe ser booleano")
+        return ("INDETERMINATE" if complete else "PENDING", reason)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -578,8 +756,12 @@ class PendingSimulation:
             "direction": self.direction,
             "horizon_seconds": self.horizon_seconds,
             "detected_at": iso(self.detected_at),
+            "detected_market_at": iso(self.detected_at),
+            "detection_available_at": iso(self.detection_available_at),
             "entry_due_at": iso(self.entry_due_at),
+            "entry_market_due_at": iso(self.entry_due_at),
             "expiry_at": iso(self.expiry_at),
+            "expiry_market_at": iso(self.expiry_at),
             "entry_rule": self.entry_rule,
             "exit_rule": self.exit_rule,
             "status": self.status,
@@ -593,6 +775,8 @@ class PendingSimulation:
             "resolution": self.resolution,
             "quality": self.quality,
             "reason": self.reason,
+            "capture_complete": self.capture_complete,
+            "identity": self.identity,
             "final_observation": self.final_observation.to_dict() if self.final_observation else None,
         }
 
@@ -604,15 +788,15 @@ class PendingSimulation:
             instrument=str(value["instrument"]),
             direction=str(value["direction"]),
             horizon_seconds=float(value["horizon_seconds"]),
-            detected_at=utc(value["detected_at"]) or datetime.fromtimestamp(0, UTC),
-            entry_due_at=utc(value["entry_due_at"]) or datetime.fromtimestamp(0, UTC),
-            expiry_at=utc(value["expiry_at"]) or datetime.fromtimestamp(0, UTC),
+            detected_at=simulation_parse_ts(value.get("detected_at", value.get("detected_market_at"))),
+            entry_due_at=simulation_parse_ts(value["entry_due_at"]),
+            expiry_at=simulation_parse_ts(value["expiry_at"]),
             entry_rule=str(value.get("entry_rule", "first_observation_at_or_after")),
             exit_rule=str(value.get("exit_rule", "last_observation_at_or_before")),
             status=str(value.get("status", "PENDING")),
-            entry_at=utc(value.get("entry_at")),
+            entry_at=simulation_parse_ts(value["entry_at"]) if value.get("entry_at") is not None else None,
             entry_price=float(value["entry_price"]) if value.get("entry_price") is not None else None,
-            final_at=utc(value.get("final_at")),
+            final_at=simulation_parse_ts(value["final_at"]) if value.get("final_at") is not None else None,
             final_price=float(value["final_price"]) if value.get("final_price") is not None else None,
             outcome=value.get("outcome"),
             net_result=float(value["net_result"]) if value.get("net_result") is not None else None,
@@ -621,6 +805,8 @@ class PendingSimulation:
             quality=str(value.get("quality", "valid")),
             reason=value.get("reason"),
             final_observation=PriceObservation.from_dict(value["final_observation"]) if value.get("final_observation") else None,
+            capture_complete=parse_bool(value.get("capture_complete", False), name="capture_complete"),
+            detection_available_at=simulation_parse_ts(value["detection_available_at"]) if value.get("detection_available_at") is not None else None,
         )
 
 

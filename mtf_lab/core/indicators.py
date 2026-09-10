@@ -316,8 +316,14 @@ def _bar_fields(bar: Any) -> tuple[Any, Any, Any, Any, Any, Any, bool, DataQuali
 class IncrementalIndicatorEngine:
     """Estado incremental de EMA/RSI/ATR para una sola serie temporal."""
 
-    def __init__(self, config: IndicatorConfig | Mapping[str, Any] | None = None) -> None:
+    def __init__(self, config: IndicatorConfig | Mapping[str, Any] | None = None, *, max_points: int | None = None, max_issues: int | None = None) -> None:
         self.config = config if isinstance(config, IndicatorConfig) else IndicatorConfig.from_mapping(config)
+        if max_points is not None and (isinstance(max_points, bool) or int(max_points) <= 0):
+            raise ValueError("max_points debe ser entero positivo")
+        if max_issues is not None and (isinstance(max_issues, bool) or int(max_issues) <= 0):
+            raise ValueError("max_issues debe ser entero positivo")
+        self.max_points = int(max_points) if max_points is not None else None
+        self.max_issues = int(max_issues) if max_issues is not None else (self.max_points if self.max_points is not None else None)
         self._ema_fast = _EMAState(self.config.ema_fast)
         self._ema_slow = _EMAState(self.config.ema_slow)
         self._rsi = _WilderRSIState(self.config.rsi_period)
@@ -326,8 +332,8 @@ class IncrementalIndicatorEngine:
         self._timeframe: Timeframe | None = None
         self._instrument: str = "unknown"
         self._index = 0
-        self._points: list[IndicatorPoint] = []
-        self._issues: list[QualityIssue] = []
+        self._points = deque(maxlen=self.max_points) if self.max_points is not None else []
+        self._issues = deque(maxlen=self.max_issues) if self.max_issues is not None else []
 
     @property
     def points(self) -> tuple[IndicatorPoint, ...]:

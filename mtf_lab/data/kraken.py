@@ -27,7 +27,7 @@ import hashlib
 import json
 import threading
 import time
-from typing import Any, AsyncIterator, Iterator, Mapping, Sequence
+from typing import Any, AsyncIterator, Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -515,6 +515,8 @@ class KrakenPublicAdapter:
         max_events: int | None = None,
         include_snapshot: bool = True,
         stop_event: threading.Event | None = None,
+        status_callback: Callable[[KrakenStreamStatus], None] | None = None,
+        heartbeat_callback: Callable[[datetime], None] | None = None,
     ) -> Iterator[Event]:
         """Synchronous iterator over normalized public trade events.
 
@@ -529,6 +531,8 @@ class KrakenPublicAdapter:
                 max_events=max_events,
                 include_snapshot=include_snapshot,
                 stop_event=stop_event,
+                status_callback=status_callback,
+                heartbeat_callback=heartbeat_callback,
             )
         )
 
@@ -539,6 +543,8 @@ class KrakenPublicAdapter:
         max_events: int | None = None,
         include_snapshot: bool = True,
         stop_event: threading.Event | None = None,
+        status_callback: Callable[[KrakenStreamStatus], None] | None = None,
+        heartbeat_callback: Callable[[datetime], None] | None = None,
     ) -> AsyncIterator[Event]:
         if duration_seconds is not None and duration_seconds <= 0:
             raise KrakenConfigurationError("duration_seconds must be positive")
@@ -546,7 +552,7 @@ class KrakenPublicAdapter:
             raise KrakenConfigurationError("max_events must be positive")
         params = {"channel": "trade", "symbol": [self.ws_symbol], "snapshot": bool(include_snapshot)}
         emitted = 0
-        messages = self._aiter_messages("trade", params, duration_seconds=duration_seconds, stop_event=stop_event)
+        messages = self._aiter_messages("trade", params, duration_seconds=duration_seconds, stop_event=stop_event, status_callback=status_callback, heartbeat_callback=heartbeat_callback)
         try:
             async for message in messages:
                 message_type = message.get("type")
@@ -645,6 +651,8 @@ class KrakenPublicAdapter:
         *,
         duration_seconds: float | None,
         stop_event: threading.Event | None,
+        status_callback: Callable[[KrakenStreamStatus], None] | None = None,
+        heartbeat_callback: Callable[[datetime], None] | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         try:
             import websockets
@@ -660,6 +668,7 @@ class KrakenPublicAdapter:
                 return
             try:
                 self.status.state = "CONNECTING"
+                self._notify_status(status_callback, self.status)
                 # ``ping_interval`` is a protocol-level heartbeat; the explicit
                 # JSON ping below also keeps the application-level connection
                 # active when no trades arrive.
@@ -673,11 +682,13 @@ class KrakenPublicAdapter:
                     now = datetime.now(UTC)
                     self.status.state = "CONNECTED"
                     self.status.connected_at = now
+                    self._notify_status(status_callback, self.status)
                     self.status.last_error = None
                     if reconnects:
                         self.status.reconnect_count += 1
                         self.status.discontinuity = True
                         self.status.needs_reconciliation = True
+                    self._notify_status(status_callback, self.status)
                     request = {"method": "subscribe", "params": dict(params), "req_id": int(time.time() * 1000) % 2_000_000_000}
                     await socket.send(json.dumps(request, separators=(",", ":")))
                     while True:
@@ -689,6 +700,13 @@ class KrakenPublicAdapter:
                         except asyncio.TimeoutError:
                             ping = {"method": "ping", "req_id": int(time.time() * 1000) % 2_000_000_000}
                             await socket.send(json.dumps(ping, separators=(",", ":")))
+                            heartbeat_at = datetime.now(UTC)
+                            if heartbeat_callback is not None:
+                                try:
+                                    heartbeat_callback(heartbeat_at)
+                                except Exception:
+                                    pass
+                            self._notify_status(status_callback, self.status)
                             continue
                         if isinstance(raw, bytes):
                             raw = raw.decode("utf-8")
@@ -699,6 +717,7 @@ class KrakenPublicAdapter:
                         if not isinstance(message, dict):
                             raise KrakenAPIError("Kraken WebSocket message must be an object")
                         self.status.last_message_at = datetime.now(UTC)
+                        self._notify_status(status_callback, self.status)
                         if message.get("success") is False or message.get("error"):
                             detail = message.get("error") or message.get("warnings") or "subscription failed"
                             raise KrakenAPIError(f"Kraken WebSocket {channel} error: {detail}")
@@ -711,6 +730,7 @@ class KrakenPublicAdapter:
                         yield message
             except KrakenAPIError:
                 self.status.state = "ERROR"
+                self._notify_status(status_callback, self.status)
                 raise
             except asyncio.CancelledError:
                 self.status.state = "STOPPED"
@@ -718,6 +738,7 @@ class KrakenPublicAdapter:
             except Exception as exc:
                 self.status.state = "DISCONNECTED"
                 self.status.last_error = f"{type(exc).__name__}: {exc}"
+                self._notify_status(status_callback, self.status)
                 self.status.discontinuity = True
                 self.status.needs_reconciliation = True
                 if reconnects >= self.max_reconnects:
@@ -732,6 +753,16 @@ class KrakenPublicAdapter:
     @staticmethod
     def _stream_done(started: float, duration_seconds: float | None, stop_event: threading.Event | None) -> bool:
         return (duration_seconds is not None and time.monotonic() - started >= duration_seconds) or bool(stop_event and stop_event.is_set())
+
+    @staticmethod
+    def _notify_status(callback: Callable[[KrakenStreamStatus], None] | None, status: KrakenStreamStatus) -> None:
+        if callback is None:
+            return
+        try:
+            callback(status)
+        except Exception:
+            # Observability callbacks must not alter transport correctness.
+            return
 
     def _normalize_trade(self, trade: Mapping[str, Any], *, is_snapshot: bool) -> Event:
         symbol = normalize_pair(str(trade.get("symbol", self.pair)))

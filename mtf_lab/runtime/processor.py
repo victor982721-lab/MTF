@@ -38,6 +38,7 @@ from ..core import (
 )
 from ..core.aggregation import _Bucket, interval_start  # type: ignore[attr-defined]
 from ..core.quality import QualityFlag, merge_quality
+from ..ops.simulation import select_price_point
 from .state import (
     PendingSimulation,
     PriceObservation,
@@ -62,6 +63,12 @@ from .state import (
 
 
 UTC = timezone.utc
+_BLOCKING_RUNTIME_ISSUES = frozenset({
+    "out_of_order_event", "out_of_order_candle", "event_invalid", "invalid_event",
+    "candle_invalid", "price_base_mismatch", "quality_blocked", "partial_bucket",
+    "gap", "out_of_order", "out_of_order_interval", "late_closed_interval",
+    "mode_mismatch", "timeframe_not_configured",
+})
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,18 +131,29 @@ class ReplayResult:
 
 
 class _SimulationBook:
-    """Libro causal de evaluaciones virtuales aún no vencidas."""
+    """Libro causal de evaluaciones virtuales aún no vencidas.
 
-    def __init__(self, config: SimulationConfig) -> None:
+    The book shares the batch selector's availability/base/quality policy.  A
+    live watermark only observes what is known so far; it never converts a
+    missing observation into ``INDETERMINATE`` until the caller explicitly
+    declares the capture complete.
+    """
+
+    def __init__(self, config: SimulationConfig, *, max_observations: int = 4096) -> None:
         self.config = config
         self.pending: dict[str, PendingSimulation] = {}
         self.completed: dict[str, PendingSimulation] = {}
+        self.completed_ids: set[str] = set()
+        self.completed_order: deque[str] = deque()
+        self.observations: list[PriceObservation] = []
+        self._observation_ids: set[str] = set()
+        self.max_observations = max(256, int(max_observations))
 
     def add_signal(self, signal: Signal) -> tuple[PendingSimulation, ...]:
         created: list[PendingSimulation] = []
         for horizon in self.config.horizons_seconds:
             sim_id = "sim_" + hashlib.sha256(f"{signal.signal_id}|{horizon:g}".encode()).hexdigest()[:32]
-            if sim_id in self.pending or sim_id in self.completed:
+            if sim_id in self.pending or sim_id in self.completed or sim_id in self.completed_ids:
                 continue
             detected = signal.detected_at
             entry_due = detected + timedelta(seconds=self.config.entry_latency_seconds)
@@ -148,6 +166,7 @@ class _SimulationBook:
                 direction=signal.direction,
                 horizon_seconds=horizon,
                 detected_at=detected,
+                detection_available_at=detected,
                 entry_due_at=entry_due,
                 expiry_at=expiry,
                 entry_rule=self.config.entry_rule,
@@ -155,26 +174,48 @@ class _SimulationBook:
                 price_base=self.config.requested_base_price,
                 resolution=self.config.resolution,
                 quality=signal.quality.status,
+                capture_complete=False,
             )
             self.pending[sim_id] = item
             created.append(item)
         return tuple(created)
 
     def _eligible(self, observation: PriceObservation) -> bool:
-        if not observation.closed:
-            return False
-        requested = str(self.config.requested_base_price).lower().replace("trade", "traded")
-        actual = str(observation.base_price).lower().replace("trade", "traded")
-        if actual != requested and not (requested == "traded" and actual == "close") and not (requested == "close" and actual == "traded"):
-            return False
-        # Quality values from adapters are labels, not assumptions. Unknown or
-        # invalid values never become a virtual price silently.
-        return quality_label_is_usable(observation.quality)
+        return bool(observation.closed and quality_label_is_usable(observation.quality))
 
-    def _resolve(self, item: PendingSimulation, *, outcome: str, net_result: float | None, final: PriceObservation | None = None, reason: str | None = None) -> PendingSimulation:
+    def _select_entry(self, item: PendingSimulation, watermark: datetime):
+        return select_price_point(
+            self.observations,
+            item.entry_due_at,
+            rule="first_observation_at_or_after",
+            requested_base_price=item.price_base,
+            require_closed=True,
+            max_price_age_seconds=self.config.max_price_age_seconds,
+            as_of=watermark,
+            instrument=item.instrument,
+        )
+
+    def _select_final(self, item: PendingSimulation, watermark: datetime):
+        cutoff = watermark
+        if item.exit_rule == "last_observation_at_or_before":
+            cutoff = min(watermark, item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds))
+        return select_price_point(
+            self.observations,
+            item.expiry_at,
+            rule=item.exit_rule,
+            requested_base_price=item.price_base,
+            require_closed=True,
+            max_price_age_seconds=self.config.max_price_age_seconds,
+            as_of=cutoff,
+            exclude_identity=(item.final_observation.identity if item.final_observation else None),
+            exclude_market_time=item.entry_at if item.entry_at is not None else None,
+            instrument=item.instrument,
+        )
+
+    def _resolve(self, item: PendingSimulation, *, outcome: str, net_result: float | None, final: PriceObservation | None = None, reason: str | None = None, capture_complete: bool = False) -> PendingSimulation:
         updated = replace(
             item,
-            status="RESOLVED" if outcome != "INDETERMINATE" else "INDETERMINATE",
+            status="RESOLVED" if outcome in {"WIN", "LOSS", "TIE"} else "INDETERMINATE",
             final_at=final.available_at if final else item.final_at,
             final_price=final.price if final else item.final_price,
             outcome=outcome,
@@ -182,9 +223,16 @@ class _SimulationBook:
             quality=final.quality if final else item.quality,
             reason=reason,
             final_observation=final,
+            capture_complete=capture_complete,
         )
         self.pending.pop(item.simulation_id, None)
         self.completed[item.simulation_id] = updated
+        self.completed_ids.add(item.simulation_id)
+        self.completed_order.append(item.simulation_id)
+        while len(self.completed_order) > self.max_observations:
+            evicted_id = self.completed_order.popleft()
+            self.completed_ids.discard(evicted_id)
+            self.completed.pop(evicted_id, None)
         return updated
 
     def _settle_with_final(self, item: PendingSimulation, observation: PriceObservation) -> PendingSimulation:
@@ -197,63 +245,79 @@ class _SimulationBook:
             won = delta > 0 if item.direction.upper() == "UP" else delta < 0
             outcome = "WIN" if won else "LOSS"
             net = (self.config.stake * self.config.payout_net - self.config.costs) if won else (-self.config.stake * self.config.loss_amount - self.config.costs)
-        return self._resolve(item, outcome=outcome, net_result=net, final=observation)
+        return self._resolve(item, outcome=outcome, net_result=net, final=observation, reason=None, capture_complete=False)
+
+    def _refresh_item(self, item: PendingSimulation, watermark: datetime) -> PendingSimulation | None:
+        """Update entry/final candidates using only observations available now."""
+        if item.entry_price is None:
+            selection, _reason = self._select_entry(item, watermark)
+            if selection is not None:
+                entry = selection.point
+                expiry = (selection.use_time if self.config.horizon_from == "entry" else item.detected_at) + timedelta(seconds=item.horizon_seconds)
+                item = replace(item, entry_at=selection.use_time, entry_price=float(entry.price), expiry_at=expiry, quality=str(entry.quality))
+                self.pending[item.simulation_id] = item
+        if item.entry_price is not None:
+            selection, _reason = self._select_final(item, watermark)
+            if selection is not None:
+                final = selection.point
+                # For `last_observation_at_or_before`, the selector is already
+                # latest-at-cutoff. For `first...after`, the first market point
+                # is stable once its availability is visible.
+                item = replace(item, final_observation=final, final_price=float(final.price), final_at=final.available_at, quality=str(final.quality))
+                self.pending[item.simulation_id] = item
+        return item
+
+    def _final_deadline_reached(self, item: PendingSimulation, watermark: datetime) -> bool:
+        return watermark >= item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds)
 
     def observe(self, observation: PriceObservation, *, watermark: datetime | None = None) -> tuple[PendingSimulation, ...]:
-        """Consume one observation; first eligible entry and last pre-expiry exit."""
-
-        watermark = watermark or observation.available_at
+        """Consume one observation; never terminalize an open capture."""
+        watermark = (watermark or observation.available_at).astimezone(UTC)
+        if self._eligible(observation) and observation.identity not in self._observation_ids:
+            self._observation_ids.add(observation.identity)
+            self.observations.append(observation)
+            if len(self.observations) > self.max_observations:
+                removed = self.observations[:-self.max_observations]
+                self.observations = self.observations[-self.max_observations:]
+                for item in removed:
+                    self._observation_ids.discard(item.identity)
         completed: list[PendingSimulation] = []
-        if not self._eligible(observation):
-            return completed
-        # Use insertion order of ids (which is deterministic by signal/horizon)
-        # and never search for a favorable price.
-        for sim_id, item in tuple(self.pending.items()):
+        for item in tuple(self.pending.values()):
+            item = self._refresh_item(item, watermark) or item
             if item.entry_price is None:
-                if observation.timestamp >= item.entry_due_at and observation.available_at >= item.entry_due_at:
-                    age = (observation.available_at - item.entry_due_at).total_seconds()
-                    if age <= self.config.max_price_age_seconds:
-                        item = replace(item, entry_at=observation.available_at, entry_price=observation.price, quality=observation.quality)
-                        self.pending[sim_id] = item
-                    elif watermark >= item.entry_due_at + timedelta(seconds=self.config.max_price_age_seconds):
-                        completed.append(self._resolve(item, outcome="INDETERMINATE", net_result=None, reason="ENTRY_PRICE_NOT_AVAILABLE_WITHIN_MAX_AGE"))
-                        continue
-            if item.simulation_id not in self.pending:
                 continue
-            if item.entry_price is None:
-                if watermark >= item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds):
-                    completed.append(self._resolve(item, outcome="INDETERMINATE", net_result=None, reason="ENTRY_PRICE_NOT_AVAILABLE"))
-                continue
-            # Keep exactly the declared final-price policy. For a before rule
-            # only market observations not later than expiry are admissible;
-            # the after rule waits for the first observation at/after expiry.
-            admissible_final = (self.config.exit_rule == "last_observation_at_or_before" and observation.timestamp <= item.expiry_at) or (self.config.exit_rule == "first_observation_at_or_after" and observation.timestamp >= item.expiry_at)
-            if admissible_final and observation.available_at <= item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds):
-                if item.final_observation is None or (self.config.exit_rule == "last_observation_at_or_before" and observation.timestamp >= item.final_observation.timestamp) or (self.config.exit_rule == "first_observation_at_or_after" and observation.timestamp < item.final_observation.timestamp):
-                    self.pending[sim_id] = replace(item, final_observation=observation, final_price=observation.price, final_at=observation.available_at)
-                    item = self.pending[sim_id]
-            if watermark >= item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds):
-                final = item.final_observation
-                if final is None or final.available_at > item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds) or abs((item.expiry_at - final.timestamp).total_seconds()) > self.config.max_price_age_seconds or (self.config.exit_rule == "first_observation_at_or_after" and final.timestamp < item.expiry_at):
-                    completed.append(self._resolve(item, outcome="INDETERMINATE", net_result=None, reason="FINAL_PRICE_NOT_AVAILABLE_WITHIN_MAX_AGE"))
-                else:
-                    completed.append(self._settle_with_final(item, final))
+            if item.final_observation is not None and item.exit_rule == "first_observation_at_or_after" and item.final_observation.timestamp >= item.expiry_at:
+                completed.append(self._settle_with_final(item, item.final_observation))
+            elif item.exit_rule == "last_observation_at_or_before" and self._final_deadline_reached(item, watermark) and item.final_observation is not None:
+                completed.append(self._settle_with_final(item, item.final_observation))
         return tuple(completed)
 
-    def advance(self, watermark: datetime) -> tuple[PendingSimulation, ...]:
+    def advance(self, watermark: datetime, *, capture_complete: bool = True) -> tuple[PendingSimulation, ...]:
         """Advance virtual time without inventing observations."""
-
         watermark = watermark.astimezone(UTC)
         completed: list[PendingSimulation] = []
         for item in tuple(self.pending.values()):
-            if watermark < item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds):
-                continue
+            item = self._refresh_item(item, watermark) or item
+            deadline = self._final_deadline_reached(item, watermark)
             if item.entry_price is None:
-                completed.append(self._resolve(item, outcome="INDETERMINATE", net_result=None, reason="ENTRY_PRICE_NOT_AVAILABLE"))
-            elif item.final_observation is None or item.final_observation.available_at > item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds) or abs((item.expiry_at - item.final_observation.timestamp).total_seconds()) > self.config.max_price_age_seconds or (self.config.exit_rule == "first_observation_at_or_after" and item.final_observation.timestamp < item.expiry_at):
-                completed.append(self._resolve(item, outcome="INDETERMINATE", net_result=None, reason="FINAL_PRICE_NOT_AVAILABLE_WITHIN_MAX_AGE"))
-            else:
-                completed.append(self._settle_with_final(item, item.final_observation))
+                if deadline and capture_complete:
+                    outcome, reason = self.config.missing_outcome("ENTRY_PRICE_NOT_AVAILABLE", capture_complete=True)
+                    completed.append(self._resolve(item, outcome=outcome, net_result=None, reason=reason, capture_complete=True))
+                continue
+            if item.final_observation is not None:
+                if item.exit_rule == "first_observation_at_or_after" and item.final_observation.timestamp >= item.expiry_at:
+                    completed.append(self._settle_with_final(item, item.final_observation))
+                    continue
+                # A complete replay is an explicit end-of-capture boundary;
+                # once a causally admissible before-observation is known, no
+                # later record may revise it. Continuous watch still waits
+                # for the grace deadline above.
+                if item.exit_rule == "last_observation_at_or_before" and (deadline or capture_complete):
+                    completed.append(self._settle_with_final(item, item.final_observation))
+                    continue
+            if (deadline or capture_complete) and capture_complete:
+                outcome, reason = self.config.missing_outcome("FINAL_PRICE_NOT_AVAILABLE_WITHIN_MAX_AGE", capture_complete=True)
+                completed.append(self._resolve(item, outcome=outcome, net_result=None, reason=reason, capture_complete=True))
         return tuple(completed)
 
 
@@ -294,14 +358,18 @@ class IncrementalProcessor:
         if max_candles is not None and (isinstance(max_candles, bool) or max_candles <= 0):
             raise ValueError("max_candles debe ser positivo")
         self.aggregators: dict[str, CandleAggregator] = {
-            tf.name: CandleAggregator(tf, instrument=self.instrument, price_base=self.price_base, source=f"{self.source}:aggregated", mode=self.mode)
+            tf.name: CandleAggregator(
+                tf, instrument=self.instrument, price_base=self.price_base,
+                source=f"{self.source}:aggregated", mode=self.mode,
+                max_seen_event_ids=max_candles, max_issues=max_candles,
+            )
             for tf in self.timeframes
         }
         self.indicator_engines: dict[str, Any] = {}
         for tf in self.timeframes:
             from ..core.indicators import IncrementalIndicatorEngine
 
-            self.indicator_engines[tf.name] = IncrementalIndicatorEngine(strategy_cfg.indicators)
+            self.indicator_engines[tf.name] = IncrementalIndicatorEngine(strategy_cfg.indicators, max_points=max_candles)
         def _container():
             return deque(maxlen=self.max_candles) if self.max_candles is not None else []
 
@@ -311,14 +379,20 @@ class IncrementalProcessor:
         self._candle_by_key: dict[str, dict[tuple[str, datetime], Candle]] = {tf.name: {} for tf in self.timeframes}
         self._resample_buffers: dict[str, dict[datetime, dict[datetime, Candle]]] = {tf.name: {} for tf in self.timeframes}
         self._candle_ids: set[str] = set()
+        self._candle_id_counts: dict[str, int] = {}
         self._processed_candle_starts: dict[str, set[datetime]] = {tf.name: set() for tf in self.timeframes}
+        # Absolute indices avoid rebuilding a max-sized mapping on every
+        # deque eviction; convert to deque-relative indices at read sites.
         self._point_index_by_start: dict[str, dict[datetime, int]] = {tf.name: {} for tf in self.timeframes}
+        self._point_base_index: dict[str, int] = {tf.name: 0 for tf in self.timeframes}
         self._seen_event_ids: set[str] = set()
         self._events: dict[str, MarketEvent] = {}
         self.evaluations: list[Any] = []
         self.signals: list[Signal] = []
         self._decision_ids: set[str] = set()
+        self._decision_order: deque[str] = deque()
         self._signal_ids: set[str] = set()
+        self._signal_order: deque[str] = deque()
         self.episodes: dict[str, Any] = {}
         self.context: dict[str, Any] | None = None
         self._simulation_book = _SimulationBook(self.simulation_config)
@@ -402,15 +476,14 @@ class IncrementalProcessor:
         """Rebuild only after a late native replacement, never per event."""
         from ..core.indicators import IncrementalIndicatorEngine
 
-        engine = IncrementalIndicatorEngine(self.strategy_config.indicators)
+        engine = IncrementalIndicatorEngine(self.strategy_config.indicators, max_points=self.max_candles)
         points = []
         for candle in self.candles[name]:
             points.append(engine.update(candle))
         self.indicator_engines[name] = engine
-        if self.max_candles is None:
-            self.indicator_points[name] = points
-        else:
-            self.indicator_points[name] = deque(points, maxlen=self.max_candles)
+        self._point_base_index[name] = 0
+        self.indicator_points[name] = points if self.max_candles is None else deque(points, maxlen=self.max_candles)
+        self._point_index_by_start[name] = {item.start: index for index, item in enumerate(self.indicator_points[name])}
 
     def _resample_from_candle(self, base_candle: Candle) -> list[ProcessResult]:
         """Build compatible higher OHLC bars; never creates ticks or prices."""
@@ -467,6 +540,47 @@ class IncrementalProcessor:
             results.append(self._accept_candle(derived, native=False, evaluate_strategy=False))
         return results
 
+    def _remember_id(self, value: str, values: set[str], order: deque[str]) -> None:
+        if value in values:
+            return
+        values.add(value)
+        order.append(value)
+        if self.max_candles is None:
+            return
+        limit = max(self.max_candles, self.max_candles * max(1, len(self.timeframes)))
+        while len(order) > limit:
+            values.discard(order.popleft())
+
+    def _prune_episodes(self) -> None:
+        if self.max_candles is None or len(self.episodes) <= self.max_candles:
+            return
+        active = [item for item in self.episodes.values() if not getattr(item, "invalidated", False) and not getattr(item, "used", False)]
+        keep_ids = {item.episode_id for item in sorted(active, key=lambda item: item.registered_at)[-self.max_candles:]}
+        ordered = sorted(self.episodes.values(), key=lambda item: item.registered_at)
+        for item in ordered:
+            if len(self.episodes) <= self.max_candles or item.episode_id in keep_ids:
+                continue
+            self.episodes.pop(item.episode_id, None)
+
+    def _add_candle_id(self, candle_id: str | None) -> None:
+        key = str(candle_id) if candle_id is not None else ""
+        self._candle_id_counts[key] = self._candle_id_counts.get(key, 0) + 1
+        self._candle_ids.add(candle_id)
+
+    def _remove_candle_id(self, candle_id: str | None) -> None:
+        key = str(candle_id) if candle_id is not None else ""
+        count = self._candle_id_counts.get(key, 0) - 1
+        if count > 0:
+            self._candle_id_counts[key] = count
+        else:
+            self._candle_id_counts.pop(key, None)
+            self._candle_ids.discard(candle_id)
+
+    def _replace_candle_id(self, old_id: str | None, new_id: str | None) -> None:
+        if old_id != new_id:
+            self._remove_candle_id(old_id)
+            self._add_candle_id(new_id)
+
     def _append_bounded(self, name: str, candle: Candle, point: IndicatorPoint) -> None:
         candles = self.candles[name]
         if self.max_candles is None:
@@ -482,13 +596,17 @@ class IncrementalProcessor:
                 self._candle_by_key[name].pop(logical, None)
                 self._native_candle_keys.discard(logical)
                 self._derived_candle_keys.discard(logical)
-                if evicted.candle_id not in {item.candle_id for item in list(candles)[1:]}:
-                    self._candle_ids.discard(evicted.candle_id)
+                self._remove_candle_id(evicted.candle_id)
                 self._point_index_by_start[name].pop(evicted.start, None)
+                self._point_base_index[name] += 1
             candles.append(candle)
             self.indicator_points[name].append(point)
-            self._point_index_by_start[name] = {item.start: index for index, item in enumerate(self.indicator_points[name])}
         self._candle_by_key[name][self._logical_key(candle)] = candle
+
+    def _append_signal(self, signal: Signal) -> None:
+        if self.max_candles is not None and len(self.signals) >= self.max_candles * max(1, len(self.timeframes)):
+            del self.signals[0]
+        self.signals.append(signal)
 
     def _append_evaluation(self, evaluation: Any) -> None:
         if self.max_candles is not None and len(self.evaluations) >= self.max_candles * max(1, len(self.timeframes)):
@@ -526,7 +644,7 @@ class IncrementalProcessor:
                     if self._logical_key(previous) == logical_key:
                         rows[index] = candle
                         break
-                self._candle_ids.add(candle.candle_id)
+                self._replace_candle_id(existing.candle_id, candle.candle_id)
                 self._native_candle_keys.add(logical_key)
                 self._derived_candle_keys.discard(logical_key)
                 self._candle_by_key[tf_name][logical_key] = candle
@@ -544,7 +662,7 @@ class IncrementalProcessor:
                     if self._logical_key(previous) == logical_key:
                         rows[index] = candle
                         break
-                self._candle_ids.add(candle.candle_id)
+                self._replace_candle_id(existing.candle_id, candle.candle_id)
                 self._native_candle_keys.add(logical_key)
                 self._derived_candle_keys.discard(logical_key)
                 self._candle_by_key[tf_name][logical_key] = candle
@@ -564,18 +682,18 @@ class IncrementalProcessor:
             issue = self._issue("out_of_order_candle", f"Vela fuera de orden en {tf_name}: {candle.start.isoformat()}", record=candle)
             return ProcessResult(False, issues=(issue,))
         self._logical_candle_keys[tf_name].add(logical_key)
-        self._candle_ids.add(candle.candle_id)
+        self._add_candle_id(candle.candle_id)
         (self._native_candle_keys if native else self._derived_candle_keys).add(logical_key)
         self.candles_processed += 1
         point = self.indicator_engines[tf_name].update(candle)
         self._append_bounded(tf_name, candle, point)
-        self._point_index_by_start[tf_name][candle.start] = len(self.indicator_points[tf_name]) - 1
+        self._point_index_by_start[tf_name][candle.start] = self._point_base_index[tf_name] + len(self.indicator_points[tf_name]) - 1
         self.indicator_updates[tf_name] = self.indicator_updates.get(tf_name, 0) + 1
         if tf_name in {self.strategy_config.context_timeframe.name, self.strategy_config.preparation_timeframe.name}:
             self._strategy_dirty = True
         evaluations: tuple[Any, ...] = ()
         signals: tuple[Signal, ...] = ()
-        if evaluate_strategy and tf_name == self.strategy_config.trigger_timeframe.name and candle.closed:
+        if quality_issue is None and evaluate_strategy and tf_name == self.strategy_config.trigger_timeframe.name and candle.closed:
             evaluations, signals = self._evaluate_strategy()
         return ProcessResult(True, candles=(candle,), evaluations=evaluations, signals=signals, pending_simulations=self.pending_simulations, issues=(quality_issue,) if quality_issue is not None else ())
 
@@ -598,7 +716,8 @@ class IncrementalProcessor:
         current = [episode for episode in self.episodes.values() if not episode.invalidated and episode.registered_at <= as_of and episode.expires_at >= as_of]
         if current:
             episode = max(current, key=lambda item: item.registered_at)
-            index = by_start.get(episode.preparation_start)
+            absolute_index = by_start.get(episode.preparation_start)
+            index = (absolute_index - self._point_base_index.get(name, 0)) if absolute_index is not None else None
             if index is not None and index <= latest:
                 first = min(first, max(0, index - lookback))
         return list(range(first, latest + 1))
@@ -673,7 +792,7 @@ class IncrementalProcessor:
             decision_id = _decision_id(evaluation)
             if decision_id in self._decision_ids:
                 continue
-            self._decision_ids.add(decision_id)
+            self._remember_id(decision_id, self._decision_ids, self._decision_order)
             self._append_evaluation(evaluation)
             new_evaluations.append(evaluation)
         # Conservar primero los episodios que el nuevo resultado reobserva;
@@ -686,8 +805,14 @@ class IncrementalProcessor:
         for signal in result.signals:
             if signal.signal_id in self._signal_ids:
                 continue
-            self._signal_ids.add(signal.signal_id)
-            self.signals.append(signal)
+            # The episode state is authoritative across bounded strategy
+            # windows and checkpoints; a new trigger identity cannot reopen
+            # an episode already consumed by an earlier signal.
+            previous_episode = self.episodes.get(signal.episode_id)
+            if previous_episode is not None and previous_episode.used:
+                continue
+            self._remember_id(signal.signal_id, self._signal_ids, self._signal_order)
+            self._append_signal(signal)
             new_signals.append(signal)
             self._simulation_book.add_signal(signal)
             if signal.episode_id in self.episodes:
@@ -697,6 +822,7 @@ class IncrementalProcessor:
         latest = next((item for item in reversed(result.evaluations) if item.stage == "trigger" and item.values.get("context") is not None), None)
         if latest is not None:
             self.context = {"direction": latest.direction, "values": latest.values.get("context"), "timestamp": latest.timestamp}
+        self._prune_episodes()
         return tuple(new_evaluations), tuple(new_signals)
 
     def register_signal(self, signal: Signal) -> tuple[PendingSimulation, ...]:
@@ -713,8 +839,8 @@ class IncrementalProcessor:
             raise ValueError(f"Se esperaba {self.instrument}, llegó {signal.instrument}")
         if signal.signal_id in self._signal_ids:
             return tuple(item for item in self.pending_simulations if item.signal_id == signal.signal_id)
-        self._signal_ids.add(signal.signal_id)
-        self.signals.append(signal)
+        self._remember_id(signal.signal_id, self._signal_ids, self._signal_order)
+        self._append_signal(signal)
         if signal.episode_id in self.episodes:
             self.episodes[signal.episode_id] = replace(self.episodes[signal.episode_id], used=True)
         return self._simulation_book.add_signal(signal)
@@ -732,6 +858,9 @@ class IncrementalProcessor:
             resolution="event",
             closed=True,
             quality=event.quality.status,
+            instrument=event.instrument,
+            observation_id=event.event_id,
+            source_sequence=event.sequence,
         )
         return self._simulation_book.observe(observation, watermark=observation.available_at)
 
@@ -775,6 +904,8 @@ class IncrementalProcessor:
         signals: list[Signal] = []
         issues: list[RuntimeIssue] = []
         aggregation_accepted = True
+        aggregation_blocked = False
+        trigger_closed = False
         aggregation_issue_keys: set[tuple[str, str, str | None]] = set()
         # Contexto primero (M15 > M5 > M1) cuando varias temporalidades
         # cierran al recibir un evento de frontera.
@@ -790,13 +921,19 @@ class IncrementalProcessor:
                 issue = RuntimeIssue(item.code, item.message, item.timestamp, item.record_id)
                 issues.append(issue)
                 self._append_issue(issue)
+                aggregation_blocked = aggregation_blocked or issue.code in _BLOCKING_RUNTIME_ISSUES
             for candle in result.emitted:
-                accepted = self._accept_candle(candle, native=False, evaluate_strategy=evaluate_strategy)
+                accepted = self._accept_candle(candle, native=False, evaluate_strategy=False)
                 if accepted.accepted:
                     emitted.extend(accepted.candles)
-                    evaluations.extend(accepted.evaluations)
-                    signals.extend(accepted.signals)
+                    if candle.timeframe.name == self.strategy_config.trigger_timeframe.name and candle.closed:
+                        trigger_closed = True
                 issues.extend(accepted.issues)
+                aggregation_blocked = aggregation_blocked or any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in accepted.issues)
+        if evaluate_strategy and aggregation_accepted and not aggregation_blocked and trigger_closed:
+            new_evaluations, new_signals = self._evaluate_strategy()
+            evaluations.extend(new_evaluations)
+            signals.extend(new_signals)
         # Un evento que no pudo entrar de forma coherente en todas las
         # temporalidades no puede resolver simulaciones ni contarse como
         # entrada aceptada, aunque se conserve como evidencia capturada.
@@ -846,11 +983,15 @@ class IncrementalProcessor:
         self.last_available_at = available if self.last_available_at is None else max(self.last_available_at, available)
         # Evaluate once, after all same-watermark context/preparation bars have
         # been installed. This is the same order used by event aggregation.
-        if evaluate_strategy and candle.timeframe.name == self.strategy_config.trigger_timeframe.name and candle.closed:
+        if evaluate_strategy and candle.timeframe.name == self.strategy_config.trigger_timeframe.name and candle.closed and not any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in all_issues):
             evaluations, signals = self._evaluate_strategy()
             all_evaluations.extend(evaluations)
             all_signals.extend(signals)
-        obs = PriceObservation(candle.end, max(available, candle.end), candle.close, candle.price_base.value, candle.source, candle.timeframe.name, candle.closed, candle.quality.status)
+        obs = PriceObservation(
+            candle.end, max(available, candle.end), candle.close, candle.price_base.value,
+            candle.source, candle.timeframe.name, candle.closed, candle.quality.status,
+            instrument=candle.instrument, observation_id=candle.candle_id, source_ordinal=self.candles_processed,
+        )
         completed = self._simulation_book.observe(obs, watermark=obs.available_at)
         self.completed_simulations.extend(completed)
         if self.max_candles is not None:
@@ -865,7 +1006,7 @@ class IncrementalProcessor:
     feed_event = process_event
     feed_bar = process_bar
 
-    def finalize(self, watermark: datetime | None = None) -> ProcessResult:
+    def finalize(self, watermark: datetime | None = None, *, evaluate_strategy: bool = True, capture_complete: bool = True) -> ProcessResult:
         """Close active buckets at an explicit watermark; no empty candle is made."""
 
         if watermark is None:
@@ -881,7 +1022,7 @@ class IncrementalProcessor:
         for tf in sorted(self.timeframes, key=lambda item: item.seconds, reverse=True):
             result = self.aggregators[tf.name].close_until(watermark)
             for candle in result.emitted:
-                accepted = self._accept_candle(candle, native=False)
+                accepted = self._accept_candle(candle, native=False, evaluate_strategy=evaluate_strategy)
                 if accepted.accepted:
                     emitted.extend(accepted.candles)
                     evaluations.extend(accepted.evaluations)
@@ -891,7 +1032,7 @@ class IncrementalProcessor:
                 issue = RuntimeIssue(item.code, item.message, item.timestamp, item.record_id)
                 issues.append(issue)
                 self._append_issue(issue)
-        completed = list(self._simulation_book.advance(watermark))
+        completed = list(self._simulation_book.advance(watermark, capture_complete=capture_complete))
         self.completed_simulations.extend(completed)
         if self.max_candles is not None:
             del self.completed_simulations[:-self.max_candles]
@@ -933,6 +1074,7 @@ class IncrementalProcessor:
             aggregator_state[name] = {
                 "closed_through": iso(getattr(aggregator, "_closed_through", None)),
                 "seen_event_ids": sorted(getattr(aggregator, "_seen_event_ids", set())),
+                "seen_event_order": list(getattr(aggregator, "_seen_event_order", ())),
                 "last_event_time": iso(getattr(aggregator, "_last_event_time", None)),
                 "bucket": {
                     "start": iso(bucket.start),
@@ -985,10 +1127,14 @@ class IncrementalProcessor:
             "indicator_engines": {name: _engine_state(engine) for name, engine in self.indicator_engines.items()},
             "evaluations": [evaluation_dict(item) for item in self.evaluations],
             "signals": [signal_dict(item) for item in self.signals],
+            "decision_id_order": list(self._decision_order),
+            "signal_id_order": list(self._signal_order),
             "episodes": [_episode_dict(item) for item in self.episodes.values()],
             "context": {**self.context, "timestamp": iso(self.context.get("timestamp"))} if self.context else None,
             "pending_simulations": [item.to_dict() for item in self.pending_simulations],
             "completed_simulations": [item.to_dict() for item in self.completed_simulations],
+            "completed_simulation_ids": list(self._simulation_book.completed_order),
+            "simulation_observations": [item.to_dict() for item in self._simulation_book.observations],
             "last_event_time": iso(self.last_event_time),
             "last_available_at": iso(self.last_available_at),
             "events_processed": self.events_processed,
@@ -1044,7 +1190,7 @@ class IncrementalProcessor:
                 logical = processor._logical_key(candle)
                 processor._logical_candle_keys[name].add(logical)
                 processor._candle_by_key[name][logical] = candle
-                processor._candle_ids.add(candle.candle_id)
+                processor._add_candle_id(candle.candle_id)
                 processor._processed_candle_starts[name].add(candle.start)
                 processor._point_index_by_start[name][candle.start] = len(processor.candles[name]) - 1
                 (processor._native_candle_keys if not processor._is_derived(candle) else processor._derived_candle_keys).add(logical)
@@ -1078,8 +1224,10 @@ class IncrementalProcessor:
         processor.last_available_at = utc(snapshot.get("last_available_at"))
         processor.evaluations = [evaluation_from_dict(item) for item in snapshot.get("evaluations", ())]
         processor._decision_ids = {_decision_id(item) for item in processor.evaluations}
+        processor._decision_order = deque(str(item) for item in snapshot.get("decision_id_order", processor._decision_ids) if str(item) in processor._decision_ids)
         processor.signals = [signal_from_dict(item) for item in snapshot.get("signals", ())]
         processor._signal_ids = {item.signal_id for item in processor.signals}
+        processor._signal_order = deque(str(item) for item in snapshot.get("signal_id_order", processor._signal_ids) if str(item) in processor._signal_ids)
         processor.episodes = {item.episode_id: item for item in (_episode_from_dict(raw) for raw in snapshot.get("episodes", ())) }
         raw_context = snapshot.get("context")
         if isinstance(raw_context, Mapping):
@@ -1088,6 +1236,12 @@ class IncrementalProcessor:
         processor._simulation_book.pending = {item.simulation_id: item for item in (PendingSimulation.from_dict(raw) for raw in snapshot.get("pending_simulations", ())) }
         processor.completed_simulations = [PendingSimulation.from_dict(raw) for raw in snapshot.get("completed_simulations", ())]
         processor._simulation_book.completed = {item.simulation_id: item for item in processor.completed_simulations}
+        processor._simulation_book.completed_ids = {str(item) for item in snapshot.get("completed_simulation_ids", processor._simulation_book.completed)}
+        processor._simulation_book.completed_ids.update(processor._simulation_book.completed)
+        processor._simulation_book.completed_order = deque(processor._simulation_book.completed_ids)
+        processor._simulation_book.observations = [PriceObservation.from_dict(raw) for raw in snapshot.get("simulation_observations", ())]
+        processor._simulation_book.observations = processor._simulation_book.observations[-processor._simulation_book.max_observations:]
+        processor._simulation_book._observation_ids = {item.identity for item in processor._simulation_book.observations}
         processor.issues = [RuntimeIssue(str(raw.get("code")), str(raw.get("message")), utc(raw.get("timestamp")), raw.get("record_id")) for raw in snapshot.get("issues", ())]
         for name, raw_buckets in dict(snapshot.get("resample_buffers", {})).items():
             if name not in processor._resample_buffers or not isinstance(raw_buckets, Mapping):
@@ -1106,6 +1260,11 @@ class IncrementalProcessor:
             aggregator = processor.aggregators[name]
             aggregator._closed_through = utc(raw.get("closed_through"))
             aggregator._seen_event_ids = set(str(item) for item in raw.get("seen_event_ids", ()))
+            aggregator._seen_event_order.clear()
+            order = [str(item) for item in raw.get("seen_event_order", raw.get("seen_event_ids", ()))]
+            for event_id in order:
+                if event_id in aggregator._seen_event_ids:
+                    aggregator._seen_event_order.append(event_id)
             aggregator._last_event_time = utc(raw.get("last_event_time"))
             bucket_raw = raw.get("bucket")
             if bucket_raw:
@@ -1113,13 +1272,9 @@ class IncrementalProcessor:
                 aggregator._bucket = _bucket_from_dict(bucket_raw, bucket_events)
                 if bucket_events:
                     aggregator._last_order_key = max(aggregator._event_order_key(event) for event in bucket_events)
-        # Reanudar debe considerar cualquier señal previa al checkpoint como
-        # fuente para simulaciones, pero no reinsertarla ni duplicarla.
-        for signal in processor.signals:
-            if signal.signal_id not in {item.signal_id for item in processor._simulation_book.pending.values()}:
-                # add_signal deduplica por simulation_id, por lo que no pisa
-                # los estados restaurados si ya había pending/completed.
-                processor._simulation_book.add_signal(signal)
+        # No se recrean simulaciones a partir de señales históricas: si un
+        # contrato no está en pending ni en el ledger terminal del checkpoint,
+        # la persistencia durable es la autoridad y no se resucita en memoria.
         return processor
 
 
