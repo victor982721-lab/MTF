@@ -403,6 +403,16 @@ class QueryService:
 
     def snapshot(self, session_id: str) -> dict[str, Any]:
         status = self.store.status(session_id)
+        session = self.store.get_session(session_id) or {}
+        session_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
+        ctrader = session_config.get("ctrader") if isinstance(session_config.get("ctrader"), Mapping) else {}
+        execution = session_config.get("execution") if isinstance(session_config.get("execution"), Mapping) else {}
+        status["provider_environment"] = ctrader.get("environment") or session.get("mode")
+        status["provider_account_id"] = ctrader.get("account_id") or None
+        status["provider_symbol"] = ctrader.get("symbol") or session.get("instrument")
+        status["execution_environment"] = execution.get("environment") or None
+        status["execution_destination"] = execution.get("endpoint") or None
+        status["permissions"] = {"scopes": ctrader.get("required_scopes", []), "account_selected": ctrader.get("account_selected", False), "executor_enabled": execution.get("enabled", False)}
         if str(status.get("mode", "")).upper() in {"SYNTHETIC", "REPLAY"}:
             status.setdefault("connection", "OFFLINE")
             status.setdefault("analysis_enabled", False)

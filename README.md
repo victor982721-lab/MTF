@@ -231,3 +231,23 @@ calentamiento y no alimentan señales.
 
 El contrato de integración Kraken se contrastó con la documentación vigente:
 [Trades Spot WebSocket v2](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade), [Candles (OHLC) Spot WebSocket v2](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ohlc) y [Get OHLC Data Spot REST](https://docs.kraken.com/api/docs/rest-api/get-ohlc-data). La documentación confirma que `trade` puede agrupar varias operaciones, que el snapshot refleja las últimas 50, que `ohlc` se actualiza con operaciones y que REST devuelve hasta 720 entradas dejando la última como intervalo no comprometido; el adaptador conserva esas limitaciones en procedencia y no afirma recuperación completa sólo por reconectar.
+
+## Integración cTrader / Forex-CFD (experimental, fail-closed)
+
+La primera integración cTrader está separada del núcleo y usa el SDK oficial opcional `ctrader-open-api` sólo cuando se instala explícitamente. En este host Python 3.14.4 no tiene instalado el SDK ni `google.protobuf`; por ello la ruta real TCP/Protobuf queda pendiente y los fixtures no se presentan como conexión externa.
+
+Perfiles disponibles:
+
+```bash
+./mtf-lab ctrader doctor --config config/ctrader_query.toml
+./mtf-lab ctrader auth-url --config config/ctrader_query.toml
+./mtf-lab ctrader query --fixture
+./mtf-lab ctrader fixture --report /tmp/ctrader-fixture.json
+./mtf-lab cfd-paper --config config/fixture_cfd.toml
+```
+
+`ctrader_query.toml` solicita únicamente `accounts`; `ctrader_demo.toml` requiere además `trading` pero permanece deshabilitado, y ninguna cuenta se selecciona automáticamente. Los tokens se almacenan únicamente mediante referencias externas y un directorio privado fuera del proyecto; no se aceptan secretos en TOML, logs, checkpoints ni ejemplos.
+
+El paper trading CFD es un producto distinto del contrato binario: usa unidades, bid/ask, latencias, spread, comisión, conversión y financiación explícitos, con resultados `PENDING`, `CLOSED` o `UNKNOWN` cuando falta evidencia. El ejecutor demo local requiere cuenta DEMO seleccionada/verificada, endpoint demo, scope `trading` y `activate()` explícito; el fixture nunca contacta un servidor.
+
+La elegibilidad de Pepperstone para México, entidad, tarifas, Open API, almacenamiento y permisos de automatización **no está verificada**. El borrador no enviado está en `docs/pepperstone_ctrader_openapi_draft.md`.

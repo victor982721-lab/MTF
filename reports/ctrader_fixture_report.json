@@ -1,0 +1,263 @@
+{
+  "cfd_paper": {
+    "capture_complete": true,
+    "events": [
+      {
+        "at": "2026-01-01T00:00:00.000000Z",
+        "event": "submitted",
+        "signal_id": "fixture-long-1000",
+        "state": "PENDING",
+        "trade_id": "cfd_3e413c6ff10b1a296728e18f9f219d36"
+      },
+      {
+        "at": "2026-01-01T00:00:00.000000Z",
+        "event": "filled",
+        "price": "1.10020",
+        "quote_id": "fixture-entry",
+        "trade_id": "cfd_3e413c6ff10b1a296728e18f9f219d36"
+      },
+      {
+        "at": "2026-01-01T00:01:00.000000Z",
+        "event": "closed",
+        "quote_id": "fixture-close",
+        "reason": null,
+        "trade_id": "cfd_3e413c6ff10b1a296728e18f9f219d36"
+      }
+    ],
+    "product": "FOREX_CFD_LOCAL_PAPER",
+    "trades": [
+      {
+        "account_currency": "USD",
+        "close_available_at": "2026-01-01T00:01:00.000000Z",
+        "close_market_at": "2026-01-01T00:01:00.000000Z",
+        "close_policy": "first_quote_at_or_after",
+        "close_price": "1.10050",
+        "close_quote_id": "fixture-close",
+        "close_target_at": "2026-01-01T00:01:00.000000Z",
+        "commission_quote": "0",
+        "conversion_rate": null,
+        "costs_account": "0",
+        "decision_at": "2026-01-01T00:00:00.000000Z",
+        "detected_at": "2026-01-01T00:00:00.000000Z",
+        "direction": "LONG",
+        "entry_available_at": "2026-01-01T00:00:00.000000Z",
+        "entry_market_at": "2026-01-01T00:00:00.000000Z",
+        "entry_price": "1.10020",
+        "entry_quote_id": "fixture-entry",
+        "entry_side": "ask",
+        "entry_target_at": "2026-01-01T00:00:00.000000Z",
+        "fill_policy": "first_quote_at_or_after",
+        "financing_quote": "0.000000",
+        "gross_pnl_account": "0.30000",
+        "gross_pnl_quote": "0.30000",
+        "horizon_seconds": "60",
+        "identity": "cfd_3e413c6ff10b1a296728e18f9f219d36",
+        "instrument": "EUR/USD",
+        "lineage": {
+          "close_quote_id": "fixture-close",
+          "close_source": "fixture",
+          "config_hash": "230da72d3d37e0536dff0a972de9258d436c306140a0eb173ddb9cb89e067411",
+          "entry_quote_id": "fixture-entry",
+          "entry_source": "fixture",
+          "parent_signal_id": "fixture-long-1000",
+          "strategy": "offline_fixture"
+        },
+        "net_pnl": "0.30000",
+        "pip_size": "0.0001",
+        "pips": "3.0",
+        "price_precision": 5,
+        "product": "FOREX_CFD_LOCAL_PAPER",
+        "quality": "VALID",
+        "quote_currency": "USD",
+        "reason": null,
+        "signal_available_at": "2026-01-01T00:00:00.000000Z",
+        "signal_id": "fixture-long-1000",
+        "slippage_quote": "0",
+        "state": "CLOSED",
+        "trade_id": "cfd_3e413c6ff10b1a296728e18f9f219d36",
+        "units": "1000"
+      }
+    ]
+  },
+  "demo_executor_fixture": {
+    "execution": {
+      "filled_quantity": 1.0,
+      "fills": [
+        {
+          "fill_id": "demo-order-000001-fill-1",
+          "price": 1.1002,
+          "quantity": 1.0,
+          "timestamp": "2026-01-01T00:00:00.000000Z"
+        }
+      ],
+      "intent": {
+        "account_id": "fixture-demo",
+        "client_order_id": "intent_bdc8d81b399d02380a37dc6eb8d268fc",
+        "created_at": "2026-01-01T00:00:00.000000Z",
+        "intent_id": "intent_bdc8d81b399d02380a37dc6eb8d268fc",
+        "kind": "OPEN",
+        "metadata": {
+          "endpoint": "demo://ctrader",
+          "executor_version": "ctrader-demo-executor-v1",
+          "no_martingale": true,
+          "quote": {
+            "ask": 1.1002,
+            "available_at": "2026-01-01T00:00:00.000000Z",
+            "base_price": "bid_ask",
+            "bid": 1.1,
+            "quality": "VALID",
+            "source": "fixture",
+            "spread": 0.00019999999999997797,
+            "symbol": "EUR/USD",
+            "timestamp": "2026-01-01T00:00:00.000000Z"
+          },
+          "virtual_only": true
+        },
+        "position_id": null,
+        "quantity": 1.0,
+        "requested_price": 1.1002,
+        "side": "BUY",
+        "signal_id": "fixture-demo-signal",
+        "symbol": "EUR/USD"
+      },
+      "order_id": "demo-order-000001",
+      "position_ids": [
+        "demo-position-000001"
+      ],
+      "reconciled": false,
+      "reject_reason": null,
+      "remaining_quantity": 0.0,
+      "state": "FILLED",
+      "unknown_reason": null
+    },
+    "product": "CTRADER_DEMO_EXECUTOR_FIXTURE",
+    "server_contacted": false,
+    "status": {
+      "account_id": "fixture-demo",
+      "active": true,
+      "counts": {
+        "CLOSED": 0,
+        "CLOSE_PARTIAL": 0,
+        "FILLED": 1,
+        "INTENT_RECORDED": 0,
+        "PARTIAL": 0,
+        "REJECTED": 0,
+        "SUBMITTED": 0,
+        "UNKNOWN": 0
+      },
+      "endpoint": "demo://ctrader",
+      "environment": "DEMO",
+      "executor_version": "ctrader-demo-executor-v1",
+      "new_intents_enabled": true,
+      "no_blind_retry": true,
+      "own_positions": [
+        {
+          "account_id": "fixture-demo",
+          "client_order_id": "intent_bdc8d81b399d02380a37dc6eb8d268fc",
+          "entry_price": 1.1002,
+          "notional": 1.1002,
+          "owner": "mtf-lab",
+          "position_id": "demo-position-000001",
+          "quantity": 1.0,
+          "side": "BUY",
+          "symbol": "EUR/USD"
+        }
+      ],
+      "pause_reason": null,
+      "paused": false,
+      "pending_management": 0,
+      "risk_policy": {
+        "activated": false,
+        "allowed_symbols": [],
+        "close_only_own_positions": true,
+        "fixed_quantity": 1.0,
+        "max_exposure": 10000.0,
+        "max_positions": 1,
+        "max_price_age_seconds": 30.0,
+        "max_quantity": 1.0,
+        "max_spread": 0.01,
+        "no_martingale": true,
+        "required_scopes": [
+          "trading"
+        ],
+        "timeout_seconds": 1.0
+      },
+      "virtual_only": true
+    },
+    "virtual_only": true
+  },
+  "limitations": [
+    "cTrader SDK/TCP real no probado: dependencia opcional ausente en este host.",
+    "Pepperstone, aplicación OAuth, cuenta DEMO y permisos no verificados.",
+    "Los precios/órdenes son fixtures sintéticos; no representan fills ni rentabilidad externa."
+  ],
+  "ok": true,
+  "provider": {
+    "bars": 0,
+    "catalog": {
+      "requested_symbol": "EUR/USD",
+      "selected": 99,
+      "symbols": [
+        {
+          "digits": 5,
+          "enabled": null,
+          "name": "EUR/USD",
+          "pip_position": 4,
+          "symbol_id": 99
+        }
+      ]
+    },
+    "credentials_used": false,
+    "history": {
+      "count": 2,
+      "has_more": false,
+      "issues": [],
+      "request": {
+        "client_msg_id": "ctrader-00000006",
+        "is_event": false,
+        "payload": {
+          "count": 2,
+          "ctidTraderAccountId": 7,
+          "fromTimestamp": 1767225600000,
+          "period": 1,
+          "symbolId": 99,
+          "toTimestamp": 1767225720000
+        },
+        "payload_type": "PROTO_OA_GET_TRENDBARS_REQ",
+        "payload_type_id": 2137
+      },
+      "response_type": "PROTO_OA_GET_TRENDBARS_RES",
+      "symbol": {
+        "digits": 5,
+        "periods": {
+          "M1": 1,
+          "M15": 7,
+          "M5": 5
+        },
+        "pip_position": 4,
+        "price_scale": 100000,
+        "symbol": "EUR/USD",
+        "symbol_id": 99
+      },
+      "timeframe": "M1"
+    },
+    "name": "ctrader_open_api",
+    "network_performed": false,
+    "quote_events": 1,
+    "status": {
+      "action": "",
+      "auth": "AUTHENTICATED",
+      "connection": "CONNECTED",
+      "dependency": "AVAILABLE",
+      "dropped_messages": 0,
+      "heartbeat_count": 0,
+      "last_error": null,
+      "last_event_at": null,
+      "last_message_at": null,
+      "needs_reconciliation": false,
+      "pending_requests": 0,
+      "queue_size": 0,
+      "reconnect_attempt": 0
+    }
+  }
+}

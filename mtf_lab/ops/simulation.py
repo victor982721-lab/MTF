@@ -634,16 +634,19 @@ class DirectionalEvaluator:
         entry_time = entry.use_time
         expiry = (entry_time if self.spec.horizon_from == "entry" else detected) + timedelta(seconds=horizon)
         assumptions.update({"target_expiry_ts": iso_ts(expiry), "effective_entry_ts": iso_ts(entry_time), "entry_market_ts": iso_ts(entry.point.timestamp), "entry_point_id": entry.point.identity})
-        # A prefix that has not reached the declared expiry cannot make a
-        # before-observation terminal, even if an early candidate is present.
-        if not complete and (as_of is None or parse_ts(as_of) < expiry):
-            return self._result(
-                sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None,
-                simulation_type=simulation_type, horizon=horizon, direction=direction,
-                detected=detected, expiry=expiry, entry=entry, final=None,
-                outcome=Outcome.PENDING, reason="FINAL_PRICE_NOT_YET_DUE",
-                assumptions=assumptions, net=None,
-            )
+        # An open capture cannot terminalize a last-before result until the
+        # expiry plus grace period. A first-after result becomes terminal as
+        # soon as an eligible post-expiry observation is actually available.
+        if not complete and self.spec.exit_rule == "last_observation_at_or_before":
+            final_deadline = expiry + timedelta(seconds=self.spec.max_price_age_seconds)
+            if as_of is None or parse_ts(as_of) < final_deadline:
+                return self._result(
+                    sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None,
+                    simulation_type=simulation_type, horizon=horizon, direction=direction,
+                    detected=detected, expiry=expiry, entry=entry, final=None,
+                    outcome=Outcome.PENDING, reason="FINAL_PRICE_NOT_YET_DUE",
+                    assumptions=assumptions, net=None,
+                )
         # No se permite liquidar contra la misma observación ni contra una
         # marca de mercado anterior a la entrada efectiva.
         final_as_of = as_of

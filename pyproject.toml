@@ -9,6 +9,10 @@ description = "Plataforma local determinista de investigación cuantitativa y si
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+# Optional official Spotware SDK; normal MTF Lab operation remains stdlib/offline.
+ctrader = ["ctrader-open-api"]
+
 [project.scripts]
 mtf-lab = "mtf_lab.ops.cli:main"
 

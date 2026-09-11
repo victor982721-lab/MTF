@@ -6,7 +6,7 @@ quedan incluidos en el hash efectivo.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from datetime import UTC, datetime
 import hashlib
 import json
@@ -145,6 +145,10 @@ class EffectiveConfig:
     data: Mapping[str, Any]
     provider: Mapping[str, Any]
     ui: Mapping[str, Any]
+    ctrader: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    execution: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    cfd: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    ctrader_oauth: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
     @property
     def config_hash(self) -> str:
@@ -179,6 +183,10 @@ class EffectiveConfig:
             "data": dict(self.data),
             "provider": dict(self.provider),
             "ui": dict(self.ui),
+            "ctrader": dict(self.ctrader),
+            "execution": dict(self.execution),
+            "cfd": dict(self.cfd),
+            "ctrader_oauth": dict(self.ctrader_oauth),
         }
         if include_hash:
             result["config_hash"] = self.config_hash
@@ -230,7 +238,7 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
         raise ConfigError(f"no se pudo leer TOML {target}: {exc}") from exc
     if not isinstance(raw, Mapping):
         raise ConfigError("el TOML debe ser una tabla")
-    top_allowed = {"project", "storage", "data", "instrument", "timeframes", "indicators", "strategy", "quality", "simulation", "provider", "ui"}
+    top_allowed = {"project", "storage", "data", "instrument", "timeframes", "indicators", "strategy", "quality", "simulation", "provider", "ui", "ctrader", "ctrader_oauth", "execution", "cfd"}
     unknown_top = sorted(set(raw) - top_allowed)
     if unknown_top:
         raise ConfigError(f"claves raíz desconocidas: {unknown_top}")
@@ -243,18 +251,23 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
     strategy_section = _section(raw, "strategy", {"name", "context_timeframe", "preparation_timeframe", "trigger_timeframe", "setup_timeframe", "context_lookback", "preparation_lookback", "lookback", "max_distance_atr", "setup_max_atr", "rsi_threshold", "preparation_ttl_bars", "preparation_ttl_minutes", "require_closed", "one_signal_per_episode", "optional_filters", "indicators", "timeframes", "lookbacks", "conditions", "mode"})
     quality_section = _section(raw, "quality", {"max_feed_age_seconds", "max_closed_candle_age_seconds", "max_gap_minutes", "require_warmup"})
     sim_section = _section(raw, "simulation", {"horizons_seconds", "horizons_minutes", "entry_latency_seconds", "entry_rule", "exit_rule", "horizon_from", "stake", "max_price_age_seconds", "payout_net", "net_payout", "loss_amount", "tie_net", "tie_return", "costs", "tie_tolerance", "requested_base_price", "require_closed"})
-    provider = _section(raw, "provider", {"name", "rest_url", "websocket_url", "rest_max_records", "exclude_last_uncommitted", "trade_channel", "ohlc_channel"})
+    provider = _section(raw, "provider", {"name", "rest_url", "websocket_url", "rest_max_records", "exclude_last_uncommitted", "trade_channel", "ohlc_channel", "environment", "protocol", "endpoint", "account_id", "symbol", "historical_rate_limit", "request_rate_limit"})
+    ctrader = _section(raw, "ctrader", {"enabled", "operation_mode", "environment", "required_scopes", "account_id", "account_selected", "token_ref", "token_store_dir", "protocol", "host", "port", "endpoint", "symbol", "redirect_uri", "scope", "client_id_env", "client_secret_env", "token_path", "request_rate_limit", "historical_rate_limit", "heartbeat_seconds", "max_queue", "max_reconnects", "reconnect_backoff_seconds", "allow_network", "provider"})
+    ctrader_oauth = _section(raw, "ctrader_oauth", {"client_id_env", "client_secret_env", "redirect_uri", "authorization_url", "token_url"})
+    execution = _section(raw, "execution", {"enabled", "environment", "endpoint", "account_id", "scope", "activation_required", "max_quantity", "fixed_quantity", "max_exposure", "max_positions", "max_spread", "max_price_age_seconds", "allowed_symbols", "paused", "transport", "token_ref", "close_only_own_positions", "no_martingale", "timeout_seconds"})
+    cfd = _section(raw, "cfd", {"instrument", "account_currency", "default_quantity", "quantity_unit", "units", "commission", "commission_currency", "commission_fixed", "commission_per_unit", "slippage", "slippage_pips", "financing", "financing_required", "financing_rate_per_second", "conversion_rate", "fill_policy", "close_policy", "horizons_seconds", "entry_latency_seconds", "decision_latency_seconds", "close_latency_seconds", "max_spread", "max_quote_age_seconds", "max_price_age_seconds", "market_calendar", "pip_size", "price_precision", "digits", "lot_size", "min_quantity", "max_quantity", "step_quantity"})
     provider.setdefault("name", "kraken_public")
-    provider.setdefault("rest_url", "https://api.kraken.com/0/public/OHLC")
-    provider.setdefault("websocket_url", "wss://ws.kraken.com/v2")
-    provider.setdefault("rest_max_records", 720)
-    provider.setdefault("exclude_last_uncommitted", True)
-    provider.setdefault("trade_channel", True); provider.setdefault("ohlc_channel", True)
+    if not str(provider.get("name", "")).lower().startswith(("ctrader", "fixture")):
+        provider.setdefault("rest_url", "https://api.kraken.com/0/public/OHLC")
+        provider.setdefault("websocket_url", "wss://ws.kraken.com/v2")
+        provider.setdefault("rest_max_records", 720)
+        provider.setdefault("exclude_last_uncommitted", True)
+        provider.setdefault("trade_channel", True); provider.setdefault("ohlc_channel", True)
     ui = _section(raw, "ui", {"host", "port"})
     ui.setdefault("host", "127.0.0.1"); ui.setdefault("port", 8765)
     if not isinstance(provider.get("name"), str) or not str(provider.get("name")).strip():
         raise ConfigError("provider.name debe ser texto no vacío")
-    if isinstance(provider.get("rest_max_records"), bool) or not isinstance(provider.get("rest_max_records"), int) or int(provider.get("rest_max_records")) < 1:
+    if provider.get("rest_max_records") is not None and (isinstance(provider.get("rest_max_records"), bool) or not isinstance(provider.get("rest_max_records"), int) or int(provider.get("rest_max_records")) < 1):
         raise ConfigError("provider.rest_max_records debe ser entero positivo")
     if isinstance(ui.get("port"), bool) or not isinstance(ui.get("port"), int) or not 1 <= int(ui.get("port")) <= 65535:
         raise ConfigError("ui.port debe estar entre 1 y 65535")
@@ -358,6 +371,6 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
     data_effective.setdefault("resolution", timeframes[0].name)
     data_effective.setdefault("price_base", price_base)
     data_effective.setdefault("mode", mode)
-    return EffectiveConfig(str(target.resolve()), project_name, version, mode, str(symbol).strip(), price_base, timeframes, bool(tf_section.get("closed_only", True)), indicators, strategy, quality, simulation, str(db), str(logs), MappingProxyType(data_effective), MappingProxyType(dict(provider)), MappingProxyType(dict(ui)))
+    return EffectiveConfig(str(target.resolve()), project_name, version, mode, str(symbol).strip(), price_base, timeframes, bool(tf_section.get("closed_only", True)), indicators, strategy, quality, simulation, str(db), str(logs), MappingProxyType(data_effective), MappingProxyType(dict(provider)), MappingProxyType(dict(ui)), MappingProxyType(dict(ctrader)), MappingProxyType(dict(execution)), MappingProxyType(dict(cfd)), MappingProxyType(dict(ctrader_oauth)))
 
 __all__ = ["ConfigError", "EffectiveConfig", "QualityConfig", "SimulationConfig", "load_config", "normalize_simulation_mapping"]

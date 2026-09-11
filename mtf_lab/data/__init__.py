@@ -57,6 +57,18 @@ from .kraken import (
     normalize_pair,
 )
 
+from .ctrader import (
+    AuthState, CancellationToken, CTraderAuthError, CTraderClient, CTraderCodec,
+    CTraderConfig, CTraderConfigurationError, CTraderDataError, CTraderDependencyError,
+    CTraderError, CTraderFetchResult, CTraderHistoryResult, CTraderMarketCalendar, CTraderSessionWindow, CTraderInstrumentSpec, CTraderNormalizationResult,
+    CTraderProtocolError, CTraderProvider, CTraderRateLimiter, CTraderRequestCancelled, CTraderRequestTimeout,
+    CTraderStatus, CTraderSymbol, CTraderTransport, CTraderTransportError, ConnectionState,
+    DependencyReport, DependencyState, DeterministicTransport, PAYLOAD, PAYLOAD_NAMES,
+    SdkProtobufCodec, SymbolCatalog, TREND_PERIODS, TcpTlsTransport, WireMessage,
+    dependency_report, normalize_spot_event, normalize_symbol_name, normalize_trendbar,
+    synthetic_spot_event, synthetic_trendbar,
+)
+
 __all__ = [
     "Bar",
     "MarketDataProvider",
@@ -102,6 +114,16 @@ __all__ = [
     "normalize_pair",
     "parse_timestamp",
     "provider_name",
+    "AuthState", "CancellationToken", "CTraderAuthError", "CTraderClient",
+    "CTraderCodec", "CTraderConfig", "CTraderConfigurationError", "CTraderDataError",
+    "CTraderDependencyError", "CTraderError", "CTraderFetchResult", "CTraderHistoryResult", "CTraderMarketCalendar", "CTraderSessionWindow",
+    "CTraderInstrumentSpec", "CTraderNormalizationResult", "CTraderProtocolError",
+    "CTraderProvider", "CTraderRateLimiter", "CTraderRequestCancelled", "CTraderRequestTimeout",
+    "CTraderStatus", "CTraderSymbol", "CTraderTransport", "CTraderTransportError",
+    "ConnectionState", "DependencyReport", "DependencyState", "DeterministicTransport",
+    "PAYLOAD", "PAYLOAD_NAMES", "SdkProtobufCodec", "SymbolCatalog", "TREND_PERIODS",
+    "TcpTlsTransport", "WireMessage", "dependency_report", "normalize_spot_event",
+    "normalize_symbol_name", "normalize_trendbar", "synthetic_spot_event", "synthetic_trendbar",
     "resolution_name",
     "resolution_to_seconds",
 ]
