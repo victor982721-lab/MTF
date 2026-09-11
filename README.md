@@ -234,20 +234,35 @@ El contrato de integración Kraken se contrastó con la documentación vigente:
 
 ## Integración cTrader / Forex-CFD (experimental, fail-closed)
 
-La primera integración cTrader está separada del núcleo y usa el SDK oficial opcional `ctrader-open-api` sólo cuando se instala explícitamente. En este host Python 3.14.4 no tiene instalado el SDK ni `google.protobuf`; por ello la ruta real TCP/Protobuf queda pendiente y los fixtures no se presentan como conexión externa.
+La primera integración cTrader está separada del núcleo y usa el SDK oficial opcional
+`ctrader-open-api` sólo cuando se instala explícitamente. En el entorno del proyecto
+Python 3.14.4 se comprobó `ctrader-open-api 0.9.2`, `google.protobuf 3.20.1`,
+Twisted 24.3.0, pyOpenSSL 24.1.0 y `service-identity 24.2.0`; `pip check` no
+reportó conflictos. Las versiones completas y transitivas comprobadas están en
+`requirements-ctrader.lock`. El codec Protobuf real (incluido heartbeat con envelope) y
+la serialización local se validaron sin credenciales. La sonda DNS/TCP/TLS de `demo.ctraderapi.com:5035` se ejecutó el 2026-09-10 con TLSv1.3; no autenticó ninguna cuenta. La conexión de sesión contra una cuenta y las operaciones externas permanecen pendientes de autorización.
 
-Perfiles disponibles:
+Perfiles y recorridos disponibles:
 
 ```bash
 ./mtf-lab ctrader doctor --config config/ctrader_query.toml
+./mtf-lab ctrader doctor --config config/ctrader_query.toml --network  # sólo DNS/TCP/TLS DEMO
 ./mtf-lab ctrader auth-url --config config/ctrader_query.toml
+./mtf-lab ctrader callback-listen --config config/ctrader_query.toml --attempt-id ID --open-browser
+./mtf-lab ctrader token-exchange --config config/ctrader_query.toml --attempt-id ID --callback-file /ruta/callback-0600
 ./mtf-lab ctrader query --fixture
 ./mtf-lab ctrader fixture --report /tmp/ctrader-fixture.json
-./mtf-lab cfd-paper --config config/fixture_cfd.toml
+./mtf-lab cfd-paper --config config/ctrader_pipeline_fixture.toml --db /tmp/mtf-paper.sqlite3
 ```
 
-`ctrader_query.toml` solicita únicamente `accounts`; `ctrader_demo.toml` requiere además `trading` pero permanece deshabilitado, y ninguna cuenta se selecciona automáticamente. Los tokens se almacenan únicamente mediante referencias externas y un directorio privado fuera del proyecto; no se aceptan secretos en TOML, logs, checkpoints ni ejemplos.
+`auth-url` guarda un intento loopback reanudable fuera del árbol del proyecto y
+abre el navegador sólo con `--open-browser`. Para intercambiar un callback real,
+entréguelo por un archivo local 0600 o stdin; no se acepta el código en un
+argumento visible. `token-exchange --fixture` y `token-refresh --fixture` usan
+stores temporales y nunca tocan el store real.
 
-El paper trading CFD es un producto distinto del contrato binario: usa unidades, bid/ask, latencias, spread, comisión, conversión y financiación explícitos, con resultados `PENDING`, `CLOSED` o `UNKNOWN` cuando falta evidencia. El ejecutor demo local requiere cuenta DEMO seleccionada/verificada, endpoint demo, scope `trading` y `activate()` explícito; el fixture nunca contacta un servidor.
+`ctrader_query.toml` solicita únicamente `accounts`; `ctrader_demo.toml` requiere además `trading` pero permanece deshabilitado, y ninguna cuenta se selecciona automáticamente. El flujo de consulta separa conexión, autenticación de aplicación, descubrimiento de cuentas, validación DEMO y autorización de cuenta. Los tokens se almacenan únicamente mediante referencias externas y un directorio privado fuera del proyecto; no se aceptan secretos en TOML, logs, checkpoints ni ejemplos.
+
+El paper trading CFD es un producto distinto del contrato binario: usa unidades, bid/ask, latencias, spread, comisión, conversión y financiación explícitos, con resultados `PENDING`, `CLOSED` o `UNKNOWN` cuando falta evidencia. El ejecutor demo local requiere cuenta DEMO seleccionada/verificada, endpoint demo, scope `trading` y `activate()` explícito. `CTraderDemoTransport` adapta mensajes Protobuf oficiales de órdenes, cierres, fills y reconciliación, pero recibe un gateway SDK inyectado y nunca abre red/OAuth por sí solo. Su ruta externa exige `ServerAccountObservation` producida por el servidor; `verified=true` de una entrada local no basta. El fixture nunca contacta un servidor.
 
 La elegibilidad de Pepperstone para México, entidad, tarifas, Open API, almacenamiento y permisos de automatización **no está verificada**. El borrador no enviado está en `docs/pepperstone_ctrader_openapi_draft.md`.

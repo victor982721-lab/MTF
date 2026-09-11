@@ -11,7 +11,7 @@ dependencies = []
 
 [project.optional-dependencies]
 # Optional official Spotware SDK; normal MTF Lab operation remains stdlib/offline.
-ctrader = ["ctrader-open-api"]
+ctrader = ["ctrader-open-api", "service-identity"]
 
 [project.scripts]
 mtf-lab = "mtf_lab.ops.cli:main"

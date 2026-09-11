@@ -316,6 +316,7 @@ def event_dict(event: MarketEvent) -> dict[str, Any]:
         "quantity": event.quantity,
         "bid": event.bid,
         "ask": event.ask,
+        "mid": event.selected_price if event.price_base is PriceBase.MID else None,
         "received_at": iso(event.received_at),
         "available_at": iso(event.available_at),
         "source": event.source,

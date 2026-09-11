@@ -4,9 +4,10 @@ from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 from typing import Any
-from ..data.ctrader import CTraderClient, CTraderConfig, CTraderProvider, DeterministicTransport, PAYLOAD, WireMessage, synthetic_spot_event, synthetic_trendbar
+from ..data.ctrader import CTraderClient, CTraderConfig, CTraderProvider, DeterministicTransport, PAYLOAD, WireMessage, dependency_report, synthetic_spot_event, synthetic_trendbar
 from .cfd_simulation import CFDConfig, CFDSimulator, known_fixture_eurusd_long
-from .ctrader_executor import CTraderDemoExecutor, DemoAccount, DemoTransport, ExecutionPolicy, Quote
+from .ctrader_executor import CTraderDemoExecutor, DemoAccount, DemoTransport, ExecutionIntent, ExecutionPolicy, Quote, Side
+from .ctrader_demo_transport import CTraderDemoTransport, CTraderDemoTransportConfig, ServerAccountObservation, load_official_proto
 
 def _handler(request: WireMessage) -> WireMessage:
     if request.payload_type_id == PAYLOAD["PROTO_OA_SYMBOLS_LIST_REQ"]:
@@ -19,6 +20,67 @@ def _handler(request: WireMessage) -> WireMessage:
     if request.payload_type_id == PAYLOAD["PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ"]:
         return WireMessage("PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_RES", {}, request.client_msg_id)
     return WireMessage("PROTO_ERROR_RES", {"errorCode": "UNSUPPORTED_FIXTURE_REQUEST"}, request.client_msg_id)
+
+def _official_demo_probe(start: datetime) -> dict[str, Any]:
+    """Exercise message construction with the installed official descriptors."""
+
+    report = dependency_report()
+    result: dict[str, Any] = {
+        "endpoint": "demo.ctraderapi.com:5035",
+        "network_performed": False,
+        "credentials_used": False,
+        "sdk_state": report.sdk_state.value,
+        "codec_operational": report.codec_operational,
+    }
+    if not report.codec_operational:
+        result["state"] = "SDK_UNAVAILABLE"
+        result["next_action"] = "Instale el extra oficial en .venv antes de validar mensajes Protobuf reales."
+        return result
+
+    class NoopGateway:
+        def send(self, message, **kwargs):
+            raise AssertionError("el probe oficial no debe enviar mensajes")
+
+    try:
+        account = DemoAccount(
+            "7", "DEMO", "demo.ctraderapi.com:5035", frozenset({"trading"}),
+            selected=True, verified=True,
+        )
+        transport = CTraderDemoTransport(
+            account,
+            client=NoopGateway(),
+            proto=load_official_proto(),
+            symbol_ids={"EUR/USD": 99},
+            config=CTraderDemoTransportConfig(),
+            clock=lambda: start,
+            server_observation=ServerAccountObservation(
+                "7", "DEMO", "demo.ctraderapi.com:5035",
+                frozenset({"trading"}), start, source="fixture-server",
+            ),
+        )
+        intent = ExecutionIntent(
+            "fixture-official-intent", "fixture-official-signal", "EUR/USD",
+            Side.BUY, 1.0, 1.1002, start, "7",
+        )
+        message = transport.build_new_order(intent)
+        result.update({
+            "state": "MESSAGE_CONSTRUCTION_OK",
+            "message_type": type(message).__name__,
+            "payload_fields": {
+                "ctidTraderAccountId": int(message.ctidTraderAccountId),
+                "symbolId": int(message.symbolId),
+                "volume": int(message.volume),
+                "clientOrderId": str(message.clientOrderId),
+            },
+        })
+    except Exception as exc:
+        result.update({
+            "state": "MESSAGE_CONSTRUCTION_ERROR",
+            "error": type(exc).__name__,
+            "next_action": "Revise los descriptores instalados; no se abrió red.",
+        })
+    return result
+
 
 def run_ctrader_fixture(report_path: str | Path | None = None) -> dict[str, Any]:
     start = datetime(2026, 1, 1, tzinfo=UTC)
@@ -39,10 +101,17 @@ def run_ctrader_fixture(report_path: str | Path | None = None) -> dict[str, Any]
     executor.activate()
     execution = executor.submit_signal({"signal_id": "fixture-demo-signal", "instrument": "EUR/USD", "direction": "UP", "mode": "DEMO"}, Quote("EUR/USD", 1.1000, 1.1002, start, available_at=start, source="fixture"))
     provider_status = provider.status.to_dict()
+    official_probe = _official_demo_probe(start)
+    dep = dependency_report()
+    limitation_sdk = (
+        "Codec/SDK cTrader instalado y serialización local comprobada; TCP/TLS/OAuth real no probado."
+        if dep.codec_operational
+        else "SDK/codec cTrader no disponible en el intérprete de esta corrida; TCP/TLS/OAuth real no probado."
+    )
     # Receipt-time telemetry is intentionally omitted from the reproducible
     # fixture artifact; source timestamps remain fixed in the records.
     provider_status["last_message_at"] = None
-    result: dict[str, Any] = {"ok": True, "provider": {"name": provider.name, "status": provider_status, "catalog": catalog.to_dict(), "history": history.to_dict(), "quote_events": len(quote_result.quote_events), "bars": len(quote_result.bars), "network_performed": False, "credentials_used": False}, "cfd_paper": {"product": "FOREX_CFD_LOCAL_PAPER", "capture_complete": cfd_result.capture_complete, "trades": [item.to_dict() for item in cfd_result.trades], "events": list(cfd_result.events)}, "demo_executor_fixture": {"product": "CTRADER_DEMO_EXECUTOR_FIXTURE", "virtual_only": True, "server_contacted": False, "execution": execution.to_dict(), "status": executor.status()}, "limitations": ["cTrader SDK/TCP real no probado: dependencia opcional ausente en este host.", "Pepperstone, aplicación OAuth, cuenta DEMO y permisos no verificados.", "Los precios/órdenes son fixtures sintéticos; no representan fills ni rentabilidad externa."]}
+    result: dict[str, Any] = {"ok": True, "provider": {"name": provider.name, "status": provider_status, "catalog": catalog.to_dict(), "history": history.to_dict(), "quote_events": len(quote_result.quote_events), "bars": len(quote_result.bars), "network_performed": False, "credentials_used": False}, "cfd_paper": {"product": "FOREX_CFD_LOCAL_PAPER", "capture_complete": cfd_result.capture_complete, "trades": [item.to_dict() for item in cfd_result.trades], "events": list(cfd_result.events)}, "demo_executor_fixture": {"product": "CTRADER_DEMO_EXECUTOR_FIXTURE", "virtual_only": True, "server_contacted": False, "execution": execution.to_dict(), "status": executor.status()}, "official_demo_adapter": official_probe, "limitations": [limitation_sdk, "Pepperstone, aplicación OAuth, cuenta DEMO y permisos no verificados.", "Los precios/órdenes son fixtures sintéticos; no representan fills ni rentabilidad externa."]}
     if report_path is not None:
         target = Path(report_path).expanduser(); target.parent.mkdir(parents=True, exist_ok=True); target.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8"); result["report_path"] = str(target)
     client.close()

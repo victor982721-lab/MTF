@@ -11,12 +11,15 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .ctrader_activation import (
+    AccountDiscovery,
     ActivationProfile,
     BrokerAccount,
     OAuthAppConfig,
     TokenMetadata,
+    build_authorization_url,
     evaluate_activation,
-    select_demo_account,
+    record_account_discovery,
+    select_discovered_demo_account,
 )
 
 
@@ -60,20 +63,45 @@ def status_command(
     }
 
 
+def account_discovery_command(
+    token_metadata: TokenMetadata,
+    accounts: Sequence[BrokerAccount | Mapping[str, Any]],
+    *,
+    observed_at: datetime | None = None,
+    permission_scope: str | int | None = None,
+) -> AccountDiscovery:
+    """Normalize an account inventory observed by the caller; perform no I/O."""
+
+    return record_account_discovery(
+        token_metadata,
+        accounts,
+        observed_at=observed_at,
+        permission_scope=permission_scope,
+    )
+
+
 def select_account_command(
     config: Mapping[str, Any],
-    accounts: Sequence[BrokerAccount | Mapping[str, Any]],
+    discovery: AccountDiscovery,
     *,
     account_id: str,
     environment: str,
 ) -> dict[str, Any]:
-    """Validate an explicit selection and return the TOML patch; write nothing."""
+    """Validate selection from a prior discovery snapshot and write nothing."""
 
+    if not isinstance(discovery, AccountDiscovery):
+        raise ValueError("se requiere AccountDiscovery observado antes de seleccionar")
     profile, _ = _sections(config)
-    selected = select_demo_account(accounts, account_id, environment=environment)
+    selected = select_discovered_demo_account(
+        discovery,
+        account_id,
+        environment=environment,
+        token_ref=profile.token_ref,
+    )
     return {
         "accepted": True,
         "network_performed": False,
+        "discovery": discovery.redacted(),
         "selected_account": selected.redacted(),
         "config_patch": {
             "ctrader": {
@@ -84,6 +112,32 @@ def select_account_command(
             }
         },
         "next_action": "Revisa el parche y persístelo explícitamente; no se modificó ningún archivo.",
+    }
+
+
+def authorization_start_command(
+    config: Mapping[str, Any],
+    *,
+    client_id: str,
+    state: str,
+    requested_scopes: Sequence[str],
+) -> dict[str, Any]:
+    """Build an authorization handoff; never opens a browser."""
+
+    profile, app = _sections(config)
+    scopes = tuple(str(scope).strip().lower() for scope in requested_scopes)
+    if not scopes or not frozenset(scopes).issubset(profile.required_scopes):
+        raise ValueError("requested_scopes debe ser un único scope permitido por el perfil efectivo")
+    return {
+        "authorization_url": build_authorization_url(
+            app,
+            client_id=client_id,
+            scope=scopes,
+            state=state,
+        ),
+        "browser_opened": False,
+        "requested_scopes": sorted(scopes),
+        "next_action": "Abre la URL manualmente o usa la API con allow_browser=True explícito.",
     }
 
 
@@ -110,4 +164,10 @@ def token_rotation_plan_command(
     }
 
 
-__all__ = ["select_account_command", "status_command", "token_rotation_plan_command"]
+__all__ = [
+    "account_discovery_command",
+    "authorization_start_command",
+    "select_account_command",
+    "status_command",
+    "token_rotation_plan_command",
+]

@@ -1,0 +1,76 @@
+[project]
+name = "MTF Lab cTrader pipeline fixture"
+version = "0.2.0"
+mode = "replay"
+
+[instrument]
+symbol = "EUR/USD"
+price_base = "mid"
+
+[timeframes]
+base = "1m"
+values = ["1m", "5m", "15m"]
+closed_only = true
+
+[provider]
+name = "fixture_cfd"
+
+[data]
+provider = "fixture_cfd"
+instrument = "EUR/USD"
+resolution = "1m"
+source = "fixture local; no es cotización ni rentabilidad real"
+price_base = "mid"
+mode = "replay"
+
+[indicators]
+ema_fast = 2
+ema_slow = 3
+rsi_period = 2
+atr_period = 2
+wilder = true
+
+[strategy]
+name = "trend_pullback_v1"
+context_timeframe = "15m"
+setup_timeframe = "5m"
+trigger_timeframe = "1m"
+context_lookback = 1
+preparation_lookback = 3
+max_distance_atr = 2.0
+rsi_threshold = 50.0
+preparation_ttl_bars = 2
+one_signal_per_episode = true
+
+[quality]
+max_feed_age_seconds = 90
+max_closed_candle_age_seconds = 900
+max_gap_minutes = 3
+require_warmup = true
+
+[simulation]
+horizons_minutes = [1, 3, 5]
+entry_latency_seconds = 5
+entry_rule = "first_observation_at_or_after"
+exit_rule = "last_observation_at_or_before"
+max_price_age_seconds = 90
+stake = 1.0
+net_payout = 0.80
+tie_return = 0.0
+costs = 0.0
+
+
+[cfd]
+instrument = "EUR/USD"
+units = "1000"
+pip_size = "0.0001"
+price_precision = 5
+horizons_seconds = [60, 180, 300]
+account_currency = "USD"
+fill_policy = "first_quote_at_or_after"
+close_policy = "first_quote_at_or_after"
+commission_fixed = "0"
+commission_per_unit = "0"
+slippage_pips = "0"
+financing_required = false
+max_quote_age_seconds = 90

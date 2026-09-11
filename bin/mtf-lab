@@ -2,4 +2,6 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-exec "${PYTHON:-python3}" -m mtf_lab "$@"
+PY_BIN="${PYTHON:-$ROOT/.venv/bin/python}"
+if [[ ! -x "$PY_BIN" ]]; then PY_BIN="python3"; fi
+exec "$PY_BIN" -m mtf_lab "$@"

@@ -1,0 +1,27 @@
+# Captured from the validated MTF Lab .venv (Python 3.14.4).
+# The official Spotware distribution pins the first five dependencies.
+ctrader-open-api==0.9.2
+Twisted==24.3.0
+inputimeout==1.0.4
+protobuf==3.20.1
+pyOpenSSL==24.1.0
+requests==2.32.3
+
+# Transitive TLS/runtime pins observed with the SDK extra.
+service-identity==24.2.0
+cryptography==42.0.8
+cffi==2.1.1
+pycparser==3.0
+attrs==26.1.0
+Automat==25.4.16
+constantly==23.10.4
+hyperlink==21.0.0
+Incremental==24.11.0
+typing-extensions==4.16.0
+zope-interface==8.6
+pyasn1==0.6.4
+pyasn1-modules==0.4.2
+certifi==2026.7.22
+charset-normalizer==3.5.1
+idna==3.19
+urllib3==2.7.0

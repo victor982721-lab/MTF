@@ -15,3 +15,5 @@ logs/
 /data/*.sqlite3
 /data/*.db
 /data/*.jsonl
+
+*.egg-info/

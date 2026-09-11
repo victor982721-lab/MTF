@@ -187,10 +187,25 @@
     "virtual_only": true
   },
   "limitations": [
-    "cTrader SDK/TCP real no probado: dependencia opcional ausente en este host.",
+    "Codec/SDK cTrader instalado y serialización local comprobada; TCP/TLS/OAuth real no probado.",
     "Pepperstone, aplicación OAuth, cuenta DEMO y permisos no verificados.",
     "Los precios/órdenes son fixtures sintéticos; no representan fills ni rentabilidad externa."
   ],
+  "official_demo_adapter": {
+    "codec_operational": true,
+    "credentials_used": false,
+    "endpoint": "demo.ctraderapi.com:5035",
+    "message_type": "ProtoOANewOrderReq",
+    "network_performed": false,
+    "payload_fields": {
+      "clientOrderId": "fixture-official-intent",
+      "ctidTraderAccountId": 7,
+      "symbolId": 99,
+      "volume": 100
+    },
+    "sdk_state": "AVAILABLE",
+    "state": "MESSAGE_CONSTRUCTION_OK"
+  },
   "ok": true,
   "provider": {
     "bars": 0,
@@ -201,6 +216,12 @@
         {
           "digits": 5,
           "enabled": null,
+          "metadata": {
+            "digits": 5,
+            "pipPosition": 4,
+            "symbolId": 99,
+            "symbolName": "EUR/USD"
+          },
           "name": "EUR/USD",
           "pip_position": 4,
           "symbol_id": 99

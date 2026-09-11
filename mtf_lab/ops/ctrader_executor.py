@@ -593,15 +593,34 @@ def verify_demo_account(account: DemoAccount | Mapping[str, Any], *, required_sc
 
 
 class CTraderDemoExecutor:
-    """Fail-closed virtual/demo executor; never routes a REAL order."""
+    """Fail-closed DEMO executor; fixture and official gateways stay separate."""
 
     VERSION = "ctrader-demo-executor-v1"
 
-    def __init__(self, account: DemoAccount | Mapping[str, Any], *, policy: ExecutionPolicy | None = None, transport: ExecutionTransport | None = None, intent_store: IntentStore | None = None, clock: Callable[[], datetime] | None = None):
+    def __init__(self, account: DemoAccount | Mapping[str, Any], *, policy: ExecutionPolicy | None = None, transport: ExecutionTransport | None = None, intent_store: IntentStore | None = None, clock: Callable[[], datetime] | None = None, server_observation: Any | None = None):
         # Precheck REAL using the raw mapping before constructing any transport.
         raw_environment = str(account.get("environment", account.get("mode", "")) if isinstance(account, Mapping) else getattr(account, "environment", "")).strip().upper()
         if "REAL" in raw_environment or "LIVE" in raw_environment or raw_environment in {"PRODUCTION", "PAPER_LIVE"}:
             raise RealAccountForbidden("REAL/LIVE account execution is forbidden by the demo executor")
+        if transport is not None and not isinstance(transport, DemoTransport) and server_observation is None:
+            raise DemoAccountRequired("external transport requires ServerAccountObservation")
+        if server_observation is not None:
+            # An external executor may derive verified=True only from the
+            # normalized server proof object, never from a caller flag.
+            from .ctrader_demo_transport import ServerAccountObservation
+            if not isinstance(server_observation, ServerAccountObservation):
+                raise DemoAccountRequired("server_observation must be a normalized ServerAccountObservation")
+            account_obj = account if isinstance(account, DemoAccount) else DemoAccount.from_mapping(account)
+            if server_observation.account_id != account_obj.account_id or server_observation.environment != account_obj.environment or server_observation.endpoint != account_obj.endpoint:
+                raise DemoAccountRequired("server observation does not match selected account")
+            observed_scopes = set(server_observation.scopes)
+            if "scope_trade" in observed_scopes or "trade" in observed_scopes:
+                observed_scopes.add("trading")
+            account = dataclasses.replace(
+                account_obj,
+                verified=True,
+                scopes=frozenset(set(account_obj.scopes) | observed_scopes),
+            )
         self.policy = policy or ExecutionPolicy()
         self.account = verify_demo_account(account, required_scopes=self.policy.required_scopes)
         self.transport = transport or DemoTransport(account_id=self.account.account_id, endpoint=self.account.endpoint, scopes=self.account.scopes, clock=clock)
@@ -617,6 +636,7 @@ class CTraderDemoExecutor:
         if missing: raise ScopeRejected(f"transport missing required scopes: {sorted(missing)}")
         self.intent_store: IntentStore = intent_store or MemoryIntentStore()
         self.clock = clock or (lambda: datetime.now(UTC))
+        self._virtual_only = isinstance(self.transport, DemoTransport)
         self._active = False
         self._paused = False
         self._pause_reason: str | None = None
@@ -706,7 +726,7 @@ class CTraderDemoExecutor:
         nonce = f"{signal_id}|{self.account.account_id}|{symbol}|{side.value}|{kind}|{position_id or ''}"
         intent_id = "intent_" + hashlib.sha256(nonce.encode()).hexdigest()[:32]
         if intent_id in self._intents or intent_id in self._results: raise DuplicateIntent(f"intent already exists: {intent_id}")
-        return ExecutionIntent(intent_id, signal_id, symbol, side, q, quote.price_for(side), _parse_time(self.clock()), self.account.account_id, kind, position_id, {"executor_version": self.VERSION, "endpoint": self.account.endpoint, "quote": quote.to_dict(), "no_martingale": self.policy.no_martingale, "virtual_only": True})
+        return ExecutionIntent(intent_id, signal_id, symbol, side, q, quote.price_for(side), _parse_time(self.clock()), self.account.account_id, kind, position_id, {"executor_version": self.VERSION, "endpoint": self.account.endpoint, "quote": quote.to_dict(), "no_martingale": self.policy.no_martingale, "virtual_only": self._virtual_only})
 
     def submit_signal(self, signal: Any, quote: Quote | Mapping[str, Any], *, quantity: float | None = None) -> OrderResult:
         with self._lock:
@@ -801,7 +821,7 @@ class CTraderDemoExecutor:
         with self._lock:
             counts: MutableMapping[str, int] = {state.value: 0 for state in OrderState}
             for result in self._results.values(): counts[result.state.value] = counts.get(result.state.value, 0) + 1
-            return {"executor_version": self.VERSION, "environment": self.account.environment, "endpoint": self.account.endpoint, "account_id": self.account.account_id, "active": self._active, "paused": self._paused, "pause_reason": self._pause_reason, "new_intents_enabled": self._active and not self._paused, "virtual_only": True, "counts": dict(counts), "pending_management": sum(counts.get(state.value, 0) for state in (OrderState.UNKNOWN, OrderState.PARTIAL, OrderState.CLOSE_PARTIAL, OrderState.SUBMITTED)), "own_positions": [position.to_dict() for position in self._own_positions()], "risk_policy": self.policy.to_dict(), "no_blind_retry": True}
+            return {"executor_version": self.VERSION, "environment": self.account.environment, "endpoint": self.account.endpoint, "account_id": self.account.account_id, "active": self._active, "paused": self._paused, "pause_reason": self._pause_reason, "new_intents_enabled": self._active and not self._paused, "virtual_only": self._virtual_only, "counts": dict(counts), "pending_management": sum(counts.get(state.value, 0) for state in (OrderState.UNKNOWN, OrderState.PARTIAL, OrderState.CLOSE_PARTIAL, OrderState.SUBMITTED)), "own_positions": [position.to_dict() for position in self._own_positions()], "risk_policy": self.policy.to_dict(), "no_blind_retry": True}
 
 
 # Friendly aliases for a future adapter registry.

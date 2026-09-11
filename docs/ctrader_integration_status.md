@@ -1,14 +1,17 @@
 # Estado de integración cTrader/Forex-CFD
 
-Fecha de revisión: 2026-09-10. Checkout local: `8e3de714` como base; esta iteración aún no se ha publicado.
+Fecha de revisión: 2026-09-10. Checkout local sobre `f88f070`; esta iteración queda lista para publicar tras la validación final.
 
 ## Comprobado localmente
 
-- Python: 3.14.4.
-- `ctrader_open_api`, `google.protobuf`, Twisted y pyOpenSSL: no instalados en este host; no se instalaron automáticamente.
-- Fixtures cTrader Protobuf, normalización de símbolos, escalas de trendbars, cotizaciones bid/ask, correlación, timeout/cancelación, heartbeat, cola acotada y reconexión: probados offline.
+- Python: 3.14.4 en `.venv`.
+- Extra oficial instalado y comprobado en `.venv`: `ctrader-open-api 0.9.2`, `protobuf 3.20.1`, Twisted 24.3.0, pyOpenSSL 24.1.0, cryptography 42.0.8 y service-identity 24.2.0; `pip check` OK. El lock reproducible está en requirements-ctrader.lock.
+- Codec Protobuf real, clases generadas, envelope/heartbeat, framing incremental, correlación, timeout/cancelación, heartbeat, cola acotada y reconexión: probados sin credenciales.
+- El diagnóstico distingue `MISSING`, `UNIMPORTABLE`, codec operativo y perfil pendiente; `ctrader doctor --network` es una sonda DNS/TCP/TLS explícita y no autentica cuentas.
+- Sonda externa acotada 2026-09-10: `demo.ctraderapi.com:5035` DNS/TCP/TLS OK (TLSv1.3); no OAuth ni cuenta autorizada.
 - Paper CFD: probados LONG/SHORT, ask/bid, latencias, spread, comisión, conversión/financiación desconocida y horizontes independientes.
-- Ejecutor demo: probado únicamente con `DemoTransport`, sin red ni credenciales; REAL/LIVE se rechaza y `activate()` es obligatorio.
+- Ejecutor demo: `DemoTransport` local y adaptación `CTraderDemoTransport` con mensajes Protobuf oficiales, gateway inyectado y ServerAccountObservation explícita; sin red/OAuth en pruebas, REAL/LIVE se rechaza y `activate()` es obligatorio.
+- Pipeline cTrader → RuntimeCoordinator → CFD PAPER → SQLite v3/UI: probado con fixture sintético con señales auténticas y stores temporales.
 
 ## Contrato oficial usado
 
@@ -21,10 +24,9 @@ Fuentes: [Open API](https://help.ctrader.com/open-api/), [endpoints](https://hel
 
 ## Pendiente de activación humana/externa
 
-- Registrar y obtener aprobación de la aplicación cTrader.
-- Configurar `CTRADER_CLIENT_ID` y `CTRADER_CLIENT_SECRET` fuera del repositorio.
-- Ejecutar OAuth local y seleccionar explícitamente un `ctidTraderAccountId` observado como DEMO.
+- Registrar/aprobar la aplicación cTrader y configurar `CTRADER_CLIENT_ID`/`CTRADER_CLIENT_SECRET` fuera del repositorio.
+- Ejecutar OAuth local con callback protegido y seleccionar explícitamente un `ctidTraderAccountId` observado como DEMO.
 - Confirmar Pepperstone, entidad aplicable a México, tarifas, permisos de almacenamiento histórico y automatización DEMO.
-- Instalar/probar el extra oficial del SDK en un entorno aislado y verificar TCP/TLS contra una cuenta DEMO autorizada.
+- Crear el gateway SDK/Twisted síncrono autorizado y verificar TCP/TLS contra una cuenta DEMO; ninguna instalación, doctor o fixture envía operaciones.
 
 Nada de lo anterior se infiere de los fixtures. No existe una verificación externa de Pepperstone ni se enviaron operaciones.

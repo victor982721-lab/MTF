@@ -9,11 +9,15 @@ from __future__ import annotations
 import argparse
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import importlib
 import json
 import os
+import socket
+import ssl
 import sys
+import tempfile
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -853,6 +857,157 @@ def _ctrader_activation_payload(config: EffectiveConfig) -> dict[str, Any]:
     return {"ctrader": dict(config.ctrader), "ctrader_oauth": dict(config.ctrader_oauth)}
 
 
+def _selection_state_path(config: EffectiveConfig) -> Path:
+    from .ctrader_activation import ActivationProfile, SecureTokenStore
+
+    profile = ActivationProfile.from_mapping(dict(config.ctrader))
+    return SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT).root / "selection.json"
+
+
+def _discovery_state_path(config: EffectiveConfig) -> Path:
+    return _selection_state_path(config).with_name("account-discovery.json")
+
+
+def _secret_free(value: Any) -> Any:
+    forbidden = {"access_token", "accesstoken", "refresh_token", "refreshtoken", "client_secret", "clientsecret", "password"}
+    if isinstance(value, Mapping):
+        return {
+            str(key): _secret_free(item)
+            for key, item in value.items()
+            if str(key).lower() not in forbidden
+        }
+    if isinstance(value, (list, tuple)):
+        return [_secret_free(item) for item in value]
+    return value
+
+
+def _persist_discovery(config: EffectiveConfig, *, token_ref: str, observed: Mapping[str, Any], observed_at: datetime | None = None) -> Path:
+    """Persist private account metadata (never access/refresh tokens) atomically."""
+
+    from .ctrader_activation import SecureTokenStore
+
+    guard = SecureTokenStore(_discovery_state_path(config).parent, project_root=PROJECT_ROOT)
+    guard._prepare()
+    target = guard.root / "account-discovery.json"
+    temporary = guard.root / f".account-discovery.{os.getpid()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        raw_records = observed.get("records", ()) if isinstance(observed, Mapping) else ()
+        payload = {
+            "version": 1,
+            "source": "ctrader-open-api",
+            "token_ref": str(token_ref),
+            "observed_at": (observed_at or datetime.now(UTC)).astimezone(UTC).isoformat().replace("+00:00", "Z"),
+            "permissionScope": observed.get("permissionScope") if isinstance(observed, Mapping) else None,
+            "accounts": [_secret_free(dict(item)) for item in raw_records if isinstance(item, Mapping)],
+        }
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        os.chmod(target, 0o600)
+        directory_fd = os.open(guard.root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def _load_persisted_selection(config: EffectiveConfig) -> dict[str, Any] | None:
+    """Read the explicit account selection from the private external store."""
+
+    try:
+        profile_token_ref = str(config.ctrader.get("token_ref", ""))
+        path = _selection_state_path(config)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            if (os.fstat(fd).st_mode & 0o777) != 0o600:
+                return None
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                raw = json.load(handle)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if not isinstance(raw, Mapping) or raw.get("version") != 1:
+            return None
+        if str(raw.get("token_ref", "")) != profile_token_ref:
+            return None
+        if str(raw.get("environment", "")).upper() != "DEMO":
+            return None
+        account_id = str(raw.get("account_id", "")).strip()
+        if not account_id:
+            return None
+        return {"account_id": account_id, "account_selected": True, "environment": "DEMO"}
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _activation_payload_with_selection(config: EffectiveConfig) -> dict[str, Any]:
+    payload = _ctrader_activation_payload(config)
+    selected = _load_persisted_selection(config)
+    if selected and not bool(payload["ctrader"].get("account_selected", False)):
+        payload["ctrader"].update(selected)
+    return payload
+
+
+def _persist_selection(
+    config: EffectiveConfig,
+    *,
+    account_id: str,
+    token_ref: str,
+    observed_at: datetime | None = None,
+) -> Path:
+    """Persist only the explicit DEMO selection atomically outside the repo."""
+
+    from .ctrader_activation import SecureTokenStore
+
+    guard = SecureTokenStore(_selection_state_path(config).parent, project_root=PROJECT_ROOT)
+    guard._prepare()
+    target = guard.root / "selection.json"
+    temporary = guard.root / f".selection.{os.getpid()}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temporary, flags, 0o600)
+    try:
+        payload = {
+            "version": 1,
+            "token_ref": str(token_ref),
+            "account_id": str(account_id),
+            "environment": "DEMO",
+            "observed_at": (observed_at or datetime.now(UTC)).astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        }
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        os.chmod(target, 0o600)
+        directory_fd = os.open(guard.root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
 def _ctrader_config(config: EffectiveConfig):
     """Map the profile section to the provider's strict, secret-free config."""
     from ..data.ctrader import CTraderConfig
@@ -889,119 +1044,636 @@ def _token_metadata_for_config(config: EffectiveConfig):
         return None
 
 
+def _check_ctrader_connectivity(config: EffectiveConfig, *, timeout: float) -> dict[str, Any]:
+    """Perform an explicitly requested, bounded DNS/TCP/TLS probe only."""
+
+    provider_config = _ctrader_config(config)
+    host = str(provider_config.host)
+    port = int(provider_config.port)
+    result: dict[str, Any] = {
+        "requested": True,
+        "endpoint": f"{host}:{port}",
+        "dns": "NOT_CHECKED",
+        "tcp": "NOT_CHECKED",
+        "tls": "NOT_CHECKED",
+        "account_authorized": False,
+    }
+    addresses = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    result["dns"] = "OK"
+    result["address_count"] = len(addresses)
+    raw = socket.create_connection((host, port), timeout=float(timeout))
+    result["tcp"] = "OK"
+    context = ssl.create_default_context()
+    try:
+        tls = context.wrap_socket(raw, server_hostname=host)
+        try:
+            result["tls"] = "OK"
+            result["tls_version"] = tls.version()
+        finally:
+            tls.close()
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+    result["note"] = "TLS de transporte solamente; no prueba OAuth, cuenta ni permisos."
+    return result
+
+
 def cmd_ctrader_doctor(args: argparse.Namespace) -> int:
     from ..data.ctrader import dependency_report
     from .ctrader_commands import status_command
+
     config = _config_for(args)
     report = dependency_report()
-    output: dict[str, Any] = {"ok": True, "provider": "ctrader_open_api", "dependency": report.to_dict(), "config_path": config.path, "network_performed": False, "browser_opened": False}
+    output: dict[str, Any] = {
+        "ok": True,
+        "diagnostic_ok": True,
+        "provider": "ctrader_open_api",
+        "dependency": report.to_dict(),
+        "config_path": config.path,
+        "network_performed": False,
+        "browser_opened": False,
+        "connector_available": report.available,
+        "connector_usable": False,
+        "configuration_pending": False,
+        "account_authorized": False,
+        "connectivity": {"requested": False, "state": "NOT_CHECKED", "account_authorized": False},
+    }
     if config.ctrader and config.ctrader_oauth:
         try:
-            output["activation"] = status_command(_ctrader_activation_payload(config), token_metadata=_token_metadata_for_config(config), present_env_keys=set(os.environ), accounts=(), now=datetime.now(UTC))
+            activation = status_command(
+                _activation_payload_with_selection(config),
+                token_metadata=_token_metadata_for_config(config),
+                present_env_keys=set(os.environ),
+                accounts=(),
+                now=datetime.now(UTC),
+            )
+            output["activation"] = activation
+            state = str(activation["status"]["state"])
+            output["configuration_pending"] = state in {
+                "APP_CREDENTIALS_REQUIRED",
+                "ACCOUNTS_SCOPE_REQUIRED",
+                "TOKEN_REFERENCE_REQUIRED",
+                "TOKEN_EXPIRED",
+            }
         except Exception as exc:
             output["activation"] = {"state": "INVALID_PROFILE", "ready": False, "next_action": "Corrija el perfil cTrader; no se modificó nada.", "error": type(exc).__name__}
+            output["diagnostic_ok"] = False
     else:
         output["activation"] = {"state": "NOT_CONFIGURED", "ready": False, "next_action": "Use config/ctrader_query.toml o registre la aplicación; no se abrió navegador."}
+        output["configuration_pending"] = True
+    if getattr(args, "network", False):
+        output["network_performed"] = True
+        try:
+            output["connectivity"] = _check_ctrader_connectivity(config, timeout=float(getattr(args, "timeout", 5.0)))
+        except Exception as exc:
+            output["connectivity"] = {
+                "requested": True,
+                "state": "ERROR",
+                "account_authorized": False,
+                "error": f"{type(exc).__name__}: {exc}",
+                "note": "No se probó OAuth ni una cuenta; revise DNS/TCP/TLS.",
+            }
+            output["diagnostic_ok"] = False
+    output["connector_usable"] = bool(
+        report.available
+        and isinstance(output.get("activation"), Mapping)
+        and output["activation"].get("status", {}).get("ready", False)
+        and output["connectivity"].get("tls") == "OK"
+    )
+    # `ok` means the diagnostic completed; connector availability and account
+    # authorization are intentionally separate facts.
+    output["ok"] = bool(output["diagnostic_ok"])
+    print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+    return 0 if output["diagnostic_ok"] else 2
+
+
+def cmd_ctrader_auth_url(args: argparse.Namespace) -> int:
+    from .ctrader_activation import (
+        ActivationProfile,
+        LoopbackOAuthAssistant,
+        OAuthAppConfig,
+        OAuthAttemptStore,
+        SecureTokenStore,
+    )
+
+    config = _config_for(args)
+    if not config.ctrader_oauth or not config.ctrader:
+        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "next_action": "Seleccione un perfil cTrader completo.", "browser_opened": False}, ensure_ascii=False, indent=2))
+        return 2
+    app = OAuthAppConfig.from_mapping(dict(config.ctrader_oauth))
+    profile = ActivationProfile.from_mapping(dict(config.ctrader))
+    if not profile.enabled:
+        print(json.dumps({"ok": False, "state": "DISABLED", "network_performed": False, "browser_opened": False, "next_action": "Habilite explícitamente el perfil antes de iniciar OAuth."}, ensure_ascii=False, indent=2))
+        return 2
+    requested_scope = str(getattr(args, "scope", "") or ("trading" if profile.operation_mode.value == "DEMO" else "accounts")).strip().lower()
+    if requested_scope not in profile.required_scopes:
+        print(json.dumps({"ok": False, "state": "SCOPE_NOT_ALLOWED", "network_performed": False, "browser_opened": False, "next_action": "Solicite sólo un scope permitido por el perfil y autorícelo en una fase separada."}, ensure_ascii=False, indent=2))
+        return 2
+    client_id = os.environ.get(app.client_id_env, "")
+    if not client_id:
+        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "missing": [app.client_id_env], "next_action": "Defina client_id localmente; nunca lo guarde en TOML.", "browser_opened": False}, ensure_ascii=False, indent=2))
+        return 2
+    tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+    attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+    assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
+    attempt = assistant.begin(
+        client_id=client_id,
+        requested_scopes=[requested_scope],
+        open_browser=False,
+    )
+    handoff = assistant.resume_authorization(
+        attempt.attempt_id,
+        reveal_url=True,
+        open_browser=bool(getattr(args, "open_browser", False)),
+    )
+    output = {
+        "ok": True,
+        "attempt": attempt.to_public_dict(),
+        "authorization_url": handoff["authorization_url"],
+        "browser_opened": handoff["browser_opened"],
+        "network_performed": False,
+        "requested_scope": requested_scope,
+        "next_action": "Complete OAuth y ejecute callback-listen/token-exchange; accounts y trading se autorizan en fases separadas.",
+    }
     print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
-def cmd_ctrader_auth_url(args: argparse.Namespace) -> int:
-    from .ctrader_activation import OAuthAppConfig, build_authorization_url
+def cmd_ctrader_callback_listen(args: argparse.Namespace) -> int:
+    """Receive one OAuth callback through the registered local loopback server."""
+
+    from .ctrader_activation import ActivationProfile, LoopbackOAuthAssistant, OAuthAppConfig, OAuthAttemptStore, SecureTokenStore
+
     config = _config_for(args)
-    if not config.ctrader_oauth:
-        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "next_action": "Seleccione un perfil cTrader con [ctrader_oauth].", "browser_opened": False}, ensure_ascii=False, indent=2))
+    if not config.ctrader_oauth or not config.ctrader:
+        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "network_performed": False}, ensure_ascii=False, indent=2))
+        return 2
+    if not getattr(args, "attempt_id", None):
+        print(json.dumps({"ok": False, "state": "CALLBACK_REQUIRED", "network_performed": False, "next_action": "Proporcione --attempt-id devuelto por auth-url."}, ensure_ascii=False, indent=2))
         return 2
     app = OAuthAppConfig.from_mapping(dict(config.ctrader_oauth))
-    env_name = str(config.ctrader_oauth.get("client_id_env", ""))
-    client_id = os.environ.get(env_name, "")
-    if not client_id:
-        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "missing": [env_name], "next_action": "Defina client_id localmente; nunca lo guarde en TOML.", "browser_opened": False}, ensure_ascii=False, indent=2))
+    profile = ActivationProfile.from_mapping(dict(config.ctrader))
+    try:
+        tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+        attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+        assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
+        attempt = assistant.listen_callback(
+            args.attempt_id,
+            open_browser=bool(getattr(args, "open_browser", False)),
+            timeout_seconds=float(getattr(args, "timeout", 600.0)),
+        )
+    except Exception as exc:
+        print(json.dumps({"ok": False, "state": type(exc).__name__, "network_performed": False, "next_action": "No se recibió un callback válido; reanude el intento sin exponer el código.", "error": str(exc)}, ensure_ascii=False, indent=2))
         return 2
-    url = build_authorization_url(app, client_id=client_id, scope=" ".join(str(x) for x in config.ctrader.get("required_scopes", ["accounts"])), state=getattr(args, "state", None))
-    print(json.dumps({"ok": True, "authorization_url": url, "browser_opened": False, "next_action": "Abra esta URL manualmente y devuelva el callback por la URI loopback registrada; el código expira rápidamente."}, ensure_ascii=False, indent=2))
+    print(json.dumps({"ok": True, "attempt": attempt.to_public_dict(), "network_performed": False, "browser_opened": bool(getattr(args, "open_browser", False)), "next_action": "Ejecute token-exchange --attempt-id para intercambiar el código persistido; no se imprimió el código."}, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
+def _fixture_oauth_response(*, refreshed: bool = False):
+    suffix = "refreshed" if refreshed else "exchange"
+    return {
+        "accessToken": f"fixture-access-{suffix}",
+        "refreshToken": f"fixture-refresh-{suffix}",
+        "expiresIn": 3600,
+        "tokenType": "bearer",
+    }
+
+
+def _oauth_http_request(url: str, params: Mapping[str, str], timeout: float) -> Mapping[str, Any]:
+    """POST form data to the validated OAuth endpoint without echoing secrets."""
+
+    encoded = urllib.parse.urlencode(dict(params)).encode("utf-8")
+    request = urllib.request.Request(
+        str(url),
+        data=encoded,
+        method="POST",
+        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=float(timeout)) as response:
+            body = response.read(128 * 1024)
+    except Exception as exc:
+        raise RuntimeError("solicitud OAuth falló; revise conectividad y estado de la aplicación") from exc
+    try:
+        parsed = json.loads(body.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError("respuesta OAuth no es JSON válido") from exc
+    if not isinstance(parsed, Mapping):
+        raise RuntimeError("respuesta OAuth no es un objeto")
+    return parsed
+
+
+def _read_callback_input(args: argparse.Namespace) -> str:
+    """Read a callback URI from protected local input, never a process arg."""
+
+    callback_file = getattr(args, "callback_file", None)
+    use_stdin = bool(getattr(args, "callback_stdin", False))
+    if bool(callback_file) == use_stdin:
+        raise ValueError("proporcione exactamente --callback-file (0600) o --callback-stdin")
+    if use_stdin:
+        value = sys.stdin.read(16_384)
+    else:
+        path = Path(callback_file).expanduser()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise ValueError("no se pudo abrir callback-file de forma segura") from exc
+        try:
+            info = os.fstat(fd)
+            mode = info.st_mode & 0o777
+            if mode != 0o600 or info.st_uid != os.getuid():
+                raise ValueError("callback-file debe ser privado, del usuario actual y tener permisos exactos 0600")
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                value = handle.read(16_384)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+    value = value.strip()
+    if not value or len(value) > 16_384:
+        raise ValueError("callback local vacío o demasiado grande")
+    return value
+
+
 def cmd_ctrader_token_exchange(args: argparse.Namespace) -> int:
-    from .ctrader_activation import OAuthAppConfig, ActivationProfile, SecureTokenStore, exchange_authorization_code, parse_callback_uri
+    from .ctrader_activation import (
+        ActivationProfile,
+        LoopbackOAuthAssistant,
+        OAuthAppConfig,
+        OAuthAttemptPhase,
+        OAuthAttemptStore,
+        SecureTokenStore,
+    )
+
     config = _config_for(args)
     if not config.ctrader_oauth or not config.ctrader:
-        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "network_performed": False}, ensure_ascii=False, indent=2)); return 2
+        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "network_performed": False}, ensure_ascii=False, indent=2))
+        return 2
     app = OAuthAppConfig.from_mapping(dict(config.ctrader_oauth))
     profile = ActivationProfile.from_mapping(dict(config.ctrader))
+    if getattr(args, "fixture", False):
+        with tempfile.TemporaryDirectory(prefix="mtf-lab-ctrader-fixture-") as tmp:
+            fixture_root = Path(tmp)
+            tokens = SecureTokenStore.for_fixture(fixture_root / "tokens", project_root=PROJECT_ROOT)
+            attempts = OAuthAttemptStore.for_fixture(fixture_root / "attempts", project_root=PROJECT_ROOT)
+            assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens, fixture_mode=True)
+            fixture_scope = ("trading",) if "trading" in profile.required_scopes else ("accounts",)
+            attempt = assistant.begin(
+                client_id="fixture-client",
+                requested_scopes=fixture_scope,
+            )
+            callback = f"{app.redirect_uri}?code=fixture-code&state={attempt.csrf_state}"
+            assistant.receive_callback(attempt.attempt_id, callback)
+            metadata = assistant.exchange(
+                attempt.attempt_id,
+                client_id="fixture-client",
+                client_secret="fixture-runtime-only",
+                token_ref=profile.token_ref,
+                observed_scopes=profile.required_scopes,
+                requester=lambda url, params, timeout: _fixture_oauth_response(),
+            )
+            output = {
+                "ok": True,
+                "fixture": True,
+                "network_performed": False,
+                "token": metadata.to_dict(),
+                "secrets": "REDACTED",
+                "real_token_store_touched": False,
+            }
+        output["fixture_store_removed"] = not fixture_root.exists()
+        print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        return 0
+    if not getattr(args, "attempt_id", None):
+        print(json.dumps({"ok": False, "state": "CALLBACK_REQUIRED", "network_performed": False, "next_action": "Use auth-url y entregue --attempt-id más --callback-file 0600 o --callback-stdin; no pase el código como argumento."}, ensure_ascii=False, indent=2))
+        return 2
+    if getattr(args, "callback_uri", None):
+        print(json.dumps({"ok": False, "state": "CALLBACK_INPUT_UNSAFE", "network_performed": False, "next_action": "No pase el callback con código en argumentos; use --callback-file 0600 o --callback-stdin."}, ensure_ascii=False, indent=2))
+        return 2
     client_id = os.environ.get(app.client_id_env, "")
     client_secret = os.environ.get(app.client_secret_env, "")
     if not client_id or not client_secret:
-        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "next_action": "Defina variables de entorno locales; no se imprimen secretos."}, ensure_ascii=False, indent=2)); return 2
-    code = parse_callback_uri(args.callback_uri, registered_uri=app.redirect_uri, expected_state=args.state)
-    requester = (lambda url, params, timeout: {"accessToken": "fixture-access", "refreshToken": "fixture-refresh", "expiresIn": 3600, "tokenType": "bearer"}) if args.fixture else None
+        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "network_performed": False, "next_action": "Defina las variables locales de aplicación; no se guardaron secretos."}, ensure_ascii=False, indent=2))
+        return 2
+    network_performed = False
     try:
-        payload = exchange_authorization_code(app, client_id=client_id, client_secret=client_secret, code=code, requester=requester)
-        store = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
-        metadata = store.rotate(profile.token_ref, access_token=payload.access_token, refresh_token=payload.refresh_token, granted_scopes=profile.required_scopes, expires_at=datetime.now(UTC) + timedelta(seconds=payload.expires_in))
+        tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+        attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+        assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
+        pending_attempt = attempts.load(args.attempt_id)
+        if pending_attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
+            callback_uri = _read_callback_input(args)
+            assistant.receive_callback(args.attempt_id, callback_uri)
+        network_performed = True
+        metadata = assistant.exchange(
+            args.attempt_id,
+            client_id=client_id,
+            client_secret=client_secret,
+            token_ref=profile.token_ref,
+            observed_scopes=None,
+            requester=_oauth_http_request,
+        )
     except Exception as exc:
-        print(json.dumps({"ok": False, "state": type(exc).__name__, "next_action": "No se guardó un token incompleto; revise aplicación/redirect/código.", "network_performed": not bool(args.fixture)}, ensure_ascii=False, indent=2)); return 2
-    print(json.dumps({"ok": True, "network_performed": not bool(args.fixture), "token": metadata.to_dict(), "secrets": "REDACTED"}, ensure_ascii=False, indent=2, default=str)); return 0
+        print(json.dumps({"ok": False, "state": type(exc).__name__, "network_performed": network_performed, "next_action": "No se guardó un token incompleto; revise callback, aplicación y código vigente.", "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 2
+    finally:
+        client_secret = ""
+    print(json.dumps({"ok": True, "network_performed": network_performed, "token": metadata.to_dict(), "secrets": "REDACTED", "next_action": "Descubra las cuentas autorizadas antes de seleccionar una cuenta DEMO."}, ensure_ascii=False, indent=2, default=str))
+    return 0
 
 
 def cmd_ctrader_token_refresh(args: argparse.Namespace) -> int:
-    from .ctrader_activation import OAuthAppConfig, ActivationProfile, SecureTokenStore, refresh_access_token
+    from .ctrader_activation import (
+        ActivationProfile,
+        LoopbackOAuthAssistant,
+        OAuthAppConfig,
+        OAuthAttemptStore,
+        SecureTokenStore,
+    )
+
     config = _config_for(args)
     app = OAuthAppConfig.from_mapping(dict(config.ctrader_oauth))
     profile = ActivationProfile.from_mapping(dict(config.ctrader))
+    if getattr(args, "fixture", False):
+        with tempfile.TemporaryDirectory(prefix="mtf-lab-ctrader-fixture-") as tmp:
+            fixture_root = Path(tmp)
+            tokens = SecureTokenStore.for_fixture(fixture_root / "tokens", project_root=PROJECT_ROOT)
+            attempts = OAuthAttemptStore.for_fixture(fixture_root / "attempts", project_root=PROJECT_ROOT)
+            tokens.rotate(
+                profile.token_ref,
+                access_token="fixture-access-before-refresh",
+                refresh_token="fixture-refresh-before-refresh",
+                granted_scopes=profile.required_scopes,
+                expires_at=datetime.now(UTC) + timedelta(minutes=5),
+                fixture_payload=True,
+            )
+            assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens, fixture_mode=True)
+            metadata = assistant.refresh(
+                profile.token_ref,
+                client_id="fixture-client",
+                client_secret="fixture-runtime-only",
+                observed_scopes=profile.required_scopes,
+                requester=lambda url, params, timeout: _fixture_oauth_response(refreshed=True),
+            )
+            output = {
+                "ok": True,
+                "fixture": True,
+                "network_performed": False,
+                "token": metadata.to_dict(),
+                "secrets": "REDACTED",
+                "real_token_store_touched": False,
+            }
+        output["fixture_store_removed"] = not fixture_root.exists()
+        print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+        return 0
     client_id = os.environ.get(app.client_id_env, "")
     client_secret = os.environ.get(app.client_secret_env, "")
+    if not client_id or not client_secret:
+        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "network_performed": False, "next_action": "Defina las variables locales de aplicación; no se guardaron secretos."}, ensure_ascii=False, indent=2))
+        return 2
+    network_performed = False
     try:
-        store = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
-        lease = store.read(profile.token_ref)
-        if not client_id or not client_secret:
-            raise RuntimeError("faltan credenciales de aplicación en variables de entorno")
-        requester = (lambda url, params, timeout: {"accessToken": "fixture-access-refreshed", "refreshToken": "fixture-refresh-refreshed", "expiresIn": 3600, "tokenType": "bearer"}) if args.fixture else None
-        payload = refresh_access_token(app, client_id=client_id, client_secret=client_secret, refresh_token=lease.refresh_token or "", requester=requester)
-        metadata = store.rotate(profile.token_ref, access_token=payload.access_token, refresh_token=payload.refresh_token, granted_scopes=lease.metadata.granted_scopes, expires_at=datetime.now(UTC) + timedelta(seconds=payload.expires_in))
+        tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+        attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+        assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
+        existing = tokens.read(profile.token_ref)
+        network_performed = True
+        metadata = assistant.refresh(
+            profile.token_ref,
+            client_id=client_id,
+            client_secret=client_secret,
+            observed_scopes=existing.metadata.granted_scopes,
+            requester=_oauth_http_request,
+        )
     except Exception as exc:
-        print(json.dumps({"ok": False, "state": type(exc).__name__, "next_action": "No se modificó el token; revise la referencia externa y la aplicación."}, ensure_ascii=False, indent=2)); return 2
-    print(json.dumps({"ok": True, "network_performed": not bool(args.fixture), "token": metadata.to_dict(), "secrets": "REDACTED"}, ensure_ascii=False, indent=2, default=str)); return 0
+        print(json.dumps({"ok": False, "state": type(exc).__name__, "network_performed": network_performed, "next_action": "No se modificó el token previo; revise conectividad y la autorización vigente.", "error": str(exc)}, ensure_ascii=False, indent=2))
+        return 2
+    finally:
+        client_secret = ""
+    print(json.dumps({"ok": True, "network_performed": network_performed, "token": metadata.to_dict(), "secrets": "REDACTED"}, ensure_ascii=False, indent=2, default=str))
+    return 0
 
 
 def cmd_ctrader_select(args: argparse.Namespace) -> int:
-    from .ctrader_commands import select_account_command
+    from .ctrader_commands import account_discovery_command, select_account_command
+
     config = _config_for(args)
-    if not args.accounts_file:
-        print(json.dumps({"ok": False, "state": "ACCOUNT_DISCOVERY_REQUIRED", "next_action": "Proporcione --accounts-file con la respuesta ya consultada; no se selecciona automáticamente."}, ensure_ascii=False, indent=2))
+    accounts_path = Path(args.accounts_file).expanduser() if args.accounts_file else _discovery_state_path(config)
+    if not accounts_path.exists():
+        print(json.dumps({"ok": False, "state": "ACCOUNT_DISCOVERY_REQUIRED", "next_action": "Ejecute query --network o proporcione --accounts-file con una respuesta observada; no se selecciona automáticamente."}, ensure_ascii=False, indent=2))
         return 2
-    raw = json.loads(Path(args.accounts_file).read_text(encoding="utf-8"))
-    accounts = raw.get("accounts", raw) if isinstance(raw, Mapping) else raw
-    output = select_account_command(_ctrader_activation_payload(config), accounts, account_id=args.account_id, environment="DEMO")
+    metadata = _token_metadata_for_config(config)
+    if metadata is None:
+        print(json.dumps({"ok": False, "state": "TOKEN_REFERENCE_REQUIRED", "network_performed": False, "next_action": "Active primero un token externo con scope accounts."}, ensure_ascii=False, indent=2))
+        return 2
+    raw = json.loads(accounts_path.read_text(encoding="utf-8"))
+    accounts = (raw.get("accounts", raw.get("records")) if isinstance(raw, Mapping) else raw)
+    if not isinstance(accounts, list):
+        print(json.dumps({"ok": False, "state": "ACCOUNT_DISCOVERY_INVALID", "network_performed": False, "next_action": "El archivo debe contener una lista accounts observada."}, ensure_ascii=False, indent=2))
+        return 2
+    if isinstance(raw, Mapping) and raw.get("token_ref") not in {None, metadata.token_ref}:
+        print(json.dumps({"ok": False, "state": "ACCOUNT_DISCOVERY_INVALID", "network_performed": False, "next_action": "El token_ref del descubrimiento no coincide con el perfil."}, ensure_ascii=False, indent=2))
+        return 2
+    observed_at = None
+    if isinstance(raw, Mapping) and raw.get("observed_at"):
+        observed_at = datetime.fromisoformat(str(raw["observed_at"]).replace("Z", "+00:00"))
+    try:
+        discovery = account_discovery_command(
+            metadata,
+            accounts,
+            observed_at=observed_at,
+            permission_scope=(raw.get("permissionScope", raw.get("permission_scope")) if isinstance(raw, Mapping) else None),
+        )
+    except Exception as exc:
+        print(json.dumps({"ok": False, "state": "ACCOUNT_DISCOVERY_INVALID", "network_performed": False, "next_action": "La respuesta no contiene cuentas observadas válidas; repita discovery desde el servidor.", "error": type(exc).__name__}, ensure_ascii=False, indent=2))
+        return 2
+    output = select_account_command(
+        _ctrader_activation_payload(config),
+        discovery,
+        account_id=args.account_id,
+        environment="DEMO",
+    )
+    try:
+        selection_path = _persist_selection(
+            config,
+            account_id=args.account_id,
+            token_ref=metadata.token_ref,
+            observed_at=discovery.observed_at,
+        )
+    except Exception as exc:
+        print(json.dumps({"ok": False, "state": "SELECTION_PERSISTENCE_FAILED", "network_performed": False, "next_action": "No se modificó TOML; corrija el store externo y repita la selección.", "error": type(exc).__name__}, ensure_ascii=False, indent=2))
+        return 2
+    output["selection_persisted"] = True
+    output["selection_path"] = str(selection_path)
+    output["next_action"] = "Selección DEMO guardada fuera del repo; al conectar se volverá a validar contra el inventario del servidor."
     print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
 def cmd_ctrader_query(args: argparse.Namespace) -> int:
-    """Query cTrader only after the external activation gate is ready."""
+    """Connect, authenticate and discover accounts before any selection.
+
+    Discovery is a server observation, not an activation proof.  The command
+    deliberately authenticates the application and obtains the account list
+    before it can authorize a selected account; an empty/unclassified list is
+    reported as a gate rather than treated as DEMO.
+    """
+
     config = _config_for(args)
     if getattr(args, "fixture", False):
         return cmd_ctrader_fixture(args)
+    from .ctrader_activation import ActivationProfile, BrokerAccount, OAuthAppConfig, SecureTokenStore
     from .ctrader_commands import status_command
-    status = status_command(_ctrader_activation_payload(config), token_metadata=_token_metadata_for_config(config), present_env_keys=set(os.environ), accounts=(), now=datetime.now(UTC))
+
+    metadata = _token_metadata_for_config(config)
+    status_before = status_command(
+        _activation_payload_with_selection(config),
+        token_metadata=metadata,
+        present_env_keys=set(os.environ),
+        accounts=(),
+        now=datetime.now(UTC),
+    )
     if not getattr(args, "network", False):
-        print(json.dumps({"ok": False, "state": status["status"]["state"], "network_performed": False, "activation": status, "next_action": "Use --fixture para transporte local o --network sólo tras completar OAuth y seleccionar DEMO."}, ensure_ascii=False, indent=2, default=str))
+        print(json.dumps({"ok": False, "state": status_before["status"]["state"], "network_performed": False, "activation": status_before, "next_action": "Use --fixture o --network sólo tras completar OAuth externo."}, ensure_ascii=False, indent=2, default=str))
         return 2
-    if not status["status"].get("ready") or str(config.ctrader.get("operation_mode", "query")).lower() != "query":
-        print(json.dumps({"ok": False, "state": status["status"]["state"], "network_performed": False, "activation": status, "next_action": "Completa la autorización de consulta DEMO; no se abrió conexión."}, ensure_ascii=False, indent=2, default=str))
+    activation_payload = _activation_payload_with_selection(config)
+    profile = ActivationProfile.from_mapping(dict(activation_payload["ctrader"]))
+    app = OAuthAppConfig.from_mapping(dict(config.ctrader_oauth))
+    if profile.operation_mode.value != "QUERY" or metadata is None or metadata.is_expired(datetime.now(UTC)) or "accounts" not in metadata.granted_scopes:
+        print(json.dumps({"ok": False, "state": status_before["status"]["state"], "network_performed": False, "activation": status_before, "next_action": "Complete un token accounts vigente antes de conectar."}, ensure_ascii=False, indent=2, default=str))
         return 2
-    # The real TCP/Protobuf route remains explicit and dependency-gated.
+    client_id = os.environ.get(app.client_id_env, "")
+    client_secret = os.environ.get(app.client_secret_env, "")
+    if not client_id or not client_secret:
+        print(json.dumps({"ok": False, "state": "APP_CREDENTIALS_REQUIRED", "network_performed": False, "next_action": "Defina las referencias de aplicación en variables de entorno."}, ensure_ascii=False, indent=2))
+        return 2
+    store = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+    lease = store.read(profile.token_ref)
+    provider = None
+    network_performed = False
+    sequence: list[str] = []
     try:
-        provider_config = _ctrader_config(config)
         from ..data.ctrader import CTraderProvider
-        provider = CTraderProvider(provider_config)
+
+        provider = CTraderProvider(_ctrader_config(config))
         provider.connect()
-        output = {"ok": True, "network_performed": True, "status": provider.status.to_dict(), "next_action": "Autentique la cuenta y solicite el catálogo antes de consultar históricos."}
+        network_performed = True
+        sequence.append("connect")
+
+        def secret_provider(ref: str) -> str:
+            if ref == app.client_secret_env:
+                sequence.append("application_auth")
+                return client_secret
+            return ""
+
+        def token_provider(ref: str) -> str:
+            if ref == profile.token_ref:
+                sequence.append("account_discovery")
+                return lease.access_token
+            return ""
+
+        # Do not let a TOML account_id bypass the observed DEMO/environment
+        # gate.  The client performs app auth and account discovery only.
+        provider.authenticate(
+            secret_provider=secret_provider,
+            token_provider=token_provider,
+            authorize_selected=False,
+        )
+        observed = provider.discover_accounts()
+        raw_records = observed.get("records", ()) if isinstance(observed, Mapping) else ()
+        accounts: list[BrokerAccount] = []
+        for raw in raw_records:
+            if not isinstance(raw, Mapping):
+                continue
+            account_id = raw.get("account_id", raw.get("ctidTraderAccountId"))
+            if account_id is None:
+                continue
+            label = str(raw.get("brokerTitleShort", raw.get("label", "")))
+            permissions = raw.get("permissions", raw.get("permission_scope", raw.get("permissionScope", ())))
+            accounts.append(BrokerAccount(str(account_id), str(raw.get("environment", "UNKNOWN")), label, permissions))
+        discovery_path = None
+        try:
+            discovery_path = _persist_discovery(
+                config,
+                token_ref=profile.token_ref,
+                observed=observed,
+                observed_at=datetime.now(UTC),
+            )
+        except Exception:
+            # Query remains read-only if the optional local receipt cannot be
+            # written; the server inventory is still returned and revalidated.
+            discovery_path = None
+        status_after_discovery = status_command(
+            _activation_payload_with_selection(config),
+            token_metadata=metadata,
+            present_env_keys=set(os.environ),
+            accounts=accounts,
+            now=datetime.now(UTC),
+        )
+        if not status_after_discovery["status"].get("ready"):
+            output = {
+                "ok": False,
+                "network_performed": True,
+                "sequence": sequence,
+                "state": status_after_discovery["status"]["state"],
+                "accounts": [account.redacted() for account in accounts],
+                "permission_scope": observed.get("permissionScope") if isinstance(observed, Mapping) else None,
+                "discovery_path": str(discovery_path) if discovery_path else None,
+                "activation": status_after_discovery,
+                "status": provider.status.to_dict(),
+                "next_action": status_after_discovery["status"]["next_action"],
+            }
+            print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+            return 2
+        provider.authorize_account(
+            int(profile.account_id),
+            token_provider=lambda ref: lease.access_token if ref == profile.token_ref else "",
+        )
+        sequence.append("account_auth")
+        catalog = provider.resolve_symbol()
+        sequence.append("catalog")
+        history = provider.fetch_history(
+            "M1",
+            count=int(config.ctrader.get("historical_count", 500)),
+            max_pages=20,
+        )
+        sequence.append("history")
+        output = {
+            "ok": True,
+            "network_performed": True,
+            "sequence": sequence,
+            "accounts": [account.redacted() for account in accounts],
+            "permission_scope": observed.get("permissionScope") if isinstance(observed, Mapping) else None,
+            "discovery_path": str(discovery_path) if discovery_path else None,
+            "activation": status_after_discovery,
+            "catalog": catalog.to_dict() if hasattr(catalog, "to_dict") else catalog,
+            "history": history.to_dict() if hasattr(history, "to_dict") else history,
+            "status": provider.status.to_dict(),
+            "next_action": "Cuenta DEMO observada, catálogo e histórico obtenidos; las cotizaciones siguen siendo de consulta.",
+        }
     except Exception as exc:
-        output = {"ok": False, "network_performed": False, "state": type(exc).__name__, "next_action": "Verifique dependencia SDK/TCP/TLS y credenciales externas; no se sustituyó por datos sintéticos.", "error": str(exc)}
+        provider_status = provider.status.to_dict() if provider is not None else {}
+        action = provider_status.get("action") if isinstance(provider_status, Mapping) else None
+        output = {
+            "ok": False,
+            "network_performed": network_performed,
+            "sequence": sequence,
+            "state": type(exc).__name__,
+            "status": provider_status,
+            "next_action": action or "Conecte, autentique la aplicación y descubra cuentas antes de seleccionar una cuenta DEMO.",
+        }
         print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
         return 2
+    finally:
+        lease = None
+        client_secret = ""
+        if provider is not None:
+            try:
+                provider.close()
+            except Exception:
+                pass
     print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
     return 0
 
@@ -1021,17 +1693,94 @@ def cmd_ctrader_fixture(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_ctrader_capture_input(path: Path) -> tuple[Mapping[str, Any], ...]:
+    """Load a local JSON/JSONL capture without contacting a provider."""
+
+    try:
+        text = path.expanduser().read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"no se pudo leer captura cTrader: {path}") from exc
+    if path.suffix.lower() in {".jsonl", ".ndjson"}:
+        values = [json.loads(line) for line in text.splitlines() if line.strip()]
+    else:
+        parsed = json.loads(text)
+        if isinstance(parsed, Mapping) and isinstance(parsed.get("payloads"), list):
+            values = parsed["payloads"]
+        elif isinstance(parsed, Mapping) and isinstance(parsed.get("capture"), Mapping) and isinstance(parsed["capture"].get("payloads"), list):
+            values = parsed["capture"]["payloads"]
+        elif isinstance(parsed, list):
+            values = parsed
+        else:
+            raise ConfigError("captura JSON debe ser una lista o contener payloads[]")
+    if not isinstance(values, list) or not values:
+        raise ConfigError("captura cTrader vacía")
+    records: list[Mapping[str, Any]] = []
+    for index, item in enumerate(values):
+        if not isinstance(item, Mapping):
+            raise ConfigError(f"payload cTrader {index} no es objeto")
+        records.append(dict(item))
+    return tuple(records)
+
+
 def cmd_cfd_paper(args: argparse.Namespace) -> int:
-    from .cfd_simulation import CFDConfig, CFDSimulator, known_fixture_eurusd_long
-    signal, quotes = known_fixture_eurusd_long()
-    effective = _config_for(args) if getattr(args, "config", None) else None
-    cfd_values = dict(effective.cfd) if effective is not None and effective.cfd else {"instrument": "EUR/USD", "units": "1000"}
-    config = CFDConfig.from_mapping(cfd_values)
-    result = CFDSimulator(config).replay([signal], quotes)
-    output = {"ok": True, "product": "FOREX_CFD_LOCAL_PAPER", "network_performed": False, "trades": [trade.to_dict() for trade in result.trades], "events": list(result.events), "limitations": ["Fixture sintético; no cuenta, broker ni fill externo."]}
-    if args.report:
-        target = Path(args.report).expanduser(); target.parent.mkdir(parents=True, exist_ok=True); target.write_text(json.dumps(output, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8"); output["report_path"] = str(target)
-    print(json.dumps(output, ensure_ascii=False, indent=2, default=str))
+    """Run the real cTrader-normalization/runtime/CFD-paper path offline."""
+
+    from .ctrader_pipeline import CTraderPipeline, synthetic_ctrader_capture
+    from ..data.ctrader import CTraderInstrumentSpec
+    from .persistence import SQLiteStore
+
+    config = _config_for(args)
+    if getattr(args, "input", None):
+        capture_input = _load_ctrader_capture_input(Path(args.input))
+    else:
+        capture_input = synthetic_ctrader_capture(
+            start=datetime(2026, 1, 1, tzinfo=UTC),
+            symbol_id=int(config.ctrader.get("symbol_id", 99)) if config.ctrader.get("symbol_id") is not None else 99,
+            count=int(getattr(args, "count", 190)),
+            mode="REPLAY",
+        )
+    symbol_id = config.ctrader.get("symbol_id") if config.ctrader.get("symbol_id") is not None else 99
+    spec = CTraderInstrumentSpec(
+        symbol=config.instrument,
+        symbol_id=int(symbol_id),
+        digits=int(config.ctrader.get("digits", 5)),
+        pip_position=int(config.ctrader.get("pip_position", 4)),
+        price_scale=int(config.ctrader.get("price_scale", 100_000)),
+    )
+    db = _db_for(args, config)
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteStore(db) as store:
+        pipeline = CTraderPipeline(store, config, spec=spec, mode="REPLAY", max_candles=getattr(args, "max_candles", 5000))
+        result = pipeline.run(
+            capture_input,
+            session_id=getattr(args, "session", None),
+            capture_complete=not bool(getattr(args, "incomplete", False)),
+            quote_basis=("traded" if config.price_base in {"close", "traded"} else config.price_base),
+        )
+    summary: dict[str, Any] = {
+        "ok": True,
+        "product": "FOREX_CFD_LOCAL_PAPER",
+        "provider": "ctrader-open-api",
+        "network_performed": False,
+        "credentials_used": False,
+        "db": str(db),
+        "session_id": result.session_id,
+        "runtime_analysis_id": result.runtime_analysis_id,
+        "paper_analysis_id": result.paper_analysis_id,
+        "analysis_basis": result.analysis_basis,
+        "capture": result.capture.to_dict(),
+        "signals": len(result.signals),
+        "trades": [trade.to_dict() for trade in result.trades],
+        "paper_capture_complete": result.paper.capture_complete,
+        "snapshot_hash": result.snapshot_hash,
+        "next_action": "Revise la sesión en UI/reporte; las señales y fills son paper locales, no órdenes DEMO.",
+    }
+    if getattr(args, "report", None):
+        target = Path(args.report).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+        summary["report_path"] = str(target)
+    print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
     return 0
 
 
@@ -1077,15 +1826,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = subs.add_parser("ui", help="sirve interfaz local de sólo lectura"); p.add_argument("--db", type=Path); p.add_argument("--config", type=Path); p.add_argument("--session"); p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=8765); p.add_argument("--duration", type=float); p.set_defaults(func=cmd_ui)
     p = subs.add_parser("ctrader", help="consulta cTrader Open API; no envía operaciones por defecto")
     csubs = p.add_subparsers(dest="ctrader_command", required=True)
-    q = csubs.add_parser("doctor", help="diagnostica SDK opcional, OAuth y gates de cuenta"); q.add_argument("--config", type=Path); q.set_defaults(func=cmd_ctrader_doctor)
-    q = csubs.add_parser("auth-url", help="genera la URL OAuth oficial sin abrir navegador"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--state"); q.set_defaults(func=cmd_ctrader_auth_url)
-    q = csubs.add_parser("select", help="selecciona una cuenta DEMO por id desde una respuesta local"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--accounts-file", type=Path); q.add_argument("--account-id", required=True); q.set_defaults(func=cmd_ctrader_select)
-    q = csubs.add_parser("token-exchange", help="intercambia callback OAuth y rota token externo; no imprime secretos"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--callback-uri", required=True); q.add_argument("--state"); q.add_argument("--fixture", action="store_true"); q.set_defaults(func=cmd_ctrader_token_exchange)
-    q = csubs.add_parser("token-refresh", help="rota access/refresh token externo sin imprimir secretos"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--fixture", action="store_true"); q.set_defaults(func=cmd_ctrader_token_refresh)
+    q = csubs.add_parser("doctor", help="diagnostica SDK opcional, OAuth y gates de cuenta"); q.add_argument("--config", type=Path); q.add_argument("--network", "--check-network", dest="network", action="store_true", help="prueba explícitamente DNS/TCP/TLS DEMO; no autentica cuentas"); q.add_argument("--timeout", type=float, default=5.0); q.set_defaults(func=cmd_ctrader_doctor)
+    q = csubs.add_parser("auth-url", help="inicia OAuth loopback reanudable; no abre navegador salvo flag"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--scope", choices=["accounts", "trading"], help="un solo scope por intento; trading va después de accounts"); q.add_argument("--open-browser", action="store_true"); q.set_defaults(func=cmd_ctrader_auth_url)
+    q = csubs.add_parser("callback-listen", help="recibe un callback en el loopback registrado; no imprime el código"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--attempt-id", required=True); q.add_argument("--open-browser", action="store_true"); q.add_argument("--timeout", type=float, default=600.0); q.set_defaults(func=cmd_ctrader_callback_listen)
+    q = csubs.add_parser("select", help="selecciona una cuenta DEMO desde un descubrimiento local observado"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--accounts-file", type=Path); q.add_argument("--account-id", required=True); q.set_defaults(func=cmd_ctrader_select)
+    q = csubs.add_parser("token-exchange", help="reanuda OAuth; entregue callback por archivo 0600/stdin, fixture usa store temporal"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--attempt-id"); q.add_argument("--callback-file", type=Path); q.add_argument("--callback-stdin", action="store_true"); q.add_argument("--callback-uri", help=argparse.SUPPRESS); q.add_argument("--fixture", action="store_true"); q.set_defaults(func=cmd_ctrader_token_exchange)
+    q = csubs.add_parser("token-refresh", help="rota token externo; fixture usa store temporal aislado"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--fixture", action="store_true"); q.set_defaults(func=cmd_ctrader_token_refresh)
     q = csubs.add_parser("query", help="consulta cTrader tras autorización explícita o usa fixture offline"); q.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_query.toml"); q.add_argument("--fixture", action="store_true"); q.add_argument("--network", action="store_true"); q.add_argument("--report", type=Path); q.set_defaults(func=cmd_ctrader_query)
     q = csubs.add_parser("demo", help="ejecutor DEMO local: requiere --activate explícito y nunca usa servidor"); q.add_argument("--activate", action="store_true"); q.add_argument("--report", type=Path); q.set_defaults(func=cmd_ctrader_demo)
     q = csubs.add_parser("fixture", help="ejecuta fixture offline de consulta, CFD y ejecutor demo"); q.add_argument("--report", type=Path); q.set_defaults(func=cmd_ctrader_fixture)
-    p = subs.add_parser("cfd-paper", help="paper trading Forex/CFD con fixture sintético local"); p.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "fixture_cfd.toml"); p.add_argument("--report", type=Path); p.set_defaults(func=cmd_cfd_paper)
+    p = subs.add_parser("cfd-paper", help="pipeline cTrader→RuntimeCoordinator→CFD PAPER local"); p.add_argument("--config", type=Path, default=PROJECT_ROOT / "config" / "ctrader_pipeline_fixture.toml"); p.add_argument("--input", type=Path, help="captura JSON/JSONL local de payloads cTrader; sin red"); p.add_argument("--count", type=int, default=190, help="barras del fixture sintético cuando no se proporciona --input"); p.add_argument("--session"); p.add_argument("--db", type=Path); p.add_argument("--max-candles", type=int, default=5000); p.add_argument("--incomplete", action="store_true", help="conserva simulaciones futuras como PENDING"); p.add_argument("--report", type=Path); p.set_defaults(func=cmd_cfd_paper)
     return parser
 
 
