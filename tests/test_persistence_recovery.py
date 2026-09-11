@@ -94,7 +94,7 @@ class PersistenceRecoveryTests(unittest.TestCase):
             """)
             conn.commit(); conn.close()
             with SQLiteStore(path) as store:
-                self.assertEqual(store.schema_version, 3)
+                self.assertEqual(store.schema_version, 4)
                 checkpoint = store.get_checkpoint("s", "runtime", analysis_id="old", allow_alternate=False)
                 self.assertEqual(checkpoint["analysis_id"], "old")
                 self.assertIn("received_ts", [row[1] for row in store.conn.execute("PRAGMA table_info(candles)")])

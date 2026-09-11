@@ -16,6 +16,7 @@ from mtf_lab.ops.persistence import SQLiteStore
 from mtf_lab.ops.query import QueryService
 from mtf_lab.ops.ctrader_pipeline import (
     PAPER_PRODUCT,
+    PAPER_SESSION_VERSION,
     CTraderPipeline,
     normalize_ctrader_capture,
     signal_to_cfd_signal,
@@ -68,7 +69,7 @@ class CTraderPipelineTests(unittest.TestCase):
         self.assertEqual(capture.provenance["source_mode"], "SYNTHETIC_FIXTURE")
 
         reversed_capture = normalize_ctrader_capture(
-            reversed(capture.payloads),
+            reversed(capture.envelopes),
             spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99),
             quote_basis="mid",
             mode="REPLAY",
@@ -78,7 +79,7 @@ class CTraderPipelineTests(unittest.TestCase):
         self.assertEqual(capture.capture_id, reversed_capture.capture_id)
         self.assertEqual(
             [event.source_event_id for event in capture.quote_events],
-            [event.source_event_id for event in reversed(reversed_capture.quote_events)],
+            [event.source_event_id for event in reversed_capture.quote_events],
         )
 
     def test_replay_retains_partial_bid_ask_state_without_interpolation(self) -> None:
@@ -97,7 +98,7 @@ class CTraderPipelineTests(unittest.TestCase):
         self.assertEqual((partial.bid, partial.ask), (1.1, 1.1002))
         self.assertTrue(partial.metadata["partial_update"])
         self.assertEqual(partial.metadata["bid_source_timestamp"], BASE.isoformat().replace("+00:00", "Z"))
-        self.assertEqual(capture.issues, ())
+        self.assertTrue(capture.issues, "the earlier incomplete leg observation remains auditable")
 
     def test_real_runtime_warmup_emits_authentic_signals_and_adapts_cfd(self) -> None:
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
@@ -116,7 +117,7 @@ class CTraderPipelineTests(unittest.TestCase):
                 self.assertTrue(all(trade.state is TradeState.CLOSED for trade in result.trades))
                 self.assertTrue(all(signal.signal_id == cfd.signal_id for signal, cfd in zip(result.signals, result.cfd_signals)))
                 self.assertEqual(result.analysis_basis, "mid")
-                self.assertEqual(result.snapshot["schema_version"], 3)
+                self.assertEqual(result.snapshot["schema_version"], PAPER_SESSION_VERSION)
                 self.assertEqual(result.snapshot["product"], PAPER_PRODUCT)
                 self.assertEqual(result.snapshot["paper"]["product"], PAPER_PRODUCT)
                 self.assertEqual(result.snapshot["processor"]["warmup_pending"]["M1"], 0)
@@ -126,7 +127,7 @@ class CTraderPipelineTests(unittest.TestCase):
 
     def test_native_trendbars_can_be_the_runtime_analysis_stream(self) -> None:
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
-        traded = replace(pipeline_config(), price_base="traded")
+        traded = replace(pipeline_config(), price_base="native")
         with TemporaryDirectory() as tmp:
             with SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
                 result = CTraderPipeline(
@@ -137,8 +138,9 @@ class CTraderPipelineTests(unittest.TestCase):
                 self.assertTrue(result.analysis_records)
                 self.assertTrue(all(record.__class__.__name__ == "Bar" for record in result.analysis_records))
                 self.assertGreaterEqual(len(result.signals), 1)
-                self.assertEqual(result.analysis_basis, "traded")
-                self.assertTrue(all(row["simulation_type"] == "CFD_PAPER" for row in store.list_simulations(result.session_id)))
+                self.assertEqual(result.analysis_basis, "native")
+                self.assertEqual(store.list_simulations(result.session_id), [])
+                self.assertTrue(store.list_cfd_trades(result.session_id, result.paper_analysis_id))
 
     def test_paper_product_and_snapshot_are_visible_to_sqlite_and_query(self) -> None:
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
@@ -146,23 +148,23 @@ class CTraderPipelineTests(unittest.TestCase):
             db = Path(tmp) / "pipeline.sqlite3"
             with SQLiteStore(db) as store:
                 result = CTraderPipeline(store, pipeline_config(), spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="paper-visible")
-                simulations = store.list_simulations(result.session_id)
-                paper_rows = [row for row in simulations if row["simulation_type"] == "CFD_PAPER"]
+                paper_rows = store.list_cfd_trades(result.session_id, result.paper_analysis_id)
+                self.assertEqual(store.list_simulations(result.session_id), [])
                 self.assertEqual(len(paper_rows), len(result.trades))
                 self.assertGreaterEqual(len(paper_rows), 1)
-                self.assertTrue(all(row["payload"]["product"] == PAPER_PRODUCT for row in paper_rows))
-                self.assertTrue(all(row["assumptions"]["paper_only"] for row in paper_rows))
+                self.assertTrue(all(row["product"] == PAPER_PRODUCT for row in paper_rows))
+                self.assertTrue(all(isinstance(row["units"], str) for row in paper_rows))
                 self.assertTrue(all("executor" not in str(row["payload"]).lower() for row in paper_rows))
-                self.assertTrue(all(row["outcome"] in {"WIN", "LOSS", "TIE", "INDETERMINATE", "PENDING"} for row in paper_rows))
-                self.assertEqual(store.schema_version, 3)
+                self.assertTrue(all(row["state"] == "CLOSED" for row in paper_rows))
+                self.assertEqual(store.schema_version, 4)
                 checkpoint = store.get_checkpoint(result.session_id, "pipeline", analysis_id=result.paper_analysis_id, allow_alternate=False)
                 self.assertIsNotNone(checkpoint)
                 assert checkpoint is not None
-                self.assertEqual(checkpoint["state"]["schema_version"], 3)
+                self.assertEqual(checkpoint["state"]["schema_version"], PAPER_SESSION_VERSION)
                 self.assertEqual(checkpoint["state"]["paper"]["product"], PAPER_PRODUCT)
                 query_snapshot = QueryService(store).snapshot(result.session_id)
-                self.assertEqual(query_snapshot["schema_version"], 3)
-                self.assertGreaterEqual(query_snapshot["counts"]["simulations"], len(paper_rows))
+                self.assertEqual(query_snapshot["schema_version"], 4)
+                self.assertGreaterEqual(query_snapshot["counts"]["cfd_trades"], len(paper_rows))
 
     def test_replay_order_and_second_run_are_idempotent(self) -> None:
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
@@ -171,7 +173,7 @@ class CTraderPipelineTests(unittest.TestCase):
             with SQLiteStore(Path(first_tmp) / "first.sqlite3") as first_store, SQLiteStore(Path(second_tmp) / "second.sqlite3") as second_store:
                 first = CTraderPipeline(first_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="first")
                 second = CTraderPipeline(second_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(
-                    list(reversed(capture.payloads)), session_id="second", received_at=receipt
+                    list(reversed(capture.envelopes)), session_id="second", received_at=receipt
                 )
                 self.assertEqual(first.capture.capture_hash, second.capture.capture_hash)
                 self.assertEqual([item.signal_id for item in first.signals], [item.signal_id for item in second.signals])
@@ -182,7 +184,7 @@ class CTraderPipelineTests(unittest.TestCase):
             with SQLiteStore(Path(first_tmp) / "first.sqlite3") as rerun_store:
                 rerun = CTraderPipeline(rerun_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="first")
                 self.assertEqual([item.signal_id for item in rerun.signals], [item.signal_id for item in first.signals])
-                rows = rerun_store.list_simulations("first")
+                rows = rerun_store.list_cfd_trades("first", rerun.paper_analysis_id)
                 self.assertEqual(len(rows), len(first.trades))
 
     def test_only_explicit_bid_ask_quotes_and_detector_signals_cross_boundary(self) -> None:
@@ -191,8 +193,8 @@ class CTraderPipelineTests(unittest.TestCase):
         self.assertEqual(quote.quality, "SYNTHETIC")
         self.assertEqual(quote.metadata["capture_hash"], capture.capture_hash)
         self.assertEqual(quote.bid + quote.spread, quote.ask)
-        with self.assertRaises(ValueError):
-            spot_event_to_cfd_quote(replace(capture.quote_events[1], bid=None))
+        one_sided = spot_event_to_cfd_quote(replace(capture.quote_events[1], bid=None))
+        self.assertIsNone(one_sided.bid)
         with TemporaryDirectory() as tmp:
             with SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
                 result = CTraderPipeline(store, pipeline_config(), spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="boundary")

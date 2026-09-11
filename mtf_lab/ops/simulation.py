@@ -13,7 +13,7 @@ import enum
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Generic, Protocol, TypeVar
 
 
 class Outcome(str, enum.Enum):
@@ -276,6 +276,40 @@ class PricePoint:
         }
 
 
+class PricePointLike(Protocol):
+    """Read-only point contract shared by batch and runtime observations."""
+
+    @property
+    def timestamp(self) -> datetime: ...
+
+    @property
+    def price(self) -> float: ...
+
+    @property
+    def base_price(self) -> str: ...
+
+    @property
+    def quality(self) -> str: ...
+
+    @property
+    def closed(self) -> bool: ...
+
+    @property
+    def source_ordinal(self) -> int: ...
+
+    @property
+    def instrument(self) -> str: ...
+
+    @property
+    def available_ts(self) -> datetime: ...
+
+    @property
+    def identity(self) -> str: ...
+
+
+PointT = TypeVar("PointT", bound=PricePointLike)
+
+
 def _enum_value(value: Any) -> Any:
     return value.value if hasattr(value, "value") else value
 
@@ -422,13 +456,13 @@ def break_even_probability(*, payout_net: float = 0.80, loss_amount: float = 1.0
 _BLOCKED_QUALITY = frozenset(token.lower() for token in QUALITY_BLOCKED_TOKENS)
 
 
-def _quality_admissible(value: PricePoint | Any) -> bool:
+def _quality_admissible(value: PricePointLike | Any) -> bool:
     if isinstance(value, PricePoint) or hasattr(value, "quality"):
         return quality_label_is_usable(getattr(value, "quality"))
     return quality_label_is_usable(value)
 
 
-def _base_matches(point: PricePoint, wanted: str | None) -> bool:
+def _base_matches(point: PricePointLike, wanted: str | None) -> bool:
     try:
         return price_bases_match(point.base_price, wanted)
     except ValueError:
@@ -436,15 +470,15 @@ def _base_matches(point: PricePoint, wanted: str | None) -> bool:
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
-class Selection:
-    point: PricePoint
+class Selection(Generic[PointT]):
+    point: PointT
     use_time: datetime
 
 
-_Selection = Selection
+_Selection = Selection[PricePoint]
 
 
-def observation_age_seconds(point: PricePoint, target: datetime, *, rule: str) -> float:
+def observation_age_seconds(point: PricePointLike, target: datetime, *, rule: str) -> float:
     """Conservative age: market distance plus any availability delay."""
 
     target_dt = parse_ts(target)
@@ -459,7 +493,7 @@ def observation_age_seconds(point: PricePoint, target: datetime, *, rule: str) -
 
 
 def select_price_point(
-    points: Sequence[PricePoint],
+    points: Sequence[PointT],
     target: datetime,
     *,
     rule: str,
@@ -470,7 +504,7 @@ def select_price_point(
     exclude_identity: str | None = None,
     exclude_market_time: datetime | None = None,
     instrument: str | None = None,
-) -> tuple[Selection | None, str | None]:
+) -> tuple[Selection[PointT] | None, str | None]:
     """Shared deterministic selection policy for batch and runtime callers.
 
     A price is usable only after its ``available_ts``. For a final ``before``
@@ -486,7 +520,7 @@ def select_price_point(
         cutoff = target_dt + timedelta(seconds=float(max_price_age_seconds))
     else:
         cutoff = None
-    eligible: list[PricePoint] = []
+    eligible: list[PointT] = []
     for point in points:
         try:
             if require_closed and not point.closed:
@@ -750,7 +784,7 @@ class VirtualContractSimulator:
 
 
 __all__ = [
-    "DirectionalEvaluator", "EvaluationSpec", "Outcome", "PricePoint", "Selection",
+    "DirectionalEvaluator", "EvaluationSpec", "Outcome", "PricePoint", "PricePointLike", "Selection",
     "SimulationResult", "VirtualContract", "VirtualContractSimulator",
     "PRICE_BASE_ALIASES", "VALID_PRICE_BASES", "normalize_price_base",
     "price_bases_match", "normalize_completion", "outcome_for_missing_price",

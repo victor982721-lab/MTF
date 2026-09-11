@@ -1,268 +1,312 @@
 # MTF Lab
 
-Primera versión funcional, local y determinista para investigar la relación
-entre un mismo instrumento en varias temporalidades. El recorrido completo es:
+Plataforma local, determinista y Linux-first para investigar la relación de un
+instrumento en varias temporalidades y ejecutar simulaciones virtuales. El
+recorrido principal es:
 
-`fuente -> normalización/calidad -> M1/M5/M15 -> EMA/RSI/ATR -> trend_pullback_v1 -> registro -> simulación virtual -> backtest/reporte -> consulta local`.
+`fuente -> normalización/calidad -> M1/M5/M15 -> EMA/RSI/ATR -> trend_pullback_v1 -> persistencia -> simulación/backtest -> reporte/UI`.
 
-El núcleo no llama a un LLM ni a OpenAI. Las señales son hipótesis
-experimentales, no recomendaciones ni evidencia de rentabilidad.
+El núcleo no llama a un LLM ni a OpenAI. Las señales, simulaciones y fixtures
+son hipótesis y datos sintéticos: **no son recomendaciones, órdenes ni
+prueba de rentabilidad**.
 
-## Requisitos comprobados
+## Estado actual
 
-- Python **3.14.4** en el entorno de desarrollo.
-- Sólo biblioteca estándar para el modo offline. `requests`, `websockets` y
-  `rich` son opcionales para Kraken/UI enriquecida; si no están disponibles,
-  el modo offline continúa funcionando.
-- No se requiere bróker, cuenta ni clave.
+### IMPLEMENTADO Y COMPROBADO OFFLINE
 
-## Arranque rápido (sin instalar paquetes)
+- Ingesta local/sintética, normalización causal, M1/M5/M15, indicadores
+  EMA/RSI/ATR y `trend_pullback_v1`, con calidad, calentamiento, huecos,
+  duplicados, disponibilidad y procedencia separados.
+- Capturas cTrader v1, replay `as_observed`, secuencia global, generación de
+  conexión, checkpoints, restauración, idempotencia y consumidores explícitos
+  de señales.
+- Calidad bid/ask hasta el fill, base `native` para trendbars, cantidades y
+  contabilidad `Decimal`, simulación CFD PAPER incremental y persistencia SQLite
+  schema v4 con migración aditiva desde v3.
+- Codec/framing Protobuf oficial instalado, transporte DEMO controlado,
+  correlación, heartbeat, backpressure, respuestas de ejecución, reconciliación
+  y rechazo fail-closed de REAL/LIVE. Las pruebas usan gateway/transporte
+  local o falso; no contactan el bróker.
+- Instalación editable y wheel, imports desde cwd ajeno, configuraciones TOML
+  empaquetadas, lanzadores, fixtures CFD/cTrader, UI de sólo lectura, suite
+  offline, lint/formato/tipos y auditoría arquitectónica.
+
+La evidencia versionada y reproducible está en el [informe de ingeniería](reports/engineering/latest/engineering_consolidation.md),
+[engineering_results.json](reports/engineering/latest/engineering_results.json) y
+[engineering_tooling.json](reports/engineering/latest/engineering_tooling.json).
+La [matriz de fronteras A/B/C](docs/activation_boundaries.md) distingue lo que
+se comprueba localmente de lo que sólo puede observar un servidor autenticado.
+
+### IMPLEMENTADO, PENDIENTE DE VALIDACIÓN EXTERNA
+
+Los contratos y la composición para autenticación de aplicación, descubrimiento
+de cuentas, selección DEMO explícita, autenticación de cuenta, catálogo,
+market data, RuntimeCoordinator, señal, gates de seguridad, intent durable,
+`ProtoOANewOrderReq`, eventos, reconciliación, cierre y persistencia están
+implementados y cubiertos localmente con Protobuf real y un gateway controlado.
+La validación local no demuestra permisos, catálogo, límites, spreads,
+comisiones, conversiones, fills, posiciones, historia ni respuestas de un
+servidor cTrader real. Un timeout ambiguo permanece `UNKNOWN` y exige
+reconciliación; no autoriza reintentar una orden.
+
+### INTERVENCIÓN DEL USUARIO PENDIENTE
+
+La lista queda limitada a hechos, decisiones y autorizaciones externas:
+
+1. Registrar/aprobar la aplicación cTrader.
+2. Disponer fuera del repositorio de `CTRADER_CLIENT_ID` y
+   `CTRADER_CLIENT_SECRET`.
+3. Completar OAuth y consentir el alcance aplicable.
+4. Descubrir cuentas autorizadas y seleccionar explícitamente una cuenta DEMO.
+5. Verificar con el servidor DEMO el catálogo, condiciones, permisos, ruta de
+   ejecución y reconciliación.
+6. Confirmar las condiciones contractuales de Pepperstone relevantes para
+   México, almacenamiento/redistribución de datos y costes.
+
+No quedan tareas de programación en esta lista. Pepperstone no está validado
+contractualmente y ninguna simulación/fixture demuestra rentabilidad ni
+condiciones comerciales reales.
+
+## Instalación reproducible desde un clone
+
+Requiere Python **3.11 o posterior**. El modo offline del proyecto no tiene
+dependencias de ejecución obligatorias; los extras cTrader y dev se instalan en
+entornos separados. Los comandos siguientes no abren navegador, no inician
+OAuth y no usan cuentas.
 
 ```bash
-cd /home/winterboss/MTF
-./mtf-lab doctor
-./mtf-lab demo --seed 20260909
-./mtf-lab report --latest
-./mtf-lab ui --port 8765
+git clone https://github.com/victor982721-lab/MTF.git
+cd MTF
+python3 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip setuptools
+.venv/bin/python -m pip install --no-build-isolation --no-deps --editable .
 ```
 
-La demostración usa reloj virtual acelerado, crea un dataset sintético
-identificado como tal, persiste eventos/velas/decisiones/simulaciones y genera
-un informe en `reports/`. Los datos de Kraken nunca sustituyen silenciosamente
-al modo sintético.
+La instalación anterior es la instalación **base**. Si no se desea instalar el
+paquete, los lanzadores `./mtf-lab` y `./bin/mtf-lab` ejecutan directamente el
+checkout con `python3` (o con el intérprete indicado por `PYTHON`).
 
-## Comandos
+### Extra cTrader reproducible
+
+El SDK oficial es opcional para el núcleo. Para reproducir exactamente el
+entorno validado, primero instala el lock completo y después registra el extra
+sin resolver versiones nuevas:
+
+```bash
+.venv/bin/python -m pip install --requirement requirements-ctrader.lock
+.venv/bin/python -m pip install --no-build-isolation --no-deps --editable '.[ctrader]'
+.venv/bin/python -m pip check
+```
+
+`requirements-ctrader.lock` fija `ctrader-open-api==0.9.2`, Protobuf, Twisted,
+TLS y transitivas observadas. Las versiones del entorno vivo y sus hashes de
+archivos están en los manifests de ingeniería; no se incluye ningún token o
+store.
+
+### Herramientas de desarrollo
+
+Mantén Ruff y mypy en `.venv-dev`, no en el entorno de runtime:
+
+```bash
+python3 -m venv .venv-dev
+.venv-dev/bin/python -m pip install --upgrade pip setuptools
+.venv-dev/bin/python -m pip install --requirement requirements-dev.lock
+.venv-dev/bin/python -m pip install --no-build-isolation --no-deps --editable '.[dev]'
+```
+
+`.venv/` y `.venv-dev/` no se versionan. `requirements-dev.lock` fija Ruff y
+mypy y sus transitivas para el tooling; no sustituye el lock cTrader.
+
+## Arranque y comandos locales
+
+Todas las salidas de ejecución deben dirigirse a `runtime/` o a otra ruta
+ignorada. Para un smoke reproducible desde el checkout:
+
+```bash
+mkdir -p runtime/quickstart
+./mtf-lab doctor --db runtime/quickstart/doctor.sqlite3
+./mtf-lab demo --seed 42 --minutes 720 \
+  --db runtime/quickstart/demo.sqlite3 \
+  --report runtime/quickstart/demo-report.md
+./mtf-lab report --db runtime/quickstart/demo.sqlite3 --latest \
+  --output runtime/quickstart/demo-report-latest.md
+```
+
+La demo usa reloj virtual y datos sintéticos identificados como tales. No
+intercambia silenciosamente Kraken por sintéticos ni ejecuta órdenes.
 
 ```text
 mtf-lab doctor [--config CONFIG] [--check-network]
-mtf-lab demo [--seed N] [--config CONFIG] [--db PATH]
+mtf-lab demo [--seed N] [--minutes N] [--config CONFIG] [--db PATH]
 mtf-lab import DATA.{csv,jsonl} [--db PATH]
-mtf-lab watch [--instrument BTC/USD] [--duration SECONDS] [--max-events N] [--session ID] [--checkpoint-every N] [--offline-demo]
-mtf-lab replay --input DATA [--db PATH] [--checkpoint-every N] [--no-resume]
-mtf-lab backtest --db PATH [--session ID] [--config CONFIG] [--partition all|exploration|evaluation] [--boundary UTC] [--report REPORT]
-mtf-lab report [--db PATH] [--latest]
-mtf-lab ui [--host 127.0.0.1] [--port 8765] [--db PATH]
+mtf-lab replay [--input DATA] [--db PATH] [--checkpoint-every N]
+mtf-lab backtest --db PATH [--session ID] [--partition all|exploration|evaluation]
+mtf-lab report [--db PATH] [--latest] [--output PATH]
+mtf-lab watch [--instrument BTC/USD] [--duration SECONDS] [--max-events N]
+mtf-lab ui [--host 127.0.0.1] [--port 8765] [--db PATH] [--duration SECONDS]
+mtf-lab ctrader {doctor,query,fixture,...}
+mtf-lab cfd-paper [--config CONFIG] [--db PATH] [--chunk-size N]
 ```
 
-Todos los comandos muestran si el modo es `SINTÉTICO`, `REPLAY` u
-`OBSERVACIÓN EN DIRECTO`, la procedencia, la calidad y el estado de
-calentamiento. `watch` tiene duración acotada para pruebas; no ejecuta órdenes.
+`watch` y `replay` pasan por `RuntimeCoordinator`; conservan buckets,
+indicadores, episodios, simulaciones pendientes y checkpoints. La captura
+parcial es `PARTIAL`, una reconexión requiere conciliación y una ventana sin
+precio admisible queda `INDETERMINATE` en replay completo o `PENDING` durante
+observación continua.
 
-`watch` y `replay` pasan por `RuntimeCoordinator`: el mismo procesador
-incremental conserva buckets abiertos, indicadores, episodios y simulaciones
-`PENDING`, persiste checkpoints periódicos y reanuda por identidad sin duplicar
-la captura. El gate de análisis separa conexión, reconciliación, frescura y
-continuidad; una reconexión o un hueco no se convierten en salud por etiqueta.
-La captura parcial se conserva con calidad `PARTIAL` y nunca se presenta como
-cobertura completa. `replay` acepta velas nativas o eventos, deriva sólo temporalidades
-compatibles y da precedencia a una vela nativa sobre su OHLC derivada. En un
-replay completo, un horizonte sin precio admisible queda `INDETERMINATE`; en
-observación continua permanece `PENDING` hasta que expire la tolerancia.
+## Reproducción de la fase offline
 
-Para reanudar una observación acotada, conserva el `session_id` que devuelve
-`watch` y vuelve a ejecutar `mtf-lab watch --session ID --resume` (el valor
-predeterminado ya es reanudable), o usa `--no-resume` para iniciar otro estado
-incremental. Los checkpoints incluyen el hash de configuración, el cursor,
-la identidad del último registro y el estado serializable de agregadores,
-indicadores, episodios y liquidaciones pendientes.
+### Suite, auditoría y benchmark
 
-## Comparación y trazabilidad
-
-`backtest` genera la referencia `m1_trigger_reference` con el mismo disparador
-M1 y la estrategia `trend_pullback_v1` con contexto M15/preparación M5, sobre
-la misma captura, base de precio y contrato virtual. La referencia no es un
-subconjunto de las señales MTF y se conserva aun cuando MTF emita cero. Cada
-corrida identifica `dataset_hash`, `analysis_id`, hash de configuración,
-variante, partición cronológica y hash del contrato; cambiar cualquiera de
-ellos crea una identidad de análisis separada, mientras que repetir exactamente
-la misma corrida es idempotente. `--partition exploration|evaluation` y
-`--boundary UTC` excluyen señales cuyo ingreso o liquidación cruza la frontera.
-
-La persistencia SQLite usa schema v3: los checkpoints están separados por
-`analysis_id`, las señales conservan memberships por análisis y `received_at`
-permanece separado de `available_at`. Los informes segmentan por análisis, variante, instrumento, horizonte,
-partición y contrato. En `status`, `counts.signals` es el detector MTF
-primario para compatibilidad terminal y `counts.signals_total` incluye también
-la referencia M1; el informe conserva ambos linajes y no mezcla sus resultados.
-Los resultados son simulaciones virtuales y no son
-órdenes, rentabilidad demostrada ni recomendación; `independent_sample_count`
-es una agrupación temporal conservadora, no una prueba de independencia
-estadística.
-
-## Configuración
-
-Los ejemplos están en `config/`. Las claves relevantes (instrumento,
-temporalidades, períodos, tolerancias, caducidad, latencia, horizontes y
-contrato virtual) son TOML. El cargador rechaza claves desconocidas y
-combinaciones incompatibles, en vez de ignorarlas.
-
-## Datos y causalidad
-
-- Timestamps con zona horaria se normalizan a UTC y los intervalos son
-  `[inicio, fin)`.
-- Las velas cerradas son las únicas que evalúan la estrategia; una vela en
-  formación sólo se visualiza.
-- El instante de recepción y la disponibilidad para el detector se conservan
-  aparte del instante de mercado.
-- No se interpolan ticks ni se inventan precios en huecos. Duplicados,
-  discontinuidades y datos atrasados bloquean las evaluaciones afectadas.
-- El backfill se registra como revisión separada y no cambia lo afirmado en
-  directo.
-
-## Importador local
-
-CSV/JSONL requieren mapeo explícito (`timestamp`, `open`, `high`, `low`,
-`close`, opcional `volume`, `price_type`, `instrument`, `timeframe`). Se
-validan zona horaria, finitud, OHLC, orden y duplicados. `price_type` conserva
-`trade`, `bid`, `ask` o `mid`; no se intercambian silenciosamente.
-
-## Kraken público
-
-El adaptador usa el REST `/0/public/OHLC` para arranque/recuperación y el
-WebSocket Spot v2 para `trade`/`ohlc`, sin autenticación. Maneja snapshots,
-updates, lotes de operaciones, corazones, backoff y errores presentes en el
-cuerpo. BTC/USD es el símbolo inicial; se registra el mapeo a nombres internos.
-El REST devuelve como máximo 720 entradas y la última está sin comprometer,
-por lo que se excluye del conjunto cerrado hasta su cierre. Una reconexión no
-se considera recuperación completa sin conciliación explícita.
-
-## UI local de observación
-
-`mtf-lab ui` sirve un visor de sólo lectura en `127.0.0.1` con paginación y
-rangos UTC, revisiones, huecos, decisiones, condiciones, descartes y
-simulaciones. Incluye sondeo acotado, gráficos SVG de close/EMA/RSI/ATR usando
-los valores persistidos y tarjetas de conexión, cobertura, calentamiento,
-calidad y resultados pendientes; el frontend no recalcula reglas financieras.
-
-## Extender proveedores
-
-Implemente el contrato `MarketDataProvider` de `mtf_lab.data` y devuelva
-`MarketEvent` normalizados (hora de evento, recepción, identidad estable,
-precio/base, procedencia y calidad). No coloque reglas ni indicadores en el
-adaptador. La agregación, estrategia, simulador y persistencia se reutilizan
-sin cambios; el proveedor declara cobertura y revisiones.
-
-## Limitaciones conocidas
-
-- El adaptador Kraken depende de red y de la disponibilidad del endpoint; la
-  prueba puede quedar `OMITIDA_BLOQUEO_EXTERNO` y el modo offline sigue siendo
-  válido.
-- La primera versión no conecta cuentas ni ejecuta órdenes, y no incorpora
-  calendario de noticias, spreads o comisiones no configurados.
-- La evaluación basada sólo en velas no observa el intraminuto. Resultados
-  indeterminados permanecen indeterminados.
-- EMA/RSI/ATR y los umbrales iniciales son decisiones de investigación sin
-  ventaja demostrada; no se hace búsqueda masiva de parámetros.
-
-
-### Ejemplo de importación local
+Usa la suite con el intérprete que tenga el SDK cTrader instalado. El runner
+crea HOME/XDG/TMP/stores temporales, bloquea red externa y separa
+`discovered`, `executed`, `passed`, `failed` y `skipped`:
 
 ```bash
-./mtf-lab import examples/data/synthetic_m1.csv \
-  --instrument SYNTH/USD --timeframe M1 --price-base close \
-  --db runtime/import.sqlite3
-./mtf-lab replay --db runtime/import.sqlite3 --session <session_id>
+mkdir -p runtime/verification
+MTF_UI_JS_DEV=1 MTF_NODE_BIN="$(command -v node)" \
+  .venv/bin/python tools/offline_tests.py \
+  --json runtime/verification/offline_tests.json
+.venv-dev/bin/python tools/engineering_audit.py --strict \
+  --json runtime/verification/architecture.json
+.venv/bin/python -m tools.benchmark_paper --events 7500 \
+  > runtime/verification/benchmark.json
 ```
 
-Para eventos JSONL use, por ejemplo,
-`--mapping timestamp=timestamp,price=price,event_id=event_id` y una base
-`trade`; un `bid`/`ask`/`mid` requiere la columna correspondiente. Los
-fixtures problemáticos se prueban con el importador de `mtf_lab.data` en modo
-estricto o tolerante para conservar sus `issues`.
+Para ejecutar el gate completo y regenerar los manifests canónicos desde el
+árbol final:
 
-El informe canónico de la última demostración se genera bajo
-`reports/mtf_lab_demo_report.md` cuando se ejecuta el comando de entrega; los
-SQLite/logs de operación son derivados y deben elegirse mediante `--db`/`--log`.
+```bash
+.venv/bin/python tools/verify_offline.py \
+  --runtime-python .venv/bin/python \
+  --dev-python .venv-dev/bin/python \
+  --node "$(command -v node)" \
+  --write-reports \
+  --json runtime/verification/final.json
+```
 
-## Versiones observadas en la validación
+El comando no instala dependencias; verifica que ambos entornos y Node ya
+existan, bloquea la red externa y escribe `reports/engineering/latest/` sólo
+con `--write-reports`.
+No confundas el benchmark con rentabilidad o desempeño futuro. Node es una
+herramienta de QA de la UI, no una dependencia de runtime; con
+`MTF_UI_JS_DEV=1` su ausencia falla explícitamente.
 
-| Componente | Versión | Uso |
-|---|---:|---|
-| Python | 3.14.4 | runtime comprobado |
-| SQLite | 3.46.1 | persistencia |
-| websockets | 15.0.1 | WS público Kraken (opcional) |
-| requests | 2.32.5 | HTTP opcional; el adaptador usa urllib estándar |
-| rich | 13.9.4 | salida opcional |
-| numpy | 2.3.5 | disponible, no requerido por el núcleo |
+### cTrader fixture y CFD PAPER fixture
 
-La suite se ejecutó con `python3 -m unittest`; `pytest` no está instalado en
-este entorno y no se añadió ninguna dependencia para suplirlo.
-
-`BacktestRunner.run` evalúa cada señal/horizonte de forma independiente. Para
-una cartera virtual separada, `BacktestRunner.run_portfolio(...)` usa stake y
-saldo fijos, omite explícitamente señales solapadas (`skipped_overlap`) y
-calcula caída máxima; no modifica los resultados independientes ni conecta un
-motor de ejecución.
-
-La función `mtf_lab.core.assess_freshness` calcula por separado `feed_age_seconds`
-y `closed_candle_age_seconds`; sólo marca `STALE`/`LATE` cuando sus tolerancias
-explícitas se exceden, de modo que la edad normal de una vela M15 no se confunde
-con atraso de recepción.
-
-También está disponible el mismo lanzador en `bin/mtf-lab` para integrarlo en
-un `PATH` local, sin instalar paquetes.
-
-## Decisiones pendientes
-
-- Elegir futuro bróker y revisar su fuente de precios, sesiones, contratos y
-  restricciones antes de implementar un adaptador adicional.
-- Definir una partición fuera de muestra y un protocolo de investigación antes
-  de interpretar resultados; esta versión no optimiza parámetros.
-- Decidir si una futura cartera permitirá posiciones solapadas y qué fricciones
-  explícitas (spread/comisión) aplican al producto elegido.
-
-Durante el arranque Kraken se guardan por separado las velas nativas REST y los
-trades/updates WS, con `revision` y procedencia; una reconexión sólo marca
-`needs_reconciliation`. La v1 no reemplaza retroactivamente una observación ni
-afirma conciliación automática, y permite revisar esa diferencia en una sesión
-posterior.
-
-## Indicadores usados
-
-`mtf_lab.core.indicators` usa EMA con semilla SMA de `n` cierres y
-`alpha=2/(n+1)`. RSI y ATR usan Wilder: media inicial simple de `n` muestras,
-después `(prev*(n-1)+actual)/n`; RSI aparece tras `n+1` cierres y ATR tras `n`
-true ranges (el primero usa `high-low`). Una pérdida media cero da RSI 100
-(si la ganancia es positiva) o 50 (serie constante), ganancia media cero da 0,
-y ATR cero permanece cero. Valores ausentes, velas abiertas y huecos reinician
-calentamiento y no alimentan señales.
-
-## Fuentes públicas consultadas
-
-El contrato de integración Kraken se contrastó con la documentación vigente:
-[Trades Spot WebSocket v2](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade), [Candles (OHLC) Spot WebSocket v2](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ohlc) y [Get OHLC Data Spot REST](https://docs.kraken.com/api/docs/rest-api/get-ohlc-data). La documentación confirma que `trade` puede agrupar varias operaciones, que el snapshot refleja las últimas 50, que `ohlc` se actualiza con operaciones y que REST devuelve hasta 720 entradas dejando la última como intervalo no comprometido; el adaptador conserva esas limitaciones en procedencia y no afirma recuperación completa sólo por reconectar.
-
-## Integración cTrader / Forex-CFD (experimental, fail-closed)
-
-La primera integración cTrader está separada del núcleo y usa el SDK oficial opcional
-`ctrader-open-api` sólo cuando se instala explícitamente. En el entorno del proyecto
-Python 3.14.4 se comprobó `ctrader-open-api 0.9.2`, `google.protobuf 3.20.1`,
-Twisted 24.3.0, pyOpenSSL 24.1.0 y `service-identity 24.2.0`; `pip check` no
-reportó conflictos. Las versiones completas y transitivas comprobadas están en
-`requirements-ctrader.lock`. El codec Protobuf real (incluido heartbeat con envelope) y
-la serialización local se validaron sin credenciales. La sonda DNS/TCP/TLS de `demo.ctraderapi.com:5035` se ejecutó el 2026-09-10 con TLSv1.3; no autenticó ninguna cuenta. La conexión de sesión contra una cuenta y las operaciones externas permanecen pendientes de autorización.
-
-Perfiles y recorridos disponibles:
+Estos comandos son estrictamente locales y no requieren el extra si el fixture
+no carga el SDK; con el extra instalado además validan el codec oficial:
 
 ```bash
 ./mtf-lab ctrader doctor --config config/ctrader_query.toml
-./mtf-lab ctrader doctor --config config/ctrader_query.toml --network  # sólo DNS/TCP/TLS DEMO
-./mtf-lab ctrader auth-url --config config/ctrader_query.toml
-./mtf-lab ctrader callback-listen --config config/ctrader_query.toml --attempt-id ID --open-browser
-./mtf-lab ctrader token-exchange --config config/ctrader_query.toml --attempt-id ID --callback-file /ruta/callback-0600
 ./mtf-lab ctrader query --fixture
-./mtf-lab ctrader fixture --report /tmp/ctrader-fixture.json
-./mtf-lab cfd-paper --config config/ctrader_pipeline_fixture.toml --db /tmp/mtf-paper.sqlite3
+./mtf-lab ctrader fixture --report runtime/verification/ctrader-fixture.json
+./mtf-lab cfd-paper \
+  --config config/ctrader_pipeline_fixture.toml \
+  --db runtime/verification/cfd-paper.sqlite3 \
+  --report runtime/verification/cfd-paper.json \
+  --chunk-size 128
 ```
 
-`auth-url` guarda un intento loopback reanudable fuera del árbol del proyecto y
-abre el navegador sólo con `--open-browser`. Para intercambiar un callback real,
-entréguelo por un archivo local 0600 o stdin; no se acepta el código en un
-argumento visible. `token-exchange --fixture` y `token-refresh --fixture` usan
-stores temporales y nunca tocan el store real.
+`cfd-paper` genera una captura sintética, la pasa por
+`RuntimeCoordinator`/consumidores y persiste el producto CFD. Para reanudar
+una sesión, usa el `session_id` del JSON de salida:
 
-`ctrader_query.toml` solicita únicamente `accounts`; `ctrader_demo.toml` requiere además `trading` pero permanece deshabilitado, y ninguna cuenta se selecciona automáticamente. El flujo de consulta separa conexión, autenticación de aplicación, descubrimiento de cuentas, validación DEMO y autorización de cuenta. Los tokens se almacenan únicamente mediante referencias externas y un directorio privado fuera del proyecto; no se aceptan secretos en TOML, logs, checkpoints ni ejemplos.
+```bash
+./mtf-lab cfd-paper \
+  --config config/ctrader_pipeline_fixture.toml \
+  --db runtime/verification/cfd-paper.sqlite3 \
+  --session ID
+```
 
-El paper trading CFD es un producto distinto del contrato binario: usa unidades, bid/ask, latencias, spread, comisión, conversión y financiación explícitos, con resultados `PENDING`, `CLOSED` o `UNKNOWN` cuando falta evidencia. El ejecutor demo local requiere cuenta DEMO seleccionada/verificada, endpoint demo, scope `trading` y `activate()` explícito. `CTraderDemoTransport` adapta mensajes Protobuf oficiales de órdenes, cierres, fills y reconciliación, pero recibe un gateway SDK inyectado y nunca abre red/OAuth por sí solo. Su ruta externa exige `ServerAccountObservation` producida por el servidor; `verified=true` de una entrada local no basta. El fixture nunca contacta un servidor.
+`--input` acepta capturas JSON/JSONL locales; `--order market_time_corrected`
+es sólo inspección y no puede autorizar un fill observado. Los reportes son
+compactos; `--include-payloads` sólo debe usarse cuando se necesite revisar
+payloads sintéticos completos.
 
-La elegibilidad de Pepperstone para México, entidad, tarifas, Open API, almacenamiento y permisos de automatización **no está verificada**. El borrador no enviado está en `docs/pepperstone_ctrader_openapi_draft.md`.
+### UI fixture
+
+La UI es de sólo lectura y no recalcula reglas financieras. Genera primero la
+base CFD y luego sirve el visor local durante un intervalo finito; no abre un
+navegador ni contacta servicios externos:
+
+```bash
+./mtf-lab ui \
+  --db runtime/verification/cfd-paper.sqlite3 \
+  --host 127.0.0.1 --port 8765 --duration 1
+```
+
+El gate JavaScript reproducible usa el Node local:
+
+```bash
+MTF_UI_JS_DEV=1 MTF_NODE_BIN="$(command -v node)" \
+  .venv/bin/python -m unittest -q tests.test_ui_javascript
+```
+
+## Configuración y datos
+
+Los seis perfiles TOML de `config/` se conservan también como recursos
+byte-for-byte en instalaciones wheel. `--config` permite elegir un perfil; si
+no se especifica, el cargador busca primero el checkout y después el recurso
+empaquetado. Los defaults de un wheel nunca escriben en `site-packages`: usan
+`MTF_LAB_STATE_DIR` si existe o el estado XDG del usuario.
+
+El importador local requiere mapeo explícito de columnas y valida timestamps,
+OHLC, finitud, orden y duplicados. Los datos de `examples/` son sintéticos y
+versionados sólo como fixtures reproducibles; no son cotizaciones reales.
+
+La persistencia usa schema SQLite v4 y migración aditiva desde v3. Los
+checkpoints se separan por `analysis_id`; `received_at` y `available_at` no se
+confunden. `cfd_trades` permanece separado de `simulations` binarias. Economía
+desconocida conserva `None`; `commission_known=false` no significa comisión
+cero.
+
+Timestamps con zona horaria se normalizan a UTC y los intervalos son
+`[inicio, fin)`. Las velas abiertas sólo se visualizan. No se interpolan ticks
+ni precios en huecos; datos atrasados, discontinuos o duplicados bloquean la
+evaluación afectada. Kraken REST/WebSocket sigue siendo una ruta opcional y
+requiere red explícita; la última vela REST no se trata como cerrada sin la
+evidencia correspondiente.
+
+## Integración cTrader / Forex-CFD
+
+La integración conserva una fachada compatible en `mtf_lab.data.ctrader` y
+módulos separados de cuentas, configuración, protocolo, codec, transporte,
+sesión, mercado y fixtures. `CTraderClientGateway` conecta el único cliente
+SDK/lector y no se crea un puente Twisted paralelo. La ruta externa exige
+evidencia del cliente autenticado ligada a generación y vigencia; una bandera
+`verified=true` suministrada por un caller no autentica el gateway.
+
+El fixture local recorre mensajes Protobuf generados, auth simulada,
+correlación, construcción de órdenes, eventos y reconciliación, pero no es una
+sesión DEMO observada. La ejecución externa está deshabilitada; REAL/LIVE se
+rechaza fail-closed. Los comandos `auth-url`, `callback-listen`,
+`token-exchange` y `token-refresh` se conservan para activación futura y no se
+usan en el gate offline. Los secretos sólo se reciben mediante referencias o
+entradas privadas fuera del repositorio, nunca por argumentos visibles.
+
+Consulta el [estado de integración cTrader](docs/ctrader_integration_status.md)
+para límites técnicos y la [matriz de activación](docs/activation_boundaries.md)
+para la lista A/B/C. La elegibilidad de Pepperstone, entidad aplicable a
+México, permisos, almacenamiento de datos, costes y condiciones contractuales
+**no está verificada**.
+
+## Comparación, trazabilidad y límites científicos
+
+`backtest` conserva la referencia `m1_trigger_reference` junto a las señales
+MTF, con hash de dataset, configuración, variante, partición y contrato.
+Repetir la misma corrida es idempotente; cambiar una dimensión crea otra
+identidad. `independent_sample_count` es una agrupación temporal conservadora,
+no prueba independencia estadística.
+
+EMA/RSI/ATR y los umbrales iniciales son decisiones de investigación; no se
+hace búsqueda masiva de parámetros en este cierre. Los resultados sintéticos,
+backtests y PAPER fixtures no prueban rentabilidad, ventaja estadística,
+liquidez, spreads, comisiones, ejecución, disponibilidad futura ni
+cumplimiento contractual.
+
+## Fuentes públicas de protocolo
+
+- [Trades Spot WebSocket v2 de Kraken](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/trade), [Candles Spot WebSocket v2](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/ohlc) y [OHLC REST](https://docs.kraken.com/api/docs/rest-api/get-ohlc-data).
+- [Open API cTrader](https://help.ctrader.com/open-api/), [endpoints](https://help.ctrader.com/open-api/proxies-endpoints/), [conexión](https://help.ctrader.com/open-api/connection/), [autenticación](https://help.ctrader.com/open-api/account-authentication/) y [datos de símbolos](https://help.ctrader.com/open-api/symbol-data/).
+- [Presencia de campos Protobuf](https://protobuf.dev/programming-guides/field_presence/) y [contrato `Decimal` de Python](https://docs.python.org/3/library/decimal.html).

@@ -1,0 +1,1450 @@
+{
+  "baseline_commit": "46545533992918ca44804038814f1adc19107f8b",
+  "evidence_kind": "HISTORICAL_PRE_PUBLICATION_REFACTOR_NOT_CURRENT_GATE",
+  "historical_baseline": {
+    "architecture": {
+      "command": "python tools/engineering_audit.py --root .",
+      "core_clock_or_environment_accesses": [],
+      "cycles": [
+        [
+          "mtf_lab.ops.ctrader_demo_transport",
+          "mtf_lab.ops.ctrader_executor"
+        ],
+        [
+          "mtf_lab.pipeline",
+          "mtf_lab.runtime",
+          "mtf_lab.runtime.integration"
+        ]
+      ],
+      "forbidden_core_imports": [],
+      "import_resolution": "ImportFrom retains imported symbols; package re-exports do not imply every child module.",
+      "import_time_side_effects": [],
+      "metric": "1 + if/loop/except/match/conditional-expression + boolean-operands-minus-one + comprehensions; nested functions excluded",
+      "priority_modules": {
+        "mtf_lab.configuration": {
+          "bytes": 23640,
+          "lines": 376,
+          "runtime_dependency_count": 1,
+          "top_functions": [
+            {
+              "complexity": 76,
+              "end_line": 374,
+              "line": 230,
+              "lines": 145,
+              "name": "load_config"
+            },
+            {
+              "complexity": 13,
+              "end_line": 227,
+              "line": 204,
+              "lines": 24,
+              "name": "normalize_simulation_mapping"
+            },
+            {
+              "complexity": 12,
+              "end_line": 123,
+              "line": 100,
+              "lines": 24,
+              "name": "SimulationConfig.__post_init__"
+            }
+          ]
+        },
+        "mtf_lab.core.strategy": {
+          "bytes": 44556,
+          "lines": 884,
+          "runtime_dependency_count": 3,
+          "top_functions": [
+            {
+              "complexity": 54,
+              "end_line": 752,
+              "line": 647,
+              "lines": 106,
+              "name": "TrendPullbackStrategy._trigger_evaluation"
+            },
+            {
+              "complexity": 41,
+              "end_line": 388,
+              "line": 265,
+              "lines": 124,
+              "name": "StrategyConfig.from_mapping"
+            },
+            {
+              "complexity": 31,
+              "end_line": 645,
+              "line": 563,
+              "lines": 83,
+              "name": "TrendPullbackStrategy._preparation_evaluation"
+            }
+          ]
+        },
+        "mtf_lab.data.ctrader": {
+          "bytes": 109966,
+          "lines": 2324,
+          "runtime_dependency_count": 1,
+          "top_functions": [
+            {
+              "complexity": 26,
+              "end_line": 277,
+              "line": 204,
+              "lines": 74,
+              "name": "dependency_report"
+            },
+            {
+              "complexity": 25,
+              "end_line": 1839,
+              "line": 1744,
+              "lines": 96,
+              "name": "CTraderProvider.normalize_spot"
+            },
+            {
+              "complexity": 24,
+              "end_line": 1136,
+              "line": 1081,
+              "lines": 56,
+              "name": "CTraderClient._request_locked"
+            }
+          ]
+        },
+        "mtf_lab.ops.cli": {
+          "bytes": 107252,
+          "lines": 1850,
+          "runtime_dependency_count": 21,
+          "top_functions": [
+            {
+              "complexity": 62,
+              "end_line": 853,
+              "line": 612,
+              "lines": 242,
+              "name": "cmd_watch"
+            },
+            {
+              "complexity": 32,
+              "end_line": 1678,
+              "line": 1515,
+              "lines": 164,
+              "name": "cmd_ctrader_query"
+            },
+            {
+              "complexity": 28,
+              "end_line": 531,
+              "line": 457,
+              "lines": 75,
+              "name": "cmd_backtest"
+            }
+          ]
+        },
+        "mtf_lab.ops.ctrader_demo_transport": {
+          "bytes": 32212,
+          "lines": 601,
+          "runtime_dependency_count": 1,
+          "top_functions": [
+            {
+              "complexity": 44,
+              "end_line": 447,
+              "line": 404,
+              "lines": 44,
+              "name": "CTraderDemoTransport._snapshot_from_response"
+            },
+            {
+              "complexity": 24,
+              "end_line": 227,
+              "line": 180,
+              "lines": 48,
+              "name": "CTraderDemoTransport.__init__"
+            },
+            {
+              "complexity": 22,
+              "end_line": 393,
+              "line": 352,
+              "lines": 42,
+              "name": "CTraderDemoTransport._send"
+            }
+          ]
+        },
+        "mtf_lab.ops.ctrader_pipeline": {
+          "bytes": 39410,
+          "lines": 941,
+          "runtime_dependency_count": 9,
+          "top_functions": [
+            {
+              "complexity": 21,
+              "end_line": 420,
+              "line": 306,
+              "lines": 115,
+              "name": "normalize_ctrader_capture"
+            },
+            {
+              "complexity": 16,
+              "end_line": 458,
+              "line": 423,
+              "lines": 36,
+              "name": "spot_event_to_cfd_quote"
+            },
+            {
+              "complexity": 16,
+              "end_line": 586,
+              "line": 546,
+              "lines": 41,
+              "name": "CTraderPipeline.__init__"
+            }
+          ]
+        },
+        "mtf_lab.runtime.processor": {
+          "bytes": 82247,
+          "lines": 1486,
+          "runtime_dependency_count": 7,
+          "top_functions": [
+            {
+              "complexity": 60,
+              "end_line": 1278,
+              "line": 1157,
+              "lines": 122,
+              "name": "IncrementalProcessor.from_checkpoint"
+            },
+            {
+              "complexity": 36,
+              "end_line": 698,
+              "line": 621,
+              "lines": 78,
+              "name": "IncrementalProcessor._accept_candle"
+            },
+            {
+              "complexity": 29,
+              "end_line": 944,
+              "line": 867,
+              "lines": 78,
+              "name": "IncrementalProcessor.process_event"
+            }
+          ]
+        }
+      },
+      "private_state_by_module": {
+        "mtf_lab.core.aggregation": {
+          "accesses": 67,
+          "cross_object": 0,
+          "writes": 16
+        },
+        "mtf_lab.core.indicators": {
+          "accesses": 49,
+          "cross_object": 0,
+          "writes": 19
+        },
+        "mtf_lab.core.strategy": {
+          "accesses": 49,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.data.ctrader": {
+          "accesses": 255,
+          "cross_object": 0,
+          "writes": 46
+        },
+        "mtf_lab.data.kraken": {
+          "accesses": 32,
+          "cross_object": 0,
+          "writes": 5
+        },
+        "mtf_lab.data.synthetic": {
+          "accesses": 2,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.ops.backtest": {
+          "accesses": 4,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.ops.cfd_simulation": {
+          "accesses": 40,
+          "cross_object": 0,
+          "writes": 8
+        },
+        "mtf_lab.ops.cli": {
+          "accesses": 2,
+          "cross_object": 2,
+          "writes": 0
+        },
+        "mtf_lab.ops.ctrader_activation": {
+          "accesses": 16,
+          "cross_object": 2,
+          "writes": 1
+        },
+        "mtf_lab.ops.ctrader_demo_transport": {
+          "accesses": 33,
+          "cross_object": 0,
+          "writes": 4
+        },
+        "mtf_lab.ops.ctrader_executor": {
+          "accesses": 114,
+          "cross_object": 0,
+          "writes": 22
+        },
+        "mtf_lab.ops.ctrader_pipeline": {
+          "accesses": 9,
+          "cross_object": 1,
+          "writes": 0
+        },
+        "mtf_lab.ops.importer": {
+          "accesses": 2,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.ops.logging_state": {
+          "accesses": 38,
+          "cross_object": 0,
+          "writes": 11
+        },
+        "mtf_lab.ops.persistence": {
+          "accesses": 36,
+          "cross_object": 0,
+          "writes": 1
+        },
+        "mtf_lab.ops.query": {
+          "accesses": 31,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.ops.reporting": {
+          "accesses": 1,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.ops.simulation": {
+          "accesses": 10,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.ops.ui": {
+          "accesses": 9,
+          "cross_object": 0,
+          "writes": 0
+        },
+        "mtf_lab.runtime.integration": {
+          "accesses": 80,
+          "cross_object": 0,
+          "writes": 19
+        },
+        "mtf_lab.runtime.processor": {
+          "accesses": 249,
+          "cross_object": 84,
+          "writes": 38
+        }
+      },
+      "summary": {
+        "cross_object_private_accesses": 89,
+        "cycles": 2,
+        "dependency_edges": 120,
+        "dynamic_imports": 5,
+        "external_import_modules": 34,
+        "forbidden_core_imports": 0,
+        "functions": 1130,
+        "high_complexity_functions": 158,
+        "import_time_side_effects": 0,
+        "max_complexity": 76,
+        "modules": 40,
+        "parse_errors": 0,
+        "private_accesses": 1128,
+        "private_writes": 190,
+        "strict_violations": 2,
+        "typing_only_forbidden_core_imports": 0
+      },
+      "top_complexity_functions": [
+        {
+          "complexity": 76,
+          "end_line": 374,
+          "line": 230,
+          "lines": 145,
+          "module": "mtf_lab.configuration",
+          "name": "load_config"
+        },
+        {
+          "complexity": 62,
+          "end_line": 853,
+          "line": 612,
+          "lines": 242,
+          "module": "mtf_lab.ops.cli",
+          "name": "cmd_watch"
+        },
+        {
+          "complexity": 60,
+          "end_line": 1278,
+          "line": 1157,
+          "lines": 122,
+          "module": "mtf_lab.runtime.processor",
+          "name": "IncrementalProcessor.from_checkpoint"
+        },
+        {
+          "complexity": 59,
+          "end_line": 303,
+          "line": 210,
+          "lines": 94,
+          "module": "mtf_lab.ops.importer",
+          "name": "LocalImporter.read"
+        },
+        {
+          "complexity": 54,
+          "end_line": 752,
+          "line": 647,
+          "lines": 106,
+          "module": "mtf_lab.core.strategy",
+          "name": "TrendPullbackStrategy._trigger_evaluation"
+        },
+        {
+          "complexity": 47,
+          "end_line": 918,
+          "line": 798,
+          "lines": 121,
+          "module": "mtf_lab.data.translation",
+          "name": "reconcile_native_candles"
+        },
+        {
+          "complexity": 46,
+          "end_line": 676,
+          "line": 586,
+          "lines": 91,
+          "module": "mtf_lab.ops.simulation",
+          "name": "DirectionalEvaluator.evaluate_prepared"
+        },
+        {
+          "complexity": 44,
+          "end_line": 447,
+          "line": 404,
+          "lines": 44,
+          "module": "mtf_lab.ops.ctrader_demo_transport",
+          "name": "CTraderDemoTransport._snapshot_from_response"
+        },
+        {
+          "complexity": 41,
+          "end_line": 388,
+          "line": 265,
+          "lines": 124,
+          "module": "mtf_lab.core.strategy",
+          "name": "StrategyConfig.from_mapping"
+        },
+        {
+          "complexity": 41,
+          "end_line": 420,
+          "line": 246,
+          "lines": 175,
+          "module": "mtf_lab.data.importer",
+          "name": "_parse_rows"
+        },
+        {
+          "complexity": 40,
+          "end_line": 421,
+          "line": 340,
+          "lines": 82,
+          "module": "mtf_lab.pipeline",
+          "name": "persist_pipeline"
+        },
+        {
+          "complexity": 36,
+          "end_line": 698,
+          "line": 621,
+          "lines": 78,
+          "module": "mtf_lab.runtime.processor",
+          "name": "IncrementalProcessor._accept_candle"
+        }
+      ],
+      "typing_only_forbidden_core_imports": []
+    },
+    "environment": {
+      "dev_tools": {
+        "mypy": {
+          "available": false,
+          "evidence": "not found on PATH or in obvious local cache search"
+        },
+        "pyright": {
+          "available": false,
+          "evidence": "not found on PATH or in obvious local cache search"
+        },
+        "radon": {
+          "available": false,
+          "evidence": "not found on PATH or in obvious local cache search"
+        },
+        "ruff": {
+          "available": false,
+          "evidence": "not found on PATH or in obvious local cache search"
+        }
+      },
+      "distributions": {
+        "Twisted": "24.3.0",
+        "ctrader-open-api": "0.9.2",
+        "mtf-lab": "0.1.0",
+        "pip": "25.1.1",
+        "protobuf": "3.20.1",
+        "pyOpenSSL": "24.1.0",
+        "requests": "2.32.3",
+        "service-identity": "24.2.0",
+        "websockets": null
+      },
+      "launcher": {
+        "effective_interpreter": "/usr/bin/python3",
+        "help_returncode": 0,
+        "path": "mtf-lab",
+        "selection": "$ROOT/.venv/bin/python when executable, otherwise python3"
+      },
+      "pip_check": {
+        "network_attempts": [],
+        "ok": true,
+        "returncode": 0,
+        "stderr": "",
+        "stdout": "No broken requirements found.\n"
+      },
+      "python": {
+        "executable": ".venv/bin/python",
+        "implementation": "CPython",
+        "sys_version": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+        "version": "3.14.4"
+      },
+      "sqlite": "3.46.1"
+    },
+    "reference": {
+      "branch": "main",
+      "commit": "46545533992918ca44804038814f1adc19107f8b",
+      "repository": "victor982721-lab/MTF",
+      "source": "git archive of the reference commit; concurrent working-tree edits excluded"
+    },
+    "schema_version": 1,
+    "scope": {
+      "credentials_used": false,
+      "dependency_installation": false,
+      "external_network": "blocked by runner; loopback allowed for local UI tests",
+      "mode": "offline",
+      "oauth_started": false,
+      "stores": "HOME/XDG/TMP isolated for subprocesses"
+    },
+    "smoke": {
+      "core_import": {
+        "command": ".venv/bin/python -c \"import mtf_lab.core\"",
+        "network_attempts": 0,
+        "optional_modules_loaded": [],
+        "passed": true,
+        "write_attempts": 0
+      },
+      "launcher_help": {
+        "command": "./mtf-lab --help",
+        "network_attempts": 0,
+        "optional_modules_loaded": [],
+        "passed": true,
+        "write_attempts": 0
+      }
+    },
+    "tests": {
+      "canonical_command": "PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -q",
+      "discovered": 146,
+      "errors": 0,
+      "expected_failures": 0,
+      "failed": 0,
+      "failures": 0,
+      "offline_runner": "tools/offline_tests.py uses a child unittest runner so discovered, passed, failed, and skipped remain separate",
+      "passed": 146,
+      "skipped": 0,
+      "successful": true,
+      "tests_run": 146,
+      "unexpected_successes": 0,
+      "warnings": [
+        "protobuf 3.20.1 emitted datetime.utcfromtimestamp deprecation warning under Python 3.14.4"
+      ]
+    }
+  },
+  "historical_results": {
+    "architecture": {
+      "baseline": {
+        "cross_object_private_accesses": 89,
+        "cycles": 2,
+        "dependency_edges": 120,
+        "dynamic_imports": 5,
+        "external_import_modules": 34,
+        "forbidden_core_imports": 0,
+        "functions": 1130,
+        "high_complexity_functions": 158,
+        "import_time_side_effects": 0,
+        "max_complexity": 76,
+        "modules": 40,
+        "parse_errors": 0,
+        "private_accesses": 1128,
+        "private_writes": 190,
+        "strict_violations": 2,
+        "typing_only_forbidden_core_imports": 0
+      },
+      "baseline_cycles": [
+        [
+          "mtf_lab.ops.ctrader_demo_transport",
+          "mtf_lab.ops.ctrader_executor"
+        ],
+        [
+          "mtf_lab.pipeline",
+          "mtf_lab.runtime",
+          "mtf_lab.runtime.integration"
+        ]
+      ],
+      "core_clock_or_environment_accesses": [],
+      "final": {
+        "cross_object_private_accesses": 101,
+        "cycles": 0,
+        "dependency_edges": 197,
+        "dynamic_imports": 5,
+        "external_import_modules": 54,
+        "forbidden_core_imports": 0,
+        "functions": 1876,
+        "high_complexity_functions": 133,
+        "import_time_side_effects": 0,
+        "max_complexity": 76,
+        "modules": 62,
+        "parse_errors": 0,
+        "private_accesses": 1816,
+        "private_writes": 327,
+        "strict_violations": 0,
+        "typing_only_forbidden_core_imports": 0
+      },
+      "final_cycles": [],
+      "metric": "1 + if/loop/except/match/conditional-expression + boolean-operands-minus-one + comprehensions; nested functions excluded",
+      "note": "global private accesses increased; report limits/debt instead of claiming global reduction"
+    },
+    "environment": {
+      "distributions": {
+        "Twisted": "24.3.0",
+        "ctrader-open-api": "0.9.2",
+        "mtf-lab": "0.1.0",
+        "pip": "25.1.1",
+        "protobuf": "3.20.1",
+        "pyOpenSSL": "24.1.0",
+        "requests": "2.32.3",
+        "service-identity": "24.2.0",
+        "websockets": null
+      },
+      "python": {
+        "executable": ".venv/bin/python",
+        "implementation": "CPython",
+        "sys_version": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+        "version": "3.14.4"
+      },
+      "sqlite": "3.46.1"
+    },
+    "external_validation": {
+      "broker_accounts_contacted": false,
+      "external_executor_enabled": false,
+      "external_orders_sent": false,
+      "oauth_started": false,
+      "real_live_execution": "rejected",
+      "scope_note": "local fixtures and session proofs are not evidence of external account eligibility, rights, tariffs or authorization",
+      "status": "not executed and outside iteration acceptance"
+    },
+    "performance": {
+      "final": {
+        "events_durable": 7500,
+        "fixture": "synthetic repeated scenario v1; not market results",
+        "max_candles_per_timeframe": 256,
+        "network_blocked": true,
+        "samples": [
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 100,
+                "M5": 256
+              },
+              "cfd_events": 72,
+              "cfd_quote_ids": 1500,
+              "cfd_trades": 24,
+              "episodes": 62,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 100,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 8
+            },
+            "checkpoint_bytes": 4363532,
+            "events": 1500,
+            "milliseconds_per_new_event": 35.15948787600306,
+            "new_events_in_phase": 1500,
+            "phase_seconds": 52.7392318140046,
+            "python_bytes_current": 8245321,
+            "python_bytes_peak": 38502417
+          },
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 200,
+                "M5": 256
+              },
+              "cfd_events": 144,
+              "cfd_quote_ids": 3000,
+              "cfd_trades": 48,
+              "episodes": 136,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 200,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 16
+            },
+            "checkpoint_bytes": 4619338,
+            "events": 3000,
+            "milliseconds_per_new_event": 49.59348089333313,
+            "new_events_in_phase": 1500,
+            "phase_seconds": 74.3902213399997,
+            "python_bytes_current": 8703882,
+            "python_bytes_peak": 40853643
+          },
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "cfd_events": 216,
+              "cfd_quote_ids": 4096,
+              "cfd_trades": 72,
+              "episodes": 206,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 24
+            },
+            "checkpoint_bytes": 4813004,
+            "events": 4500,
+            "milliseconds_per_new_event": 51.962853252664594,
+            "new_events_in_phase": 1500,
+            "phase_seconds": 77.9442798789969,
+            "python_bytes_current": 9033523,
+            "python_bytes_peak": 42718437
+          },
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "cfd_events": 279,
+              "cfd_quote_ids": 4096,
+              "cfd_trades": 93,
+              "episodes": 256,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 31
+            },
+            "checkpoint_bytes": 4900260,
+            "events": 6000,
+            "milliseconds_per_new_event": 59.92010066866836,
+            "new_events_in_phase": 1500,
+            "phase_seconds": 89.88015100300254,
+            "python_bytes_current": 9603296,
+            "python_bytes_peak": 44052102
+          },
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "cfd_events": 351,
+              "cfd_quote_ids": 4096,
+              "cfd_trades": 117,
+              "episodes": 256,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 39
+            },
+            "checkpoint_bytes": 4978389,
+            "events": 7500,
+            "milliseconds_per_new_event": 54.28669639267415,
+            "new_events_in_phase": 1500,
+            "phase_seconds": 81.43004458901123,
+            "python_bytes_current": 9700891,
+            "python_bytes_peak": 44759757
+          }
+        ],
+        "schema_version": 1,
+        "stores": "temporary",
+        "warmup_retention_events": 3840
+      },
+      "initial_checkpoint_duplication_diagnostic": {
+        "events_durable": 4500,
+        "fixture": "synthetic repeated scenario v1; not market results",
+        "max_candles_per_timeframe": 256,
+        "network_blocked": true,
+        "samples": [
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 100,
+                "M5": 256
+              },
+              "cfd_events": 72,
+              "cfd_quote_ids": 1500,
+              "cfd_trades": 24,
+              "episodes": 62,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 100,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 8
+            },
+            "checkpoint_bytes": 8612150,
+            "events": 1500,
+            "phase_seconds": 84.13416809900082,
+            "python_bytes_current": 8297521,
+            "python_bytes_peak": 55696500
+          },
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 200,
+                "M5": 256
+              },
+              "cfd_events": 144,
+              "cfd_quote_ids": 3000,
+              "cfd_trades": 48,
+              "episodes": 136,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 200,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 16
+            },
+            "checkpoint_bytes": 9026274,
+            "events": 3000,
+            "phase_seconds": 118.43407815699175,
+            "python_bytes_current": 8740110,
+            "python_bytes_peak": 58625056
+          },
+          {
+            "active_sizes": {
+              "candles": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "cfd_events": 216,
+              "cfd_quote_ids": 4096,
+              "cfd_trades": 72,
+              "episodes": 206,
+              "evaluations": 768,
+              "events": 768,
+              "indicator_points": {
+                "M1": 256,
+                "M15": 256,
+                "M5": 256
+              },
+              "seen_event_ids": 768,
+              "signals": 24
+            },
+            "checkpoint_bytes": 9323687,
+            "events": 4500,
+            "phase_seconds": 123.49845945699781,
+            "python_bytes_current": 9072816,
+            "python_bytes_peak": 60941673
+          }
+        ],
+        "schema_version": 1,
+        "stores": "temporary",
+        "warmup_retention_events": 3840
+      },
+      "limits": [
+        "synthetic repeated scenario, not market profitability",
+        "not all signal/terminal capacities reached",
+        "tracemalloc/SQLite/checkpoints included; concurrent local work means no general speedup claim",
+        "durable archive grows by design while working windows are bounded"
+      ],
+      "measurement_source_manifest_sha256": "d43c28d01c94a202f0d9f45e5f2af871ef7a040a87cc6f7857d6f43f0cf62677",
+      "memory_definition": "tracemalloc current and peak, not total heap or RSS",
+      "paper_code_and_fixture_unchanged": true,
+      "subsequent_added_files": [
+        "tests/test_ui_javascript.py"
+      ],
+      "subsequent_changed_files": [
+        "mtf_lab/ops/ui.py",
+        "tests/test_cli_contracts.py"
+      ],
+      "timing_definition": "phase_seconds resets after each sample; divide by new_events_in_phase, not cumulative events"
+    },
+    "preservation": {
+      "oauth_or_activation_config_mutation": false,
+      "original_user_stores_used": false,
+      "profiles_sdk_lock_launchers_git_diff_empty": [
+        "config",
+        "requirements-ctrader.lock",
+        "mtf-lab",
+        "bin/mtf-lab"
+      ],
+      "runtime_dependency_set_not_reinstalled_or_updated": true,
+      "runtime_sdk_versions_checked_at_both_ends": [
+        "ctrader-open-api",
+        "protobuf",
+        "Twisted"
+      ]
+    },
+    "references": {
+      "baseline": "#/historical_baseline",
+      "integration_status": "docs/ctrader_integration_status.md",
+      "report": "reports/engineering/latest/engineering_consolidation.md",
+      "tooling": "#/historical_tooling"
+    },
+    "schema_version": 1,
+    "scope": "local offline engineering consolidation; not publication, installation or broker activation",
+    "source_tree": {
+      "base_commit": "46545533992918ca44804038814f1adc19107f8b",
+      "file_count": 107,
+      "files": {
+        "bin/mtf-lab": "881e0adf8d902e36bd423728f1acb3af3c595791047b5bca6dfe6b9bd018f0f0",
+        "config/ctrader_demo.toml": "937b2b5c1413c3b999446a7d72e8f0dae5512785556b480580de6e4e13b36d4e",
+        "config/ctrader_pipeline_fixture.toml": "4d3e16ee82c9b9f2f3a0531d4ff0da769123765e6e8f1eb9b36175056729dc45",
+        "config/ctrader_query.toml": "a5fa6f5981341b33d3f3228a4aa4141dc1b83e167f0087d3ecba5ac08de2c4e1",
+        "config/default.toml": "29fd88f4ac68c39e280b4f07b897683bf36efc3f5f081d57e28ad145604c8274",
+        "config/fixture_cfd.toml": "d882c36576df13ef01a05b5953f5c4884dd68768075cd6b5c6cdfd34b50644e9",
+        "config/kraken.toml": "e15e4bfb8c4215b995ec2685ff47043c5a0d08856fafeae01fbdb3973296713d",
+        "mtf-lab": "d6b7623ea231c869693f6a2d7db4e2c391b53926db412b50d93997486c95e3d3",
+        "mtf_lab/__init__.py": "12bbc3085e13799091ed88e830f2753db8b65d0ad5a0365a52ce226c3819e88a",
+        "mtf_lab/__main__.py": "e31a5d89f2743d4978c04450251d6c8bd32832fa1217bb46c2c4ad7da627eb04",
+        "mtf_lab/configuration.py": "6f01c8e8f42b352443eaff63b204f7c0521e1a50aa4339bf27356d36be8f299e",
+        "mtf_lab/core/__init__.py": "7873b5fe5a963aa71515adae189fe746dadbf84b4eb07ed18d4feae5b2f2a658",
+        "mtf_lab/core/aggregation.py": "08f0bb6b88da31a0dbd4ac0947172d2323ee25635bdd50728f817e56e426ca16",
+        "mtf_lab/core/canonical.py": "6734739959b1c6c53ac088d752da186b6e8f5e2963adb3a8a855c0f5c9b4534d",
+        "mtf_lab/core/cfd_quality.py": "b18f26f71c677560037689ef8f19c1c3e6f440ed4b12721649c8c40b0baa60dc",
+        "mtf_lab/core/cfd_simulation.py": "405aa243752f2eac14c63762f11d0593a8609d6e980f3a318e9f007e125438ac",
+        "mtf_lab/core/indicators.py": "2f61c68044e0f3edf54864b0f770ef41b9e20add2bc0f15cdf79c5c9b5854d93",
+        "mtf_lab/core/models.py": "6d07778e4fae94d379d94640a53c04d97c42a121d93bc8202a468d00afe708e2",
+        "mtf_lab/core/numeric.py": "7faba5884cc3c05db34d53b72624989ef35cabe6f80c6fa3e48e6fb2bab363b9",
+        "mtf_lab/core/quality.py": "1b21a74fd8c0a461ad35746393ffc533178e5bc6676405453673583196d0167d",
+        "mtf_lab/core/reference.py": "69545dee335d8ad73f28d839ee88ffb5c42a5047320f576059629464aa4868a2",
+        "mtf_lab/core/strategy.py": "686ecab1538b7e564233ce8f34b65a6488e3ac5984ce816ac5e287d5f03cd30f",
+        "mtf_lab/data/__init__.py": "812f007b0191f2f592e4c1a3c6919193da7d20c63149b98061b00bf7b575ab4d",
+        "mtf_lab/data/capture.py": "40687551f9be9757fa180bbf4c3c4e0b7144c12c038146a36e7dcda5d0585e3b",
+        "mtf_lab/data/ctrader.py": "da280c9c2815524c33e47e391d37bb4c2205d11ec08099b545e5c6ae31fb9887",
+        "mtf_lab/data/ctrader_accounts.py": "70b5040795cbccfdf5e15634d4fef79031b003ef63ffed55c9a9cbd45f6b65cf",
+        "mtf_lab/data/ctrader_config.py": "9f794704e3d55e62932a8b1181ee461de607458be01cc4153f0c64158ae6132c",
+        "mtf_lab/data/ctrader_errors.py": "9ae6ce6b856f0518fc56f0df359c63a5bd305d7d167822eaf02080a40e6bc367",
+        "mtf_lab/data/ctrader_fixtures.py": "55e1345aa9867cb55ddd1cea457e713ca80a087ed4aef3cf07e6077a65f6dd3d",
+        "mtf_lab/data/ctrader_market.py": "0c69fe7fd7136ec608638a1db5c4b5254e3de5b4c26d503aaafda010a0295414",
+        "mtf_lab/data/ctrader_protocol.py": "1fb88f0a82112aca55e45701910e0edcb82a72d0fae0491688979d9d8e078eba",
+        "mtf_lab/data/ctrader_session.py": "cf028d8c8dcb236e4598726b6a452f6c9aa30ef9bead18e8b545a79a61e64fec",
+        "mtf_lab/data/ctrader_transport.py": "9e6a148fb3770c99f4b3af031195c923bdf44ac10e4fd9e4081742c9818790e8",
+        "mtf_lab/data/importer.py": "31ceea6ca21f284ec701c5527eab0e3e4992ff86a9c5f9a8ff89b9bebf366032",
+        "mtf_lab/data/kraken.py": "ed108989424214541d297635fc59332106c13212d54a97edf49ba08b934ace97",
+        "mtf_lab/data/models.py": "d60203757f6f275919fd0bdcb9aaa69b3ce02e251d8de70b1626d851eb3d7b6b",
+        "mtf_lab/data/paper_fixture.py": "dd5d1dfc4f73ce85bd1a724014fe145522d9055e7ec472518189380ec261bed1",
+        "mtf_lab/data/provider.py": "d5e81561ebc7fcff560acfde2b747336aa4d1d90981c500b78e10895fcf1eaa2",
+        "mtf_lab/data/synthetic.py": "3f6e12136e365325cfb51ab0130b1ad178fec7c300f1bd1db9e7def8118c6158",
+        "mtf_lab/data/test_data.py": "7548a1d274a60b3836aee5256726d76afc219d9deecc6123387609976c48ea26",
+        "mtf_lab/data/translation.py": "0f4e2e7ebe5cb718d2406c66163735e3735edad25698d5b7fbf133aada20df96",
+        "mtf_lab/ops/__init__.py": "d967bb1751412c2d69334529538ea79d28d2c2cce553e039ecf988b504cf55f3",
+        "mtf_lab/ops/application_services.py": "81a031f6b1ee1f07c5506110fc3758707ca73944c7a2ed1206069408341203d9",
+        "mtf_lab/ops/backtest.py": "b21553b8c9ae0ff09931c3da46f3414cfd963ff3a429677e58bd62ce3f85507b",
+        "mtf_lab/ops/cfd_simulation.py": "2b86c916a1883cef4d37bf8379d5de216143f773411f2b2ceea080d760f1f1af",
+        "mtf_lab/ops/cli.py": "d4c41806c0967689868d5a534874ce8afe4dae4ada60b7c1b2b06912a6568ac9",
+        "mtf_lab/ops/cli_arguments.py": "cb64f2cf3a8eb7df039aef185d5aca106cdb3dbd9338d4dc42fb63aec4643c1a",
+        "mtf_lab/ops/cli_handlers.py": "6e82555550db8b1009e7e501e8d4f1ace4cb054a432de5a77f943d192abbc154",
+        "mtf_lab/ops/ctrader_activation.py": "371c78030997b058f7074083afad14298eb15081c54cbe940e65327724542cc8",
+        "mtf_lab/ops/ctrader_capture.py": "baa0ff9da45def7ca8fa230759287afef6ac39168c53f141eef58485cd064d32",
+        "mtf_lab/ops/ctrader_cli_services.py": "6b6d0c6981ca4d9c53e92620dedf8d045f613cb7afc6b6b2a3203b0152755e11",
+        "mtf_lab/ops/ctrader_commands.py": "5de9c6b8eb84a8864fe12e900bb636f866fc231962c9f6e6ec152bc9f6a3e584",
+        "mtf_lab/ops/ctrader_demo.py": "c03af8b355c10e302248c60458bc0038065bfce8da142755f9c173a30cf3f16d",
+        "mtf_lab/ops/ctrader_demo_transport.py": "39651417f56ebb332515b296cac516aabbf4d17a68b7143b7d1ea8106cde9177",
+        "mtf_lab/ops/ctrader_executor.py": "0dee28352ae345d67b0c7a0cb3a8f7a360d8447026e0b0fcbac5c238ac2bbaa2",
+        "mtf_lab/ops/ctrader_paper_adapters.py": "c6365c2e5364bfcb2fac720217d1bb287fd580590e209f5a405a13bc70317e32",
+        "mtf_lab/ops/ctrader_pipeline.py": "b54fa710ab1de6933c894c53a9801919777fa88515563651d69743594a582530",
+        "mtf_lab/ops/demo.py": "687903fcc03a1ff6661872ee86a18186704f9ba3e9c9e2243c1633c315115d84",
+        "mtf_lab/ops/importer.py": "e383e816325bb42e4d41c3898e22bda8da2c7cb4b0994b47cf414bcf86449962",
+        "mtf_lab/ops/logging_state.py": "058e28ae9fd080cbe3fdde563f614841d42028d0294e001809ebbd7816b0cd82",
+        "mtf_lab/ops/persistence.py": "a74c9f1649b62ac80b0b75ea48be0f8cb503326b5e66226863379b8edbffbfd3",
+        "mtf_lab/ops/query.py": "55371dd0f401e04a9dd4fe24cff262f26c564f719707d582a797acea08cc2495",
+        "mtf_lab/ops/reporting.py": "6bd1af3c0f51d431b5e27f11c3c165b5ec323600566a002d7a67c2c42787a00c",
+        "mtf_lab/ops/simulation.py": "9a5911769573707f60d335e0a05745575f07d5b0df8e1d8978ed5b55a84c5ace",
+        "mtf_lab/ops/ui.py": "734d6d7135717b1dabb519d437537b5dd305d2d02cc217d0228eda77c271c84e",
+        "mtf_lab/pipeline.py": "72949c253bb807557e5b775af5915c8b5031aae2ccd3c25afd7444fc45a0e1ff",
+        "mtf_lab/runtime/__init__.py": "366ae7eec2e65d81d6976b46786c4ec4d56570f3281f32491e7a808adea670db",
+        "mtf_lab/runtime/consumers.py": "bc1750ec953ff876ce77d11cb647abbdc6a989cef1c4fa5c74b995bff13fd030",
+        "mtf_lab/runtime/integration.py": "04e96d19eff163006aebead6bf075be59b69eac48b556b464482923863a691b3",
+        "mtf_lab/runtime/processor.py": "19e28e857de85012c00dbae0ef902460ff5e76340bd6171c5bd3ce985b0a7d6e",
+        "mtf_lab/runtime/state.py": "48ceeeb20d1c82d874e9e44ccf1e33f9d9727774f67ccad9908e2780926a829f",
+        "pyproject.toml": "c56b8fb71096b1d6e5c3333d62214fe5a565ed143152784335a5f7f9ff2a79f9",
+        "requirements-ctrader.lock": "817ba49bb45a2a130050916b34255e5a2fdab2b1ee98e1923bf29ccf32ecf084",
+        "requirements-dev.lock": "67589bd953bc0e7df3b23152df7a69be38518548501b91fd872dde1dcff6fca3",
+        "tests/test_aggregation_coverage.py": "b5d15542b2e2c05e6cf66114ad3ee2c393b128c53bee89716a5346191169557d",
+        "tests/test_architecture.py": "02cc307081eba48325bd84e66e947285a9e2a845299de0b58150b4599e231356",
+        "tests/test_capture_causality.py": "e5116a9b4cd675db3b8202bfd2c91bf38cb5b22334513d3b5d8a0234fb1bc20b",
+        "tests/test_cfd_contracts.py": "4a96fd1e0c5f1a8ea30393262c74bb6ac5ae265167f9eb7c22a0e0c3a9025942",
+        "tests/test_cfd_simulation.py": "e61221334ae4997bb55f29f94d0ca9c4bb6d918910d12d9e9ad9b9b5d93da694",
+        "tests/test_cli_contracts.py": "036d4884027e401d8f0e22b25bcd7e00bd0678ac4fb00fdc32abb3b1b73d4b38",
+        "tests/test_core.py": "85f6bba106ebd8175cddc448fc32dc3714056bf9e1250f27ecf5de6cc8b1761c",
+        "tests/test_ctrader_activation.py": "a288cedf4613d24253cec43c51cc84954fcd2bc1f82380c7e329ed2cc785a10f",
+        "tests/test_ctrader_cli_activation.py": "eafdae53ed923b541c1665a0ac6993cf09dc93107bae3f8069057a2f21b65a5c",
+        "tests/test_ctrader_demo_contracts.py": "29215651d36454d4f910db7e2369e7282c17a7bd7b3be03f8ed7226b13dee700",
+        "tests/test_ctrader_demo_transport.py": "604ce947b6e521bf47a7f8d3721637ed99b102076bdf97b1e355136fce9cc210",
+        "tests/test_ctrader_executor.py": "130f8f1adb97d8fe7ba7b0f27d1295540537f40c63cf781fb58e57d23c91d88b",
+        "tests/test_ctrader_pipeline.py": "5b362cd268c2bf680fba73401900055f23db1c96c913ea4ef608c1d260404136",
+        "tests/test_ctrader_profiles.py": "87450f469c00b8de8ceb740f2a0d7037462148338d74f97c0f46a3844eadbd8b",
+        "tests/test_ctrader_provider.py": "52ddabcca0042010b1e60159cdbd92a3e484012ccbbf903f028d1b866ff4bf39",
+        "tests/test_ctrader_quote_quality.py": "587fc9f69c1a8bb6bb9bba216d0e4a2dd2457876a5031671d8a5b200880b603a",
+        "tests/test_ctrader_session_contract.py": "1c952a9f103a720ee71f8641f38f73992b49b031f6679d7cc4f0a981d6985c02",
+        "tests/test_data_translation.py": "710f89609eb656543c071af65c6ac3165d1617e6c91d47ba320675a409a31008",
+        "tests/test_domain_boundaries.py": "88adfe40f6b35b73d079894d16348e3105ca8bb3e4b1dc5ee8341522cbaed2a1",
+        "tests/test_ops.py": "277845d43205fdbae7290029e44952215d1067a7b41a8530043a0e8dba2d16fa",
+        "tests/test_paper_session.py": "ffc9d2c56436a4591728390dc7ac3deb1b1fd12678b6c19e8ed3bded7ad61541",
+        "tests/test_persistence_recovery.py": "fe18463f25b5402cf52025d67a6d01b2eeb7cd1a14d4c8158b337632b47eda04",
+        "tests/test_pipeline.py": "04577c27db9b576c7a559b94f862f495d457a7a735ff609875a6ba5ad21cec35",
+        "tests/test_product_persistence.py": "526a1ed61ad35cc021ea15e20faf7f7c705e40a98d0e25ecd10fb5c976ebdd34",
+        "tests/test_runtime_incremental.py": "7be7e7fb0263cf688b77862d33bedd4938da2b18f531b503f4f55a91f0f56663",
+        "tests/test_runtime_operational.py": "cded5400882202bf61d4b0b1362d1388ca7a5fd3390975288ecb8dad6930e676",
+        "tests/test_signal_consumers.py": "c50f1bdb8efe53db96287f93ec0e7275246943cfcd09985dccdf7de97ad1f466",
+        "tests/test_simulation_parity.py": "288a5d281929bbb84a85390fdd20166350af89246192e846f0f624e16ac75cd0",
+        "tests/test_ui_javascript.py": "5cc46991cdad243387486b6ee5bd482a0556fddefbea6827403105d2dad3802f",
+        "tests/test_ui_query.py": "4ee4841a279299ae6c80ed2277f4f3b87cea05178481bc5131f7facd962325b2",
+        "tools/benchmark_paper.py": "88efca0ea9880cbd39f701c307740d19dfa0644d997a3e6ff8c3c95b7cb5df3b",
+        "tools/engineering_audit.py": "7578670a6a35fa71956489aa8aa6e04ebb8c4d24459275e27248f44e22f55d8f",
+        "tools/offline_tests.py": "aab7e53caf05311a92b6aff899ec3d138b78f37ca3676c0122b19b4a276a4b27"
+      },
+      "head_commit": "46545533992918ca44804038814f1adc19107f8b",
+      "manifest_algorithm": "SHA-256 of UTF-8 json.dumps(file_sha256_map, sort_keys=True, separators=(comma,colon)); docs and caches excluded",
+      "manifest_sha256": "7c65ed68c95ca382447f2a4d4cf9fffe89746601755e81bd8b6302901ac29b36",
+      "new_commit_created": false,
+      "pushed": false
+    },
+    "validation": {
+      "command": "MTF_UI_JS_DEV=1 MTF_NODE_BIN=<validated Node executable> PYTHONDONTWRITEBYTECODE=1 .venv/bin/python tools/offline_tests.py --json <temporary result>",
+      "critical_typing_lint": {
+        "mypy_strict_pass": true,
+        "ruff_check_pass": true,
+        "ruff_format_pass": true,
+        "scope_note": "not a repository-wide strict typing/lint claim; targets byte-identical to the individual tool receipts",
+        "target_count": 19,
+        "targets": [
+          "mtf_lab/core/canonical.py",
+          "mtf_lab/core/cfd_simulation.py",
+          "mtf_lab/core/cfd_quality.py",
+          "mtf_lab/core/numeric.py",
+          "mtf_lab/core/reference.py",
+          "mtf_lab/data/capture.py",
+          "mtf_lab/data/ctrader_accounts.py",
+          "mtf_lab/data/ctrader_config.py",
+          "mtf_lab/data/ctrader_errors.py",
+          "mtf_lab/data/ctrader_fixtures.py",
+          "mtf_lab/data/ctrader_market.py",
+          "mtf_lab/data/ctrader_protocol.py",
+          "mtf_lab/data/ctrader_session.py",
+          "mtf_lab/data/ctrader_transport.py",
+          "mtf_lab/ops/ctrader_capture.py",
+          "mtf_lab/ops/ctrader_paper_adapters.py",
+          "mtf_lab/ops/ctrader_pipeline.py",
+          "mtf_lab/ops/ctrader_demo_transport.py",
+          "mtf_lab/runtime/consumers.py"
+        ]
+      },
+      "external_network_attempts": [],
+      "javascript_dev_gate": "active; 3 tests cover compilation, nonempty DOM rendering, warmup/gap paths and card containment; missing Node is failure",
+      "node_version": "v24.19.0",
+      "offline_success": true,
+      "offline_suite": {
+        "discovered": 265,
+        "errors": 0,
+        "expected_failures": 0,
+        "failed": 0,
+        "failures": 0,
+        "passed": 265,
+        "skipped": 0,
+        "successful": true,
+        "tests_run": 265,
+        "unexpected_successes": 0
+      },
+      "pip_check": {
+        "message": "No broken requirements found.",
+        "ok": true,
+        "returncode": 0
+      },
+      "sdk_generated_messages_exercised": true,
+      "smoke": {
+        "core_import": {
+          "external_network_attempts": [],
+          "ok": true,
+          "optional_sdk_modules_loaded": [],
+          "returncode": 0,
+          "write_attempts": []
+        },
+        "help": {
+          "external_network_attempts": [],
+          "ok": true,
+          "optional_sdk_modules_loaded": [],
+          "returncode": 0,
+          "write_attempts": []
+        }
+      },
+      "ui": {
+        "binaryRows": 0,
+        "browser_closed": true,
+        "cfdHeaders": [
+          "Detectada",
+          "Operación",
+          "Señal",
+          "Dirección",
+          "Unidades",
+          "Estado",
+          "Estado económico",
+          "Economía",
+          "Cierre observado",
+          "Entrada",
+          "Cierre",
+          "Bruto",
+          "Neto",
+          "Razón"
+        ],
+        "cfdRows": 3,
+        "console_errors": [],
+        "denied_nonlocal_requests": [],
+        "load_errors": [],
+        "mode": "REPLAY · ctrader-open-api · EUR/USD",
+        "overflowing_cards": 0,
+        "page_errors": [],
+        "page_width": 1440,
+        "qa_runtime": "installed Chrome and bundled Playwright; temporary profile and loopback-only routing",
+        "read_only_ui": true,
+        "sample": [
+          "2026-01-01T02:03:01.000000Z",
+          "cfd_1535ada1828a31cf5f554b149683f6f1",
+          "sig_687925a60fea6cd93c2ebf1a7d8523ab",
+          "LONG",
+          "1000",
+          "CLOSED",
+          "INDETERMINATE",
+          "UNKNOWN",
+          "true",
+          "1.11290",
+          "1.11305",
+          "0.15000",
+          "null",
+          "COMMISSION_UNKNOWN"
+        ],
+        "temporary_database": true,
+        "title": "MTF Lab",
+        "viewport_width": 1440
+      },
+      "write_boundary_violations": []
+    },
+    "verified_at_local": "2026-09-11T03:42:42.095631-06:00",
+    "verified_at_utc": "2026-09-11T09:42:42.095631+00:00"
+  },
+  "historical_tooling": {
+    "configuration": {
+      "dev_extra": [
+        "ruff==0.16.7",
+        "mypy==2.3.1"
+      ],
+      "ignored_local_paths": [
+        ".venv-dev/",
+        ".ruff_cache/",
+        ".mypy_cache/",
+        ".dmypy.json"
+      ],
+      "lock_file": "requirements-dev.lock",
+      "mypy": {
+        "python_version": "3.11",
+        "warn_unused_configs": true
+      },
+      "pyproject_extra": "dev",
+      "ruff": {
+        "format_quote_style": "double",
+        "line_length": 120,
+        "lint_select": [
+          "E4",
+          "E7",
+          "E9",
+          "F",
+          "I",
+          "UP",
+          "B",
+          "SIM",
+          "C901"
+        ],
+        "mccabe_max_complexity": 10,
+        "target_version": "py311"
+      }
+    },
+    "installation": {
+      "command": "python -m venv .venv-dev && .venv-dev/bin/python -m pip install --only-binary=:all: --index-url https://pypi.org/simple ruff mypy",
+      "index": "https://pypi.org/simple",
+      "isolated_home_xdg": "<isolated-state>",
+      "pip_check": {
+        "returncode": 0,
+        "stdout": "No broken requirements found."
+      },
+      "pip_config": "/dev/null",
+      "pip_version": "25.1.1",
+      "resolved": {
+        "ast-serialize": "0.11.1",
+        "librt": "0.15.0",
+        "mypy": "2.3.1",
+        "mypy-extensions": "1.1.0",
+        "pathspec": "1.1.1",
+        "ruff": "0.16.7",
+        "typing-extensions": "4.16.0"
+      },
+      "wheels_only": true
+    },
+    "interpreters": {
+      "dev": {
+        "path": ".venv-dev/bin/python",
+        "version": "3.14.4"
+      },
+      "runtime": {
+        "path": ".venv/bin/python",
+        "version": "3.14.4"
+      },
+      "runtime_pip_check": {
+        "returncode": 0,
+        "stdout": "No broken requirements found."
+      },
+      "runtime_sdk_versions": {
+        "Twisted": "24.3.0",
+        "ctrader-open-api": "0.9.2",
+        "protobuf": "3.20.1"
+      }
+    },
+    "purpose": "Development-only lint, format and strict typing tooling; runtime remains stdlib/offline.",
+    "quality_checks": {
+      "final_gates": {
+        "architecture": {
+          "cycles": [],
+          "forbidden_core_imports": [],
+          "import_time_side_effects": [],
+          "receipt": "#/historical_results#architecture",
+          "strict_returncode": 0,
+          "summary": {
+            "cross_object_private_accesses": 101,
+            "cycles": 0,
+            "dependency_edges": 197,
+            "dynamic_imports": 5,
+            "external_import_modules": 54,
+            "forbidden_core_imports": 0,
+            "functions": 1876,
+            "high_complexity_functions": 133,
+            "import_time_side_effects": 0,
+            "max_complexity": 76,
+            "modules": 62,
+            "parse_errors": 0,
+            "private_accesses": 1816,
+            "private_writes": 327,
+            "strict_violations": 0,
+            "typing_only_forbidden_core_imports": 0
+          }
+        },
+        "mypy": {
+          "cache": "temporary outside checkout",
+          "command": ".venv-dev/bin/mypy --strict --no-incremental --follow-imports=silent --python-executable .venv/bin/python --cache-dir <temporary> --show-error-codes mtf_lab/core/canonical.py mtf_lab/core/cfd_simulation.py mtf_lab/core/cfd_quality.py mtf_lab/core/numeric.py mtf_lab/core/reference.py mtf_lab/data/capture.py mtf_lab/data/ctrader_accounts.py mtf_lab/data/ctrader_config.py mtf_lab/data/ctrader_errors.py mtf_lab/data/ctrader_fixtures.py mtf_lab/data/ctrader_market.py mtf_lab/data/ctrader_protocol.py mtf_lab/data/ctrader_session.py mtf_lab/data/ctrader_transport.py mtf_lab/ops/ctrader_capture.py mtf_lab/ops/ctrader_paper_adapters.py mtf_lab/ops/ctrader_pipeline.py mtf_lab/ops/ctrader_demo_transport.py mtf_lab/runtime/consumers.py",
+          "files_checked": 19,
+          "python_executable": ".venv/bin/python",
+          "receipt": "#/historical_results#validation.critical_typing_lint",
+          "result": "Success: no issues found in 19 source files",
+          "returncode": 0
+        },
+        "offline_validation": {
+          "discovered": 265,
+          "expected_failures": 0,
+          "failed": 0,
+          "javascript_dev_gate": "MTF_UI_JS_DEV=1; explicit Node v24.19.0; no JS skips",
+          "passed": 265,
+          "pip_check": {
+            "result": "No broken requirements found.",
+            "returncode": 0
+          },
+          "receipt": "#/historical_results#validation",
+          "skipped": 0,
+          "smoke": {
+            "core_import": {
+              "loaded_optional_count": 0,
+              "network_attempts": 0,
+              "ok": true,
+              "returncode": 0,
+              "write_attempts": 0
+            },
+            "help": {
+              "loaded_optional_count": 0,
+              "network_attempts": 0,
+              "ok": true,
+              "returncode": 0,
+              "write_attempts": 0
+            }
+          },
+          "success": true,
+          "tests_run": 265,
+          "unexpected_successes": 0
+        },
+        "ruff": {
+          "check": {
+            "command": ".venv-dev/bin/ruff check --no-cache --output-format concise mtf_lab/core/canonical.py mtf_lab/core/cfd_simulation.py mtf_lab/core/cfd_quality.py mtf_lab/core/numeric.py mtf_lab/core/reference.py mtf_lab/data/capture.py mtf_lab/data/ctrader_accounts.py mtf_lab/data/ctrader_config.py mtf_lab/data/ctrader_errors.py mtf_lab/data/ctrader_fixtures.py mtf_lab/data/ctrader_market.py mtf_lab/data/ctrader_protocol.py mtf_lab/data/ctrader_session.py mtf_lab/data/ctrader_transport.py mtf_lab/ops/ctrader_capture.py mtf_lab/ops/ctrader_paper_adapters.py mtf_lab/ops/ctrader_pipeline.py mtf_lab/ops/ctrader_demo_transport.py mtf_lab/runtime/consumers.py",
+            "result": "All checks passed",
+            "returncode": 0
+          },
+          "format_check": {
+            "command": ".venv-dev/bin/ruff format --check --no-cache mtf_lab/core/canonical.py mtf_lab/core/cfd_simulation.py mtf_lab/core/cfd_quality.py mtf_lab/core/numeric.py mtf_lab/core/reference.py mtf_lab/data/capture.py mtf_lab/data/ctrader_accounts.py mtf_lab/data/ctrader_config.py mtf_lab/data/ctrader_errors.py mtf_lab/data/ctrader_fixtures.py mtf_lab/data/ctrader_market.py mtf_lab/data/ctrader_protocol.py mtf_lab/data/ctrader_session.py mtf_lab/data/ctrader_transport.py mtf_lab/ops/ctrader_capture.py mtf_lab/ops/ctrader_paper_adapters.py mtf_lab/ops/ctrader_pipeline.py mtf_lab/ops/ctrader_demo_transport.py mtf_lab/runtime/consumers.py",
+            "result": "19 files already formatted",
+            "returncode": 0
+          }
+        },
+        "scope_note": "Ruff/mypy cover exactly these 19 source modules; whole offline suite and UI gates have separate scopes. No repository-wide lint or typing claim.",
+        "source_manifest": {
+          "files": 107,
+          "receipt": "#/historical_results#source_tree",
+          "sha256": "7c65ed68c95ca382447f2a4d4cf9fffe89746601755e81bd8b6302901ac29b36"
+        },
+        "target_count": 19,
+        "targets": [
+          "mtf_lab/core/canonical.py",
+          "mtf_lab/core/cfd_simulation.py",
+          "mtf_lab/core/cfd_quality.py",
+          "mtf_lab/core/numeric.py",
+          "mtf_lab/core/reference.py",
+          "mtf_lab/data/capture.py",
+          "mtf_lab/data/ctrader_accounts.py",
+          "mtf_lab/data/ctrader_config.py",
+          "mtf_lab/data/ctrader_errors.py",
+          "mtf_lab/data/ctrader_fixtures.py",
+          "mtf_lab/data/ctrader_market.py",
+          "mtf_lab/data/ctrader_protocol.py",
+          "mtf_lab/data/ctrader_session.py",
+          "mtf_lab/data/ctrader_transport.py",
+          "mtf_lab/ops/ctrader_capture.py",
+          "mtf_lab/ops/ctrader_paper_adapters.py",
+          "mtf_lab/ops/ctrader_pipeline.py",
+          "mtf_lab/ops/ctrader_demo_transport.py",
+          "mtf_lab/runtime/consumers.py"
+        ],
+        "ui_browser": {
+          "binary_rows": 0,
+          "cfd_rows": 3,
+          "console_errors": 0,
+          "javascript_errors": 0,
+          "overflowing_cards": 0,
+          "page_width": 1440,
+          "receipt": "#/historical_results#validation.ui",
+          "viewport_width": 1440
+        }
+      },
+      "initial_diagnostics": {
+        "mypy_follow_imports_silent": {
+          "by_file": {
+            "mtf_lab/core/cfd_simulation.py": 41,
+            "mtf_lab/data/capture.py": 1,
+            "mtf_lab/data/ctrader_protocol.py": 2,
+            "mtf_lab/runtime/consumers.py": 4
+          },
+          "errors": 48,
+          "note": "Initial five-file diagnostic; superseded by the final 19-file gate below.",
+          "returncode": 1
+        },
+        "mypy_follow_imports_skip": {
+          "by_file": {
+            "mtf_lab/core/cfd_simulation.py": 34,
+            "mtf_lab/data/capture.py": 1,
+            "mtf_lab/data/ctrader_protocol.py": 2,
+            "mtf_lab/runtime/consumers.py": 3
+          },
+          "errors": 40,
+          "note": "Retained only as the initial smoke diagnostic; it is not a current pending gate.",
+          "returncode": 1
+        },
+        "ruff_check": {
+          "autofix_run": false,
+          "by_code": {
+            "C901": 4,
+            "F401": 3,
+            "I001": 5,
+            "SIM108": 1,
+            "SIM114": 2,
+            "UP035": 2,
+            "UP037": 8,
+            "UP042": 4
+          },
+          "by_file": {
+            "mtf_lab/core/canonical.py": 1,
+            "mtf_lab/core/cfd_simulation.py": 18,
+            "mtf_lab/data/capture.py": 2,
+            "mtf_lab/data/ctrader_protocol.py": 2,
+            "mtf_lab/runtime/consumers.py": 6
+          },
+          "errors": 29,
+          "returncode": 1
+        },
+        "ruff_format_check": {
+          "autofix_run": false,
+          "returncode": 1,
+          "unformatted_files": [
+            "mtf_lab/core/canonical.py",
+            "mtf_lab/core/cfd_simulation.py",
+            "mtf_lab/data/capture.py",
+            "mtf_lab/data/ctrader_protocol.py",
+            "mtf_lab/runtime/consumers.py"
+          ]
+        },
+        "status": "historical_initial_diagnostic_not_pending",
+        "targets": [
+          "mtf_lab/core/canonical.py",
+          "mtf_lab/data/capture.py",
+          "mtf_lab/core/cfd_simulation.py",
+          "mtf_lab/data/ctrader_protocol.py",
+          "mtf_lab/runtime/consumers.py"
+        ]
+      }
+    },
+    "schema_version": 1,
+    "scope": {
+      "dev_venv": ".venv-dev",
+      "network": "No broker/OAuth/account access; final validation receipt reports no external network attempts.",
+      "runtime_dependency_mutation": false,
+      "runtime_venv": ".venv"
+    },
+    "validation": {
+      "final_receipt": "#/historical_results",
+      "initial_diagnostics": "retained separately for history; not current outstanding errors"
+    }
+  },
+  "observed_at_utc": "2026-09-11T09:42:42.095631+00:00",
+  "portability_note": "Original engineering evidence consolidated once. Only interpreter/workspace/temporary paths and internal reference locators were normalized; counts, results, source hashes and measurements are unchanged. JSON Pointer references identify historical sections, not current evidence.",
+  "preservation_check": {
+    "initial_files": 128,
+    "missing_tracked_files": 0,
+    "new_files": 42,
+    "prior_report_files_verified_against_initial_inventory": 107,
+    "prior_report_hash_mismatches": 0,
+    "tracked_modified": 32
+  },
+  "schema_version": 1
+}

@@ -6,18 +6,74 @@ quedan incluidos en el hash efectivo.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, fields
-from datetime import UTC, datetime
 import hashlib
-import json
 import math
+import os
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 from .core import IndicatorConfig, StrategyConfig, Timeframe, parse_timeframe
+from .core.canonical import canonical_json, canonical_value
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_BUNDLED_CONFIG_ROOT = Path(__file__).resolve().parent / "resources" / "config"
+
+
+def _is_source_checkout(root: Path) -> bool:
+    """Accept a root only when its project identity is explicitly MTF Lab."""
+    manifest = root / "pyproject.toml"
+    config = root / "config"
+    if not config.is_dir() or not manifest.is_file():
+        return False
+    try:
+        import tomllib
+
+        metadata = tomllib.loads(manifest.read_text(encoding="utf-8")).get("project", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return isinstance(metadata, dict) and metadata.get("name") == "mtf-lab"
+
+
+def packaged_config_path(name: str = "default.toml") -> Path:
+    """Return a checked-in config path for source and wheel installations.
+
+    A source checkout keeps ``config/`` as the canonical editable location.
+    Wheels carry byte-for-byte copies below ``mtf_lab/resources/config`` so a
+    regular (non-editable) install does not reach back into the checkout.
+    """
+    relative = Path(name)
+    if relative.is_absolute() or relative.parent != Path("."):
+        raise ValueError(f"nombre de configuración no válido: {name!r}")
+    source = PROJECT_ROOT / "config" / relative
+    if _is_source_checkout(PROJECT_ROOT) and source.is_file():
+        return source
+    bundled = _BUNDLED_CONFIG_ROOT / relative
+    if bundled.is_file():
+        return bundled
+    # Keep a useful, deterministic path in the error emitted by load_config.
+    return source
+
+
+def default_state_dir() -> Path:
+    """Return a writable state directory without using site-packages.
+
+    Source checkouts preserve the historical ``data/`` location.  A regular
+    wheel has no repository root, so it uses the explicit override or the
+    user's XDG state directory instead of attempting to write beside code.
+    """
+    explicit = os.environ.get("MTF_LAB_STATE_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    if _is_source_checkout(PROJECT_ROOT):
+        return PROJECT_ROOT / "data"
+    xdg_state = os.environ.get("XDG_STATE_HOME")
+    base = Path(xdg_state).expanduser() if xdg_state else Path.home() / ".local" / "state"
+    return base / "mtf-lab"
+
 
 class ConfigError(ValueError):
     """Configuración ausente, desconocida o incompatible."""
@@ -36,18 +92,43 @@ def _finite(value: Any, name: str, *, minimum: float | None = None) -> float:
 
 
 def _canonical(value: Any) -> Any:
+    """Return strict JSON-compatible values for configuration hashes."""
+
+    return canonical_value(value)
+
+
+def _detach(value: Any) -> Any:
+    """Detach nested mapping proxies while preserving JSON container shape."""
+
     if isinstance(value, Mapping):
-        return {str(k): _canonical(v) for k, v in sorted(value.items(), key=lambda item: str(item[0]))}
-    if isinstance(value, (list, tuple)):
-        return [_canonical(item) for item in value]
-    if hasattr(value, "value") and not isinstance(value, (str, bytes)):
-        return _canonical(value.value)
-    if isinstance(value, Timeframe):
-        return {"name": value.name, "seconds": value.seconds}
-    if isinstance(value, datetime):
-        return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        return _canonical(value.to_dict())
+        return {key: _detach(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach(item) for item in value)
+    if isinstance(value, set):
+        return {_detach(item) for item in value}
+    return deepcopy(value)
+
+
+def _freeze_mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+    if value is None:
+        return MappingProxyType({})
+    if not isinstance(value, Mapping):
+        raise ConfigError("las secciones de configuración deben ser tablas")
+    # EffectiveConfig is frozen, but nested TOML/provider mappings are still
+    # mutable unless ownership is detached here. Keep nested list/dict shape
+    # for public JSON compatibility while preventing caller-side mutation.
+    return MappingProxyType(_detach(value))
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    if isinstance(value, list):
+        return [_thaw(item) for item in value]
     return value
 
 
@@ -115,10 +196,13 @@ class SimulationConfig:
         if not isinstance(self.require_closed, bool):
             raise ConfigError("simulation.require_closed debe ser booleano")
         if self.requested_base_price is not None:
-            base = str(self.requested_base_price).lower()
+            raw_base = self.requested_base_price.value if hasattr(self.requested_base_price, "value") else self.requested_base_price
+            if not isinstance(raw_base, str):
+                raise ConfigError(f"simulation.requested_base_price no soportada: {self.requested_base_price!r}")
+            base = raw_base.strip().lower()
             if base == "trade":
                 base = "traded"
-            if base not in {"traded", "close", "bid", "ask", "mid"}:
+            if base not in {"traded", "close", "bid", "ask", "mid", "native"}:
                 raise ConfigError(f"simulation.requested_base_price no soportada: {self.requested_base_price!r}")
             object.__setattr__(self, "requested_base_price", base)
 
@@ -150,9 +234,18 @@ class EffectiveConfig:
     cfd: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     ctrader_oauth: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
 
+    def __post_init__(self) -> None:
+        for name in ("data", "provider", "ui", "ctrader", "execution", "cfd", "ctrader_oauth"):
+            object.__setattr__(self, name, _freeze_mapping(getattr(self, name)))
+        if self.price_base == "close":
+            # Alias histórico de una vela OHLC; no se aplica a native.
+            object.__setattr__(self, "price_base", "traded")
+        if self.price_base not in {"traded", "bid", "ask", "mid", "native"}:
+            raise ConfigError(f"instrument.price_base no soportada: {self.price_base!r}")
+
     @property
     def config_hash(self) -> str:
-        encoded = json.dumps(self.to_dict(include_hash=False), ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        encoded = canonical_json(self.to_dict(include_hash=False)).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
     def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
@@ -180,13 +273,13 @@ class EffectiveConfig:
             "quality": self.quality.to_dict(),
             "simulation": self.simulation.to_dict(),
             "storage": {"db": self.storage_db, "logs": self.storage_logs},
-            "data": dict(self.data),
-            "provider": dict(self.provider),
-            "ui": dict(self.ui),
-            "ctrader": dict(self.ctrader),
-            "execution": dict(self.execution),
-            "cfd": dict(self.cfd),
-            "ctrader_oauth": dict(self.ctrader_oauth),
+            "data": _thaw(self.data),
+            "provider": _thaw(self.provider),
+            "ui": _thaw(self.ui),
+            "ctrader": _thaw(self.ctrader),
+            "execution": _thaw(self.execution),
+            "cfd": _thaw(self.cfd),
+            "ctrader_oauth": _thaw(self.ctrader_oauth),
         }
         if include_hash:
             result["config_hash"] = self.config_hash
@@ -229,7 +322,7 @@ def normalize_simulation_mapping(config: EffectiveConfig | Mapping[str, Any] | N
 
 def load_config(path: str | Path | None = None) -> EffectiveConfig:
     import tomllib
-    target = Path(path).expanduser() if path is not None else PROJECT_ROOT / "config" / "default.toml"
+    target = Path(path).expanduser() if path is not None else packaged_config_path()
     if not target.exists():
         raise ConfigError(f"configuración no encontrada: {target}")
     try:
@@ -255,7 +348,7 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
     ctrader = _section(raw, "ctrader", {"enabled", "operation_mode", "environment", "required_scopes", "account_id", "account_selected", "token_ref", "token_store_dir", "protocol", "host", "port", "endpoint", "symbol", "redirect_uri", "scope", "client_id_env", "client_secret_env", "token_path", "request_rate_limit", "historical_rate_limit", "heartbeat_seconds", "max_queue", "max_reconnects", "reconnect_backoff_seconds", "allow_network", "provider"})
     ctrader_oauth = _section(raw, "ctrader_oauth", {"client_id_env", "client_secret_env", "redirect_uri", "authorization_url", "token_url"})
     execution = _section(raw, "execution", {"enabled", "environment", "endpoint", "account_id", "scope", "activation_required", "max_quantity", "fixed_quantity", "max_exposure", "max_positions", "max_spread", "max_price_age_seconds", "allowed_symbols", "paused", "transport", "token_ref", "close_only_own_positions", "no_martingale", "timeout_seconds"})
-    cfd = _section(raw, "cfd", {"instrument", "account_currency", "default_quantity", "quantity_unit", "units", "commission", "commission_currency", "commission_fixed", "commission_per_unit", "slippage", "slippage_pips", "financing", "financing_required", "financing_rate_per_second", "conversion_rate", "fill_policy", "close_policy", "horizons_seconds", "entry_latency_seconds", "decision_latency_seconds", "close_latency_seconds", "max_spread", "max_quote_age_seconds", "max_price_age_seconds", "market_calendar", "pip_size", "price_precision", "digits", "lot_size", "min_quantity", "max_quantity", "step_quantity"})
+    cfd = _section(raw, "cfd", {"instrument", "account_currency", "default_quantity", "quantity_unit", "units", "commission", "commission_currency", "commission_fixed", "commission_per_unit", "commission_known", "terminal_retention", "event_retention", "quote_id_retention", "max_active_trades", "slippage", "slippage_pips", "financing", "financing_required", "financing_rate_per_second", "conversion_rate", "fill_policy", "close_policy", "horizons_seconds", "entry_latency_seconds", "decision_latency_seconds", "close_latency_seconds", "max_spread", "max_quote_age_seconds", "max_price_age_seconds", "market_calendar", "pip_size", "price_precision", "digits", "lot_size", "min_quantity", "max_quantity", "step_quantity"})
     provider.setdefault("name", "kraken_public")
     if not str(provider.get("name", "")).lower().startswith(("ctrader", "fixture")):
         provider.setdefault("rest_url", "https://api.kraken.com/0/public/OHLC")
@@ -286,7 +379,7 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
     price_base = str(instrument_section.get("price_base", data_section.get("price_base", "traded"))).lower()
     if price_base == "trade":
         price_base = "traded"
-    if price_base not in {"traded", "close", "bid", "ask", "mid"}:
+    if price_base not in {"traded", "close", "bid", "ask", "mid", "native"}:
         raise ConfigError(f"instrument.price_base no soportada: {price_base!r}")
     values = tf_section.get("values", ("M1", "M5", "M15"))
     if not isinstance(values, (list, tuple)) or isinstance(values, (str, bytes)):
@@ -363,7 +456,7 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
     if not required_strategy_tfs.issubset({tf.name for tf in timeframes}):
         raise ConfigError("strategy requiere temporalidades presentes en timeframes.values")
     project_name = str(project.get("name", "MTF Lab")); version = str(project.get("version", "0.1.0"))
-    db = Path(storage.get("db", PROJECT_ROOT / "data" / "mtf_lab.sqlite3")).expanduser()
+    db = Path(storage.get("db", default_state_dir() / "mtf_lab.sqlite3")).expanduser()
     logs = Path(storage.get("logs", db.with_suffix(".jsonl"))).expanduser()
     data_effective = dict(data_section)
     data_effective.setdefault("provider", provider.get("name"))
@@ -373,4 +466,13 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
     data_effective.setdefault("mode", mode)
     return EffectiveConfig(str(target.resolve()), project_name, version, mode, str(symbol).strip(), price_base, timeframes, bool(tf_section.get("closed_only", True)), indicators, strategy, quality, simulation, str(db), str(logs), MappingProxyType(data_effective), MappingProxyType(dict(provider)), MappingProxyType(dict(ui)), MappingProxyType(dict(ctrader)), MappingProxyType(dict(execution)), MappingProxyType(dict(cfd)), MappingProxyType(dict(ctrader_oauth)))
 
-__all__ = ["ConfigError", "EffectiveConfig", "QualityConfig", "SimulationConfig", "load_config", "normalize_simulation_mapping"]
+__all__ = [
+    "ConfigError",
+    "EffectiveConfig",
+    "QualityConfig",
+    "SimulationConfig",
+    "default_state_dir",
+    "load_config",
+    "normalize_simulation_mapping",
+    "packaged_config_path",
+]

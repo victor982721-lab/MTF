@@ -287,38 +287,7 @@ def run_detector(streams: Mapping[str, Iterable[Candle]], *, mode: str | Operati
 
 
 
-def m1_reference_signals(series: IndicatorSeries, *, rsi_threshold: float = 50.0, mode: str = "REPLAY", identity_salt: str = "") -> list[dict[str, Any]]:
-    """Referencia controlada: sólo cruce EMA20 + RSI en M1.
-
-    Reutiliza los mismos puntos calculados por ``compute_indicators``; no es
-    una segunda versión de trend_pullback_v1 y se identifica como variante.
-    """
-    rows: list[dict[str, Any]] = []
-    for index, point in enumerate(series.points):
-        if index == 0 or not point.ready:
-            continue
-        previous = series.points[index - 1]
-        if not previous.ready or previous.ema_fast is None or point.ema_fast is None or point.rsi is None:
-            continue
-        direction: str | None = None
-        if previous.close <= previous.ema_fast and point.close > point.ema_fast and point.rsi > rsi_threshold:
-            direction = "UP"
-        elif previous.close >= previous.ema_fast and point.close < point.ema_fast and point.rsi < rsi_threshold:
-            direction = "DOWN"
-        if direction is None:
-            continue
-        detected = point.available_at or point.end
-        token = f"m1-reference|{series.instrument}|{point.start.isoformat()}|{direction}|rsi>{rsi_threshold:g}|mode={mode}|salt={identity_salt}"
-        rows.append({
-            "signal_id": "m1ref_" + hashlib.sha256(token.encode()).hexdigest()[:32],
-            "instrument": series.instrument, "direction": direction,
-            "detected_at": detected, "timestamp": detected,
-            "mode": mode, "status": "REFERENCE_M1",
-            "available_at": detected,
-            "values": {"close": point.close, "ema_fast": point.ema_fast, "rsi": point.rsi, "rsi_threshold": rsi_threshold, "variant": "m1_trigger_reference"},
-            "quality": point.quality.status,
-        })
-    return rows
+from .core.reference import m1_reference_signals
 
 
 def evaluation_spec_from_config(config: Mapping[str, Any] | Any | None = None) -> EvaluationSpec:

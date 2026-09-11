@@ -1,8 +1,6 @@
 {
   "session_id": "5119b000-036c-45d7-9ac0-873870fc00ff",
-  "db_path": "/tmp/mtf_lab_demo_artifact.sqlite3",
   "report_path": "reports/mtf_lab_demo_report.md",
-  "log_path": "/tmp/mtf_lab_demo_artifact.jsonl",
   "dataset": {
     "seed": 20260909,
     "requested_virtual_minutes": 720,
@@ -763,5 +761,7 @@
       "La ausencia de una fuente de noticias o de un bróker no se interpreta como comprobación.",
       "Una simulación INDETERMINATE o PENDING no se cuenta como ganancia, pérdida ni operación resuelta."
     ]
-  }
+  },
+  "artifact_kind": "HISTORICAL_SYNTHETIC_DEMO",
+  "runtime_artifacts": "Temporary SQLite and JSONL are not distributed; reproduction creates new local outputs."
 }

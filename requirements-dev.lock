@@ -1,0 +1,10 @@
+# Development-only lock for Linux/Python 3.14.4 in .venv-dev.
+# Runtime .venv and the validated cTrader SDK are intentionally untouched.
+# pip itself is the isolated bootstrap tool and is not part of this lock.
+ast-serialize==0.11.1
+librt==0.15.0
+mypy==2.3.1
+mypy-extensions==1.1.0
+pathspec==1.1.1
+ruff==0.16.7
+typing-extensions==4.16.0

@@ -16,8 +16,10 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from ..configuration import EffectiveConfig
 from ..core import Candle, MarketEvent, OperationMode, PriceBase
+from ..core.reference import m1_reference_signals
 from ..ops.persistence import SQLiteStore, payload_hash
 from .processor import IncrementalProcessor, ProcessResult, ReplayResult, RuntimeIssue, _looks_like_candle, _replay_key
+from .consumers import SignalConsumer
 from .state import SimulationConfig as RuntimeSimulationConfig, candle_dict, event_dict, to_core_candle, to_core_event
 
 
@@ -118,6 +120,7 @@ class RuntimeCoordinator:
         checkpoint_every: int = 100,
         source: str = "runtime",
         max_candles: int | None = 5000,
+        signal_consumer: SignalConsumer | None = None,
         resume: bool = True,
         clock: Callable[[], datetime] | None = None,
         checkpoint_interval_seconds: float | None = None,
@@ -179,7 +182,10 @@ class RuntimeCoordinator:
             processor_snapshot = None
             self.checkpoint_name = f"{checkpoint_name}:{self.analysis_id[:12]}"
         if processor_snapshot:
-            self.processor = IncrementalProcessor.from_checkpoint(processor_snapshot)
+            self.processor = IncrementalProcessor.from_checkpoint(
+                processor_snapshot,
+                signal_consumer=signal_consumer,
+            )
             if self.processor.mode is not self.mode:
                 raise ValueError("el checkpoint y el modo de ejecución no coinciden")
             self._input_ordinal = int(snapshot.get("events_processed", 0))
@@ -209,7 +215,20 @@ class RuntimeCoordinator:
                 source=source,
                 price_base=("traded" if config.price_base == "close" else config.price_base),
                 max_candles=max_candles,
+                signal_consumer=signal_consumer,
             )
+
+    @property
+    def signal_consumer(self) -> SignalConsumer:
+        """Selected product boundary; no caller needs processor internals."""
+
+        return self.processor.signal_consumer
+
+    @property
+    def signals(self) -> tuple[Any, ...]:
+        """Detector signals retained by the processor."""
+
+        return tuple(self.processor.signals)
 
     def _analysis_fields(self, *, variant: str | None = None) -> dict[str, Any]:
         return {
@@ -421,7 +440,7 @@ class RuntimeCoordinator:
         # ``complete`` only changes simulation grace/watermark. It never
         # bypasses an active gate for new decisions.
         allow_signals = self.can_emit_signals
-        if complete:
+        if complete and self.processor.signal_consumer.consumer_type == "binary_simulation":
             watermark = watermark + timedelta(seconds=max(self.config.simulation.horizons_seconds) + self.config.simulation.max_price_age_seconds)
         result = self.processor.finalize(watermark, evaluate_strategy=allow_signals, capture_complete=complete)
         self._runtime_block_from_result(result)
@@ -456,11 +475,19 @@ class RuntimeCoordinator:
         self._checkpoint_if_due(force=force_checkpoint)
         return result
 
-    def checkpoint(self) -> None:
-        state = {
+    def export_state(self) -> dict[str, Any]:
+        """Return coordinator state for an atomic application checkpoint.
+
+        The returned mapping contains only JSON-compatible detector and
+        operational state. Product sessions can persist it beside their own
+        snapshot and cursor without reaching into processor internals.
+        """
+        return {
+            "runtime_checkpoint_version": 1,
             "processor": self.processor.checkpoint(),
             "config_hash": self.config.config_hash,
             "analysis_id": self.analysis_id,
+            "cursor": {"analysis_id": self.analysis_id, "ordinal": self._input_ordinal},
             "status": asdict(self.status()),
             "operational": {
                 "capture_state": self.capture_state,
@@ -478,9 +505,63 @@ class RuntimeCoordinator:
                 "last_checkpoint_at": _jsonable(self._last_checkpoint_at),
             },
         }
+
+    def restore_state(self, snapshot: Mapping[str, Any] | str) -> None:
+        """Restore detector and coordinator state after validating identity."""
+        if isinstance(snapshot, str):
+            snapshot = json.loads(snapshot)
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("snapshot debe ser mapping o JSON")
+        # Store checkpoints wrap the application state under ``state``; direct
+        # exports do not. Accept both forms without silently accepting a third.
+        payload = snapshot.get("state", snapshot)
+        if not isinstance(payload, Mapping):
+            raise ValueError("state de coordinador inválido")
+        analysis_id = payload.get("analysis_id")
+        if analysis_id is not None and str(analysis_id) != self.analysis_id:
+            raise ValueError("analysis_id del checkpoint no coincide")
+        config_hash = payload.get("config_hash")
+        if config_hash is not None and str(config_hash) != self.config.config_hash:
+            raise ValueError("config_hash del checkpoint no coincide")
+        processor_snapshot = payload.get("processor")
+        if not isinstance(processor_snapshot, Mapping):
+            raise ValueError("checkpoint sin processor")
+        # Keep the selected consumer object (and any application sink) while
+        # restoring its versioned state through the public processor boundary.
+        self.processor = IncrementalProcessor.from_checkpoint(
+            processor_snapshot,
+            signal_consumer=self.processor.signal_consumer,
+        )
+        cursor = payload.get("cursor", snapshot.get("cursor", {}))
+        if not isinstance(cursor, Mapping):
+            cursor = {}
+        cursor_analysis = cursor.get("analysis_id")
+        if cursor_analysis is not None and str(cursor_analysis) != self.analysis_id:
+            raise ValueError("analysis_id del cursor no coincide")
+        self._input_ordinal = int(cursor.get("ordinal", snapshot.get("events_processed", 0)))
+        self._last_checkpoint_events = self._input_ordinal
+        operational = payload.get("operational", {})
+        if isinstance(operational, Mapping):
+            self.capture_state = str(operational.get("capture_state", self.capture_state))
+            self.freshness_state = str(operational.get("freshness_state", self.freshness_state))
+            self.continuity_state = str(operational.get("continuity_state", self.continuity_state))
+            self.connection_state = str(operational.get("connection_state", self.connection_state))
+            self.reconciliation_state = str(operational.get("reconciliation_state", self.reconciliation_state))
+            self.external_blocked_reasons = [str(item) for item in operational.get("external_blocked_reasons", ())]
+            self._external_block_details = {str(key): dict(value) for key, value in dict(operational.get("external_block_details", {})).items() if isinstance(value, Mapping)}
+            self._runtime_block_details = {str(key): dict(value) for key, value in dict(operational.get("runtime_block_details", {})).items() if isinstance(value, Mapping)}
+            self._block_history = [dict(item) for item in operational.get("block_history", ()) if isinstance(item, Mapping)]
+            self.last_received_at = _parse_datetime(operational.get("last_received_at"))
+            self.last_heartbeat_at = _parse_datetime(operational.get("last_heartbeat_at"))
+            self.last_processed_at = _parse_datetime(operational.get("last_processed_at"))
+            self._last_checkpoint_at = _parse_datetime(operational.get("last_checkpoint_at"))
+
+    def checkpoint(self) -> dict[str, Any]:
+        state = self.export_state()
         self.store.save_checkpoint(self.session_id, self.checkpoint_name, cursor={"analysis_id": self.analysis_id, "ordinal": self._input_ordinal}, events_processed=self._input_ordinal, last_event_id=self.processor.last_event_id, state=state)
         self._last_checkpoint_events = self._input_ordinal
         self._last_checkpoint_at = _clock_value(self._clock)
+        return state
 
     def update_feed_state(self, *, connection: str | None = None, reconciliation: str | None = None, freshness: str | None = None, continuity: str | None = None, blocked_reasons: Iterable[str] = (), block_details: Mapping[str, Any] | None = None, heartbeat_at: datetime | None = None) -> None:
         """Replace the current operational gate; history never implies health."""
@@ -542,7 +623,6 @@ class RuntimeCoordinator:
 
     def reference_signals(self) -> tuple[list[dict[str, Any]], str]:
         """Persiste la referencia M1 sobre la misma captura, aunque MTF sea cero."""
-        from ..pipeline import m1_reference_signals
         name = self.config.strategy.trigger_timeframe.name
         engine = self.processor.indicator_engines.get(name)
         if engine is None:

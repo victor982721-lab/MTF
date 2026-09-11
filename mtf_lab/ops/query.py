@@ -13,12 +13,11 @@ import base64
 import dataclasses
 import hashlib
 import json
-import math
-from collections.abc import Iterable, Mapping
-from datetime import UTC, datetime
+from collections.abc import Mapping
+from datetime import datetime
 from typing import Any
 
-from .persistence import SQLiteStore, utc_iso
+from .persistence import SQLiteStore, canonical_json, utc_iso
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -52,6 +51,8 @@ _TABLES: dict[str, tuple[str, str, str]] = {
     "signals": ("signals", "detected_ts", "signal_row_id"),
     "discards": ("discards", "observed_ts", "discard_row_id"),
     "simulations": ("simulations", "detected_ts", "simulation_row_id"),
+    "cfd_trades": ("cfd_trades", "detected_at", "cfd_trade_row_id"),
+    "capture_envelopes": ("capture_envelopes", "available_at", "capture_row_id"),
 }
 
 
@@ -74,6 +75,172 @@ def _text(value: Any) -> str:
     return str(value) if value is not None else ""
 
 
+def _resolve_query_alias(primary: str | None, alias: str | None, label: str) -> str | None:
+    if alias is not None:
+        if primary is not None and str(primary) != str(alias):
+            raise ValueError(f"{label} y su alias no pueden diferir")
+        return alias
+    return primary
+
+
+def _resolve_query_state(state: object | None, alias: object | None) -> object | None:
+    if alias is not None:
+        state_text = str(getattr(state, "value", state)).upper() if state is not None else None
+        alias_text = str(getattr(alias, "value", alias)).upper()
+        if state_text is not None and state_text != alias_text:
+            raise ValueError("state y lifecycle_state no pueden diferir")
+        return alias
+    return state
+
+
+def _append_query_equals(
+    clauses: list[str], params: list[Any], pairs: tuple[tuple[str, object | None], ...],
+) -> None:
+    for column, value in pairs:
+        if value is not None:
+            clauses.append(f"{column}=?")
+            params.append(str(getattr(value, "value", value)))
+
+
+def _append_query_cfd_options(
+    clauses: list[str], params: list[Any], state: object | None,
+    horizon_seconds: object | None, terminal: bool | None,
+) -> None:
+    if state is not None:
+        clauses.append("state=?")
+        params.append(str(getattr(state, "value", state)).upper())
+    if horizon_seconds is not None:
+        clauses.append("horizon_seconds=?")
+        params.append(str(horizon_seconds))
+    if terminal is not None:
+        if not isinstance(terminal, bool):
+            raise ValueError("terminal debe ser booleano")
+        clauses.append("terminal=?")
+        params.append(int(terminal))
+
+
+def _append_query_cfd_ranges(
+    clauses: list[str], params: list[Any], start_ts: Any | None, end_ts: Any | None,
+) -> None:
+    if start_ts is not None:
+        clauses.append("detected_at>=?")
+        params.append(_parse_time(start_ts))
+    if end_ts is not None:
+        clauses.append("detected_at<?")
+        params.append(_parse_time(end_ts))
+
+
+def _cfd_query_where(
+    session_id: str,
+    analysis_id: str | None,
+    trade_id: str | None,
+    signal_id: str | None,
+    state: object | None,
+    instrument: str | None,
+    product: str | None,
+    variant: str | None,
+    partition: str | None,
+    horizon_seconds: object | None,
+    terminal: bool | None,
+    start_ts: Any | None,
+    end_ts: Any | None,
+) -> tuple[list[str], list[Any], dict[str, Any]]:
+    filters: dict[str, Any] = {
+        "session_id": session_id, "analysis_id": analysis_id, "trade_id": trade_id,
+        "signal_id": signal_id, "state": str(getattr(state, "value", state)).upper() if state is not None else None,
+        "instrument": instrument, "product": product, "variant": variant,
+        "partition": partition, "horizon_seconds": str(horizon_seconds) if horizon_seconds is not None else None,
+        "terminal": terminal, "start_ts": _parse_time(start_ts), "end_ts": _parse_time(end_ts),
+    }
+    clauses = ["session_id=?"]
+    params: list[Any] = [session_id]
+    _append_query_equals(clauses, params, (("analysis_id", analysis_id), ("trade_id", trade_id), ("signal_id", signal_id), ("instrument", instrument), ("product", product), ("variant", variant), ("partition", partition)))
+    _append_query_cfd_options(clauses, params, state, horizon_seconds, terminal)
+    _append_query_cfd_ranges(clauses, params, start_ts, end_ts)
+    return clauses, params, filters
+
+
+def _query_cursor_condition(decoded: Mapping[str, Any] | None, order: str) -> tuple[str, list[Any], bool]:
+    if not decoded:
+        return "", [], False
+    op = str(decoded["op"])
+    operator = ">" if ((order == "asc" and op == "after") or (order == "desc" and op == "before")) else "<"
+    sql = f" AND (detected_at {operator} ? OR (detected_at=? AND cfd_trade_row_id {operator} ?))"
+    return sql, [decoded["ts"], decoded["ts"], int(decoded["row_id"])], op == "before"
+
+
+def _query_cfd_cursor_pair(
+    service: QueryService,
+    items: list[dict[str, Any]],
+    filters: Mapping[str, Any],
+    order: str,
+    decoded: Mapping[str, Any] | None,
+    has_more: bool,
+) -> tuple[str | None, str | None]:
+    if not items:
+        return None, None
+    first, last = items[0], items[-1]
+    next_cursor = service._cursor(table="cfd_trades", filters=filters, order=order, op="after", ts=str(last["detected_at"]), row_id=int(last["cfd_trade_row_id"])) if has_more or (decoded and decoded.get("op") == "before") else None
+    prev_cursor = service._cursor(table="cfd_trades", filters=filters, order=order, op="before", ts=str(first["detected_at"]), row_id=int(first["cfd_trade_row_id"])) if decoded else None
+    return next_cursor, prev_cursor
+
+
+def _snapshot_context(status: dict[str, Any], session: Mapping[str, Any]) -> None:
+    session_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
+    ctrader = session_config.get("ctrader") if isinstance(session_config.get("ctrader"), Mapping) else {}
+    execution = session_config.get("execution") if isinstance(session_config.get("execution"), Mapping) else {}
+    status.update({
+        "provider_environment": ctrader.get("environment") or session.get("mode"),
+        "provider_account_id": ctrader.get("account_id") or None,
+        "provider_symbol": ctrader.get("symbol") or session.get("instrument"),
+        "execution_environment": execution.get("environment") or None,
+        "execution_destination": execution.get("endpoint") or None,
+        "permissions": {"scopes": ctrader.get("required_scopes", []), "account_selected": ctrader.get("account_selected", False), "executor_enabled": execution.get("enabled", False)},
+    })
+    if str(status.get("mode", "")).upper() in {"SYNTHETIC", "REPLAY"}:
+        status.setdefault("connection", "OFFLINE")
+        status.setdefault("analysis_enabled", False)
+
+
+def _snapshot_coverage(store: SQLiteStore, session_id: str) -> dict[str, dict[str, Any]]:
+    coverage: dict[str, dict[str, Any]] = {}
+    rows = store.conn.execute(
+        "SELECT timeframe, MIN(start_ts), MAX(end_ts), SUM(closed=0), COUNT(*) FROM candles WHERE session_id=? GROUP BY timeframe",
+        (session_id,),
+    )
+    for row in rows:
+        coverage[str(row[0])] = {"start_ts": row[1], "end_ts": row[2], "open_count": int(row[3] or 0), "count": int(row[4] or 0)}
+    return coverage
+
+
+def _snapshot_cfd_lifecycle(store: SQLiteStore, session_id: str) -> dict[str, Any]:
+    empty = {"cfd_lifecycle": {"pending_or_filled": 0, "closed": 0, "terminal_unknown_or_rejected": 0}, "pending_cfd_trades": 0}
+    if not store._table_exists("cfd_trades"):
+        return empty
+    counts = store.conn.execute(
+        "SELECT SUM(state IN ('PENDING','FILLED')), SUM(state='CLOSED'), SUM(state IN ('REJECTED','UNKNOWN')) FROM cfd_trades WHERE session_id=?",
+        (session_id,),
+    ).fetchone()
+    pending = int(counts[0] or 0)
+    return {"cfd_lifecycle": {"pending_or_filled": pending, "closed": int(counts[1] or 0), "terminal_unknown_or_rejected": int(counts[2] or 0)}, "pending_cfd_trades": pending}
+
+
+def _apply_checkpoint_projection(store: SQLiteStore, status: dict[str, Any], session_id: str) -> None:
+    for name in ("runtime", "pipeline"):
+        checkpoint = store.get_checkpoint(session_id, name)
+        if not checkpoint:
+            continue
+        state = checkpoint.get("state") if isinstance(checkpoint.get("state"), Mapping) else {}
+        runtime_status = state.get("status") if isinstance(state.get("status"), Mapping) else {}
+        processor = state.get("processor") if isinstance(state.get("processor"), Mapping) else {}
+        if runtime_status:
+            status.update({key: runtime_status[key] for key in ("connection", "analysis_enabled", "analysis_blocked_reasons", "pending_simulations", "completed_simulations") if key in runtime_status})
+        if processor:
+            status["warmup_pending"] = processor.get("warmup_pending", {})
+            status["runtime_processor"] = {key: processor.get(key) for key in ("events_processed", "candles_processed", "signals", "evaluations", "errors", "last_event_time", "last_available_at")}
+        break
+
+
 class QueryService:
     """Bounded read model over an existing :class:`SQLiteStore`.
 
@@ -88,7 +255,7 @@ class QueryService:
         self.max_limit = max(1, int(max_limit))
 
     def _filter_hash(self, table: str, filters: Mapping[str, Any]) -> str:
-        payload = json.dumps({"table": table, **dict(filters)}, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+        payload = canonical_json({"table": table, **dict(filters)})
         return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
     def _cursor(self, *, table: str, filters: Mapping[str, Any], order: str, op: str, ts: str, row_id: int, condition_ordinal: int | None = None) -> str:
@@ -139,6 +306,25 @@ class QueryService:
         elif table == "simulations":
             result["assumptions"] = _decode_json(result.pop("assumptions_json", None), {})
             result["payload"] = _decode_json(result.pop("payload_json", None), {})
+        elif table == "cfd_trades":
+            result["lineage"] = _decode_json(result.pop("lineage_json", None), {}) or {}
+            result["payload"] = _decode_json(result.pop("payload_json", None), {}) or {}
+            result["terminal"] = bool(int(result.get("terminal", 0)))
+            result["close_observed"] = bool(int(result.get("close_observed", 0)))
+            result["lifecycle_state"] = result.get("state")
+            # CFD lifecycle and economic knowledge are separate dimensions;
+            # never project them to binary WIN/LOSS/TIE labels.
+            economic_state = str(result.get("economic_state") or ("NOT_SETTLED" if result.get("state") in {"PENDING", "FILLED"} else ("DETERMINED" if result.get("net_pnl") is not None else "INDETERMINATE"))).upper()
+            result["economic_state"] = economic_state
+            result["economic_result_state"] = economic_state
+            result["economic_status"] = {"NOT_SETTLED": "NOT_SETTLED", "DETERMINED": "KNOWN", "INDETERMINATE": "UNKNOWN"}.get(economic_state, "UNKNOWN")
+            result["economic_result"] = {"state": economic_state, "net_pnl": result.get("net_pnl"), "gross_pnl_quote": result.get("gross_pnl_quote"), "costs_quote": result.get("costs_quote"), "gross_pnl_account": result.get("gross_pnl_account"), "costs_account": result.get("costs_account"), "reason": result.get("economic_reason")}
+        elif table == "capture_envelopes":
+            envelope = _decode_json(result.pop("envelope_json", None), {}) or {}
+            result["payload"] = envelope.get("payload")
+            for field in ("capture_schema", "event_time", "received_at", "available_at", "ingest_sequence", "connection_generation", "source_identity", "message_class", "availability_policy"):
+                if field in envelope:
+                    result[field] = envelope[field]
         return result
 
     def _base_where(
@@ -333,6 +519,95 @@ class QueryService:
             prev_cursor = self._cursor(table=table, filters=filters, order=order, op="before", ts=str(matched[0][time_col]), row_id=int(matched[0][row_col])) if decoded else None
         return QueryPage(matched, limit, order, total, next_cursor, prev_cursor, has_more)
 
+    def query_cfd_trades(
+        self,
+        session_id: str,
+        *,
+        analysis_id: str | None = None,
+        analysis: str | None = None,
+        trade_id: str | None = None,
+        signal_id: str | None = None,
+        state: str | None = None,
+        lifecycle_state: str | None = None,
+        instrument: str | None = None,
+        product: str | None = None,
+        variant: str | None = None,
+        partition: str | None = None,
+        horizon_seconds: object | None = None,
+        terminal: bool | None = None,
+        start_ts: Any | None = None,
+        end_ts: Any | None = None,
+        recent: bool = False,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> QueryPage:
+        """Read CFD lifecycle rows without projecting binary outcomes."""
+
+        bounded = min(self.max_limit, max(1, int(limit)))
+        analysis_id = _resolve_query_alias(analysis_id, analysis, "analysis")
+        state = _resolve_query_state(state, lifecycle_state)
+        clauses, params, filters = _cfd_query_where(
+            session_id, analysis_id, trade_id, signal_id, state, instrument, product,
+            variant, partition, horizon_seconds, terminal, start_ts, end_ts,
+        )
+        if not self.store._table_exists("cfd_trades"):
+            return QueryPage([], bounded, "desc" if recent else "asc", 0)
+        order = "desc" if recent else "asc"
+        decoded = self._read_cursor(cursor, table="cfd_trades", filters=filters, order=order)
+        cursor_sql, cursor_params, reverse_page = _query_cursor_condition(decoded, order)
+        table_order = "DESC" if ((order == "desc") != reverse_page) else "ASC"
+        where = " AND ".join(clauses) + cursor_sql
+        rows = self.store.conn.execute(
+            f"SELECT * FROM cfd_trades WHERE {where} ORDER BY detected_at {table_order}, cfd_trade_row_id {table_order} LIMIT ?",
+            (*params, *cursor_params, bounded + 1),
+        ).fetchall()
+        has_more = len(rows) > bounded
+        items = [self._decode_row("cfd_trades", dict(row)) for row in rows[:bounded]]
+        if reverse_page:
+            items.reverse()
+        total = int(self.store.conn.execute(f"SELECT COUNT(*) FROM cfd_trades WHERE {' AND '.join(clauses)}", tuple(params)).fetchone()[0])
+        next_cursor, prev_cursor = _query_cfd_cursor_pair(self, items, filters, order, decoded, has_more)
+        return QueryPage(items, bounded, order, total, next_cursor, prev_cursor, has_more)
+
+    def query_capture_envelopes(
+        self,
+        session_id: str,
+        *,
+        after_cursor: object | None = None,
+        after_sequence: int | None = None,
+        start_ts: Any | None = None,
+        end_ts: Any | None = None,
+        available_start: Any | None = None,
+        available_end: Any | None = None,
+        connection_generation: int | None = None,
+        message_class: str | None = None,
+        limit: int = 100,
+        cursor: object | None = None,
+    ) -> QueryPage:
+        """Bound one page of durable causal envelopes using the store iterator."""
+
+        if cursor is not None:
+            if after_cursor is not None:
+                raise ValueError("use cursor o after_cursor, no ambos")
+            after_cursor = cursor
+        bounded = min(self.max_limit, max(1, int(limit)))
+        rows = list(self.store.iter_capture_envelopes(
+            session_id,
+            after_cursor=after_cursor,
+            after_sequence=after_sequence,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            available_start=available_start,
+            available_end=available_end,
+            connection_generation=connection_generation,
+            message_class=message_class,
+            limit=bounded + 1,
+        ))
+        has_more = len(rows) > bounded
+        rows = rows[:bounded]
+        next_cursor = rows[-1].get("cursor_token") if has_more and rows else None
+        return QueryPage(rows, bounded, "causal", None, next_cursor, None, has_more)
+
     def query_revisions(self, session_id: str, **kwargs: Any) -> QueryPage:
         kwargs["revisions"] = "all"
         kwargs["revision_only"] = True
@@ -399,45 +674,20 @@ class QueryService:
             "signals": self.query_signals(session_id, recent=True, limit=bounded).to_dict(),
             "discards": self.query_discards(session_id, recent=True, limit=bounded).to_dict(),
             "simulations": self.query_simulations(session_id, recent=True, limit=bounded).to_dict(),
+            "cfd_trades": self.query_cfd_trades(session_id, recent=True, limit=bounded).to_dict(),
         }
 
     def snapshot(self, session_id: str) -> dict[str, Any]:
         status = self.store.status(session_id)
         session = self.store.get_session(session_id) or {}
-        session_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
-        ctrader = session_config.get("ctrader") if isinstance(session_config.get("ctrader"), Mapping) else {}
-        execution = session_config.get("execution") if isinstance(session_config.get("execution"), Mapping) else {}
-        status["provider_environment"] = ctrader.get("environment") or session.get("mode")
-        status["provider_account_id"] = ctrader.get("account_id") or None
-        status["provider_symbol"] = ctrader.get("symbol") or session.get("instrument")
-        status["execution_environment"] = execution.get("environment") or None
-        status["execution_destination"] = execution.get("endpoint") or None
-        status["permissions"] = {"scopes": ctrader.get("required_scopes", []), "account_selected": ctrader.get("account_selected", False), "executor_enabled": execution.get("enabled", False)}
-        if str(status.get("mode", "")).upper() in {"SYNTHETIC", "REPLAY"}:
-            status.setdefault("connection", "OFFLINE")
-            status.setdefault("analysis_enabled", False)
-        coverage: dict[str, dict[str, Any]] = {}
-        for row in self.store.conn.execute("SELECT timeframe, MIN(start_ts), MAX(end_ts), SUM(closed=0), COUNT(*) FROM candles WHERE session_id=? GROUP BY timeframe", (session_id,)):
-            coverage[str(row[0])] = {"start_ts": row[1], "end_ts": row[2], "open_count": int(row[3] or 0), "count": int(row[4] or 0)}
-        status["coverage"] = coverage
+        _snapshot_context(status, session)
+        status["coverage"] = _snapshot_coverage(self.store, session_id)
         status["revisions_count"] = int(self.store.conn.execute("SELECT COUNT(*) FROM candles WHERE session_id=? AND revision>0", (session_id,)).fetchone()[0])
+        status.update(_snapshot_cfd_lifecycle(self.store, session_id))
         status["gaps"] = self.query_gaps(session_id)
-        # Expose the latest runtime snapshot when available; this remains a
-        # read-only projection and does not infer readiness from row counts.
-        checkpoints = [self.store.get_checkpoint(session_id, name) for name in ("runtime", "pipeline")]
-        for checkpoint in checkpoints:
-            if not checkpoint:
-                continue
-            state = checkpoint.get("state") if isinstance(checkpoint.get("state"), Mapping) else {}
-            runtime_status = state.get("status") if isinstance(state.get("status"), Mapping) else {}
-            processor = state.get("processor") if isinstance(state.get("processor"), Mapping) else {}
-            if runtime_status:
-                status.update({key: runtime_status[key] for key in ("connection", "analysis_enabled", "analysis_blocked_reasons", "pending_simulations", "completed_simulations") if key in runtime_status})
-            if processor:
-                status["warmup_pending"] = processor.get("warmup_pending", {})
-                status["runtime_processor"] = {key: processor.get(key) for key in ("events_processed", "candles_processed", "signals", "evaluations", "errors", "last_event_time", "last_available_at")}
-            break
+        _apply_checkpoint_projection(self.store, status, session_id)
         return status
+
 
 
 __all__ = ["QueryPage", "QueryService"]

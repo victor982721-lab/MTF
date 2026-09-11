@@ -7,15 +7,16 @@ aceptados deben ser conscientes de zona horaria y se almacenan como UTC.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
-import json
 import math
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from .canonical import canonical_json
 from .quality import DataQuality
 
 
@@ -49,12 +50,46 @@ Mode = OperationMode
 
 
 class PriceBase(str, Enum):
-    """Base de precio, sin conversiones implícitas entre bid/ask/mid/trade."""
+    """Base de precio, sin conversiones implícitas entre quote/trade/native."""
 
     TRADED = "traded"
     BID = "bid"
     ASK = "ask"
     MID = "mid"
+    NATIVE = "native"
+    # Alias semántico para integraciones que nombran la base por proveedor.
+    # Comparte el valor ``native`` para que no exista una segunda base que
+    # pueda mezclarse accidentalmente con la primera.
+    PROVIDER_NATIVE = "native"
+
+
+_PRICE_BASE_ALIASES = {
+    "trade": PriceBase.TRADED,
+    "close": PriceBase.TRADED,
+    "provider_native": PriceBase.NATIVE,
+    "provider-native": PriceBase.NATIVE,
+}
+
+
+def _coerce_price_base(value: PriceBase | str) -> PriceBase:
+    if isinstance(value, PriceBase):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("price_base debe ser PriceBase o texto")
+    raw = value.strip().lower()
+    if raw in _PRICE_BASE_ALIASES:
+        return _PRICE_BASE_ALIASES[raw]
+    return PriceBase(raw)
+
+
+def normalize_price_base(value: PriceBase | str) -> PriceBase:
+    """Normaliza una base explícita; ``close``/``trade`` son aliases históricos.
+
+    ``native`` y ``provider_native`` convergen a la misma identidad enum. No
+    hay conversión entre una base nativa y traded/quote.
+    """
+
+    return _coerce_price_base(value)
 
 
 class EventKind(str, Enum):
@@ -140,13 +175,29 @@ def _finite(value: float | int | None, field_name: str, *, allow_none: bool = Tr
     return result
 
 
+def _detach(value: Any) -> Any:
+    """Copy nested mappings without trying to pickle an existing proxy."""
+
+    if isinstance(value, Mapping):
+        return {key: _detach(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_detach(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_detach(item) for item in value)
+    if isinstance(value, set):
+        return {_detach(item) for item in value}
+    return deepcopy(value)
+
+
 def _mapping(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
     if value is None:
         return MappingProxyType({})
     if not isinstance(value, Mapping):
         raise TypeError("metadata debe ser un mapping")
-    # Copia defensiva: los registros no deben cambiar por mutación externa.
-    return MappingProxyType(dict(value))
+    # Copia profunda defensiva: una dataclass frozen no protege un dict/lista
+    # anidado que el caller conserve y modifique después de construir el
+    # registro. Se mantiene la forma de listas para compatibilidad de payloads.
+    return MappingProxyType(_detach(value))
 
 
 def _event_identity_payload(
@@ -181,7 +232,7 @@ def _event_identity_payload(
         "bid": bid,
         "ask": ask,
     }
-    return json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return canonical_json(payload).encode("utf-8")
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,8 +286,7 @@ class MarketEvent:
         object.__setattr__(self, "source", str(self.source).strip() or "unknown")
         if not isinstance(self.mode, OperationMode):
             object.__setattr__(self, "mode", OperationMode(str(self.mode).upper()))
-        if not isinstance(self.price_base, PriceBase):
-            object.__setattr__(self, "price_base", PriceBase(str(self.price_base).lower()))
+        object.__setattr__(self, "price_base", _coerce_price_base(self.price_base))
         if not isinstance(self.event_kind, EventKind):
             object.__setattr__(self, "event_kind", EventKind(str(self.event_kind).lower()))
         object.__setattr__(self, "metadata", _mapping(self.metadata))
@@ -273,13 +323,30 @@ class MarketEvent:
             return self.bid
         if self.price_base is PriceBase.ASK:
             return self.ask
+        if self.price_base is PriceBase.NATIVE:
+            # Native es una base explícita, no un alias de MID. Para eventos
+            # puntuales el campo ``price`` contiene el valor ya seleccionado
+            # por el adaptador; las trendbars nativas usan Candle.
+            return self.price
         if self.bid is None or self.ask is None:
             return None
         return (self.bid + self.ask) / 2.0
 
     @property
+    def availability_known(self) -> bool:
+        """Indica si existe evidencia de recepción/disponibilidad local."""
+
+        return self.available_at is not None or self.received_at is not None
+
+    @property
     def effective_available_at(self) -> datetime:
-        """Momento de disponibilidad; recepción/evento sólo son fallback."""
+        """Momento lógico legado; ``availability_known`` conserva la evidencia.
+
+        El fallback a ``event_time`` existe sólo para compatibilidad de los
+        agregadores históricos. Los adaptadores que no conocen recepción deben
+        conservar ``available_at=None`` y marcar la política de disponibilidad;
+        este valor no debe presentarse como latencia observada.
+        """
 
         return self.available_at or self.received_at or self.event_time
 
@@ -354,8 +421,7 @@ class Candle:
         object.__setattr__(self, "origin", str(self.origin).strip() or "aggregated")
         if not isinstance(self.mode, OperationMode):
             object.__setattr__(self, "mode", OperationMode(str(self.mode).upper()))
-        if not isinstance(self.price_base, PriceBase):
-            object.__setattr__(self, "price_base", PriceBase(str(self.price_base).lower()))
+        object.__setattr__(self, "price_base", _coerce_price_base(self.price_base))
         object.__setattr__(self, "metadata", _mapping(self.metadata))
         candle_id = self.candle_id
         if candle_id is None:
@@ -384,6 +450,18 @@ class Candle:
         return self.available_at if self.closed else self.available_at
 
     @property
+    def availability_known(self) -> bool:
+        """Indica si la vela tiene evidencia local de disponibilidad."""
+
+        return self.available_at is not None or self.received_at is not None
+
+    @property
+    def is_native(self) -> bool:
+        """True sólo para la base explícita nativa del proveedor."""
+
+        return self.price_base is PriceBase.NATIVE
+
+    @property
     def is_synthetic(self) -> bool:
         return self.mode is OperationMode.SYNTHETIC or self.quality.has(QualityFlagLike.SYNTHETIC)
 
@@ -410,6 +488,7 @@ __all__ = [
     "PriceBase",
     "Timeframe",
     "UTC",
+    "normalize_price_base",
     "normalize_utc",
     "parse_timeframe",
 ]

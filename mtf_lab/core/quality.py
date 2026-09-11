@@ -33,6 +33,88 @@ class QualityFlag(str, Enum):
     LATE = "late"
 
 
+class QualityState(str, Enum):
+    """Estados de calidad que pueden viajar por una frontera de dominio.
+
+    ``QualityFlag`` conserva la representación histórica de múltiples
+    banderas. Este enum ofrece un estado escalar para consumidores que no
+    deben interpretar texto libre. Cuando hay varias banderas, ``state`` usa
+    exactamente la precedencia documentada por :attr:`DataQuality.status`.
+    """
+
+    VALID = "valid"
+    SYNTHETIC = "synthetic"
+    INVALID = "invalid"
+    DUPLICATE = "duplicate"
+    OUT_OF_ORDER = "out_of_order"
+    GAP = "gap"
+    DISCONNECTED = "disconnected"
+    STALE = "stale"
+    UNRECONCILED = "unreconciled"
+    INSUFFICIENT = "insufficient"
+    PARTIAL = "partial"
+    OPEN = "open"
+    LATE = "late"
+    UNKNOWN = "unknown"
+    BLOCKED = "blocked"
+
+
+class QualityReason(str, Enum):
+    """Códigos de razón conocidos, separados de su texto de presentación.
+
+    Las razones heredadas pueden seguir siendo texto descriptivo en
+    ``DataQuality.reasons``. ``reason_codes`` sólo reconoce coincidencias
+    exactas con este vocabulario; nunca clasifica por una búsqueda de
+    subcadena.
+    """
+
+    INSTRUMENT_MISSING = "instrument_missing"
+    TIMESTAMP_INVALID = "timestamp_invalid"
+    INTERVAL_INVALID = "interval_invalid"
+    TIMEFRAME_MISMATCH = "timeframe_mismatch"
+    NON_FINITE = "non_finite"
+    PRICE_BASE_MISSING = "price_base_missing"
+    PRICE_BASE_CONFLICT = "price_base_conflict"
+    PRICE_BASE_AMBIGUOUS = "price_base_ambiguous"
+    QUALITY_BLOCKED = "quality_blocked"
+    QUALITY_UNKNOWN = "quality_unknown"
+    QUALITY_INVALID = "quality_invalid"
+    QUANTITY_NEGATIVE = "quantity_negative"
+    CANDLE_OPEN = "candle_open"
+    CANDLE_SHAPE_INVALID = "candle_shape_invalid"
+    OHLC_INCOHERENT = "ohlc_incoherent"
+    NEGATIVE_MEASURE = "negative_measure"
+    SOURCE_TIMESTAMP_MISSING = "source_timestamp_missing"
+    MISSING_SOURCE_TIMESTAMP = "source_timestamp_missing"
+    AVAILABILITY_UNKNOWN = "availability_unknown"
+    SNAPSHOT = "snapshot"
+    CROSSED = "crossed"
+    STALE = "stale"
+    OUT_OF_ORDER = "out_of_order"
+    OUT_OF_ORDER_REASON = "out_of_order"
+    DISCONNECTED = "disconnected"
+    DISCONNECTED_REASON = "disconnected"
+    SESSION_MISMATCH = "session_mismatch"
+    FUTURE_SOURCE_TIMESTAMP = "future_source_timestamp"
+    GAP = "gap"
+    GAP_REASON = "gap"
+    PARTIAL = "partial"
+    PARTIAL_REASON = "partial"
+    OPEN = "open"
+    OPEN_REASON = "open"
+    LATE = "late"
+    LATE_REASON = "late"
+
+
+# Names used by a few adapters/readers; aliases keep one vocabulary rather
+# than creating parallel enums with subtly different values.
+QualityStatus = QualityState
+ReasonCode = QualityReason
+
+
+_QUALITY_REASON_BY_VALUE = {reason.value: reason for reason in QualityReason}
+
+
 _BLOCKING_FLAGS = frozenset(
     {
         QualityFlag.INVALID,
@@ -61,11 +143,26 @@ class DataQuality:
     def __post_init__(self) -> None:
         normalized: set[QualityFlag] = set()
         for flag in self.flags:
-            normalized.add(flag if isinstance(flag, QualityFlag) else QualityFlag(str(flag).lower()))
+            if isinstance(flag, QualityFlag):
+                normalized.add(flag)
+                continue
+            if not isinstance(flag, str):
+                raise TypeError("quality flags must be QualityFlag values or strings")
+            normalized.add(QualityFlag(flag.strip().lower()))
         object.__setattr__(self, "flags", frozenset(normalized))
-        object.__setattr__(self, "reasons", tuple(str(reason) for reason in self.reasons))
+        normalized_reasons: list[str] = []
+        for reason in self.reasons:
+            if isinstance(reason, QualityReason):
+                normalized_reasons.append(reason.value)
+            elif isinstance(reason, str):
+                normalized_reasons.append(reason)
+            else:
+                raise TypeError("quality reasons must be strings or QualityReason values")
+        object.__setattr__(self, "reasons", tuple(normalized_reasons))
         if self.source is not None:
-            object.__setattr__(self, "source", str(self.source))
+            if not isinstance(self.source, str):
+                raise TypeError("quality source must be a string")
+            object.__setattr__(self, "source", self.source)
 
     @classmethod
     def valid(cls, *, synthetic: bool = False, source: str | None = None) -> "DataQuality":
@@ -83,14 +180,83 @@ class DataQuality:
         )
 
     @classmethod
-    def from_flag(cls, flag: QualityFlag | str, reason: str = "", *, source: str | None = None) -> "DataQuality":
-        return cls(frozenset({QualityFlag(flag)}), (reason,) if reason else (), source)
+    def from_state(
+        cls,
+        state: QualityState | str,
+        reasons: Iterable[str | QualityReason] = (),
+        *,
+        source: str | None = None,
+    ) -> "DataQuality":
+        """Construct quality from an exact typed state.
+
+        Unknown states are conservatively represented as ``invalid`` rather
+        than silently becoming valid.
+        """
+
+        if isinstance(state, QualityState):
+            normalized = state
+        elif isinstance(state, str):
+            try:
+                normalized = QualityState(state.strip().lower())
+            except ValueError:
+                normalized = QualityState.UNKNOWN
+        else:
+            raise TypeError("quality state must be QualityState or string")
+        if normalized is QualityState.VALID:
+            flags: frozenset[QualityFlag] = frozenset()
+        elif normalized is QualityState.UNKNOWN or normalized is QualityState.BLOCKED:
+            flags = frozenset({QualityFlag.INVALID})
+        else:
+            flags = frozenset({QualityFlag(normalized.value)})
+        return cls(flags, tuple(reasons), source)
+
+    @classmethod
+    def from_flag(
+        cls,
+        flag: QualityFlag | str,
+        reason: str | QualityReason = "",
+        *,
+        source: str | None = None,
+    ) -> "DataQuality":
+        normalized_flag = flag if isinstance(flag, QualityFlag) else QualityFlag(flag)
+        return cls(frozenset({normalized_flag}), (reason,) if reason else (), source)
 
     @property
     def usable(self) -> bool:
         """Alias de ``valid`` para llamadores del detector."""
 
         return self.valid
+
+    @property
+    def state(self) -> QualityState:
+        """Estado tipado con la misma precedencia que ``status``."""
+
+        try:
+            return QualityState(self.status)
+        except ValueError:  # pragma: no cover - defensive for future flags
+            return QualityState.UNKNOWN
+
+    @property
+    def quality_state(self) -> QualityState:
+        """Alias explícito para fronteras que evitan el nombre genérico state."""
+
+        return self.state
+
+    @property
+    def reason_codes(self) -> tuple[QualityReason, ...]:
+        """Razones conocidas por coincidencia exacta, sin heurísticas de texto."""
+
+        return tuple(
+            code
+            for reason in self.reasons
+            if (code := _QUALITY_REASON_BY_VALUE.get(reason)) is not None
+        )
+
+    @property
+    def typed_reasons(self) -> tuple[QualityReason, ...]:
+        """Alias legible para consumidores que requieren razones tipadas."""
+
+        return self.reason_codes
 
     @property
     def status(self) -> str:
@@ -118,10 +284,32 @@ class DataQuality:
     def has(self, flag: QualityFlag | str) -> bool:
         return QualityFlag(flag) in self.flags
 
-    def with_flags(self, *flags: QualityFlag | str, reason: str = "") -> "DataQuality":
-        extra = {flag if isinstance(flag, QualityFlag) else QualityFlag(str(flag).lower()) for flag in flags}
+    def with_flags(
+        self,
+        *flags: QualityFlag | str,
+        reason: str | QualityReason = "",
+    ) -> "DataQuality":
+        extra: set[QualityFlag] = set()
+        for flag in flags:
+            if isinstance(flag, QualityFlag):
+                extra.add(flag)
+            elif isinstance(flag, str):
+                extra.add(QualityFlag(flag.strip().lower()))
+            else:
+                raise TypeError("quality flags must be QualityFlag values or strings")
         reasons = self.reasons + ((reason,) if reason else ())
         return DataQuality(self.flags | frozenset(extra), reasons, self.source)
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serializa calidad sin convertir enums u objetos arbitrarios a texto."""
+
+        return {
+            "state": self.state.value,
+            "flags": sorted(flag.value for flag in self.flags),
+            "reasons": list(self.reasons),
+            "reason_codes": [reason.value for reason in self.reason_codes],
+            "source": self.source,
+        }
 
 
 class _ValidityDescriptor:
@@ -273,6 +461,10 @@ def merge_quality(*qualities: DataQuality | None, source: str | None = None) -> 
 __all__ = [
     "DataQuality",
     "QualityFlag",
+    "QualityReason",
+    "QualityState",
+    "QualityStatus",
+    "ReasonCode",
     "QualityIssue",
     "QualityReport",
     "ValidationResult",

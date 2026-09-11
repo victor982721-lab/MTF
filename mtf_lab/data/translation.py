@@ -34,6 +34,7 @@ from mtf_lab.core.models import (
 from mtf_lab.core.quality import (
     DataQuality as CoreQuality,
     QualityFlag,
+    QualityReason,
     merge_quality,
     validate_candle,
     validate_event,
@@ -69,7 +70,15 @@ _DATA_MODES = {
     "OBSERVATION_EN_DIRECTO": "OBSERVATION_EN_DIRECTO",
 }
 _CORE_MODES = {"LIVE": OperationMode.LIVE, "REPLAY": OperationMode.REPLAY, "SYNTHETIC": OperationMode.SYNTHETIC}
-_BASES = {"traded": PriceBase.TRADED, "bid": PriceBase.BID, "ask": PriceBase.ASK, "mid": PriceBase.MID}
+_BASES = {
+    "traded": PriceBase.TRADED,
+    "bid": PriceBase.BID,
+    "ask": PriceBase.ASK,
+    "mid": PriceBase.MID,
+    "native": PriceBase.NATIVE,
+    "provider-native": PriceBase.NATIVE,
+    "provider_native": PriceBase.NATIVE,
+}
 _QUALITY_FLAGS = {flag.value: flag for flag in QualityFlag}
 _EVENT_KINDS = {kind.value: kind for kind in EventKind}
 
@@ -105,6 +114,7 @@ def _core_mode(value: Any, *, name: str = "mode") -> OperationMode:
 
 def _data_base(value: Any, *, name: str = "price_basis") -> str:
     raw = _text(value, name=name).lower()
+    raw = {"provider-native": "native", "provider_native": "native"}.get(raw, raw)
     if raw not in _BASES:
         raise TranslationError(f"base de precio desconocida: {value!r}; no se intercambia silenciosamente", code="PRICE_BASE_UNKNOWN")
     return raw
@@ -114,6 +124,7 @@ def _core_base(value: Any, *, name: str = "price_base") -> PriceBase:
     if isinstance(value, PriceBase):
         return value
     raw = _text(value, name=name).lower()
+    raw = {"provider-native": "native", "provider_native": "native"}.get(raw, raw)
     try:
         return _BASES[raw]
     except KeyError as exc:
@@ -149,7 +160,12 @@ def _quality_flags(raw: Any, *, name: str = "quality_flags") -> frozenset[Qualit
         raise TranslationError(f"{name} debe ser una secuencia de estados conocidos", code="QUALITY_INVALID")
     flags: set[QualityFlag] = set()
     for item in values:
-        raw_flag = item.value if isinstance(item, QualityFlag) else str(item).strip().lower()
+        if isinstance(item, QualityFlag):
+            raw_flag = item.value
+        elif isinstance(item, str):
+            raw_flag = item.strip().lower()
+        else:
+            raise TranslationError(f"estado de calidad no textual: {item!r}", code="QUALITY_INVALID")
         try:
             flags.add(_QUALITY_FLAGS[raw_flag])
         except KeyError as exc:
@@ -160,11 +176,19 @@ def _quality_flags(raw: Any, *, name: str = "quality_flags") -> frozenset[Qualit
 def _quality_reasons(raw: Any, *, name: str = "quality_reasons") -> tuple[str, ...]:
     if raw is None:
         return ()
-    if isinstance(raw, str):
-        return (raw,)
+    if isinstance(raw, (str, QualityReason)):
+        return (raw.value if isinstance(raw, QualityReason) else raw,)
     if not isinstance(raw, (list, tuple)):
         raise TranslationError(f"{name} debe ser una secuencia de razones", code="QUALITY_INVALID")
-    return tuple(str(item) for item in raw)
+    reasons: list[str] = []
+    for item in raw:
+        if isinstance(item, QualityReason):
+            reasons.append(item.value)
+        elif isinstance(item, str):
+            reasons.append(item)
+        else:
+            raise TranslationError(f"{name} sólo admite texto o QualityReason: {item!r}", code="QUALITY_INVALID")
+    return tuple(reasons)
 
 
 def _quality_from_data_metadata(metadata: Mapping[str, Any], *, source: str, synthetic: bool, closed: bool | None = None) -> CoreQuality:
@@ -244,32 +268,88 @@ def _quality_to_data_metadata(metadata: Mapping[str, Any], quality: CoreQuality)
     return result
 
 
-def _provenance_mapping(raw: Any, *, fallback: DataProvenance) -> dict[str, Any]:
+def _provenance_mapping(
+    raw: Any,
+    *,
+    fallback: DataProvenance,
+    expected_price_basis: str | None = None,
+) -> dict[str, Any]:
+    """Return validated provenance and reject a basis conflict explicitly."""
+
+    expected = _data_base(expected_price_basis, name="expected_price_basis") if expected_price_basis is not None else None
     if raw is None:
-        return fallback.to_dict()
-    if isinstance(raw, DataProvenance):
+        result = fallback.to_dict()
+    elif isinstance(raw, DataProvenance):
         # Validate all state-bearing fields even when the object was assembled
         # dynamically without static type checking.
         _data_mode(raw.mode, name="provenance.mode")
-        _data_base(raw.price_basis, name="provenance.price_basis")
-        return raw.to_dict()
-    if not isinstance(raw, Mapping):
+        declared = _data_base(raw.price_basis, name="provenance.price_basis")
+        result = raw.to_dict()
+        result["price_basis"] = declared
+    elif isinstance(raw, Mapping):
+        if "mode" in raw:
+            _data_mode(raw["mode"], name="provenance.mode")
+        if "price_basis" in raw:
+            declared = _data_base(raw["price_basis"], name="provenance.price_basis")
+        else:
+            declared = fallback.price_basis
+        result = dict(raw)
+        # A provenance table may contain future provider fields; preserve them
+        # rather than dropping them, while validating state fields above.
+        result.setdefault("provider", fallback.provider)
+        result.setdefault("mode", fallback.mode)
+        result.setdefault("instrument", fallback.instrument)
+        result.setdefault("price_basis", declared)
+        result.setdefault("synthetic", fallback.synthetic)
+        result["price_basis"] = declared
+        if not isinstance(result["synthetic"], bool):
+            raise TranslationError("provenance.synthetic debe ser booleano", code="PROVENANCE_INVALID")
+    else:
         raise TranslationError("metadata.provenance debe ser DataProvenance o tabla", code="PROVENANCE_INVALID")
-    if "mode" in raw:
-        _data_mode(raw["mode"], name="provenance.mode")
-    if "price_basis" in raw:
-        _data_base(raw["price_basis"], name="provenance.price_basis")
-    result = dict(raw)
-    # A provenance table may contain future provider fields; preserve them
-    # rather than dropping them, while validating state fields above.
-    result.setdefault("provider", fallback.provider)
-    result.setdefault("mode", fallback.mode)
-    result.setdefault("instrument", fallback.instrument)
-    result.setdefault("price_basis", fallback.price_basis)
-    result.setdefault("synthetic", fallback.synthetic)
-    if not isinstance(result["synthetic"], bool):
-        raise TranslationError("provenance.synthetic debe ser booleano", code="PROVENANCE_INVALID")
+    declared = _data_base(result.get("price_basis"), name="provenance.price_basis")
+    if expected is not None and declared != expected:
+        raise TranslationError(
+            f"provenance.price_basis={declared} no coincide con la base explícita {expected}",
+            code="PROVENANCE_CONFLICT",
+        )
+    result["price_basis"] = declared
     return result
+
+
+def _reject_ctrader_traded_ambiguity(
+    *,
+    source: str,
+    basis: str,
+    metadata: Mapping[str, Any],
+) -> None:
+    """Reject legacy cTrader trendbars labeled ``traded``.
+
+    cTrader trendbars carry provider-native OHLC semantics, not a demonstrated
+    last-trade series. Generic/Kraken traded bars remain valid. The test is
+    deliberately based on exact provider/source markers, never free-form
+    substring classification.
+    """
+
+    if basis != "traded":
+        return
+    provider = metadata.get("provider")
+    origin = metadata.get("origin")
+    semantics = metadata.get("price_basis_semantics")
+    source_key = source.strip().lower() if isinstance(source, str) else ""
+    provider_key = provider.strip().lower() if isinstance(provider, str) else ""
+    origin_key = origin.strip().lower() if isinstance(origin, str) else ""
+    native_marker = semantics.strip().lower() if isinstance(semantics, str) else ""
+    ctrader_marker = source_key in {"ctrader", "ctrader-open-api", "ctrader_open_api"} or provider_key in {"ctrader", "ctrader-open-api", "ctrader_open_api"}
+    if (
+        ctrader_marker
+        or (origin_key in {"native", "provider-native", "provider_native"} and provider_key in {"ctrader", "ctrader-open-api", "ctrader_open_api"})
+        or native_marker in {"native", "provider-native", "provider_native", "unknown"}
+    ):
+        raise TranslationError(
+            "trendbar cTrader requiere price_basis='native'; traded sería ambiguo",
+            code="PRICE_BASE_AMBIGUOUS",
+            reasons=(QualityReason.PRICE_BASE_AMBIGUOUS.value,),
+        )
 
 
 def _fallback_provenance(*, source: str, mode: str, instrument: str, price_basis: str, resolution: str | None = None, synthetic: bool = False, notes: Sequence[str] = ()) -> DataProvenance:
@@ -344,7 +424,13 @@ def data_event_to_core(event: DataEvent) -> CoreEvent:
         raise TranslationError("evento MID sin campo mid explícito", code="PRICE_BASE_MISSING")
     if basis == "mid" and (event.bid is None or event.ask is None):
         raise TranslationError("evento MID requiere bid y ask explícitos para el contrato core", code="PRICE_BASE_MISSING")
-    selected_raw = {"traded": event.price, "bid": event.bid, "ask": event.ask, "mid": event.mid}[basis]
+    selected_raw = {
+        "traded": event.price,
+        "native": event.price,
+        "bid": event.bid,
+        "ask": event.ask,
+        "mid": event.mid,
+    }[basis]
     if selected_raw is None or not math.isclose(float(event.price), float(selected_raw), rel_tol=1e-12, abs_tol=1e-12):
         raise TranslationError("price no coincide con la base explícita del evento", code="PRICE_BASE_CONFLICT")
     if basis == "mid" and not math.isclose(float(event.mid), (float(event.bid) + float(event.ask)) / 2.0, rel_tol=1e-12, abs_tol=1e-12):
@@ -358,7 +444,11 @@ def data_event_to_core(event: DataEvent) -> CoreEvent:
         synthetic=synthetic,
         notes=("traducción data.Event -> core.MarketEvent",),
     )
-    provenance = _provenance_mapping(metadata.get("provenance"), fallback=fallback_provenance)
+    provenance = _provenance_mapping(
+        metadata.get("provenance"),
+        fallback=fallback_provenance,
+        expected_price_basis=basis,
+    )
     metadata = _metadata_with_translation(
         metadata,
         data_id=event.data_id,
@@ -382,7 +472,7 @@ def data_event_to_core(event: DataEvent) -> CoreEvent:
     return CoreEvent(
         instrument=event.instrument,
         event_time=normalize_utc(event.event_time, "event_time"),
-        price=event.price if basis == "traded" else None,
+        price=event.price if basis in {"traded", "native"} else None,
         quantity=event.quantity,
         bid=event.bid,
         ask=event.ask,
@@ -463,7 +553,11 @@ def core_event_to_data(event: CoreEvent) -> DataEvent:
         synthetic=synthetic,
         notes=("traducción core.MarketEvent -> data.Event",),
     )
-    provenance = _provenance_mapping(provenance_raw, fallback=fallback)
+    provenance = _provenance_mapping(
+        provenance_raw,
+        fallback=fallback,
+        expected_price_basis=basis,
+    )
     metadata = _quality_to_data_metadata(metadata, quality)
     side = metadata.get("side")
     if side is not None:
@@ -514,6 +608,7 @@ def data_bar_to_core(bar: DataBar) -> CoreCandle:
     if bar.source_record_id is not None:
         _strict_id(bar.source_record_id, name="source_record_id")
     metadata = dict(bar.metadata)
+    _reject_ctrader_traded_ambiguity(source=bar.source, basis=basis, metadata=metadata)
     identity = _identity_mapping(metadata)
     mode = _data_mode_from_metadata(metadata, synthetic=synthetic, default="REPLAY")
     core_mode = _core_mode("SYNTHETIC" if mode == "SYNTHETIC" else ("LIVE" if mode in {"OBSERVACIÓN EN DIRECTO", "OBSERVATION_EN_DIRECTO"} else "REPLAY"))
@@ -527,7 +622,11 @@ def data_bar_to_core(bar: DataBar) -> CoreCandle:
         synthetic=synthetic,
         notes=("traducción data.Bar -> core.Candle",),
     )
-    provenance = _provenance_mapping(metadata.get("provenance"), fallback=fallback)
+    provenance = _provenance_mapping(
+        metadata.get("provenance"),
+        fallback=fallback,
+        expected_price_basis=basis,
+    )
     metadata["revision"] = revision
     metadata["volume_was_none"] = bar.volume is None
     metadata["trade_count_was_none"] = bar.trade_count is None
@@ -610,7 +709,11 @@ def core_bar_to_data(bar: CoreCandle) -> DataBar:
         synthetic=synthetic,
         notes=("traducción core.Candle -> data.Bar",),
     )
-    provenance = _provenance_mapping(provenance_raw, fallback=fallback)
+    provenance = _provenance_mapping(
+        provenance_raw,
+        fallback=fallback,
+        expected_price_basis=basis,
+    )
     metadata = _quality_to_data_metadata(metadata, quality)
     metadata = _metadata_with_translation(
         metadata,

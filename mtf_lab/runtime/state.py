@@ -121,7 +121,9 @@ def quality_from(value: Any, *, synthetic: bool = False) -> DataQuality:
                 result = result.with_flags(status, reason=status)
             except ValueError:
                 result = result.with_flags("invalid", reason=status)
-        return DataQuality(result.flags, reasons or result.reasons, result.source)
+        raw_source = value.get("source", result.source)
+        source = raw_source if raw_source is None or isinstance(raw_source, str) else str(raw_source)
+        return DataQuality(result.flags, reasons or result.reasons, source)
     raw = str(value).strip().lower()
     if raw in {"", "valid", "validated", "ok", "good", "synthetic", "synthetic_validated", "synthetic_valid", "valid_data", "data_quality_validated", "public_provider_closed", "closed_valid", "validated_local"}:
         return result
@@ -139,6 +141,9 @@ def quality_label_is_usable(value: Any) -> bool:
 
 def _price_base(value: Any, default: PriceBase | None = None) -> PriceBase:
     fallback = default.value if isinstance(default, PriceBase) else None
+    raw = value.value if isinstance(value, PriceBase) else value
+    if isinstance(raw, str) and raw.strip().lower() in {"native", "provider_native", "provider-native"}:
+        return PriceBase.NATIVE
     canonical = normalize_price_base(value, default=fallback, allow_none=default is not None)
     if canonical is None:
         raise ValueError("base de precio ausente")
@@ -207,7 +212,13 @@ def to_core_event(record: Any, *, mode: OperationMode | str = OperationMode.REPL
         raise ValueError("evento MID requiere mid, bid y ask explícitos")
     if basis is PriceBase.MID and not math.isclose(float(mid), (float(bid) + float(ask)) / 2.0, rel_tol=1e-12, abs_tol=1e-12):
         raise ValueError("mid no coincide con el promedio explícito de bid y ask")
-    selected = {PriceBase.TRADED: raw_price, PriceBase.BID: bid, PriceBase.ASK: ask, PriceBase.MID: mid}[basis]
+    selected = {
+        PriceBase.TRADED: raw_price,
+        PriceBase.BID: bid,
+        PriceBase.ASK: ask,
+        PriceBase.MID: mid,
+        PriceBase.NATIVE: raw_price,
+    }[basis]
     if selected is None:
         raise ValueError(f"falta precio explícito para la base {basis.value}")
     if raw_price is not None and basis is not PriceBase.TRADED and not math.isclose(float(raw_price), float(selected), rel_tol=1e-12, abs_tol=1e-12):
@@ -332,7 +343,19 @@ def event_dict(event: MarketEvent) -> dict[str, Any]:
 
 
 def event_from_dict(value: Mapping[str, Any]) -> MarketEvent:
-    return to_core_event(value, mode=value.get("mode", "REPLAY"))
+    event = to_core_event(value, mode=value.get("mode", "REPLAY"))
+    # ``to_core_event`` adds an explicit MID metadata hint for plain mappings.
+    # Preserve the original metadata shape when a checkpoint came from a core
+    # event whose provider translation did not carry that hint.
+    metadata = value.get("metadata")
+    if (
+        event.price_base is PriceBase.MID
+        and isinstance(metadata, Mapping)
+        and "mid" not in metadata
+        and "mid" in event.metadata
+    ):
+        event = replace(event, metadata={key: item for key, item in event.metadata.items() if key != "mid"})
+    return event
 
 
 def candle_dict(candle: Candle) -> dict[str, Any]:
@@ -539,8 +562,8 @@ class PriceObservation:
         if available < market:
             quality = f"INVALID:availability_before_market:{quality}"
         try:
-            base = normalize_price_base(self.base_price, allow_none=False)
-        except ValueError:
+            base = _price_base(self.base_price).value
+        except (TypeError, ValueError):
             base = str(self.base_price or "unknown").strip().lower() or "unknown"
             quality = f"INVALID:unknown_price_base:{base}:{quality}"
         if not math.isfinite(float(self.price)):

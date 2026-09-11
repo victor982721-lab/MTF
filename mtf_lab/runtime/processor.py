@@ -9,7 +9,7 @@ que el flujo aporta observaciones causales suficientes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from collections import deque
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -36,9 +36,15 @@ from ..core import (
     compute_indicators,
     parse_timeframe,
 )
-from ..core.aggregation import _Bucket, interval_start  # type: ignore[attr-defined]
+from ..core.aggregation import _Bucket, interval_start
 from ..core.quality import QualityFlag, merge_quality
-from ..ops.simulation import select_price_point
+from .consumers import (
+    BinarySimulationConsumer,
+    SignalConsumer,
+    SignalConsumerEvent,
+    SignalConsumerResult,
+    consumer_from_checkpoint,
+)
 from .state import (
     PendingSimulation,
     PriceObservation,
@@ -94,6 +100,7 @@ class ProcessResult:
     simulations: tuple[PendingSimulation, ...] = ()
     pending_simulations: tuple[PendingSimulation, ...] = ()
     issues: tuple[RuntimeIssue, ...] = ()
+    consumer_events: tuple[SignalConsumerEvent, ...] = ()
 
     @property
     def emitted_candles(self) -> tuple[Candle, ...]:
@@ -130,197 +137,6 @@ class ReplayResult:
         }
 
 
-class _SimulationBook:
-    """Libro causal de evaluaciones virtuales aún no vencidas.
-
-    The book shares the batch selector's availability/base/quality policy.  A
-    live watermark only observes what is known so far; it never converts a
-    missing observation into ``INDETERMINATE`` until the caller explicitly
-    declares the capture complete.
-    """
-
-    def __init__(self, config: SimulationConfig, *, max_observations: int = 4096) -> None:
-        self.config = config
-        self.pending: dict[str, PendingSimulation] = {}
-        self.completed: dict[str, PendingSimulation] = {}
-        self.completed_ids: set[str] = set()
-        self.completed_order: deque[str] = deque()
-        self.observations: list[PriceObservation] = []
-        self._observation_ids: set[str] = set()
-        self.max_observations = max(256, int(max_observations))
-
-    def add_signal(self, signal: Signal) -> tuple[PendingSimulation, ...]:
-        created: list[PendingSimulation] = []
-        for horizon in self.config.horizons_seconds:
-            sim_id = "sim_" + hashlib.sha256(f"{signal.signal_id}|{horizon:g}".encode()).hexdigest()[:32]
-            if sim_id in self.pending or sim_id in self.completed or sim_id in self.completed_ids:
-                continue
-            detected = signal.detected_at
-            entry_due = detected + timedelta(seconds=self.config.entry_latency_seconds)
-            expiry_origin = entry_due if self.config.horizon_from == "entry" else detected
-            expiry = expiry_origin + timedelta(seconds=horizon)
-            item = PendingSimulation(
-                simulation_id=sim_id,
-                signal_id=signal.signal_id,
-                instrument=signal.instrument,
-                direction=signal.direction,
-                horizon_seconds=horizon,
-                detected_at=detected,
-                detection_available_at=detected,
-                entry_due_at=entry_due,
-                expiry_at=expiry,
-                entry_rule=self.config.entry_rule,
-                exit_rule=self.config.exit_rule,
-                price_base=self.config.requested_base_price,
-                resolution=self.config.resolution,
-                quality=signal.quality.status,
-                capture_complete=False,
-            )
-            self.pending[sim_id] = item
-            created.append(item)
-        return tuple(created)
-
-    def _eligible(self, observation: PriceObservation) -> bool:
-        return bool(observation.closed and quality_label_is_usable(observation.quality))
-
-    def _select_entry(self, item: PendingSimulation, watermark: datetime):
-        return select_price_point(
-            self.observations,
-            item.entry_due_at,
-            rule="first_observation_at_or_after",
-            requested_base_price=item.price_base,
-            require_closed=True,
-            max_price_age_seconds=self.config.max_price_age_seconds,
-            as_of=watermark,
-            instrument=item.instrument,
-        )
-
-    def _select_final(self, item: PendingSimulation, watermark: datetime):
-        cutoff = watermark
-        if item.exit_rule == "last_observation_at_or_before":
-            cutoff = min(watermark, item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds))
-        return select_price_point(
-            self.observations,
-            item.expiry_at,
-            rule=item.exit_rule,
-            requested_base_price=item.price_base,
-            require_closed=True,
-            max_price_age_seconds=self.config.max_price_age_seconds,
-            as_of=cutoff,
-            exclude_identity=(item.final_observation.identity if item.final_observation else None),
-            exclude_market_time=item.entry_at if item.entry_at is not None else None,
-            instrument=item.instrument,
-        )
-
-    def _resolve(self, item: PendingSimulation, *, outcome: str, net_result: float | None, final: PriceObservation | None = None, reason: str | None = None, capture_complete: bool = False) -> PendingSimulation:
-        updated = replace(
-            item,
-            status="RESOLVED" if outcome in {"WIN", "LOSS", "TIE"} else "INDETERMINATE",
-            final_at=final.available_at if final else item.final_at,
-            final_price=final.price if final else item.final_price,
-            outcome=outcome,
-            net_result=net_result,
-            quality=final.quality if final else item.quality,
-            reason=reason,
-            final_observation=final,
-            capture_complete=capture_complete,
-        )
-        self.pending.pop(item.simulation_id, None)
-        self.completed[item.simulation_id] = updated
-        self.completed_ids.add(item.simulation_id)
-        self.completed_order.append(item.simulation_id)
-        while len(self.completed_order) > self.max_observations:
-            evicted_id = self.completed_order.popleft()
-            self.completed_ids.discard(evicted_id)
-            self.completed.pop(evicted_id, None)
-        return updated
-
-    def _settle_with_final(self, item: PendingSimulation, observation: PriceObservation) -> PendingSimulation:
-        assert item.entry_price is not None
-        delta = observation.price - item.entry_price
-        if abs(delta) <= self.config.tie_tolerance:
-            outcome = "TIE"
-            net = self.config.tie_net - self.config.costs
-        else:
-            won = delta > 0 if item.direction.upper() == "UP" else delta < 0
-            outcome = "WIN" if won else "LOSS"
-            net = (self.config.stake * self.config.payout_net - self.config.costs) if won else (-self.config.stake * self.config.loss_amount - self.config.costs)
-        return self._resolve(item, outcome=outcome, net_result=net, final=observation, reason=None, capture_complete=False)
-
-    def _refresh_item(self, item: PendingSimulation, watermark: datetime) -> PendingSimulation | None:
-        """Update entry/final candidates using only observations available now."""
-        if item.entry_price is None:
-            selection, _reason = self._select_entry(item, watermark)
-            if selection is not None:
-                entry = selection.point
-                expiry = (selection.use_time if self.config.horizon_from == "entry" else item.detected_at) + timedelta(seconds=item.horizon_seconds)
-                item = replace(item, entry_at=selection.use_time, entry_price=float(entry.price), expiry_at=expiry, quality=str(entry.quality))
-                self.pending[item.simulation_id] = item
-        if item.entry_price is not None:
-            selection, _reason = self._select_final(item, watermark)
-            if selection is not None:
-                final = selection.point
-                # For `last_observation_at_or_before`, the selector is already
-                # latest-at-cutoff. For `first...after`, the first market point
-                # is stable once its availability is visible.
-                item = replace(item, final_observation=final, final_price=float(final.price), final_at=final.available_at, quality=str(final.quality))
-                self.pending[item.simulation_id] = item
-        return item
-
-    def _final_deadline_reached(self, item: PendingSimulation, watermark: datetime) -> bool:
-        return watermark >= item.expiry_at + timedelta(seconds=self.config.max_price_age_seconds)
-
-    def observe(self, observation: PriceObservation, *, watermark: datetime | None = None) -> tuple[PendingSimulation, ...]:
-        """Consume one observation; never terminalize an open capture."""
-        watermark = (watermark or observation.available_at).astimezone(UTC)
-        if self._eligible(observation) and observation.identity not in self._observation_ids:
-            self._observation_ids.add(observation.identity)
-            self.observations.append(observation)
-            if len(self.observations) > self.max_observations:
-                removed = self.observations[:-self.max_observations]
-                self.observations = self.observations[-self.max_observations:]
-                for item in removed:
-                    self._observation_ids.discard(item.identity)
-        completed: list[PendingSimulation] = []
-        for item in tuple(self.pending.values()):
-            item = self._refresh_item(item, watermark) or item
-            if item.entry_price is None:
-                continue
-            if item.final_observation is not None and item.exit_rule == "first_observation_at_or_after" and item.final_observation.timestamp >= item.expiry_at:
-                completed.append(self._settle_with_final(item, item.final_observation))
-            elif item.exit_rule == "last_observation_at_or_before" and self._final_deadline_reached(item, watermark) and item.final_observation is not None:
-                completed.append(self._settle_with_final(item, item.final_observation))
-        return tuple(completed)
-
-    def advance(self, watermark: datetime, *, capture_complete: bool = True) -> tuple[PendingSimulation, ...]:
-        """Advance virtual time without inventing observations."""
-        watermark = watermark.astimezone(UTC)
-        completed: list[PendingSimulation] = []
-        for item in tuple(self.pending.values()):
-            item = self._refresh_item(item, watermark) or item
-            deadline = self._final_deadline_reached(item, watermark)
-            if item.entry_price is None:
-                if deadline and capture_complete:
-                    outcome, reason = self.config.missing_outcome("ENTRY_PRICE_NOT_AVAILABLE", capture_complete=True)
-                    completed.append(self._resolve(item, outcome=outcome, net_result=None, reason=reason, capture_complete=True))
-                continue
-            if item.final_observation is not None:
-                if item.exit_rule == "first_observation_at_or_after" and item.final_observation.timestamp >= item.expiry_at:
-                    completed.append(self._settle_with_final(item, item.final_observation))
-                    continue
-                # A complete replay is an explicit end-of-capture boundary;
-                # once a causally admissible before-observation is known, no
-                # later record may revise it. Continuous watch still waits
-                # for the grace deadline above.
-                if item.exit_rule == "last_observation_at_or_before" and (deadline or capture_complete):
-                    completed.append(self._settle_with_final(item, item.final_observation))
-                    continue
-            if (deadline or capture_complete) and capture_complete:
-                outcome, reason = self.config.missing_outcome("FINAL_PRICE_NOT_AVAILABLE_WITHIN_MAX_AGE", capture_complete=True)
-                completed.append(self._resolve(item, outcome=outcome, net_result=None, reason=reason, capture_complete=True))
-        return tuple(completed)
-
-
 class IncrementalProcessor:
     """Motor incremental y reanudable para eventos y velas nativas."""
 
@@ -338,6 +154,7 @@ class IncrementalProcessor:
         source: str = "runtime",
         price_base: PriceBase | str = PriceBase.TRADED,
         max_candles: int | None = None,
+        signal_consumer: SignalConsumer | None = None,
     ) -> None:
         self.mode = mode_from(mode)
         self.instrument = instrument.strip() if instrument else None
@@ -354,6 +171,20 @@ class IncrementalProcessor:
         self.strategy_config = strategy_cfg
         self.strategy = TrendPullbackStrategy(strategy_cfg)
         self.simulation_config = simulation if isinstance(simulation, SimulationConfig) else SimulationConfig.from_mapping(simulation)
+        if signal_consumer is None:
+            signal_consumer = BinarySimulationConsumer(self.simulation_config)
+        if not isinstance(signal_consumer, SignalConsumer):
+            raise TypeError("signal_consumer no cumple el contrato SignalConsumer")
+        self.signal_consumer = signal_consumer
+        # Kept as a compatibility view for existing binary callers.  Non-binary
+        # consumers intentionally expose no book object.
+        self._simulation_book = getattr(signal_consumer, "book", None)
+        self._consumer_pending: tuple[PendingSimulation, ...] = ()
+        self._consumer_events: deque[SignalConsumerEvent] = deque(
+            maxlen=max(256, max_candles or 4096)
+        )
+        self._consumer_event_count = 0
+        self._transition_consumer_events: list[SignalConsumerEvent] = []
         self.max_candles = max_candles
         if max_candles is not None and (isinstance(max_candles, bool) or max_candles <= 0):
             raise ValueError("max_candles debe ser positivo")
@@ -395,7 +226,6 @@ class IncrementalProcessor:
         self._signal_order: deque[str] = deque()
         self.episodes: dict[str, Any] = {}
         self.context: dict[str, Any] | None = None
-        self._simulation_book = _SimulationBook(self.simulation_config)
         self.completed_simulations: list[PendingSimulation] = []
         self.issues: list[RuntimeIssue] = []
         self.last_event_time: datetime | None = None
@@ -416,7 +246,60 @@ class IncrementalProcessor:
 
     @property
     def pending_simulations(self) -> tuple[PendingSimulation, ...]:
-        return tuple(self._simulation_book.pending.values())
+        return self._consumer_pending
+
+    @property
+    def consumer_events(self) -> tuple[SignalConsumerEvent, ...]:
+        """Ventana acotada de deltas recientes del consumidor."""
+
+        return tuple(self._consumer_events)
+
+    @property
+    def consumer_checkpoint(self) -> dict[str, Any]:
+        """Checkpoint serializable del consumidor de producto."""
+
+        return self.signal_consumer.checkpoint().to_dict()
+
+    def _begin_transition(self) -> None:
+        self._transition_consumer_events = []
+
+    def _apply_consumer_result(self, result: SignalConsumerResult) -> tuple[PendingSimulation, ...]:
+        self._consumer_pending = tuple(result.pending_simulations)
+        for event in result.events:
+            self._consumer_events.append(event)
+            self._transition_consumer_events.append(event)
+            self._consumer_event_count += 1
+        completed = tuple(result.completed_simulations)
+        if completed:
+            self.completed_simulations.extend(completed)
+            if self.max_candles is not None:
+                del self.completed_simulations[:-self.max_candles]
+        return completed
+
+    def _dispatch_signal(self, signal: Signal) -> SignalConsumerResult:
+        return self.signal_consumer.on_signal(signal)
+
+    def _dispatch_observation(
+        self,
+        observation: PriceObservation,
+        *,
+        watermark: datetime,
+    ) -> tuple[PendingSimulation, ...]:
+        return self._apply_consumer_result(
+            self.signal_consumer.on_observation(observation, watermark=watermark)
+        )
+
+    def _dispatch_advance(
+        self,
+        watermark: datetime,
+        *,
+        capture_complete: bool,
+    ) -> tuple[PendingSimulation, ...]:
+        return self._apply_consumer_result(
+            self.signal_consumer.advance(
+                watermark, capture_complete=capture_complete
+            )
+        )
 
     @property
     def status(self) -> dict[str, Any]:
@@ -425,6 +308,9 @@ class IncrementalProcessor:
             "instrument": self.instrument,
             "source": self.source,
             "price_base": self.price_base.value,
+            "consumer_type": self.signal_consumer.consumer_type,
+            "consumer_product": getattr(self.signal_consumer, "product", self.signal_consumer.consumer_type),
+            "consumer_event_count": self._consumer_event_count,
             "max_candles": self.max_candles,
             "timeframes": [tf.name for tf in self.timeframes],
             "last_event_time": iso(self.last_event_time),
@@ -814,7 +700,7 @@ class IncrementalProcessor:
             self._remember_id(signal.signal_id, self._signal_ids, self._signal_order)
             self._append_signal(signal)
             new_signals.append(signal)
-            self._simulation_book.add_signal(signal)
+            self._apply_consumer_result(self._dispatch_signal(signal))
             if signal.episode_id in self.episodes:
                 self.episodes[signal.episode_id] = replace(self.episodes[signal.episode_id], used=True)
         # A compact current-context view for status/UI; detailed decisions stay
@@ -843,7 +729,10 @@ class IncrementalProcessor:
         self._append_signal(signal)
         if signal.episode_id in self.episodes:
             self.episodes[signal.episode_id] = replace(self.episodes[signal.episode_id], used=True)
-        return self._simulation_book.add_signal(signal)
+        self._begin_transition()
+        result = self._dispatch_signal(signal)
+        self._apply_consumer_result(result)
+        return result.pending_simulations
 
     def _observe_event(self, event: MarketEvent) -> tuple[PendingSimulation, ...]:
         selected = event.selected_price
@@ -862,7 +751,9 @@ class IncrementalProcessor:
             observation_id=event.event_id,
             source_sequence=event.sequence,
         )
-        return self._simulation_book.observe(observation, watermark=observation.available_at)
+        return self._dispatch_observation(
+            observation, watermark=observation.available_at
+        )
 
     def process_event(self, record: Any, *, evaluate_strategy: bool = True) -> ProcessResult:
         """Consume one event; aggregate all temporalities in close order.
@@ -871,6 +762,7 @@ class IncrementalProcessor:
         it still warms aggregators, indicators and the observation book but does
         not emit historical decisions or signals.
         """
+        self._begin_transition()
 
         try:
             event = to_core_event(record, mode=self.mode)
@@ -938,10 +830,17 @@ class IncrementalProcessor:
         # temporalidades no puede resolver simulaciones ni contarse como
         # entrada aceptada, aunque se conserve como evidencia capturada.
         completed = list(self._observe_event(event)) if aggregation_accepted else []
-        self.completed_simulations.extend(completed)
-        if self.max_candles is not None:
-            del self.completed_simulations[:-self.max_candles]
-        return ProcessResult(aggregation_accepted, events=(event,), candles=tuple(emitted), evaluations=tuple(evaluations), signals=tuple(signals), simulations=tuple(completed), pending_simulations=self.pending_simulations, issues=tuple(issues))
+        return ProcessResult(
+            aggregation_accepted,
+            events=(event,),
+            candles=tuple(emitted),
+            evaluations=tuple(evaluations),
+            signals=tuple(signals),
+            simulations=tuple(completed),
+            pending_simulations=self.pending_simulations,
+            issues=tuple(issues),
+            consumer_events=tuple(self._transition_consumer_events),
+        )
 
     # Common aliases used by replay/observation coordinators.
     update = process_event
@@ -953,6 +852,7 @@ class IncrementalProcessor:
         ``evaluate_strategy=False`` is reserved for bootstrap/recovery history:
         it warms indicators and continuity but cannot emit historical signals.
         """
+        self._begin_transition()
 
         try:
             candle = to_core_candle(record, mode=self.mode)
@@ -992,11 +892,17 @@ class IncrementalProcessor:
             candle.source, candle.timeframe.name, candle.closed, candle.quality.status,
             instrument=candle.instrument, observation_id=candle.candle_id, source_ordinal=self.candles_processed,
         )
-        completed = self._simulation_book.observe(obs, watermark=obs.available_at)
-        self.completed_simulations.extend(completed)
-        if self.max_candles is not None:
-            del self.completed_simulations[:-self.max_candles]
-        return ProcessResult(True, candles=tuple(all_candles), evaluations=tuple(all_evaluations), signals=tuple(all_signals), simulations=tuple(completed), pending_simulations=self.pending_simulations, issues=tuple(all_issues))
+        completed = self._dispatch_observation(obs, watermark=obs.available_at)
+        return ProcessResult(
+            True,
+            candles=tuple(all_candles),
+            evaluations=tuple(all_evaluations),
+            signals=tuple(all_signals),
+            simulations=tuple(completed),
+            pending_simulations=self.pending_simulations,
+            issues=tuple(all_issues),
+            consumer_events=tuple(self._transition_consumer_events),
+        )
 
     # Explicit aliases keep the adapter seam readable for providers and UI.
     process_candle = process_bar
@@ -1008,6 +914,7 @@ class IncrementalProcessor:
 
     def finalize(self, watermark: datetime | None = None, *, evaluate_strategy: bool = True, capture_complete: bool = True) -> ProcessResult:
         """Close active buckets at an explicit watermark; no empty candle is made."""
+        self._begin_transition()
 
         if watermark is None:
             watermark = self.last_available_at or self.last_event_time
@@ -1032,11 +939,21 @@ class IncrementalProcessor:
                 issue = RuntimeIssue(item.code, item.message, item.timestamp, item.record_id)
                 issues.append(issue)
                 self._append_issue(issue)
-        completed = list(self._simulation_book.advance(watermark, capture_complete=capture_complete))
-        self.completed_simulations.extend(completed)
-        if self.max_candles is not None:
-            del self.completed_simulations[:-self.max_candles]
-        return ProcessResult(True, candles=tuple(emitted), evaluations=tuple(evaluations), signals=tuple(signals), simulations=tuple(completed), pending_simulations=self.pending_simulations, issues=tuple(issues))
+        completed = list(
+            self._dispatch_advance(
+                watermark, capture_complete=capture_complete
+            )
+        )
+        return ProcessResult(
+            True,
+            candles=tuple(emitted),
+            evaluations=tuple(evaluations),
+            signals=tuple(signals),
+            simulations=tuple(completed),
+            pending_simulations=self.pending_simulations,
+            issues=tuple(issues),
+            consumer_events=tuple(self._transition_consumer_events),
+        )
 
     def replay(self, records: Iterable[Any], *, sort: bool = True) -> ReplayResult:
         """Replay mixed events/native bars once, with deterministic tie ordering."""
@@ -1104,6 +1021,16 @@ class IncrementalProcessor:
                 "wilder": self.strategy_config.indicators.wilder,
             },
         }
+        completed_ids = (
+            list(self._simulation_book.completed_order)
+            if self._simulation_book is not None
+            else [item.simulation_id for item in self.completed_simulations]
+        )
+        observations = (
+            self._simulation_book.observations
+            if self._simulation_book is not None
+            else ()
+        )
         return {
             "checkpoint_version": self.CHECKPOINT_VERSION,
             "config_hash": config_hash(self.strategy_config, self.simulation_config, self.timeframes, self.mode, self.price_base),
@@ -1111,6 +1038,8 @@ class IncrementalProcessor:
             "instrument": self.instrument,
             "source": self.source,
             "price_base": self.price_base.value,
+            "consumer_type": self.signal_consumer.consumer_type,
+            "consumer_product": getattr(self.signal_consumer, "product", self.signal_consumer.consumer_type),
             "timeframes": [tf.name for tf in self.timeframes],
             "strategy": strategy_data,
             "simulation": self.simulation_config.to_dict(),
@@ -1131,10 +1060,15 @@ class IncrementalProcessor:
             "signal_id_order": list(self._signal_order),
             "episodes": [_episode_dict(item) for item in self.episodes.values()],
             "context": {**self.context, "timestamp": iso(self.context.get("timestamp"))} if self.context else None,
+            # These top-level fields remain for v1 readers. The consumer block
+            # is the authoritative product state for new snapshots.
             "pending_simulations": [item.to_dict() for item in self.pending_simulations],
             "completed_simulations": [item.to_dict() for item in self.completed_simulations],
-            "completed_simulation_ids": list(self._simulation_book.completed_order),
-            "simulation_observations": [item.to_dict() for item in self._simulation_book.observations],
+            "completed_simulation_ids": completed_ids,
+            "simulation_observations": [item.to_dict() for item in observations],
+            "consumer": self.consumer_checkpoint,
+            "consumer_events": [event.to_dict() for event in self._consumer_events],
+            "consumer_event_count": self._consumer_event_count,
             "last_event_time": iso(self.last_event_time),
             "last_available_at": iso(self.last_available_at),
             "events_processed": self.events_processed,
@@ -1154,7 +1088,7 @@ class IncrementalProcessor:
     snapshot_json = checkpoint_json
 
     @classmethod
-    def from_checkpoint(cls, snapshot: Mapping[str, Any] | str, *, allow_config_mismatch: bool = False) -> "IncrementalProcessor":
+    def from_checkpoint(cls, snapshot: Mapping[str, Any] | str, *, allow_config_mismatch: bool = False, signal_consumer: SignalConsumer | None = None) -> "IncrementalProcessor":
         if isinstance(snapshot, str):
             snapshot = json.loads(snapshot)
         if not isinstance(snapshot, Mapping):
@@ -1163,6 +1097,12 @@ class IncrementalProcessor:
             raise ValueError("versión de checkpoint no soportada")
         strategy_raw = dict(snapshot.get("strategy", {}))
         simulation_raw = dict(snapshot.get("simulation", {}))
+        consumer_raw = snapshot.get("consumer")
+        signal_consumer = _checkpoint_consumer(
+            signal_consumer,
+            consumer_raw,
+            simulation_raw,
+        )
         processor = cls(
             strategy=strategy_raw,
             simulation=simulation_raw,
@@ -1172,106 +1112,18 @@ class IncrementalProcessor:
             source=snapshot.get("source", "runtime"),
             price_base=snapshot.get("price_base", "traded"),
             max_candles=snapshot.get("max_candles"),
+            signal_consumer=signal_consumer,
         )
         expected_hash = config_hash(processor.strategy_config, processor.simulation_config, processor.timeframes, processor.mode, processor.price_base)
         if not allow_config_mismatch and snapshot.get("config_hash") != expected_hash:
             raise ValueError("config_hash del checkpoint no coincide")
-        processor._seen_event_ids = set(str(item) for item in snapshot.get("seen_event_ids", ()))
-        processor._events = {event.event_id: event for event in (event_from_dict(item) for item in snapshot.get("events", ())) }
-        for name, rows in dict(snapshot.get("candles", {})).items():
-            if name not in processor.candles:
-                continue
-            for raw in rows:
-                candle = candle_from_dict(raw)
-                # Reconstruct the effective bounded history; the indicator
-                # state below is restored separately, so a max_candles
-                # checkpoint does not change EMA/RSI/ATR due to warmup loss.
-                processor.candles[name].append(candle)
-                logical = processor._logical_key(candle)
-                processor._logical_candle_keys[name].add(logical)
-                processor._candle_by_key[name][logical] = candle
-                processor._add_candle_id(candle.candle_id)
-                processor._processed_candle_starts[name].add(candle.start)
-                processor._point_index_by_start[name][candle.start] = len(processor.candles[name]) - 1
-                (processor._native_candle_keys if not processor._is_derived(candle) else processor._derived_candle_keys).add(logical)
-        raw_points = snapshot.get("indicator_points")
-        if isinstance(raw_points, Mapping):
-            for name, rows in raw_points.items():
-                if name not in processor.indicator_points:
-                    continue
-                processor.indicator_points[name].clear()
-                for raw in rows:
-                    processor.indicator_points[name].append(_indicator_point_from_dict(raw))
-        else:
-            # Backward-compatible fallback for version-1 checkpoints created
-            # before engine state was explicit.
-            for name, values in processor.candles.items():
-                for candle in values:
-                    point = processor.indicator_engines[name].update(candle)
-                    processor.indicator_points[name].append(point)
-        for name, raw in dict(snapshot.get("indicator_engines", {})).items():
-            if name in processor.indicator_engines and isinstance(raw, Mapping):
-                _restore_engine_state(processor.indicator_engines[name], raw)
-        processor.candles_processed = int(snapshot.get("candles_processed", sum(len(rows) for rows in processor.candles.values())))
-        processor.strategy_evaluations = int(snapshot.get("strategy_evaluations", 0))
-        processor.strategy_skipped = int(snapshot.get("strategy_skipped", 0))
-        processor._strategy_dirty = bool(snapshot.get("strategy_dirty", True))
-        processor.last_strategy_window_sizes = {str(key): int(value) for key, value in dict(snapshot.get("last_strategy_window_sizes", {})).items()}
-        processor.indicator_updates = {str(key): int(value) for key, value in dict(snapshot.get("indicator_updates", {})).items()}
-        processor.events_processed = int(snapshot.get("events_processed", len(processor._events)))
-        processor.last_event_time = utc(snapshot.get("last_event_time"))
-        processor.last_event_id = snapshot.get("last_event_id")
-        processor.last_available_at = utc(snapshot.get("last_available_at"))
-        processor.evaluations = [evaluation_from_dict(item) for item in snapshot.get("evaluations", ())]
-        processor._decision_ids = {_decision_id(item) for item in processor.evaluations}
-        processor._decision_order = deque(str(item) for item in snapshot.get("decision_id_order", processor._decision_ids) if str(item) in processor._decision_ids)
-        processor.signals = [signal_from_dict(item) for item in snapshot.get("signals", ())]
-        processor._signal_ids = {item.signal_id for item in processor.signals}
-        processor._signal_order = deque(str(item) for item in snapshot.get("signal_id_order", processor._signal_ids) if str(item) in processor._signal_ids)
-        processor.episodes = {item.episode_id: item for item in (_episode_from_dict(raw) for raw in snapshot.get("episodes", ())) }
-        raw_context = snapshot.get("context")
-        if isinstance(raw_context, Mapping):
-            processor.context = dict(raw_context)
-            processor.context["timestamp"] = utc(raw_context.get("timestamp"))
-        processor._simulation_book.pending = {item.simulation_id: item for item in (PendingSimulation.from_dict(raw) for raw in snapshot.get("pending_simulations", ())) }
-        processor.completed_simulations = [PendingSimulation.from_dict(raw) for raw in snapshot.get("completed_simulations", ())]
-        processor._simulation_book.completed = {item.simulation_id: item for item in processor.completed_simulations}
-        processor._simulation_book.completed_ids = {str(item) for item in snapshot.get("completed_simulation_ids", processor._simulation_book.completed)}
-        processor._simulation_book.completed_ids.update(processor._simulation_book.completed)
-        processor._simulation_book.completed_order = deque(processor._simulation_book.completed_ids)
-        processor._simulation_book.observations = [PriceObservation.from_dict(raw) for raw in snapshot.get("simulation_observations", ())]
-        processor._simulation_book.observations = processor._simulation_book.observations[-processor._simulation_book.max_observations:]
-        processor._simulation_book._observation_ids = {item.identity for item in processor._simulation_book.observations}
-        processor.issues = [RuntimeIssue(str(raw.get("code")), str(raw.get("message")), utc(raw.get("timestamp")), raw.get("record_id")) for raw in snapshot.get("issues", ())]
-        for name, raw_buckets in dict(snapshot.get("resample_buffers", {})).items():
-            if name not in processor._resample_buffers or not isinstance(raw_buckets, Mapping):
-                continue
-            for raw_start, raw_bucket in raw_buckets.items():
-                bucket_start = utc(raw_start)
-                if bucket_start is None or not isinstance(raw_bucket, Mapping):
-                    continue
-                processor._resample_buffers[name][bucket_start] = {
-                    (utc(raw_base) or datetime.fromtimestamp(0, UTC)): candle_from_dict(raw_candle)
-                    for raw_base, raw_candle in raw_bucket.items()
-                }
-        for name, raw in dict(snapshot.get("aggregators", {})).items():
-            if name not in processor.aggregators:
-                continue
-            aggregator = processor.aggregators[name]
-            aggregator._closed_through = utc(raw.get("closed_through"))
-            aggregator._seen_event_ids = set(str(item) for item in raw.get("seen_event_ids", ()))
-            aggregator._seen_event_order.clear()
-            order = [str(item) for item in raw.get("seen_event_order", raw.get("seen_event_ids", ()))]
-            for event_id in order:
-                if event_id in aggregator._seen_event_ids:
-                    aggregator._seen_event_order.append(event_id)
-            aggregator._last_event_time = utc(raw.get("last_event_time"))
-            bucket_raw = raw.get("bucket")
-            if bucket_raw:
-                bucket_events = [event_from_dict(item) for item in bucket_raw.get("events", ())]
-                aggregator._bucket = _bucket_from_dict(bucket_raw, bucket_events)
-                if bucket_events:
-                    aggregator._last_order_key = max(aggregator._event_order_key(event) for event in bucket_events)
+        _restore_capture_history(processor, snapshot)
+        _restore_indicator_state(processor, snapshot)
+        _restore_detector_state(processor, snapshot)
+        _restore_checkpoint_consumer(processor, consumer_raw, snapshot)
+        _restore_issues(processor, snapshot)
+        _restore_resample_buffers(processor, snapshot)
+        _restore_aggregators(processor, snapshot)
         # No se recrean simulaciones a partir de señales históricas: si un
         # contrato no está en pending ni en el ledger terminal del checkpoint,
         # la persistencia durable es la autoridad y no se resucita en memoria.
@@ -1280,6 +1132,244 @@ class IncrementalProcessor:
 
 IncrementalRuntime = IncrementalProcessor
 RuntimeService = IncrementalProcessor
+
+
+def _checkpoint_consumer(
+    selected: SignalConsumer | None,
+    raw_checkpoint: Any,
+    simulation_raw: Mapping[str, Any],
+) -> SignalConsumer:
+    if selected is not None:
+        return selected
+    simulation = SimulationConfig.from_mapping(simulation_raw)
+    max_observations = 4096
+    if isinstance(raw_checkpoint, Mapping):
+        state = raw_checkpoint.get("state", {})
+        limit = state.get("max_observations") if isinstance(state, Mapping) else None
+        if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+            max_observations = limit
+    return consumer_from_checkpoint(
+        raw_checkpoint,
+        simulation=simulation,
+        max_observations=max_observations,
+    )
+
+
+def _restore_capture_history(
+    processor: IncrementalProcessor,
+    snapshot: Mapping[str, Any],
+) -> None:
+    processor._seen_event_ids = set(str(item) for item in snapshot.get("seen_event_ids", ()))
+    processor._events = {}
+    for raw in snapshot.get("events", ()):
+        event = event_from_dict(raw)
+        if event.event_id is not None:
+            processor._events[event.event_id] = event
+    for name, rows in dict(snapshot.get("candles", {})).items():
+        if name not in processor.candles:
+            continue
+        _restore_candles_for_timeframe(processor, name, rows)
+
+
+def _restore_candles_for_timeframe(
+    processor: IncrementalProcessor,
+    name: str,
+    rows: Any,
+) -> None:
+    for raw in rows:
+        candle = candle_from_dict(raw)
+        processor.candles[name].append(candle)
+        logical = processor._logical_key(candle)
+        processor._logical_candle_keys[name].add(logical)
+        processor._candle_by_key[name][logical] = candle
+        processor._add_candle_id(candle.candle_id)
+        processor._processed_candle_starts[name].add(candle.start)
+        processor._point_index_by_start[name][candle.start] = len(processor.candles[name]) - 1
+        target = processor._native_candle_keys if not processor._is_derived(candle) else processor._derived_candle_keys
+        target.add(logical)
+
+
+def _restore_indicator_state(
+    processor: IncrementalProcessor,
+    snapshot: Mapping[str, Any],
+) -> None:
+    raw_points = snapshot.get("indicator_points")
+    if isinstance(raw_points, Mapping):
+        _restore_indicator_points(processor, raw_points)
+    else:
+        _rebuild_indicator_points(processor)
+    for name, raw in dict(snapshot.get("indicator_engines", {})).items():
+        if name in processor.indicator_engines and isinstance(raw, Mapping):
+            _restore_engine_state(processor.indicator_engines[name], raw)
+
+
+def _restore_indicator_points(
+    processor: IncrementalProcessor,
+    raw_points: Mapping[str, Any],
+) -> None:
+    for name, rows in raw_points.items():
+        if name not in processor.indicator_points:
+            continue
+        processor.indicator_points[name].clear()
+        for raw in rows:
+            processor.indicator_points[name].append(_indicator_point_from_dict(raw))
+
+
+def _rebuild_indicator_points(processor: IncrementalProcessor) -> None:
+    for name, values in processor.candles.items():
+        for candle in values:
+            point = processor.indicator_engines[name].update(candle)
+            processor.indicator_points[name].append(point)
+
+
+def _restore_detector_state(
+    processor: IncrementalProcessor,
+    snapshot: Mapping[str, Any],
+) -> None:
+    processor.candles_processed = int(snapshot.get("candles_processed", sum(len(rows) for rows in processor.candles.values())))
+    processor.strategy_evaluations = int(snapshot.get("strategy_evaluations", 0))
+    processor.strategy_skipped = int(snapshot.get("strategy_skipped", 0))
+    processor._strategy_dirty = bool(snapshot.get("strategy_dirty", True))
+    processor.last_strategy_window_sizes = {str(key): int(value) for key, value in dict(snapshot.get("last_strategy_window_sizes", {})).items()}
+    processor.indicator_updates = {str(key): int(value) for key, value in dict(snapshot.get("indicator_updates", {})).items()}
+    processor.events_processed = int(snapshot.get("events_processed", len(processor._events)))
+    processor.last_event_time = utc(snapshot.get("last_event_time"))
+    processor.last_event_id = snapshot.get("last_event_id")
+    processor.last_available_at = utc(snapshot.get("last_available_at"))
+    processor.evaluations = [evaluation_from_dict(item) for item in snapshot.get("evaluations", ())]
+    processor._decision_ids = {_decision_id(item) for item in processor.evaluations}
+    processor._decision_order = deque(str(item) for item in snapshot.get("decision_id_order", processor._decision_ids) if str(item) in processor._decision_ids)
+    processor.signals = [signal_from_dict(item) for item in snapshot.get("signals", ())]
+    processor._signal_ids = {item.signal_id for item in processor.signals}
+    processor._signal_order = deque(str(item) for item in snapshot.get("signal_id_order", processor._signal_ids) if str(item) in processor._signal_ids)
+    processor.episodes = {item.episode_id: item for item in (_episode_from_dict(raw) for raw in snapshot.get("episodes", ()))}
+    raw_context = snapshot.get("context")
+    if isinstance(raw_context, Mapping):
+        processor.context = dict(raw_context)
+        processor.context["timestamp"] = utc(raw_context.get("timestamp"))
+
+
+def _restore_issues(
+    processor: IncrementalProcessor,
+    snapshot: Mapping[str, Any],
+) -> None:
+    processor.issues = [
+        RuntimeIssue(
+            str(raw.get("code")),
+            str(raw.get("message")),
+            utc(raw.get("timestamp")),
+            raw.get("record_id"),
+        )
+        for raw in snapshot.get("issues", ())
+    ]
+
+
+def _restore_resample_buffers(
+    processor: IncrementalProcessor,
+    snapshot: Mapping[str, Any],
+) -> None:
+    for name, raw_buckets in dict(snapshot.get("resample_buffers", {})).items():
+        if name not in processor._resample_buffers or not isinstance(raw_buckets, Mapping):
+            continue
+        for raw_start, raw_bucket in raw_buckets.items():
+            bucket_start = utc(raw_start)
+            if bucket_start is None or not isinstance(raw_bucket, Mapping):
+                continue
+            processor._resample_buffers[name][bucket_start] = {
+                (utc(raw_base) or datetime.fromtimestamp(0, UTC)): candle_from_dict(raw_candle)
+                for raw_base, raw_candle in raw_bucket.items()
+            }
+
+
+def _restore_aggregators(
+    processor: IncrementalProcessor,
+    snapshot: Mapping[str, Any],
+) -> None:
+    for name, raw in dict(snapshot.get("aggregators", {})).items():
+        if name not in processor.aggregators:
+            continue
+        _restore_aggregator(processor.aggregators[name], raw)
+
+
+def _restore_aggregator(
+    aggregator: Any,
+    raw: Mapping[str, Any],
+) -> None:
+    aggregator._closed_through = utc(raw.get("closed_through"))
+    aggregator._seen_event_ids = set(str(item) for item in raw.get("seen_event_ids", ()))
+    aggregator._seen_event_order.clear()
+    order = [str(item) for item in raw.get("seen_event_order", raw.get("seen_event_ids", ()))]
+    for event_id in order:
+        if event_id in aggregator._seen_event_ids:
+            aggregator._seen_event_order.append(event_id)
+    aggregator._last_event_time = utc(raw.get("last_event_time"))
+    bucket_raw = raw.get("bucket")
+    if not bucket_raw:
+        return
+    bucket_events = [event_from_dict(item) for item in bucket_raw.get("events", ())]
+    aggregator._bucket = _bucket_from_dict(bucket_raw, bucket_events)
+    if bucket_events:
+        aggregator._last_order_key = max(aggregator._event_order_key(event) for event in bucket_events)
+
+
+def _restore_legacy_binary_book(
+    processor: IncrementalProcessor,
+    snapshot: Mapping[str, Any],
+) -> None:
+    book = processor._simulation_book
+    if book is None:
+        return
+    book.pending = {
+        item.simulation_id: item
+        for item in (
+            PendingSimulation.from_dict(raw)
+            for raw in snapshot.get("pending_simulations", ())
+        )
+    }
+    completed = [
+        PendingSimulation.from_dict(raw)
+        for raw in snapshot.get("completed_simulations", ())
+    ]
+    book.completed = {item.simulation_id: item for item in completed}
+    book.completed_ids = {
+        str(item)
+        for item in snapshot.get("completed_simulation_ids", book.completed)
+    }
+    book.completed_ids.update(book.completed)
+    book.completed_order = deque(
+        item for item in book.completed_ids if item in book.completed
+    )
+    book.observations = [
+        PriceObservation.from_dict(raw)
+        for raw in snapshot.get("simulation_observations", ())
+    ][-book.max_observations :]
+    book._observation_ids = {item.identity for item in book.observations}
+
+
+def _restore_checkpoint_consumer(
+    processor: IncrementalProcessor,
+    raw_checkpoint: Any,
+    snapshot: Mapping[str, Any],
+) -> None:
+    if isinstance(raw_checkpoint, Mapping):
+        processor.signal_consumer.restore(raw_checkpoint)
+    else:
+        _restore_legacy_binary_book(processor, snapshot)
+    processor._consumer_pending = tuple(
+        getattr(processor.signal_consumer, "pending_simulations", ())
+    )
+    processor.completed_simulations = [
+        PendingSimulation.from_dict(raw)
+        for raw in snapshot.get("completed_simulations", ())
+    ]
+    processor._consumer_events.clear()
+    for raw in snapshot.get("consumer_events", ()):
+        if isinstance(raw, Mapping):
+            processor._consumer_events.append(SignalConsumerEvent.from_mapping(raw))
+    processor._consumer_event_count = int(
+        snapshot.get("consumer_event_count", len(processor._consumer_events))
+    )
+    processor._transition_consumer_events = []
 
 
 def _bucket_from_dict(raw: Mapping[str, Any], events: Sequence[MarketEvent]) -> Any:

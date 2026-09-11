@@ -134,7 +134,7 @@ class CTraderOfficialTransportTests(unittest.TestCase):
         gateway = FakeOfficialGateway(lambda *_: None)
         observation = ServerAccountObservation(
             "123", "DEMO", "demo.ctraderapi.com:5035",
-            frozenset({"trading"}), self.now,
+            frozenset({"trading"}), self.now, source="fixture-server",
         )
         transport = CTraderDemoTransport(
             self.account,

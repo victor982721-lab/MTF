@@ -1,269 +1,85 @@
-"""Pipeline local cTrader -> RuntimeCoordinator -> CFD paper.
+"""Composition root for causal cTrader capture -> detector -> local CFD PAPER.
 
-Este módulo es un adaptador de integración, no un proveedor nuevo: usa la
-normalización existente de :mod:`mtf_lab.data.ctrader`, el detector incremental
-existente y :class:`CFDSimulator`.  No abre TCP/TLS, no autentica cuentas y no
-contiene órdenes, ejecutor DEMO ni contratos binarios.
-
-La captura conserva por separado:
-
-* ``Event`` de spot con bid/ask/mid y snapshots;
-* ``Bar`` nativas de cTrader, con escala relativa/procedencia;
-* el conjunto que realmente alimenta al detector, elegido por la base de
-  precio efectiva (MID/BID/ASK usa eventos; TRADED usa trendbars nativas).
-
-La ruta de papel sólo consume señales auténticas emitidas por
-``RuntimeCoordinator``.  Sus productos se guardan en la tabla v3 ``simulations``
-como ``CFD_PAPER`` y el snapshot JSON se guarda en ``checkpoints``; no se
-reutiliza la tabla para fingir una cuenta, un fill de broker o una orden.
+Replay feeds the same resumable application session as incremental ingestion.
+No binary book, OAuth, socket or external executor is constructed here.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime, timedelta
-import hashlib
-import json
-import math
+from datetime import UTC, datetime
+from itertools import islice
 from typing import Any
 
 from ..configuration import EffectiveConfig
-from ..core import OperationMode
+from ..core.canonical import canonical_value, fingerprint, instant_text
 from ..core.strategy import Signal
-from ..data.ctrader import (
-    CTraderConfig,
-    CTraderInstrumentSpec,
-    CTraderNormalizationResult,
-    CTraderProvider,
-    DeterministicTransport,
-    WireMessage,
-    synthetic_spot_event,
-    synthetic_trendbar,
-)
+from ..data.capture import CaptureEnvelope, CaptureIndex, CaptureOrder, MessageClass, ordering_key, parse_instant
+from ..data.ctrader import CTraderInstrumentSpec, CTraderNormalizationResult
 from ..data.models import Bar, Event
-from ..ops.cfd_simulation import (
-    CFDConfig,
-    CFDQuote,
-    CFDReplayResult,
-    CFDSignal,
-    CFDSimulator,
-    TradeState,
-)
-from ..ops.persistence import SQLiteStore, payload_hash
-from ..runtime import ReplayResult, RuntimeCoordinator
+from ..data.paper_fixture import synthetic_ctrader_payloads
+from ..runtime import ProcessResult, ReplayResult, RuntimeCoordinator
+from ..runtime.consumers import CFDSignalConsumer
 from ..runtime.state import signal_from_dict
-
+from .cfd_simulation import CFDConfig, CFDReplayResult, CFDSignal, CFDSimulationError, CFDSimulator, CFDTrade
+from .ctrader_capture import (
+    NORMALIZATION_VERSION,
+    CaptureCoverage,
+    CausalNormalizer,
+    CTraderCapture,
+    CTraderPipelineError,
+    capture_envelopes,
+    capture_identity,
+    normalize_ctrader_capture,
+    synthetic_ctrader_capture,
+)
+from .ctrader_paper_adapters import signal_to_cfd_signal, spot_event_to_cfd_quote
+from .persistence import SQLiteStore
 
 PAPER_PRODUCT = "FOREX_CFD_LOCAL_PAPER"
 PAPER_VARIANT = "ctrader_cfd_paper"
-SCHEMA_VERSION = 3
+PAPER_SESSION_VERSION = 1
+PAPER_REPORT_VERSION = 1
+_RETENTION = 256
 
 
-class CTraderPipelineError(ValueError):
-    """Entrada o combinación incompatible en la frontera del pipeline."""
-
-
-def _mode(value: str | OperationMode) -> str:
-    if isinstance(value, OperationMode):
-        return value.value
-    text = str(value).strip().upper()
-    if text in {"LIVE", "OBSERVACIÓN EN DIRECTO", "OBSERVACION_EN_DIRECTO"}:
-        return "LIVE"
-    if text == "REPLAY":
+def _mode(value: Any) -> str:
+    mode = value.value if hasattr(value, "value") else str(value)
+    if mode.upper() in {"REPLAY", "SYNTHETIC"}:
         return "REPLAY"
-    raise CTraderPipelineError(f"modo cTrader no soportado por este pipeline: {value!r}")
+    if mode.upper() in {"LIVE", "OBSERVACIÓN EN DIRECTO"}:
+        return "LIVE"
+    raise CTraderPipelineError(f"unsupported cTrader observation mode: {mode}")
 
 
-def _utc(value: datetime, *, name: str) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
-        raise CTraderPipelineError(f"{name} debe ser datetime con zona horaria")
-    return value.astimezone(UTC)
-
-
-def _iso(value: datetime | None) -> str | None:
-    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z") if value else None
-
-
-def _payload(value: Any) -> Mapping[str, Any]:
-    if isinstance(value, WireMessage):
-        value = value.payload
-    if not isinstance(value, Mapping) and hasattr(value, "DESCRIPTOR") and hasattr(value, "SerializeToString"):
-        try:
-            from google.protobuf.json_format import MessageToDict
-            value = MessageToDict(value, preserving_proto_field_name=True)
-        except Exception as exc:
-            raise CTraderPipelineError("no se pudo convertir SpotEvent Protobuf a mapping") from exc
-    if not isinstance(value, Mapping):
-        raise CTraderPipelineError(f"SpotEvent debe ser mapping/WireMessage, llegó {type(value).__name__}")
-    return value
-
-
-def _payload_sequence(value: Mapping[str, Any]) -> int | str:
-    for key in ("sequence", "sourceSequence", "source_sequence", "sequenceNumber", "sequence_number"):
-        if value.get(key) is not None:
-            return value[key]
-    # La secuencia sintética debe ser estable cuando se reordena una captura;
-    # nunca se usa el ordinal de llegada como identidad del mercado.
-    return "payload-" + payload_hash(value)[:24]
-
-
-def _payload_received_at(value: Mapping[str, Any]) -> datetime | None:
-    raw = value.get("timestamp", value.get("timestamp_ms"))
-    if raw is None:
+def _snapshot_cursor(value: object) -> tuple[str, int] | None:
+    if value is None:
         return None
-    try:
-        number = float(raw)
-    except (TypeError, ValueError):
-        return None
-    # cTrader SpotEvent usa milisegundos desde Unix; valores pequeños se
-    # aceptan como segundos sólo para fixtures explícitos.
-    if abs(number) > 10_000_000_000:
-        number /= 1000.0
-    return datetime.fromtimestamp(number, UTC)
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise CTraderPipelineError("snapshot cursor requires [available_at, global_sequence]")
+    when, sequence = value
+    if not isinstance(when, str) or isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise CTraderPipelineError("invalid snapshot cursor types")
+    parse_instant(when)
+    return when, sequence
 
 
-def _capture_processing_key(value: Mapping[str, Any]) -> tuple[Any, ...]:
-    source_time = _payload_received_at(value)
-    sequence = value.get("sequence", value.get("sourceSequence", value.get("source_sequence")))
-    try:
-        sequence_key = (0, int(sequence))
-    except (TypeError, ValueError):
-        sequence_key = (1, str(sequence or ""))
-    return (source_time or datetime.min.replace(tzinfo=UTC), sequence_key, payload_hash(value))
-
-
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    if isinstance(value, (tuple, list)):
-        return [_jsonable(item) for item in value]
-    if isinstance(value, datetime):
-        return _iso(value)
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        return _jsonable(value.to_dict())
-    if hasattr(value, "DESCRIPTOR") and hasattr(value, "SerializeToString"):
-        try:
-            from google.protobuf.json_format import MessageToDict
-            return _jsonable(MessageToDict(value, preserving_proto_field_name=True))
-        except Exception:
-            return {"protobuf_type": type(value).__name__}
-    if hasattr(value, "value"):
-        return value.value
-    return value
-
-
-def _ordered_record_key(record: Event | Bar) -> tuple[Any, ...]:
-    if isinstance(record, Event):
-        return (record.effective_available_at, record.event_time, 1, record.data_id)
-    return (record.available_at or record.interval_end, record.interval_end, 0, record.data_id)
-
-
-def _decorate_provenance(
-    metadata: Mapping[str, Any],
-    *,
-    mode: str,
-    source_mode: str,
-    instrument: str,
-    price_basis: str,
-    resolution: str | None = None,
-    synthetic: bool = False,
-) -> dict[str, Any]:
-    result = dict(metadata)
-    # cTrader normalizer exposes PUBLIC_PROVIDER as adapter metadata.  It is
-    # not one of the core quality flags; preserve it under a source-only key
-    # instead of letting the strict data->core translator reject the record.
-    source_quality = result.pop("quality", None)
-    if source_quality is not None:
-        result["source_quality"] = source_quality
-    result["source_mode"] = source_mode
-    result["mode"] = mode
-    result["synthetic_fixture"] = bool(synthetic)
-    result["provenance"] = {
-        **(dict(result.get("provenance")) if isinstance(result.get("provenance"), Mapping) else {}),
-        "provider": "ctrader-open-api",
-        "mode": mode,
-        "source_mode": source_mode,
-        "instrument": instrument,
-        "price_basis": price_basis,
-        "resolutions": [resolution] if resolution else [],
-        "synthetic": bool(synthetic),
-    }
-    return result
-
-
-def _rebind_event(event: Event, *, mode: str, synthetic: bool = False) -> Event:
-    source_mode = "SYNTHETIC_FIXTURE" if synthetic else str((event.metadata or {}).get("mode", "LIVE"))
-    metadata = _decorate_provenance(
-        event.metadata,
-        mode=mode,
-        source_mode=source_mode,
-        instrument=event.instrument,
-        price_basis=event.price_basis,
-        resolution="event",
-        synthetic=synthetic,
+def _coverage_from_dict(raw: Mapping[str, Any]) -> CaptureCoverage:
+    return CaptureCoverage(
+        requested_start=parse_instant(raw.get("requested_start")),
+        requested_end=parse_instant(raw.get("requested_end")),
+        observed_start=parse_instant(raw.get("observed_start")),
+        observed_end=parse_instant(raw.get("observed_end")),
+        dataset_end_declared=raw.get("dataset_end_declared", False),
+        continuity=raw.get("continuity", "UNKNOWN"),
+        availability_known=raw.get("availability_known", False),
     )
-    return replace(event, metadata=metadata)
-
-
-def _rebind_bar(bar: Bar, *, mode: str, synthetic: bool = False) -> Bar:
-    source_mode = "SYNTHETIC_FIXTURE" if synthetic else str((bar.metadata or {}).get("mode", "LIVE"))
-    metadata = _decorate_provenance(
-        bar.metadata,
-        mode=mode,
-        source_mode=source_mode,
-        instrument=bar.instrument,
-        price_basis=bar.price_basis,
-        resolution=bar.resolution,
-        synthetic=synthetic,
-    )
-    return replace(bar, metadata=metadata)
-
-
-@dataclass(frozen=True, slots=True)
-class CTraderCapture:
-    """Captura normalizada de SpotEvents y trendbars, con hash estable."""
-
-    payloads: tuple[Mapping[str, Any], ...]
-    records: tuple[Event | Bar, ...]
-    quote_events: tuple[Event, ...]
-    bars: tuple[Bar, ...]
-    issues: tuple[str, ...]
-    capture_id: str
-    capture_hash: str
-    provenance: Mapping[str, Any]
-    snapshot_count: int = 0
-
-    @property
-    def events(self) -> tuple[Event, ...]:
-        return self.quote_events
-
-    @property
-    def is_complete(self) -> bool:
-        return bool(self.records) and not self.issues
-
-    def to_dict(self, *, include_payloads: bool = False) -> dict[str, Any]:
-        result: dict[str, Any] = {
-            "schema_version": SCHEMA_VERSION,
-            "capture_id": self.capture_id,
-            "capture_hash": self.capture_hash,
-            "record_count": len(self.records),
-            "quote_event_count": len(self.quote_events),
-            "bar_count": len(self.bars),
-            "snapshot_count": self.snapshot_count,
-            "synthetic": bool(self.provenance.get("synthetic", False)),
-            "issues": list(self.issues),
-            "provenance": dict(self.provenance),
-        }
-        if include_payloads:
-            result["payloads"] = [_jsonable(item) for item in self.payloads]
-        return result
 
 
 @dataclass(frozen=True, slots=True)
 class CTraderPipelineResult:
-    """Resultado auditable de una corrida de captura y CFD paper."""
-
     capture: CTraderCapture
     session_id: str
     runtime_analysis_id: str
@@ -279,269 +95,34 @@ class CTraderPipelineResult:
     snapshot_hash: str
 
     @property
-    def trades(self):
+    def trades(self) -> tuple[CFDTrade, ...]:
         return self.paper.trades
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_payloads: bool = False) -> dict[str, Any]:
+        if include_payloads and not self.capture.envelopes:
+            raise CTraderPipelineError(
+                "full capture export requires the durable archive, not the compact result window"
+            )
         return {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": PAPER_REPORT_VERSION,
             "product": PAPER_PRODUCT,
             "session_id": self.session_id,
             "runtime_analysis_id": self.runtime_analysis_id,
             "paper_analysis_id": self.paper_analysis_id,
             "analysis_basis": self.analysis_basis,
-            # Reports carry raw normalized-source payloads so the same input
-            # can be replayed; compact SQLite/UI snapshots intentionally omit
-            # them and retain hashes/provenance instead.
-            "capture": self.capture.to_dict(include_payloads=True),
+            "capture": self.capture.to_dict(include_payloads=include_payloads),
             "runtime_result": self.runtime_result.to_dict(),
-            "runtime_status": _jsonable(self.runtime_status),
-            "signals": [signal.as_dict() for signal in self.signals],
-            "cfd_signals": [signal.to_dict() for signal in self.cfd_signals],
+            "runtime_status": canonical_value(self.runtime_status),
+            "signals": [item.as_dict() for item in self.signals],
+            "cfd_signals": [item.to_dict() for item in self.cfd_signals],
             "paper": self.paper.to_dict(),
             "snapshot_hash": self.snapshot_hash,
+            "retention": {"result_window": _RETENTION, "archive": "SQLite capture_envelopes/cfd_trades"},
         }
 
 
-def normalize_ctrader_capture(
-    payloads: Iterable[Mapping[str, Any] | WireMessage],
-    *,
-    spec: CTraderInstrumentSpec,
-    quote_basis: str = "mid",
-    mode: str | OperationMode = "REPLAY",
-    received_at: datetime | Callable[[int, Mapping[str, Any]], datetime] | None = None,
-) -> CTraderCapture:
-    """Normaliza una secuencia de ProtoOASpotEvent sin abrir red.
-
-    ``received_at`` es inyectable para que los fixtures sean reproducibles; en
-    un adaptador live el caller puede proveer ``datetime.now(UTC)`` por evento.
-    Las identidades se derivan del payload/proveedor, no del orden local.
-    """
-
-    capture_mode = _mode(mode)
-    materialized = tuple(_payload(item) for item in payloads)
-    records: list[Event | Bar] = []
-    quotes: list[Event] = []
-    bars: list[Bar] = []
-    issues: list[str] = []
-    snapshot_count = 0
-    # Reuse the provider's stateful bid/ask normalizer without connecting its
-    # transport. This preserves partial quote legs during replay as well as in
-    # live streaming, while retaining native trendbars unchanged.
-    stateful_provider = CTraderProvider(
-        CTraderConfig(
-            symbol=spec.symbol,
-            symbol_id=spec.symbol_id,
-            digits=spec.digits,
-            pip_position=spec.pip_position,
-            price_scale=spec.price_scale,
-            quote_basis=quote_basis,
-        ),
-        transport=DeterministicTransport(),
-    )
-    processing = tuple(sorted(enumerate(materialized), key=lambda item: _capture_processing_key(item[1])))
-    normalized_rows: dict[int, tuple[CTraderNormalizationResult, bool]] = {}
-    for original_index, raw in processing:
-        if callable(received_at):
-            received = _utc(received_at(original_index, raw), name="received_at")
-        elif received_at is not None:
-            received = _utc(received_at, name="received_at")
-        else:
-            source_time = _payload_received_at(raw)
-            received = source_time or datetime.now(UTC)
-        normalized: CTraderNormalizationResult = stateful_provider.normalize_spot(
-            raw,
-            received_at=received,
-            snapshot=bool(raw.get("snapshot", raw.get("isSnapshot", False))),
-            sequence=_payload_sequence(raw),
-        )
-        normalized_rows[original_index] = (
-            normalized,
-            bool(raw.get("synthetic_fixture", raw.get("synthetic", False))),
-        )
-        if normalized.snapshot:
-            snapshot_count += 1
-        # One-sided quote updates are temporary state conditions. If a later
-        # payload supplies the missing leg, do not poison the completed capture
-        # with the transient quote_basis diagnostic.
-        issues.extend(issue for issue in normalized.issues if not issue.startswith("quote_basis="))
-    # Preserve the caller's payload order in the capture view while stateful
-    # normalization itself was applied in causal time order.
-    for original_index in range(len(materialized)):
-        normalized, synthetic = normalized_rows[original_index]
-        for event in normalized.quote_events:
-            rebound = _rebind_event(event, mode=capture_mode, synthetic=synthetic)
-            quotes.append(rebound)
-            records.append(rebound)
-        for bar in normalized.bars:
-            rebound = _rebind_bar(bar, mode=capture_mode, synthetic=synthetic)
-            bars.append(rebound)
-            records.append(rebound)
-    # Hash normalized records in causal identity order, making replay of the
-    # same capture independent of the input list order.
-    ordered = tuple(sorted(records, key=_ordered_record_key))
-    normalized_rows = [_jsonable(record.to_dict()) for record in ordered]
-    digest = payload_hash(normalized_rows)
-    capture_id = "cap_" + digest[:32]
-    timestamps: list[datetime] = []
-    for record in records:
-        timestamps.append(record.event_time if isinstance(record, Event) else record.interval_start)
-        timestamps.append(record.event_time if isinstance(record, Event) else record.interval_end)
-    provenance = {
-        "schema_version": SCHEMA_VERSION,
-        "provider": "ctrader-open-api",
-        "mode": capture_mode,
-        "source_mode": "SYNTHETIC_FIXTURE" if any(bool(raw.get("synthetic_fixture", raw.get("synthetic", False))) for raw in materialized) else "LIVE",
-        "instrument": spec.symbol,
-        "symbol_id": spec.symbol_id,
-        "price_basis": str(quote_basis).lower(),
-        "resolutions": sorted({bar.resolution for bar in bars}),
-        "source_hash": digest,
-        "capture_hash": digest,
-        "coverage_start": _iso(min(timestamps)) if timestamps else None,
-        "coverage_end": _iso(max(timestamps)) if timestamps else None,
-        "synthetic": any(bool(raw.get("synthetic_fixture", raw.get("synthetic", False))) for raw in materialized),
-        "notes": (
-            "captura normalizada de ProtoOASpotEvent",
-            "trendbars nativas; no se interpolan ticks",
-            "fixture local si el caller usa synthetic_ctrader_payloads",
-        ),
-    }
-    return CTraderCapture(
-        payloads=materialized,
-        records=tuple(records),
-        quote_events=tuple(quotes),
-        bars=tuple(bars),
-        issues=tuple(issues),
-        capture_id=capture_id,
-        capture_hash=digest,
-        provenance=provenance,
-        snapshot_count=snapshot_count,
-    )
-
-
-def spot_event_to_cfd_quote(event: Event, *, capture_hash: str | None = None) -> CFDQuote:
-    """Convierte sólo un quote con bid y ask explícitos a CFDQuote.
-
-    Los snapshots y eventos sin timestamp de origen se conservan, pero quedan
-    con calidad no utilizable por el simulador; nunca se convierten en un fill.
-    """
-
-    if not isinstance(event, Event):
-        raise CTraderPipelineError("se esperaba un Event normalizado de cTrader")
-    if event.bid is None or event.ask is None:
-        raise CTraderPipelineError("SpotEvent sin bid/ask explícitos; no se fabrica quote")
-    source_timestamp_missing = bool((event.metadata or {}).get("source_timestamp_missing", False))
-    synthetic = bool((event.metadata or {}).get("synthetic_fixture", False) or ((event.metadata or {}).get("provenance", {}) or {}).get("synthetic", False))
-    quality = "SNAPSHOT" if event.is_snapshot else ("UNKNOWN" if source_timestamp_missing else ("SYNTHETIC" if synthetic else "VALID"))
-    metadata = {
-        "provider": "ctrader-open-api",
-        "event_data_id": event.data_id,
-        "source_event_id": event.source_event_id,
-        "source_timestamp_missing": source_timestamp_missing,
-        "is_snapshot": event.is_snapshot,
-        "synthetic": synthetic,
-        "capture_hash": capture_hash,
-        "provenance": dict((event.metadata or {}).get("provenance", {})) if isinstance((event.metadata or {}).get("provenance"), Mapping) else {},
-    }
-    return CFDQuote(
-        instrument=event.instrument,
-        market_time=event.event_time,
-        bid=str(event.bid),
-        ask=str(event.ask),
-        quote_id=event.source_event_id or event.data_id,
-        available_at=event.effective_available_at,
-        source=event.source,
-        sequence=event.source_sequence,
-        quality=quality,
-        metadata=metadata,
-    )
-
-
-def signal_to_cfd_signal(signal: Signal | Mapping[str, Any], *, capture_hash: str | None = None, strategy: str = "trend_pullback_v1") -> CFDSignal:
-    """Adaptador puro: sólo acepta señales emitidas por el detector."""
-
-    if isinstance(signal, Mapping):
-        signal = signal_from_dict(signal)
-    if not isinstance(signal, Signal):
-        raise CTraderPipelineError("se esperaba Signal del detector RuntimeCoordinator")
-    metadata = {
-        "source": "RuntimeCoordinator",
-        "capture_hash": capture_hash,
-        "episode_id": signal.episode_id,
-        "context_start": _iso(signal.context_start),
-        "preparation_start": _iso(signal.preparation_start),
-        "trigger_start": _iso(signal.trigger_start),
-        "trigger_end": _iso(signal.trigger_end),
-        "values": dict(signal.values),
-        "mode": signal.mode.value,
-        "quality_flags": sorted(flag.value for flag in signal.quality.flags),
-    }
-    return CFDSignal(
-        signal_id=signal.signal_id,
-        instrument=signal.instrument,
-        direction=signal.direction,
-        detected_at=signal.detected_at,
-        available_at=signal.detected_at,
-        strategy=strategy,
-        quality=signal.quality.status,
-        metadata=metadata,
-    )
-
-
-def _paper_outcome(trade: Any) -> str:
-    if trade.state is TradeState.PENDING or trade.state is TradeState.FILLED:
-        return "PENDING"
-    if trade.state is TradeState.UNKNOWN or trade.state is TradeState.REJECTED:
-        return "INDETERMINATE"
-    if trade.net_pnl is None:
-        return "INDETERMINATE"
-    if trade.net_pnl > 0:
-        return "WIN"
-    if trade.net_pnl < 0:
-        return "LOSS"
-    return "TIE"
-
-
-class _CFDOnlyRuntimeCoordinator(RuntimeCoordinator):
-    """RuntimeCoordinator real, sin persistir su simulador de contratos.
-
-    El runtime sigue agregando, calentando, evaluando y guardando decisiones y
-    señales.  Se descarta únicamente su libreta virtual genérica para que esta
-    ruta no mezcle productos binarios con el producto CFD PAPER.
-    """
-
-    def _persist_simulation(self, item: Any) -> None:  # pragma: no cover - exercised through process/replay
-        return None
-
-    def _clear_virtual_book(self) -> None:
-        book = getattr(self.processor, "_simulation_book", None)
-        if book is not None:
-            book.pending.clear()
-            book.completed.clear()
-            book.completed_ids.clear()
-            book.completed_order.clear()
-            book.observations.clear()
-            book._observation_ids.clear()
-        self.processor.completed_simulations.clear()
-
-    def process(self, record: Any, *, bootstrap: bool = False):
-        result = super().process(record, bootstrap=bootstrap)
-        self._clear_virtual_book()
-        return result
-
-    def advance(self, watermark: datetime, *, complete: bool = False):
-        result = super().advance(watermark, complete=complete)
-        self._clear_virtual_book()
-        return result
-
-    def checkpoint(self) -> None:
-        self._clear_virtual_book()
-        super().checkpoint()
-
-
 class CTraderPipeline:
-    """Orquestador offline/live-ready de captura normalizada y CFD paper."""
+    """Validate configuration once and connect exactly one application session."""
 
     def __init__(
         self,
@@ -550,387 +131,707 @@ class CTraderPipeline:
         *,
         spec: CTraderInstrumentSpec | None = None,
         cfd_config: CFDConfig | Mapping[str, Any] | None = None,
-        mode: str | OperationMode | None = None,
+        mode: Any = None,
         checkpoint_name: str = "runtime",
         pipeline_checkpoint_name: str = "pipeline",
-        max_candles: int | None = 5000,
+        max_candles: int | None = 256,
     ) -> None:
-        if not isinstance(store, SQLiteStore):
-            raise TypeError("store debe ser SQLiteStore")
-        if not isinstance(config, EffectiveConfig):
-            raise TypeError("config debe ser EffectiveConfig")
         self.store = store
         self.config = config
         self.mode = _mode(mode or config.mode)
         self.spec = spec or CTraderInstrumentSpec(
             symbol=config.instrument,
-            symbol_id=(config.ctrader.get("symbol_id") if isinstance(config.ctrader, Mapping) else None),
-            digits=int(config.ctrader.get("digits", 5)) if isinstance(config.ctrader, Mapping) else 5,
-            pip_position=int(config.ctrader.get("pip_position", 4)) if isinstance(config.ctrader, Mapping) else 4,
-            price_scale=int(config.ctrader.get("price_scale", 100_000)) if isinstance(config.ctrader, Mapping) else 100_000,
+            symbol_id=config.ctrader.get("symbol_id"),
+            digits=int(config.ctrader.get("digits", 5)),
+            pip_position=int(config.ctrader.get("pip_position", 4)),
+            price_scale=int(config.ctrader.get("price_scale", 100_000)),
         )
-        if self.spec.symbol != config.instrument.upper().replace("-", "/"):
-            raise CTraderPipelineError(f"instrumento cTrader/config incompatible: {self.spec.symbol} vs {config.instrument}")
-        raw_cfd = dict(config.cfd) if isinstance(config.cfd, Mapping) else {}
-        if cfd_config is None:
-            cfd_config = CFDConfig.from_mapping(raw_cfd or {"instrument": config.instrument})
-        elif isinstance(cfd_config, Mapping):
-            cfd_config = CFDConfig.from_mapping(cfd_config)
-        if not isinstance(cfd_config, CFDConfig):
-            raise TypeError("cfd_config debe ser CFDConfig o mapping")
-        if cfd_config.instrument != self.spec.symbol:
-            raise CTraderPipelineError(f"CFD/config incompatible con cTrader: {cfd_config.instrument} vs {self.spec.symbol}")
-        self.cfd_config = cfd_config
-        self.checkpoint_name = str(checkpoint_name)
-        self.pipeline_checkpoint_name = str(pipeline_checkpoint_name)
-        self.max_candles = max_candles
+        supplied = cfd_config if cfd_config is not None else config.cfd
+        self.cfd_config = supplied if isinstance(supplied, CFDConfig) else CFDConfig.from_mapping(supplied)
+        self.checkpoint_name = checkpoint_name
+        self.pipeline_checkpoint_name = pipeline_checkpoint_name
+        self.max_candles = max_candles if max_candles is not None else 256
+        self._validate()
+
+    def _validate(self) -> None:
+        minimum = max(
+            self.config.indicators.ema_slow,
+            self.config.indicators.rsi_period + 1,
+            self.config.indicators.atr_period + 1,
+            self.config.strategy.context_lookback + 1,
+            self.config.strategy.preparation_lookback + 1,
+        )
+        if isinstance(self.max_candles, bool) or self.max_candles < minimum:
+            raise CTraderPipelineError(f"bounded history must retain at least {minimum} candles per timeframe")
+        if self.spec.symbol != self.config.instrument.upper().replace("-", "/"):
+            raise CTraderPipelineError("cTrader/config instrument mismatch")
+        if self.cfd_config.instrument != self.spec.symbol:
+            raise CTraderPipelineError("CFD/config instrument mismatch")
+        if self.config.price_base not in {"native", "bid", "ask", "mid"}:
+            raise CTraderPipelineError(
+                "cTrader trendbars require price_base='native'; trade semantics are not established"
+            )
 
     @property
     def analysis_basis(self) -> str:
-        base = "traded" if self.config.price_base == "close" else str(self.config.price_base).lower()
-        if base not in {"traded", "bid", "ask", "mid"}:
-            raise CTraderPipelineError(f"base de precio cTrader no soportada: {base!r}")
-        return base
+        return self.config.price_base
 
-    def _session_config(self) -> dict[str, Any]:
+    def session_config(self) -> dict[str, Any]:
         config = self.config.to_dict()
         config["pipeline"] = {
             "provider": "ctrader-open-api",
             "product": PAPER_PRODUCT,
-            "schema_version": SCHEMA_VERSION,
+            "session_version": PAPER_SESSION_VERSION,
+            "normalization_version": NORMALIZATION_VERSION,
             "analysis_basis": self.analysis_basis,
+            "history_retention": self.max_candles,
             "network_performed": False,
             "execution_enabled": False,
         }
         return config
 
-    def _analysis_records(self, capture: CTraderCapture) -> tuple[Event | Bar, ...]:
-        basis = self.analysis_basis
-        if basis == "traded":
-            rows: tuple[Event | Bar, ...] = tuple(capture.bars)
-        else:
-            rows = tuple(event for event in capture.quote_events if event.price_basis == basis)
-        if not rows:
-            raise CTraderPipelineError(f"la captura no contiene registros para la base de análisis {basis}")
-        return tuple(sorted(rows, key=_ordered_record_key))
-
-    def _persist_paper_trade(self, session_id: str, trade: Any, *, paper_analysis_id: str, capture: CTraderCapture) -> None:
-        raw_trade = trade.to_dict()
-        detected = trade.detected_at
-        expiry = trade.close_target_at or (trade.entry_target_at + timedelta(seconds=float(trade.horizon_seconds)))
-        assumptions = {
-            "schema_version": SCHEMA_VERSION,
-            "product": PAPER_PRODUCT,
-            "paper_only": True,
-            "provider": "ctrader-open-api",
-            "capture_hash": capture.capture_hash,
-            "analysis_basis": self.analysis_basis,
-            "units": raw_trade["units"],
-            "fill_policy": raw_trade["fill_policy"],
-            "close_policy": raw_trade["close_policy"],
-            "pip_size": raw_trade["pip_size"],
-            "price_precision": raw_trade["price_precision"],
-            "commission_quote": raw_trade["commission_quote"],
-            "slippage_quote": raw_trade["slippage_quote"],
-            "financing_quote": raw_trade["financing_quote"],
-            "lineage": raw_trade["lineage"],
-            "provenance": dict(capture.provenance),
-        }
-        row = {
-            "product": PAPER_PRODUCT,
-            "simulation_id": f"paper:{trade.trade_id}",
-            "signal_id": trade.signal_id,
-            "simulation_type": "CFD_PAPER",
-            "horizon_seconds": float(trade.horizon_seconds),
-            "direction": trade.direction.value,
-            "detected_ts": detected,
-            "entry_ts": trade.entry_available_at,
-            "expiry_ts": expiry,
-            "entry_price": trade.entry_price,
-            "final_price": trade.close_price,
-            "outcome": _paper_outcome(trade),
-            # The v3 column is named stake; this product is linear and stores
-            # units explicitly in assumptions rather than pretending risk.
-            "stake": float(trade.units),
-            "net_result": trade.net_pnl,
-            "price_base": "bid_ask",
-            "quality": trade.quality,
-            "resolution": "spot",
-            "assumptions": assumptions,
-            "payload": {
-                "schema_version": SCHEMA_VERSION,
-                "product": PAPER_PRODUCT,
-                "trade": raw_trade,
-                "capture": capture.to_dict(),
-            },
-        }
-        self.store.update_simulation(
-            session_id,
-            row,
-            analysis_id=paper_analysis_id,
-            variant=PAPER_VARIANT,
-            analysis_config_hash=payload_hash({"runtime": self.config.config_hash, "cfd": self.cfd_config.config_hash}),
-            contract_hash=self.cfd_config.config_hash,
-            partition="paper",
-            ignore_pending_terminal=True,
-        )
-
-    def _save_pipeline_snapshot(
+    def open_session(
         self,
-        session_id: str,
-        coordinator: _CFDOnlyRuntimeCoordinator,
-        capture: CTraderCapture,
-        paper_analysis_id: str,
-        paper: CFDReplayResult,
-    ) -> tuple[dict[str, Any], str]:
-        status = asdict(coordinator.status())
-        processor_status = coordinator.processor.status
-        processor_snapshot = coordinator.processor.checkpoint()
-        # The query/UI read model already consumes state.processor; keep the
-        # warm-up projection there without changing the processor checkpoint
-        # contract or inventing a readiness conclusion from row counts.
-        processor_snapshot["warmup_pending"] = dict(processor_status.get("warmup_pending", {}))
-        snapshot: dict[str, Any] = {
-            "schema_version": SCHEMA_VERSION,
-            "product": PAPER_PRODUCT,
-            "capture": capture.to_dict(),
-            "runtime": {
-                "analysis_id": coordinator.analysis_id,
-                "status": _jsonable(status),
-                "analysis_basis": self.analysis_basis,
-            },
-            "processor": processor_snapshot,
-            "paper": {
-                "analysis_id": paper_analysis_id,
-                "product": PAPER_PRODUCT,
-                "capture_complete": paper.capture_complete,
-                "config": self.cfd_config.to_dict(),
-                "trades": [trade.to_dict() for trade in paper.trades],
-                "events": [_jsonable(event) for event in paper.events],
-            },
-            # QueryService consumes this compact projection without inferring
-            # health from row counts; the complete state remains above.
-            "status": _jsonable(status),
-        }
-        # Analysis/session ids are intentionally excluded from the parity
-        # digest: replaying the same capture in another SQLite session must
-        # yield the same market/product state while retaining distinct DB
-        # lineage in the full snapshot.
-        parity_material = {
-            "schema_version": snapshot["schema_version"],
-            "product": snapshot["product"],
-            "capture": snapshot["capture"],
-            "analysis_basis": snapshot["runtime"]["analysis_basis"],
-            "processor": snapshot["processor"],
-            "paper": {
-                key: value for key, value in snapshot["paper"].items() if key != "analysis_id"
-            },
-        }
-        digest = payload_hash(parity_material)
-        snapshot["snapshot_hash"] = digest
-        self.store.save_checkpoint(
-            session_id,
-            self.pipeline_checkpoint_name,
-            analysis_id=paper_analysis_id,
-            cursor={"analysis_id": paper_analysis_id, "runtime_analysis_id": coordinator.analysis_id, "capture_hash": capture.capture_hash},
-            events_processed=coordinator.processor.events_processed + coordinator.processor.candles_processed,
-            last_event_id=coordinator.processor.last_event_id,
-            state=snapshot,
+        *,
+        dataset_id: str,
+        session_id: str | None = None,
+        coverage: CaptureCoverage | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        resume: bool = True,
+    ) -> CTraderPaperSession:
+        return CTraderPaperSession(
+            self, dataset_id=dataset_id, session_id=session_id, coverage=coverage, provenance=provenance, resume=resume
         )
-        return snapshot, digest
 
     def run(
         self,
-        capture: CTraderCapture | Iterable[Mapping[str, Any] | WireMessage],
+        capture: CTraderCapture | Iterable[Any],
         *,
         session_id: str | None = None,
         capture_complete: bool = True,
         received_at: datetime | Callable[[int, Mapping[str, Any]], datetime] | None = None,
         quote_basis: str = "mid",
         finish_session: bool = True,
+        chunk_size: int = 128,
+        order: CaptureOrder = "as_observed",
     ) -> CTraderPipelineResult:
-        if not isinstance(capture, CTraderCapture):
-            capture = normalize_ctrader_capture(
-                capture,
-                spec=self.spec,
-                quote_basis=quote_basis,
-                mode=self.mode,
-                received_at=received_at,
-            )
+        if order != "as_observed":
+            raise CTraderPipelineError("market-time corrected captures are inspection-only, not as-observed PAPER")
+        if isinstance(capture, CTraderCapture):
+            return self._run_capture(capture, session_id, capture_complete, finish_session, chunk_size)
+        with CaptureIndex(capture_envelopes(capture, received_at=received_at), mode=order) as index:
+            identity = capture_identity(index.capture_hash, self.spec, quote_basis)
+            last = index.last_envelope
+            coverage = _coverage_from_dict(last.payload) if last and last.message_class is MessageClass.END else None
+            session = self.open_session(dataset_id=identity, session_id=session_id, coverage=coverage)
+            session.ingest_many(index.iter_after(session.cursor), chunk_size=chunk_size)
+            return session.finish(capture_complete=capture_complete, finish_session=finish_session)
+
+    def _run_capture(
+        self, capture: CTraderCapture, session_id: str | None, complete: bool, finish: bool, chunk_size: int
+    ) -> CTraderPipelineResult:
+        if capture.provenance.get("order", "as_observed") != "as_observed":
+            raise CTraderPipelineError("corrected market-time captures cannot be relabeled as as-observed PAPER")
         if capture.provenance.get("instrument") != self.spec.symbol:
-            raise CTraderPipelineError("capture y spec cTrader no corresponden al mismo instrumento")
-        analysis_records = self._analysis_records(capture)
-        sid = self.store.create_session(
+            raise CTraderPipelineError("capture/spec instrument mismatch")
+        if not capture.envelopes:
+            raise CTraderPipelineError("replay requires versioned envelopes, not an unproven normalized record cache")
+        session = self.open_session(
+            dataset_id=capture.capture_hash,
             session_id=session_id,
-            mode=self.mode,
-            provider="ctrader-open-api",
-            instrument=self.spec.symbol,
-            config=self._session_config(),
-            code_version=self.config.version,
-            dataset_ref=capture.capture_id,
-            metadata={"schema_version": SCHEMA_VERSION, "product": PAPER_PRODUCT, "provenance": dict(capture.provenance), "capture": capture.to_dict()},
+            coverage=capture.coverage,
+            provenance=capture.provenance,
         )
-        self.store.save_config(sid, "effective", self._session_config())
-        self.store.save_config(sid, "cfd-paper", self.cfd_config.to_dict())
-        coordinator = _CFDOnlyRuntimeCoordinator(
+        with CaptureIndex(capture.envelopes) as index:
+            session.ingest_many(index.iter_after(session.cursor), chunk_size=chunk_size)
+        result = session.finish(capture_complete=complete, finish_session=finish)
+        return replace(result, capture=replace(result.capture, payloads=capture.payloads, envelopes=capture.envelopes))
+
+
+class CTraderPaperSession:
+    """Ingest/advance/snapshot/restore/finish with one consistent durable cursor.
+
+    A batch commits capture facts, detector/product changes and both checkpoints
+    together. On failure, in-memory state is restored to the previous commit.
+    Windows in returned reports are bounded; full immutable inputs and product
+    history belong to SQLite, not to an ever-growing session list.
+    """
+
+    def __init__(
+        self,
+        pipeline: CTraderPipeline,
+        *,
+        dataset_id: str,
+        session_id: str | None,
+        coverage: CaptureCoverage | None,
+        provenance: Mapping[str, Any] | None,
+        resume: bool,
+    ) -> None:
+        self.pipeline = pipeline
+        self.store = pipeline.store
+        self.dataset_id = dataset_id
+        self.stream_identity_hash = fingerprint({"stream_ref": dataset_id, "capture_contract": 1})
+        self.input_prefix_hash = fingerprint({"capture_version": 1, "order": "as_observed"})
+        self.coverage = replace(
+            coverage or CaptureCoverage(), observed_start=None, observed_end=None, availability_known=False
+        )
+        self.provenance = dict(
+            provenance
+            or {
+                "provider": "ctrader-open-api",
+                "instrument": pipeline.spec.symbol,
+                "mode": pipeline.mode,
+                "order": "as_observed",
+            }
+        )
+        self.cursor: tuple[str, int] | None = None
+        self.max_ingest_sequence = -1
+        self.logical_time = datetime(1970, 1, 1, tzinfo=UTC)
+        self.finished = False
+        self.end_seen = False
+        self.failed = False
+        self._stats = dict.fromkeys(
+            (
+                "envelopes",
+                "accepted",
+                "duplicate",
+                "rejected",
+                "candles",
+                "signals",
+                "evaluations",
+                "quotes",
+                "bars",
+                "snapshots",
+                "quote_rejections",
+            ),
+            0,
+        )
+        self._issues: deque[str] = deque(maxlen=64)
+        self._analysis_records: deque[Event | Bar] = deque(maxlen=_RETENTION)
+        self._signals: deque[Signal] = deque(maxlen=_RETENTION)
+        self._cfd_signals: deque[CFDSignal] = deque(maxlen=_RETENTION)
+        self.session_id = self.store.create_session(
+            session_id=session_id,
+            mode=pipeline.mode,
+            provider="ctrader-open-api",
+            instrument=pipeline.spec.symbol,
+            config=pipeline.session_config(),
+            code_version=pipeline.config.version,
+            dataset_ref=dataset_id,
+            metadata={"product": PAPER_PRODUCT, "provenance": self.provenance},
+        )
+        self.normalizer = CausalNormalizer(
+            pipeline.spec,
+            quote_basis=(pipeline.analysis_basis if pipeline.analysis_basis != "native" else "mid"),
+            mode=pipeline.mode,
+            max_quote_age_seconds=pipeline.config.quality.max_feed_age_seconds,
+        )
+        self.coordinator = RuntimeCoordinator(
             self.store,
-            sid,
-            self.config,
-            mode=self.mode,
-            dataset_hash=capture.capture_hash,
+            self.session_id,
+            pipeline.config,
+            mode=pipeline.mode,
+            dataset_hash=self.stream_identity_hash,
             variant="trend_pullback_v1",
             partition="paper",
-            checkpoint_name=self.checkpoint_name,
+            checkpoint_name=pipeline.checkpoint_name,
             source="ctrader-open-api",
-            max_candles=self.max_candles,
-            resume=True,
-            identity_extra={"provider": "ctrader-open-api", "product": PAPER_PRODUCT, "analysis_basis": self.analysis_basis},
+            max_candles=pipeline.max_candles,
+            resume=False,
+            checkpoint_every=2**63 - 1,
+            clock=lambda: self.logical_time,
+            identity_extra={
+                "product": PAPER_PRODUCT,
+                "session_version": PAPER_SESSION_VERSION,
+                "history_retention": pipeline.max_candles,
+                "dataset_hash_kind": "logical_stream_identity",
+            },
+            signal_consumer=CFDSignalConsumer(max_events=_RETENTION, signal_sink=self._on_detector_signal),
         )
-        # Feed only the explicitly selected price basis to the detector.
-        # Native bars/quotes of the other representation are captured after
-        # processing so their durable payload is identical on a resumed run
-        # (indicator provenance is already available in both runs).
-        runtime_result = coordinator.replay(analysis_records, sort=True, bootstrap=False, complete=capture_complete)
-        if self.analysis_basis == "traded":
-            for event in capture.quote_events:
-                coordinator.capture_only(event)
-        else:
-            for bar in capture.bars:
-                coordinator.capture_only(bar)
-        signals = tuple(coordinator.processor.signals)
-        cfd_signals = tuple(signal_to_cfd_signal(signal, capture_hash=capture.capture_hash) for signal in signals)
-        quotes = tuple(spot_event_to_cfd_quote(event, capture_hash=capture.capture_hash) for event in capture.quote_events)
-        paper = CFDSimulator(self.cfd_config).replay(cfd_signals, quotes, capture_complete=capture_complete)
-        paper_config_hash = payload_hash({"runtime": self.config.config_hash, "cfd": self.cfd_config.config_hash})
-        paper_analysis_id = self.store.create_analysis(
-            sid,
-            dataset_hash=capture.capture_hash,
-            config_hash=paper_config_hash,
+        self.paper_analysis_id = self.store.create_analysis(
+            self.session_id,
+            dataset_hash=self.stream_identity_hash,
+            config_hash=fingerprint(pipeline.session_config()),
             variant=PAPER_VARIANT,
-            contract_hash=self.cfd_config.config_hash,
+            contract_hash=pipeline.cfd_config.config_hash,
             partition="paper",
-            code_version=self.config.version,
-            metadata={"product": PAPER_PRODUCT, "runtime_analysis_id": coordinator.analysis_id, "schema_version": SCHEMA_VERSION},
-            identity_extra={"runtime_analysis_id": coordinator.analysis_id},
+            code_version=pipeline.config.version,
+            identity_extra={
+                "runtime_analysis_id": self.coordinator.analysis_id,
+                "session_version": PAPER_SESSION_VERSION,
+            },
         )
-        for trade in paper.trades:
-            self._persist_paper_trade(sid, trade, paper_analysis_id=paper_analysis_id, capture=capture)
-        if finish_session and capture_complete:
-            coordinator.finish(status="COMPLETED")
-        else:
-            coordinator.checkpoint()
-        snapshot, snapshot_hash = self._save_pipeline_snapshot(sid, coordinator, capture, paper_analysis_id, paper)
-        status = _jsonable(asdict(coordinator.status()))
-        return CTraderPipelineResult(
-            capture=capture,
-            session_id=sid,
-            runtime_analysis_id=coordinator.analysis_id,
-            paper_analysis_id=paper_analysis_id,
-            analysis_basis=self.analysis_basis,
-            analysis_records=analysis_records,
-            runtime_result=runtime_result,
-            runtime_status=status,
-            signals=signals,
-            cfd_signals=cfd_signals,
-            paper=paper,
-            snapshot=snapshot,
-            snapshot_hash=snapshot_hash,
+        self.simulator = CFDSimulator(pipeline.cfd_config, terminal_lookup=self._terminal_trade)
+        if resume:
+            self._resume()
+
+    def _resume(self) -> None:
+        saved = self.store.get_checkpoint(
+            self.session_id,
+            self.pipeline.pipeline_checkpoint_name,
+            analysis_id=self.paper_analysis_id,
+            allow_alternate=False,
+        )
+        if saved:
+            self.restore(saved["state"])
+
+    def ingest(self, envelope: CaptureEnvelope) -> None:
+        self._apply_batch((envelope,))
+
+    def ingest_many(self, envelopes: Iterable[CaptureEnvelope], *, chunk_size: int = 128) -> None:
+        if isinstance(chunk_size, bool) or chunk_size <= 0:
+            raise CTraderPipelineError("chunk_size must be a positive integer")
+        iterator = iter(envelopes)
+        while batch := tuple(islice(iterator, chunk_size)):
+            self._apply_batch(batch)
+
+    def _apply_batch(self, batch: Iterable[CaptureEnvelope]) -> None:
+        if self.failed:
+            raise CTraderPipelineError("failed session must be restored before ingest")
+        before = self.snapshot()
+        try:
+            with self.store.atomic_batch():
+                for envelope in batch:
+                    self._ingest(envelope)
+                self.checkpoint()
+        except BaseException:
+            self._load_state(before)
+            raise
+
+    def _ingest(self, envelope: CaptureEnvelope) -> None:
+        key = ordering_key(envelope)
+        inserted = self.store.save_capture_envelope(self.session_id, envelope.to_dict())
+        if self.cursor is not None and key <= self.cursor:
+            if inserted:
+                raise CTraderPipelineError(
+                    "session requires causal order; use explicit CaptureIndex for unordered files"
+                )
+            return
+        if self.finished or self.end_seen:
+            raise CTraderPipelineError("dataset already finished; use another dataset/session for new input")
+        if envelope.available_at is None:
+            raise CTraderPipelineError("missing envelope availability")
+        self.logical_time = envelope.available_at
+        self.input_prefix_hash = fingerprint({"previous": self.input_prefix_hash, "envelope": envelope.to_dict()})
+        self.max_ingest_sequence = max(self.max_ingest_sequence, envelope.ingest_sequence)
+        self._stats["envelopes"] += 1
+        self._observe_coverage(envelope)
+        self._generation_gate(envelope)
+        normalized = self.normalizer.normalize(envelope)
+        self._control(envelope)
+        self._consume_records(normalized)
+        self.cursor = key
+
+    def reader_resume_arguments(self) -> dict[str, int]:
+        """Seed a newly constructed reader from the committed capture cursor."""
+        return {
+            "next_ingest_sequence": self.max_ingest_sequence + 1,
+            "initial_generation": self.normalizer.generation or 0,
+        }
+
+    def _generation_gate(self, envelope: CaptureEnvelope) -> None:
+        previous = self.normalizer.generation
+        if previous is None or previous == envelope.connection_generation:
+            return
+        self.simulator.disconnect(reason="CONNECTION_GENERATION_CHANGED")
+        self.coverage = replace(self.coverage, continuity="DISCONTINUOUS")
+        self.coordinator.update_feed_state(
+            continuity="UNKNOWN", reconciliation="PENDING", blocked_reasons=("reconciliation_required",)
         )
 
-
-def _fixture_close_series(count: int) -> list[float]:
-    if count < 130:
-        raise CTraderPipelineError("el fixture cTrader requiere al menos 130 barras M1")
-    closes: list[float] = []
-    for index in range(100):
-        closes.append(1.1000 + index * 0.0001)
-    for _ in range(15):
-        closes.append(closes[-1] + 0.0002)
-    # Con indicadores pequeños este tramo forma contexto alcista, una
-    # preparación M5 de retroceso y un cruce M1 auténtico en 02:02 UTC.
-    closes.extend([1.1125, 1.1118, 1.1110, 1.1106, 1.1105, 1.1104, 1.1120, 1.1125, 1.1128, 1.1130])
-    while len(closes) < count:
-        closes.append(closes[-1] + 0.00015)
-    return closes
-
-
-def synthetic_ctrader_payloads(
-    *,
-    start: datetime = datetime(2026, 1, 1, tzinfo=UTC),
-    symbol_id: int = 99,
-    count: int = 190,
-) -> tuple[Mapping[str, Any], ...]:
-    """Fixture offline de SpotEvent + trendbar; no es mercado real."""
-
-    start = _utc(start, name="start")
-    spec = CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=symbol_id)
-    closes = _fixture_close_series(count)
-    payloads: list[Mapping[str, Any]] = []
-    scale = spec.price_scale
-    for index, close in enumerate(closes):
-        bar_start = start + timedelta(minutes=index)
-        bar_end = bar_start + timedelta(minutes=1)
-        previous = closes[index - 1] if index else close
-        open_price = previous
-        low_price = min(open_price, close) - 0.0001
-        high_price = max(open_price, close) + 0.0001
-        low_relative = int(round(low_price * scale))
-        raw_bar = synthetic_trendbar(
-            timestamp_minutes=int(bar_start.timestamp() // 60),
-            period="M1",
-            low_relative=low_relative,
-            delta_open=int(round(open_price * scale)) - low_relative,
-            delta_close=int(round(close * scale)) - low_relative,
-            delta_high=int(round(high_price * scale)) - low_relative,
-            volume=42,
+    def _observe_coverage(self, envelope: CaptureEnvelope) -> None:
+        instant = envelope.available_at
+        first = self.coverage.observed_start is None
+        self.coverage = replace(
+            self.coverage,
+            observed_start=self.coverage.observed_start or instant,
+            observed_end=instant,
+            availability_known=(envelope.received_at is not None)
+            if first
+            else (self.coverage.availability_known and envelope.received_at is not None),
         )
-        bid_relative = int(round((close - 0.0001) * scale))
-        ask_relative = int(round((close + 0.0001) * scale))
-        payload = dict(
-            synthetic_spot_event(
-                timestamp_ms=int(bar_end.timestamp() * 1000),
-                symbol_id=symbol_id,
-                bid_relative=bid_relative,
-                ask_relative=ask_relative,
-                trendbars=(raw_bar,),
-                snapshot=index == 0,
+        if envelope.message_class is MessageClass.END:
+            self.end_seen = True
+            continuity = envelope.payload.get("continuity", self.coverage.continuity)
+            if continuity not in {"UNKNOWN", "CONTINUOUS", "DISCONTINUOUS"}:
+                raise CTraderPipelineError("unknown end-of-dataset continuity state")
+            self.coverage = replace(
+                self.coverage,
+                dataset_end_declared=True,
+                continuity=continuity,
+                requested_start=parse_instant(envelope.payload.get("requested_start")) or self.coverage.requested_start,
+                requested_end=parse_instant(envelope.payload.get("requested_end")) or self.coverage.requested_end,
             )
+
+    def _control(self, envelope: CaptureEnvelope) -> None:
+        if envelope.message_class is MessageClass.CLOCK:
+            result = (
+                self.coordinator.heartbeat(self.logical_time)
+                if envelope.payload.get("clock_kind") == "heartbeat"
+                else self.coordinator.tick(self.logical_time)
+            )
+            self._detector_result(result)
+            self._persist_trades(self.simulator.advance(self.logical_time, capture_complete=False))
+        elif envelope.message_class is MessageClass.CONNECTION:
+            self._connection(envelope)
+
+    def _connection(self, envelope: CaptureEnvelope) -> None:
+        state = envelope.payload.get("state")
+        if state == "DISCONNECTED":
+            self.simulator.disconnect()
+            self.coverage = replace(self.coverage, continuity="DISCONTINUOUS")
+            self.coordinator.update_feed_state(
+                connection="DISCONNECTED", continuity="GAP", blocked_reasons=("capture_disconnected",)
+            )
+        elif state in {"CONNECTED", "RECONNECTED"}:
+            self.simulator.disconnect(reason="RECONCILIATION_REQUIRED")
+            self.coordinator.update_feed_state(
+                connection="CONNECTED",
+                reconciliation="PENDING",
+                continuity="UNKNOWN",
+                blocked_reasons=("reconciliation_required",),
+            )
+        elif state == "RECONCILED":
+            self.simulator.reconnect(envelope.connection_generation)
+            self.coverage = replace(self.coverage, continuity="CONTINUOUS")
+            self.coordinator.update_feed_state(
+                connection="CONNECTED", reconciliation="RECONCILED", continuity="CONTINUOUS", blocked_reasons=()
+            )
+        else:
+            raise CTraderPipelineError(f"unknown recorded connection state {state!r}")
+
+    def _consume_records(self, normalized: CTraderNormalizationResult) -> None:
+        self._stats["quotes"] += len(normalized.quote_events)
+        self._stats["bars"] += len(normalized.bars)
+        self._stats["snapshots"] += int(normalized.snapshot)
+        self._issues.extend(normalized.issues)
+        self._refresh_price_freshness(normalized)
+        records = normalized.bars if self.pipeline.analysis_basis == "native" else normalized.quote_events
+        for record in records:
+            if record.price_basis != self.pipeline.analysis_basis:
+                raise CTraderPipelineError("mixed analysis price bases are not allowed")
+            self._analysis_records.append(record)
+            self._detector_result(self.coordinator.process(record))
+        evidence = normalized.quote_events if self.pipeline.analysis_basis == "native" else normalized.bars
+        for record in evidence:
+            self.coordinator.capture_only(record)
+        for event in normalized.quote_events:
+            self._deliver_quote(event)
+        self._persist_trades(self.simulator.advance(self.logical_time, capture_complete=False))
+
+    def _refresh_price_freshness(self, normalized: CTraderNormalizationResult) -> None:
+        if self.pipeline.mode != "LIVE" or normalized.quote_quality is None:
+            return
+        usable = normalized.quote_quality.usable
+        blocked = self.coordinator.external_blocked_reasons
+        if usable:
+            blocked = [reason for reason in blocked if reason != "feed_stale"]
+        self.coordinator.update_feed_state(freshness="FRESH" if usable else "BLOCKED", blocked_reasons=blocked)
+
+    def _deliver_quote(self, event: Event) -> None:
+        try:
+            quote = spot_event_to_cfd_quote(event, capture_hash=self.capture_hash)
+        except CFDSimulationError as exc:
+            self._issues.append(f"cfd_quote_rejected:{exc.code}")
+            self._stats["quote_rejections"] = self._stats.get("quote_rejections", 0) + 1
+            return
+        self._persist_trades(self.simulator.on_quote(quote))
+
+    def _detector_result(self, result: ProcessResult) -> None:
+        if result.accepted:
+            self._stats["accepted"] += 1
+        elif result.issues:
+            key = (
+                "duplicate"
+                if all(item.code in {"duplicate_event", "duplicate_candle"} for item in result.issues)
+                else "rejected"
+            )
+            self._stats[key] += 1
+        self._stats["candles"] += len(result.candles)
+        self._stats["signals"] += len(result.signals)
+        self._stats["evaluations"] += len(result.evaluations)
+        self._issues.extend(item.code for item in result.issues)
+        self._signals.extend(result.signals)
+
+    def _on_detector_signal(self, signal: Signal) -> None:
+        """The sole CFD signal adapter, wired into the detector's consumer."""
+        if self.coverage.continuity != "CONTINUOUS":
+            self._issues.append("paper_continuity_not_established")
+            return
+        converted = signal_to_cfd_signal(signal, capture_hash=self.capture_hash)
+        self._cfd_signals.append(converted)
+        self._persist_trades(self.simulator.submit_all(converted))
+
+    def _terminal_trade(self, trade_id: str) -> CFDTrade | None:
+        """Resolve evicted terminal identities from the exact durable product log."""
+        row = self.store.get_cfd_trade(self.session_id, self.paper_analysis_id, trade_id)
+        if row is None or row["state"] not in {"CLOSED", "UNKNOWN", "REJECTED"}:
+            return None
+        return CFDTrade.from_mapping(row["payload"])
+
+    def _persist_trades(self, trades: Iterable[CFDTrade]) -> None:
+        for trade in trades:
+            self.store.save_cfd_trade(
+                self.session_id,
+                self.paper_analysis_id,
+                trade.to_dict(),
+                variant=PAPER_VARIANT,
+                partition="paper",
+                analysis_config_hash=fingerprint(self.pipeline.session_config()),
+                contract_hash=self.pipeline.cfd_config.config_hash,
+            )
+
+    def _advance(self, watermark: datetime) -> None:
+        if watermark < self.logical_time:
+            raise CTraderPipelineError("logical clock cannot go backwards")
+        self.logical_time = watermark
+        self._detector_result(self.coordinator.advance(watermark, complete=False))
+        self._persist_trades(self.simulator.advance(watermark, capture_complete=False))
+
+    def advance(self, watermark: datetime) -> None:
+        """Record a logical clock event so its decision effects survive replay."""
+        next_sequence = self.max_ingest_sequence + 1
+        generation = self.normalizer.generation or 0
+        self.ingest(CaptureEnvelope(watermark, watermark, watermark, next_sequence, generation, MessageClass.CLOCK, {}))
+
+    @property
+    def capture_hash(self) -> str:
+        """Hash of the actually ingested causal prefix, never a caller's label."""
+        return capture_identity(self.input_prefix_hash, self.pipeline.spec, self.normalizer.quote_basis)
+
+    def capture_summary(self) -> CTraderCapture:
+        return CTraderCapture(
+            (),
+            (),
+            (),
+            (),
+            tuple(self._issues),
+            "cap_" + self.capture_hash[:32],
+            self.capture_hash,
+            self.provenance,
+            self._stats["snapshots"],
+            coverage=self.coverage,
+            record_count=self._stats["quotes"] + self._stats["bars"],
+            quote_count=self._stats["quotes"],
+            bar_count=self._stats["bars"],
         )
-        # Stable source sequence survives reversed replay and makes identity
-        # independent of local arrival ordinal.
-        payload["sequence"] = index
-        payloads.append(payload)
-    return tuple(payloads)
 
+    def snapshot(self) -> dict[str, Any]:
+        runtime = self.coordinator.export_state()
+        # A compact query projection, not a second copy of the recovery state.
+        processor = {
+            key: runtime["processor"][key]
+            for key in ("events_processed", "candles_processed", "last_event_time", "last_available_at")
+        }
+        processor.update(
+            {
+                "warmup_pending": dict(self.coordinator.processor.status.get("warmup_pending", {})),
+                "signals": self._stats["signals"],
+                "evaluations": self._stats["evaluations"],
+                "errors": len(self._issues),
+                "consumer_type": self.coordinator.processor.signal_consumer.consumer_type,
+            }
+        )
+        paper = self.simulator.snapshot()
+        capture = self.capture_summary().to_dict()
+        state: dict[str, Any] = {
+            "schema_version": PAPER_SESSION_VERSION,
+            "product": PAPER_PRODUCT,
+            "dataset_id": self.dataset_id,
+            "input_prefix_hash": self.input_prefix_hash,
+            "max_ingest_sequence": self.max_ingest_sequence,
+            "cfd_signals": [item.to_dict() for item in self._cfd_signals],
+            "config_hash": fingerprint(self.pipeline.session_config()),
+            "paper_analysis_id": self.paper_analysis_id,
+            "capture": capture,
+            "cursor": list(self.cursor) if self.cursor else None,
+            "logical_time": instant_text(self.logical_time),
+            "finished": self.finished,
+            "end_seen": self.end_seen,
+            "normalizer": self.normalizer.snapshot(),
+            "runtime": runtime,
+            "processor": processor,
+            "paper": {
+                **paper,
+                "analysis_id": self.paper_analysis_id,
+                "capture_complete": self.finished and self.coverage.complete,
+            },
+            "stats": dict(self._stats),
+            "signals": [item.as_dict() for item in self._signals],
+            "status": canonical_value(asdict(self.coordinator.status())),
+        }
+        economic = {
+            key: state[key]
+            for key in (
+                "schema_version",
+                "product",
+                "dataset_id",
+                "input_prefix_hash",
+                "max_ingest_sequence",
+                "cfd_signals",
+                "config_hash",
+                "capture",
+                "cursor",
+                "logical_time",
+                "finished",
+                "end_seen",
+                "normalizer",
+                "processor",
+                "stats",
+                "signals",
+            )
+        }
+        economic["capture"] = {key: value for key, value in capture.items() if key not in {"provenance", "synthetic"}}
+        economic["processor"] = runtime["processor"]
+        economic["paper"] = paper
+        state["snapshot_hash"] = fingerprint(economic)
+        state["integrity_hash"] = fingerprint(state)
+        return state
 
-def synthetic_ctrader_capture(
-    *,
-    start: datetime = datetime(2026, 1, 1, tzinfo=UTC),
-    symbol_id: int = 99,
-    count: int = 190,
-    mode: str | OperationMode = "REPLAY",
-) -> CTraderCapture:
-    """Construye la captura normalizada usada por pruebas offline."""
+    def checkpoint(self) -> dict[str, Any]:
+        with self.store.atomic_batch():
+            self.coordinator.checkpoint()
+            state = self.snapshot()
+            self.store.save_checkpoint(
+                self.session_id,
+                self.pipeline.pipeline_checkpoint_name,
+                analysis_id=self.paper_analysis_id,
+                cursor={
+                    "analysis_id": self.paper_analysis_id,
+                    "runtime_analysis_id": self.coordinator.analysis_id,
+                    "capture_hash": self.dataset_id,
+                    "availability_cursor": state["cursor"],
+                },
+                events_processed=self._stats["envelopes"],
+                state=state,
+            )
+        return state
 
-    payloads = synthetic_ctrader_payloads(start=start, symbol_id=symbol_id, count=count)
-    def receipt(index: int, raw: Mapping[str, Any]) -> datetime:
-        source_time = _payload_received_at(raw)
-        assert source_time is not None
-        return source_time + timedelta(seconds=1)
-    return normalize_ctrader_capture(
-        payloads,
-        spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=symbol_id),
-        quote_basis="mid",
-        mode=mode,
-        received_at=receipt,
-    )
+    def restore(self, state: Mapping[str, Any]) -> None:
+        self._validate_snapshot_identity(state)
+        self._validate_snapshot_progress(state)
+        self._validate_snapshot_terminals(state)
+        before = self.snapshot()
+        try:
+            self._load_state(state)
+        except BaseException:
+            self._load_state(before)
+            raise
+
+    def _validate_snapshot_identity(self, state: Mapping[str, Any]) -> None:
+        material = dict(state)
+        expected = material.pop("integrity_hash", None)
+        if expected != fingerprint(material):
+            raise CTraderPipelineError("PAPER checkpoint integrity mismatch")
+        if state.get("schema_version") != PAPER_SESSION_VERSION or state.get("product") != PAPER_PRODUCT:
+            raise CTraderPipelineError("unsupported PAPER session snapshot contract")
+        if state.get("dataset_id") != self.dataset_id or state.get("config_hash") != fingerprint(
+            self.pipeline.session_config()
+        ):
+            raise CTraderPipelineError("snapshot dataset/config mismatch")
+        if state.get("paper_analysis_id") != self.paper_analysis_id:
+            raise CTraderPipelineError("snapshot belongs to another paper analysis/session")
+
+    def _validate_snapshot_progress(self, state: Mapping[str, Any]) -> None:
+        if not isinstance(state.get("finished"), bool) or not isinstance(state.get("end_seen"), bool):
+            raise CTraderPipelineError("snapshot lifecycle flags must be booleans")
+        cursor = _snapshot_cursor(state.get("cursor"))
+        if self.cursor is not None and (cursor is None or cursor < self.cursor):
+            raise CTraderPipelineError("restore cannot rewind a committed session")
+
+    def _validate_snapshot_terminals(self, state: Mapping[str, Any]) -> None:
+        for trade in state["paper"]["trades"]:
+            existing = self.store.get_cfd_trade(self.session_id, self.paper_analysis_id, trade["trade_id"])
+            if (
+                existing
+                and existing["state"] in {"CLOSED", "UNKNOWN", "REJECTED"}
+                and existing["state"] != trade["state"]
+            ):
+                raise CTraderPipelineError("restore cannot resurrect a durable terminal CFD trade")
+
+    def _load_state(self, state: Mapping[str, Any]) -> None:
+        self.input_prefix_hash = state["input_prefix_hash"]
+        self.max_ingest_sequence = state["max_ingest_sequence"]
+        self._cfd_signals = deque((CFDSignal.from_mapping(item) for item in state["cfd_signals"]), maxlen=_RETENTION)
+        self.normalizer.restore(state["normalizer"])
+        self.coordinator.restore_state(state["runtime"])
+        paper = dict(state["paper"])
+        paper.pop("analysis_id", None)
+        paper.pop("capture_complete", None)
+        self.simulator.restore(paper)
+        self.cursor = _snapshot_cursor(state["cursor"])
+        logical_time = parse_instant(state["logical_time"])
+        if logical_time is None:
+            raise CTraderPipelineError("checkpoint lacks logical_time")
+        self.logical_time = logical_time
+        self.finished = bool(state["finished"])
+        self.end_seen = bool(state.get("end_seen", False))
+        self._stats = dict(state["stats"])
+        self.coverage = _coverage_from_dict(state["capture"]["coverage"])
+        self._issues = deque(state["capture"]["issues"], maxlen=64)
+        self._signals = deque((signal_from_dict(item) for item in state["signals"]), maxlen=_RETENTION)
+        self._analysis_records.clear()
+        self.failed = False
+
+    def finish(self, *, capture_complete: bool = True, finish_session: bool = True) -> CTraderPipelineResult:
+        if self.finished:
+            return self.result()
+        before = self.snapshot()
+        try:
+            with self.store.atomic_batch():
+                self.coverage = replace(
+                    self.coverage, dataset_end_declared=capture_complete or self.coverage.dataset_end_declared
+                )
+                self._advance(self.logical_time)
+                if capture_complete and finish_session and self.coverage.complete:
+                    self.simulator.finish(self.logical_time, capture_complete=True)
+                    self._persist_trades(self.simulator.trades)
+                    self.finished = True
+                    self.coordinator.finish(status="COMPLETED")
+                self.checkpoint()
+        except BaseException:
+            self._load_state(before)
+            raise
+        return self.result()
+
+    def result(self) -> CTraderPipelineResult:
+        state = self.snapshot()
+        replay = ReplayResult(
+            self._stats["accepted"],
+            self._stats["duplicate"],
+            self._stats["rejected"],
+            self._stats["candles"],
+            self._stats["signals"],
+            self._stats["evaluations"],
+            0,
+            0,
+        )
+        paper = CFDReplayResult(self.simulator.trades, self.simulator.events, self.finished and self.coverage.complete)
+        signals = tuple(self._signals)
+        return CTraderPipelineResult(
+            self.capture_summary(),
+            self.session_id,
+            self.coordinator.analysis_id,
+            self.paper_analysis_id,
+            self.pipeline.analysis_basis,
+            tuple(self._analysis_records),
+            replay,
+            state["status"],
+            signals,
+            tuple(self._cfd_signals),
+            paper,
+            state,
+            state["snapshot_hash"],
+        )
 
 
 __all__ = [
     "CTraderCapture",
     "CTraderPipeline",
+    "CTraderPaperSession",
     "CTraderPipelineError",
     "CTraderPipelineResult",
+    "CaptureCoverage",
     "PAPER_PRODUCT",
     "PAPER_VARIANT",
     "normalize_ctrader_capture",

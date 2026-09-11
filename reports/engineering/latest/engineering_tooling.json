@@ -1,0 +1,979 @@
+{
+  "configuration": {
+    "mypy_targets": [
+      "mtf_lab/core/canonical.py",
+      "mtf_lab/core/cfd_simulation.py",
+      "mtf_lab/core/cfd_quality.py",
+      "mtf_lab/core/numeric.py",
+      "mtf_lab/core/reference.py",
+      "mtf_lab/data/capture.py",
+      "mtf_lab/data/ctrader_accounts.py",
+      "mtf_lab/data/ctrader_config.py",
+      "mtf_lab/data/ctrader_errors.py",
+      "mtf_lab/data/ctrader_fixtures.py",
+      "mtf_lab/data/ctrader_market.py",
+      "mtf_lab/data/ctrader_protocol.py",
+      "mtf_lab/data/ctrader_session.py",
+      "mtf_lab/data/ctrader_transport.py",
+      "mtf_lab/ops/ctrader_capture.py",
+      "mtf_lab/ops/ctrader_paper_adapters.py",
+      "mtf_lab/ops/ctrader_pipeline.py",
+      "mtf_lab/ops/ctrader_demo_transport.py",
+      "mtf_lab/ops/ctrader_demo_composition.py",
+      "mtf_lab/runtime/consumers.py"
+    ],
+    "report_directory": "reports/engineering/latest",
+    "ruff_command_scope": "critical refactor modules plus tools/*.py; not repository-wide legacy claim",
+    "ruff_format_targets": [
+      "mtf_lab/core/canonical.py",
+      "mtf_lab/core/cfd_simulation.py",
+      "mtf_lab/core/cfd_quality.py",
+      "mtf_lab/core/numeric.py",
+      "mtf_lab/core/reference.py",
+      "mtf_lab/data/capture.py",
+      "mtf_lab/data/ctrader_accounts.py",
+      "mtf_lab/data/ctrader_config.py",
+      "mtf_lab/data/ctrader_errors.py",
+      "mtf_lab/data/ctrader_fixtures.py",
+      "mtf_lab/data/ctrader_market.py",
+      "mtf_lab/data/ctrader_protocol.py",
+      "mtf_lab/data/ctrader_session.py",
+      "mtf_lab/data/ctrader_transport.py",
+      "mtf_lab/ops/ctrader_capture.py",
+      "mtf_lab/ops/ctrader_paper_adapters.py",
+      "mtf_lab/ops/ctrader_pipeline.py",
+      "mtf_lab/ops/ctrader_demo_transport.py",
+      "mtf_lab/ops/ctrader_demo_composition.py",
+      "mtf_lab/runtime/consumers.py",
+      "tools/benchmark_paper.py",
+      "tools/engineering_audit.py",
+      "tools/offline_tests.py",
+      "tools/verify_offline.py",
+      "tests/test_engineering_delivery.py",
+      "tests/test_demo_composition.py",
+      "tests/test_packaging_delivery.py",
+      "tests/test_migration_delivery.py"
+    ]
+  },
+  "external_validation": {
+    "account_discovery": "NOT_EXECUTED",
+    "credentials_used": false,
+    "demo_orders": "NOT_EXECUTED",
+    "network_policy": "external network blocked by offline child guard",
+    "oauth": "NOT_EXECUTED",
+    "real_live_execution": "REJECTED",
+    "status": "NOT_EXECUTED"
+  },
+  "identity_contract": {
+    "checkout_provenance": "head_commit and head_tree_hash describe HEAD before this gate; they do not identify uncommitted working-tree content",
+    "mutation_check": "source_integrity compares the pre-gate and post-gate content_sha256 and must be ok",
+    "self_referential_outputs_excluded": [
+      "reports/engineering/latest/engineering_results.json",
+      "reports/engineering/latest/engineering_tooling.json"
+    ],
+    "validated_working_tree_identity": [
+      "content_sha256",
+      "files"
+    ]
+  },
+  "interpreters": {
+    "dev_distributions": {
+      "mypy": "2.3.1",
+      "pip": "25.1.1",
+      "ruff": "0.16.7"
+    },
+    "dev_python": {
+      "available": true,
+      "path": ".venv-dev/bin/python",
+      "probe": {
+        "command": [
+          ".venv-dev/bin/python",
+          "-c",
+          "\nimport importlib.metadata as metadata\nimport json\nimport platform\nimport sqlite3\n\nnames = ('ruff', 'mypy', 'pip')\nversions = {}\nfor name in names:\n    try:\n        versions[name] = metadata.version(name)\n    except metadata.PackageNotFoundError:\n        versions[name] = None\nprint(json.dumps({\n    \"implementation\": platform.python_implementation(),\n    \"python_version\": platform.python_version(),\n    \"sqlite\": sqlite3.sqlite_version,\n    \"distributions\": versions,\n}, sort_keys=True))\n"
+        ],
+        "duration_seconds": 0.318,
+        "metadata": {
+          "distributions": {
+            "mypy": "2.3.1",
+            "pip": "25.1.1",
+            "ruff": "0.16.7"
+          },
+          "implementation": "CPython",
+          "python_version": "3.14.4",
+          "sqlite": "3.46.1"
+        },
+        "ok": true,
+        "returncode": 0,
+        "stderr_tail": "",
+        "stdout_tail": "{\"distributions\": {\"mypy\": \"2.3.1\", \"pip\": \"25.1.1\", \"ruff\": \"0.16.7\"}, \"implementation\": \"CPython\", \"python_version\": \"3.14.4\", \"sqlite\": \"3.46.1\"}\n",
+        "timed_out": false
+      }
+    },
+    "distributions": {
+      "Twisted": "24.3.0",
+      "ctrader-open-api": "0.9.2",
+      "mtf-lab": "0.1.0",
+      "pip": "25.1.1",
+      "protobuf": "3.20.1",
+      "pyOpenSSL": "24.1.0",
+      "requests": "2.32.3",
+      "service-identity": "24.2.0"
+    },
+    "node": {
+      "command": [
+        "<absolute-path>",
+        "--version"
+      ],
+      "duration_seconds": 0.039,
+      "ok": true,
+      "path_available": true,
+      "returncode": 0,
+      "stderr_tail": "",
+      "stdout_tail": "v22.22.1\n",
+      "timed_out": false,
+      "version": "v22.22.1"
+    },
+    "python": {
+      "dev": "3.14.4",
+      "runtime": "3.14.4"
+    },
+    "runtime_python": {
+      "available": true,
+      "path": ".venv/bin/python",
+      "probe": {
+        "command": [
+          ".venv/bin/python",
+          "-c",
+          "\nimport importlib.metadata as metadata\nimport json\nimport platform\nimport sqlite3\n\nnames = ('mtf-lab', 'ctrader-open-api', 'protobuf', 'Twisted', 'service-identity', 'requests', 'pyOpenSSL', 'pip')\nversions = {}\nfor name in names:\n    try:\n        versions[name] = metadata.version(name)\n    except metadata.PackageNotFoundError:\n        versions[name] = None\nprint(json.dumps({\n    \"implementation\": platform.python_implementation(),\n    \"python_version\": platform.python_version(),\n    \"sqlite\": sqlite3.sqlite_version,\n    \"distributions\": versions,\n}, sort_keys=True))\n"
+        ],
+        "duration_seconds": 0.343,
+        "metadata": {
+          "distributions": {
+            "Twisted": "24.3.0",
+            "ctrader-open-api": "0.9.2",
+            "mtf-lab": "0.1.0",
+            "pip": "25.1.1",
+            "protobuf": "3.20.1",
+            "pyOpenSSL": "24.1.0",
+            "requests": "2.32.3",
+            "service-identity": "24.2.0"
+          },
+          "implementation": "CPython",
+          "python_version": "3.14.4",
+          "sqlite": "3.46.1"
+        },
+        "ok": true,
+        "returncode": 0,
+        "stderr_tail": "",
+        "stdout_tail": "{\"distributions\": {\"Twisted\": \"24.3.0\", \"ctrader-open-api\": \"0.9.2\", \"mtf-lab\": \"0.1.0\", \"pip\": \"25.1.1\", \"protobuf\": \"3.20.1\", \"pyOpenSSL\": \"24.1.0\", \"requests\": \"2.32.3\", \"service-identity\": \"24.2.0\"}, \"implementation\": \"CPython\", \"python_version\": \"3.14.4\", \"sqlite\": \"3.46.1\"}\n",
+        "timed_out": false
+      }
+    },
+    "sqlite": "3.46.1"
+  },
+  "quality_checks": {
+    "final_gates": {
+      "architecture": {
+        "command": {
+          "command": [
+            ".venv/bin/python",
+            "tools/engineering_audit.py",
+            "--strict",
+            "--json",
+            "<temporary>/architecture.json"
+          ],
+          "duration_seconds": 1.764,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "timed_out": false
+        },
+        "cycles": [],
+        "forbidden_core_imports": [],
+        "import_time_side_effects": [],
+        "ok": true,
+        "parse_errors": [],
+        "summary": {
+          "cross_object_private_accesses": 103,
+          "cycles": 0,
+          "dependency_edges": 210,
+          "dynamic_imports": 7,
+          "external_import_modules": 55,
+          "forbidden_core_imports": 0,
+          "functions": 1969,
+          "high_complexity_functions": 142,
+          "import_time_side_effects": 0,
+          "max_complexity": 76,
+          "modules": 64,
+          "parse_errors": 0,
+          "private_accesses": 1945,
+          "private_writes": 357,
+          "strict_violations": 0,
+          "typing_only_forbidden_core_imports": 0
+        }
+      },
+      "benchmark": {
+        "command": {
+          "command": [
+            ".venv/bin/python",
+            "-m",
+            "tools.benchmark_paper",
+            "--events",
+            "7500"
+          ],
+          "duration_seconds": 435.686,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "{\"events_durable\": 7500, \"fixture\": \"synthetic repeated scenario v1; not market results\", \"max_candles_per_timeframe\": 256, \"network_blocked\": true, \"samples\": [{\"active_sizes\": {\"candles\": {\"M1\": 256, \"M15\": 100, \"M5\": 256}, \"cfd_events\": 72, \"cfd_quote_ids\": 1500, \"cfd_trades\": 24, \"episodes\": 62, \"evaluations\": 768, \"events\": 768, \"indicator_points\": {\"M1\": 256, \"M15\": 100, \"M5\": 256}, \"seen_event_ids\": 768, \"signals\": 8}, \"checkpoint_bytes\": 4363532, \"events\": 1500, \"phase_seconds\": 62.05415229097707, \"python_bytes_current\": 8220364, \"python_bytes_peak\": 38483425}, {\"active_sizes\": {\"candles\": {\"M1\": 256, \"M15\": 200, \"M5\": 256}, \"cfd_events\": 144, \"cfd_quote_ids\": 3000, \"cfd_trades\": 48, \"episodes\": 136, \"evaluations\": 768, \"events\": 768, \"indicator_points\": {\"M1\": 256, \"M15\": 200, \"M5\": 256}, \"seen_event_ids\": 768, \"signals\": 16}, \"checkpoint_bytes\": 4619338, \"events\": 3000, \"phase_seconds\": 82.46331322399783, \"python_bytes_current\": 8697635, \"python_bytes_peak\": 40846394}, {\"active_sizes\": {\"candles\": {\"M1\": 256, \"M15\": 256, \"M5\": 256}, \"cfd_events\": 216, \"cfd_quote_ids\": 4096, \"cfd_trades\": 72, \"episodes\": 206, \"evaluations\": 768, \"events\": 768, \"indicator_points\": {\"M1\": 256, \"M15\": 256, \"M5\": 256}, \"seen_event_ids\": 768, \"signals\": 24}, \"checkpoint_bytes\": 4813004, \"events\": 4500, \"phase_seconds\": 86.25171262197546, \"python_bytes_current\": 9027932, \"python_bytes_peak\": 42711749}, {\"active_sizes\": {\"candles\": {\"M1\": 256, \"M15\": 256, \"M5\": 256}, \"cfd_events\": 279, \"cfd_quote_ids\": 4096, \"cfd_trades\": 93, \"episodes\": 256, \"evaluations\": 768, \"events\": 768, \"indicator_points\": {\"M1\": 256, \"M15\": 256, \"M5\": 256}, \"seen_event_ids\": 768, \"signals\": 31}, \"checkpoint_bytes\": 4900260, \"events\": 6000, \"phase_seconds\": 90.3242578410136, \"python_bytes_current\": 9598145, \"python_bytes_peak\": 44046007}, {\"active_sizes\": {\"candles\": {\"M1\": 256, \"M15\": 256, \"M5\": 256}, \"cfd_events\": 351, \"cfd_quote_ids\": 4096, \"cfd_trades\": 117, \"episodes\": 256, \"evaluations\": 768, \"events\": 768, \"indicator_points\": {\"M1\": 256, \"M15\": 256, \"M5\": 256}, \"seen_event_ids\": 768, \"signals\": 39}, \"checkpoint_bytes\": 4978389, \"events\": 7500, \"phase_seconds\": 100.61473813900375, \"python_bytes_current\": 9696394, \"python_bytes_peak\": 44736654}], \"schema_version\": 1, \"stores\": \"temporary\", \"warmup_retention_events\": 3840}\n",
+          "timed_out": false
+        },
+        "events_requested": 7500,
+        "ok": true,
+        "result": {
+          "events_durable": 7500,
+          "fixture": "synthetic repeated scenario v1; not market results",
+          "max_candles_per_timeframe": 256,
+          "network_blocked": true,
+          "samples": [
+            {
+              "active_sizes": {
+                "candles": {
+                  "M1": 256,
+                  "M15": 100,
+                  "M5": 256
+                },
+                "cfd_events": 72,
+                "cfd_quote_ids": 1500,
+                "cfd_trades": 24,
+                "episodes": 62,
+                "evaluations": 768,
+                "events": 768,
+                "indicator_points": {
+                  "M1": 256,
+                  "M15": 100,
+                  "M5": 256
+                },
+                "seen_event_ids": 768,
+                "signals": 8
+              },
+              "checkpoint_bytes": 4363532,
+              "events": 1500,
+              "phase_seconds": 62.05415229097707,
+              "python_bytes_current": 8220364,
+              "python_bytes_peak": 38483425
+            },
+            {
+              "active_sizes": {
+                "candles": {
+                  "M1": 256,
+                  "M15": 200,
+                  "M5": 256
+                },
+                "cfd_events": 144,
+                "cfd_quote_ids": 3000,
+                "cfd_trades": 48,
+                "episodes": 136,
+                "evaluations": 768,
+                "events": 768,
+                "indicator_points": {
+                  "M1": 256,
+                  "M15": 200,
+                  "M5": 256
+                },
+                "seen_event_ids": 768,
+                "signals": 16
+              },
+              "checkpoint_bytes": 4619338,
+              "events": 3000,
+              "phase_seconds": 82.46331322399783,
+              "python_bytes_current": 8697635,
+              "python_bytes_peak": 40846394
+            },
+            {
+              "active_sizes": {
+                "candles": {
+                  "M1": 256,
+                  "M15": 256,
+                  "M5": 256
+                },
+                "cfd_events": 216,
+                "cfd_quote_ids": 4096,
+                "cfd_trades": 72,
+                "episodes": 206,
+                "evaluations": 768,
+                "events": 768,
+                "indicator_points": {
+                  "M1": 256,
+                  "M15": 256,
+                  "M5": 256
+                },
+                "seen_event_ids": 768,
+                "signals": 24
+              },
+              "checkpoint_bytes": 4813004,
+              "events": 4500,
+              "phase_seconds": 86.25171262197546,
+              "python_bytes_current": 9027932,
+              "python_bytes_peak": 42711749
+            },
+            {
+              "active_sizes": {
+                "candles": {
+                  "M1": 256,
+                  "M15": 256,
+                  "M5": 256
+                },
+                "cfd_events": 279,
+                "cfd_quote_ids": 4096,
+                "cfd_trades": 93,
+                "episodes": 256,
+                "evaluations": 768,
+                "events": 768,
+                "indicator_points": {
+                  "M1": 256,
+                  "M15": 256,
+                  "M5": 256
+                },
+                "seen_event_ids": 768,
+                "signals": 31
+              },
+              "checkpoint_bytes": 4900260,
+              "events": 6000,
+              "phase_seconds": 90.3242578410136,
+              "python_bytes_current": 9598145,
+              "python_bytes_peak": 44046007
+            },
+            {
+              "active_sizes": {
+                "candles": {
+                  "M1": 256,
+                  "M15": 256,
+                  "M5": 256
+                },
+                "cfd_events": 351,
+                "cfd_quote_ids": 4096,
+                "cfd_trades": 117,
+                "episodes": 256,
+                "evaluations": 768,
+                "events": 768,
+                "indicator_points": {
+                  "M1": 256,
+                  "M15": 256,
+                  "M5": 256
+                },
+                "seen_event_ids": 768,
+                "signals": 39
+              },
+              "checkpoint_bytes": 4978389,
+              "events": 7500,
+              "phase_seconds": 100.61473813900375,
+              "python_bytes_current": 9696394,
+              "python_bytes_peak": 44736654
+            }
+          ],
+          "schema_version": 1,
+          "stores": "temporary",
+          "warmup_retention_events": 3840
+        },
+        "verified_synthetic": true
+      },
+      "compilation": {
+        "command": {
+          "command": [
+            ".venv/bin/python",
+            "-m",
+            "compileall",
+            "-q",
+            "mtf_lab",
+            "tests",
+            "tools"
+          ],
+          "duration_seconds": 0.732,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "timed_out": false
+        },
+        "ok": true
+      },
+      "document_links": {
+        "broken": [],
+        "deferred_generated": [
+          "reports/engineering/latest/engineering_results.json",
+          "reports/engineering/latest/engineering_tooling.json"
+        ],
+        "links_checked": 34,
+        "ok": true,
+        "required_documents": [
+          "reports/engineering/latest/engineering_consolidation.md",
+          "docs/activation_boundaries.md"
+        ]
+      },
+      "environment": {
+        "dev": {
+          "command": [
+            ".venv-dev/bin/python",
+            "-c",
+            "\nimport importlib.metadata as metadata\nimport json\nimport platform\nimport sqlite3\n\nnames = ('ruff', 'mypy', 'pip')\nversions = {}\nfor name in names:\n    try:\n        versions[name] = metadata.version(name)\n    except metadata.PackageNotFoundError:\n        versions[name] = None\nprint(json.dumps({\n    \"implementation\": platform.python_implementation(),\n    \"python_version\": platform.python_version(),\n    \"sqlite\": sqlite3.sqlite_version,\n    \"distributions\": versions,\n}, sort_keys=True))\n"
+          ],
+          "duration_seconds": 0.318,
+          "metadata": {
+            "distributions": {
+              "mypy": "2.3.1",
+              "pip": "25.1.1",
+              "ruff": "0.16.7"
+            },
+            "implementation": "CPython",
+            "python_version": "3.14.4",
+            "sqlite": "3.46.1"
+          },
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "{\"distributions\": {\"mypy\": \"2.3.1\", \"pip\": \"25.1.1\", \"ruff\": \"0.16.7\"}, \"implementation\": \"CPython\", \"python_version\": \"3.14.4\", \"sqlite\": \"3.46.1\"}\n",
+          "timed_out": false
+        },
+        "runtime": {
+          "command": [
+            ".venv/bin/python",
+            "-c",
+            "\nimport importlib.metadata as metadata\nimport json\nimport platform\nimport sqlite3\n\nnames = ('mtf-lab', 'ctrader-open-api', 'protobuf', 'Twisted', 'service-identity', 'requests', 'pyOpenSSL', 'pip')\nversions = {}\nfor name in names:\n    try:\n        versions[name] = metadata.version(name)\n    except metadata.PackageNotFoundError:\n        versions[name] = None\nprint(json.dumps({\n    \"implementation\": platform.python_implementation(),\n    \"python_version\": platform.python_version(),\n    \"sqlite\": sqlite3.sqlite_version,\n    \"distributions\": versions,\n}, sort_keys=True))\n"
+          ],
+          "duration_seconds": 0.343,
+          "metadata": {
+            "distributions": {
+              "Twisted": "24.3.0",
+              "ctrader-open-api": "0.9.2",
+              "mtf-lab": "0.1.0",
+              "pip": "25.1.1",
+              "protobuf": "3.20.1",
+              "pyOpenSSL": "24.1.0",
+              "requests": "2.32.3",
+              "service-identity": "24.2.0"
+            },
+            "implementation": "CPython",
+            "python_version": "3.14.4",
+            "sqlite": "3.46.1"
+          },
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "{\"distributions\": {\"Twisted\": \"24.3.0\", \"ctrader-open-api\": \"0.9.2\", \"mtf-lab\": \"0.1.0\", \"pip\": \"25.1.1\", \"protobuf\": \"3.20.1\", \"pyOpenSSL\": \"24.1.0\", \"requests\": \"2.32.3\", \"service-identity\": \"24.2.0\"}, \"implementation\": \"CPython\", \"python_version\": \"3.14.4\", \"sqlite\": \"3.46.1\"}\n",
+          "timed_out": false
+        }
+      },
+      "format": {
+        "command": {
+          "command": [
+            ".venv-dev/bin/python",
+            "-m",
+            "ruff",
+            "format",
+            "--check",
+            "--no-cache",
+            "mtf_lab/core/canonical.py",
+            "mtf_lab/core/cfd_simulation.py",
+            "mtf_lab/core/cfd_quality.py",
+            "mtf_lab/core/numeric.py",
+            "mtf_lab/core/reference.py",
+            "mtf_lab/data/capture.py",
+            "mtf_lab/data/ctrader_accounts.py",
+            "mtf_lab/data/ctrader_config.py",
+            "mtf_lab/data/ctrader_errors.py",
+            "mtf_lab/data/ctrader_fixtures.py",
+            "mtf_lab/data/ctrader_market.py",
+            "mtf_lab/data/ctrader_protocol.py",
+            "mtf_lab/data/ctrader_session.py",
+            "mtf_lab/data/ctrader_transport.py",
+            "mtf_lab/ops/ctrader_capture.py",
+            "mtf_lab/ops/ctrader_paper_adapters.py",
+            "mtf_lab/ops/ctrader_pipeline.py",
+            "mtf_lab/ops/ctrader_demo_transport.py",
+            "mtf_lab/ops/ctrader_demo_composition.py",
+            "mtf_lab/runtime/consumers.py",
+            "tools/benchmark_paper.py",
+            "tools/engineering_audit.py",
+            "tools/offline_tests.py",
+            "tools/verify_offline.py",
+            "tests/test_engineering_delivery.py",
+            "tests/test_demo_composition.py",
+            "tests/test_packaging_delivery.py",
+            "tests/test_migration_delivery.py"
+          ],
+          "duration_seconds": 0.115,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "28 files already formatted\n",
+          "timed_out": false
+        },
+        "ok": true,
+        "targets": [
+          "mtf_lab/core/canonical.py",
+          "mtf_lab/core/cfd_simulation.py",
+          "mtf_lab/core/cfd_quality.py",
+          "mtf_lab/core/numeric.py",
+          "mtf_lab/core/reference.py",
+          "mtf_lab/data/capture.py",
+          "mtf_lab/data/ctrader_accounts.py",
+          "mtf_lab/data/ctrader_config.py",
+          "mtf_lab/data/ctrader_errors.py",
+          "mtf_lab/data/ctrader_fixtures.py",
+          "mtf_lab/data/ctrader_market.py",
+          "mtf_lab/data/ctrader_protocol.py",
+          "mtf_lab/data/ctrader_session.py",
+          "mtf_lab/data/ctrader_transport.py",
+          "mtf_lab/ops/ctrader_capture.py",
+          "mtf_lab/ops/ctrader_paper_adapters.py",
+          "mtf_lab/ops/ctrader_pipeline.py",
+          "mtf_lab/ops/ctrader_demo_transport.py",
+          "mtf_lab/ops/ctrader_demo_composition.py",
+          "mtf_lab/runtime/consumers.py",
+          "tools/benchmark_paper.py",
+          "tools/engineering_audit.py",
+          "tools/offline_tests.py",
+          "tools/verify_offline.py",
+          "tests/test_engineering_delivery.py",
+          "tests/test_demo_composition.py",
+          "tests/test_packaging_delivery.py",
+          "tests/test_migration_delivery.py"
+        ]
+      },
+      "format_full_repository_advisory": {
+        "codes": [],
+        "command": [
+          ".venv-dev/bin/python",
+          "-m",
+          "ruff",
+          "format",
+          "--check",
+          "--no-cache",
+          "mtf_lab",
+          "tests",
+          "tools"
+        ],
+        "completed": true,
+        "files_with_findings": 0,
+        "finding_count": 53,
+        "returncode": 1,
+        "status": "advisory"
+      },
+      "git_diff_check": {
+        "ok": true,
+        "staged": {
+          "command": [
+            "git",
+            "diff",
+            "--cached",
+            "--check",
+            "--"
+          ],
+          "duration_seconds": 0.016,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "timed_out": false
+        },
+        "unstaged": {
+          "command": [
+            "git",
+            "diff",
+            "--check",
+            "HEAD",
+            "--"
+          ],
+          "duration_seconds": 0.018,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "timed_out": false
+        }
+      },
+      "mypy": {
+        "command": {
+          "command": [
+            ".venv-dev/bin/python",
+            "-m",
+            "mypy",
+            "--strict",
+            "--follow-imports=silent",
+            "--no-incremental",
+            "--python-executable",
+            ".venv/bin/python",
+            "--cache-dir",
+            "<temporary>/mypy-cache",
+            "--show-error-codes",
+            "mtf_lab/core/canonical.py",
+            "mtf_lab/core/cfd_simulation.py",
+            "mtf_lab/core/cfd_quality.py",
+            "mtf_lab/core/numeric.py",
+            "mtf_lab/core/reference.py",
+            "mtf_lab/data/capture.py",
+            "mtf_lab/data/ctrader_accounts.py",
+            "mtf_lab/data/ctrader_config.py",
+            "mtf_lab/data/ctrader_errors.py",
+            "mtf_lab/data/ctrader_fixtures.py",
+            "mtf_lab/data/ctrader_market.py",
+            "mtf_lab/data/ctrader_protocol.py",
+            "mtf_lab/data/ctrader_session.py",
+            "mtf_lab/data/ctrader_transport.py",
+            "mtf_lab/ops/ctrader_capture.py",
+            "mtf_lab/ops/ctrader_paper_adapters.py",
+            "mtf_lab/ops/ctrader_pipeline.py",
+            "mtf_lab/ops/ctrader_demo_transport.py",
+            "mtf_lab/ops/ctrader_demo_composition.py",
+            "mtf_lab/runtime/consumers.py"
+          ],
+          "duration_seconds": 3.831,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "Success: no issues found in 20 source files\n",
+          "timed_out": false
+        },
+        "files_checked": 20,
+        "ok": true,
+        "targets": [
+          "mtf_lab/core/canonical.py",
+          "mtf_lab/core/cfd_simulation.py",
+          "mtf_lab/core/cfd_quality.py",
+          "mtf_lab/core/numeric.py",
+          "mtf_lab/core/reference.py",
+          "mtf_lab/data/capture.py",
+          "mtf_lab/data/ctrader_accounts.py",
+          "mtf_lab/data/ctrader_config.py",
+          "mtf_lab/data/ctrader_errors.py",
+          "mtf_lab/data/ctrader_fixtures.py",
+          "mtf_lab/data/ctrader_market.py",
+          "mtf_lab/data/ctrader_protocol.py",
+          "mtf_lab/data/ctrader_session.py",
+          "mtf_lab/data/ctrader_transport.py",
+          "mtf_lab/ops/ctrader_capture.py",
+          "mtf_lab/ops/ctrader_paper_adapters.py",
+          "mtf_lab/ops/ctrader_pipeline.py",
+          "mtf_lab/ops/ctrader_demo_transport.py",
+          "mtf_lab/ops/ctrader_demo_composition.py",
+          "mtf_lab/runtime/consumers.py"
+        ]
+      },
+      "offline_suite": {
+        "closure": {
+          "all_discovered_attended": true,
+          "discovered_positive": true,
+          "zero_expected_failures": true,
+          "zero_failed": true,
+          "zero_skipped": true,
+          "zero_unexpected_successes": true
+        },
+        "command": {
+          "command": [
+            ".venv/bin/python",
+            "tools/offline_tests.py",
+            "--root",
+            ".",
+            "--timeout",
+            "900.0",
+            "--json",
+            "<temporary>/offline-results.json"
+          ],
+          "duration_seconds": 126.079,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "",
+          "timed_out": false
+        },
+        "counts": {
+          "consistent": true,
+          "discovered": 299,
+          "executed": 299,
+          "expected_failures": 0,
+          "failed": 0,
+          "passed": 299,
+          "skipped": 0,
+          "tests_run": 299,
+          "unexpected_successes": 0
+        },
+        "diagnostic": null,
+        "network_attempts": 0,
+        "node": {
+          "command": [
+            "<absolute-path>",
+            "--version"
+          ],
+          "duration_seconds": 0.039,
+          "ok": true,
+          "path_available": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "v22.22.1\n",
+          "timed_out": false,
+          "version": "v22.22.1"
+        },
+        "ok": true,
+        "required_ui_javascript": true,
+        "runner_output": {
+          "failure_identifiers": [],
+          "stderr_tail": ".................................................................................................................................................................................................................................[SYNTHETIC] conexión=OFFLINE eventos=0 velas=0 señales=0 descartes=0 errores=0 calentamiento={'M1': 49, 'M5': 49, 'M15': 49} cobertura={}\n[SYNTHETIC] conexión=OFFLINE eventos=2400 velas=3040 señales=84 descartes=2025 errores=0 calentamiento={'M1': 49, 'M5': 49, 'M15': 49} cobertura={}\n[SYNTHETIC] conexión=OFFLINE eventos=2400 velas=3040 señales=84 descartes=2025 errores=0 calentamiento={'M1': 49, 'M5': 49, 'M15': 49} cobertura={}\n................................[SYNTHETIC] conexión=OFFLINE eventos=0 velas=0 señales=0 descartes=0 errores=0 calentamiento={'M1': 49, 'M5': 49, 'M15': 49} cobertura={}\n[SYNTHETIC] conexión=OFFLINE eventos=2400 velas=3040 señales=105 descartes=2070 errores=0 calentamiento={'M1': 49, 'M5': 49, 'M15': 49} cobertura={}\n[SYNTHETIC] conexión=OFFLINE eventos=2400 velas=3040 señales=105 descartes=2070 errores=0 calentamiento={'M1': 49, 'M5': 49, 'M15': 49} cobertura={}\n..........................................\n----------------------------------------------------------------------\nRan 299 tests in 118.416s\n\nOK\n",
+          "stdout_tail": "__MTF_SUMMARY__{\"discovered\": 299, \"errors\": 0, \"expected_failures\": 0, \"failed\": 0, \"failure_identifiers\": [], \"failures\": 0, \"passed\": 299, \"skipped\": 0, \"successful\": true, \"tests_run\": 299, \"unexpected_successes\": 0}\n"
+        },
+        "runner_success": true,
+        "runner_summary": {
+          "discovered": 299,
+          "errors": 0,
+          "expected_failures": 0,
+          "failed": 0,
+          "failure_identifiers": [],
+          "failures": 0,
+          "passed": 299,
+          "skipped": 0,
+          "successful": true,
+          "tests_run": 299,
+          "unexpected_successes": 0
+        },
+        "smoke": {
+          "core_import": {
+            "loaded_optional": [],
+            "network_attempts": [],
+            "ok": true,
+            "returncode": 0,
+            "runtime": {
+              "executable": "<repo>/.venv/bin/python",
+              "loaded_optional": [],
+              "network_attempts": [],
+              "version": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+              "write_attempts": []
+            },
+            "stderr": "",
+            "write_attempts": []
+          },
+          "help": {
+            "command": [
+              "<repo>/mtf-lab",
+              "--help"
+            ],
+            "loaded_optional": [],
+            "network_attempts": [],
+            "ok": true,
+            "returncode": 0,
+            "runtime": {
+              "executable": "<repo>/.venv/bin/python",
+              "loaded_optional": [],
+              "network_attempts": [],
+              "version": "3.14.4 (main, Aug 20 2026, 10:41:58) [GCC 15.2.0]",
+              "write_attempts": []
+            },
+            "stderr": "",
+            "stdout": "usage: mtf-lab [-h]\n               {doctor,demo,import,replay,backtest,report,watch,ui,ctrader,cfd-paper} ...\n\nMTF Lab — investigación cuantitativa local, virtual y reproducible\n\npositional arguments:\n  {doctor,demo,import,replay,backtest,report,watch,ui,ctrader,cfd-paper}\n    doctor              revisa Python, configuración, SQLite y opcionalmente\n                        conectividad\n    demo                recorrido offline sintético reproducible\n    import              importa CSV/JSONL local con validación explícita\n    replay              reproduce una fuente local con agregación/indicadores\n                        incrementales\n    backtest            compara referencia M1 y estrategia MTF con simulación\n                        virtual\n    report              genera o imprime informe de una sesión\n    watch               observación pública acotada/continua; no ejecuta\n                        órdenes\n    ui                  sirve interfaz local de sólo lectura\n    ctrader             consulta cTrader Open API; no envía operaciones por\n                        defecto\n    cfd-paper           pipeline cTrader→RuntimeCoordinator→CFD PAPER local\n\noptions:\n  -h, --help            show this help message and exit\n",
+            "write_attempts": []
+          }
+        },
+        "write_attempts": 0
+      },
+      "pip_check": {
+        "command": {
+          "command": [
+            ".venv/bin/python",
+            "-m",
+            "pip",
+            "check"
+          ],
+          "duration_seconds": 1.275,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "No broken requirements found.\n",
+          "timed_out": false
+        },
+        "ok": true
+      },
+      "ruff": {
+        "command": {
+          "command": [
+            ".venv-dev/bin/python",
+            "-m",
+            "ruff",
+            "check",
+            "--no-cache",
+            "--output-format",
+            "concise",
+            "mtf_lab/core/canonical.py",
+            "mtf_lab/core/cfd_simulation.py",
+            "mtf_lab/core/cfd_quality.py",
+            "mtf_lab/core/numeric.py",
+            "mtf_lab/core/reference.py",
+            "mtf_lab/data/capture.py",
+            "mtf_lab/data/ctrader_accounts.py",
+            "mtf_lab/data/ctrader_config.py",
+            "mtf_lab/data/ctrader_errors.py",
+            "mtf_lab/data/ctrader_fixtures.py",
+            "mtf_lab/data/ctrader_market.py",
+            "mtf_lab/data/ctrader_protocol.py",
+            "mtf_lab/data/ctrader_session.py",
+            "mtf_lab/data/ctrader_transport.py",
+            "mtf_lab/ops/ctrader_capture.py",
+            "mtf_lab/ops/ctrader_paper_adapters.py",
+            "mtf_lab/ops/ctrader_pipeline.py",
+            "mtf_lab/ops/ctrader_demo_transport.py",
+            "mtf_lab/ops/ctrader_demo_composition.py",
+            "mtf_lab/runtime/consumers.py",
+            "tools/benchmark_paper.py",
+            "tools/engineering_audit.py",
+            "tools/offline_tests.py",
+            "tools/verify_offline.py",
+            "tests/test_engineering_delivery.py",
+            "tests/test_demo_composition.py",
+            "tests/test_packaging_delivery.py",
+            "tests/test_migration_delivery.py"
+          ],
+          "duration_seconds": 0.126,
+          "ok": true,
+          "returncode": 0,
+          "stderr_tail": "",
+          "stdout_tail": "All checks passed!\n",
+          "timed_out": false
+        },
+        "ok": true,
+        "targets": [
+          "mtf_lab/core/canonical.py",
+          "mtf_lab/core/cfd_simulation.py",
+          "mtf_lab/core/cfd_quality.py",
+          "mtf_lab/core/numeric.py",
+          "mtf_lab/core/reference.py",
+          "mtf_lab/data/capture.py",
+          "mtf_lab/data/ctrader_accounts.py",
+          "mtf_lab/data/ctrader_config.py",
+          "mtf_lab/data/ctrader_errors.py",
+          "mtf_lab/data/ctrader_fixtures.py",
+          "mtf_lab/data/ctrader_market.py",
+          "mtf_lab/data/ctrader_protocol.py",
+          "mtf_lab/data/ctrader_session.py",
+          "mtf_lab/data/ctrader_transport.py",
+          "mtf_lab/ops/ctrader_capture.py",
+          "mtf_lab/ops/ctrader_paper_adapters.py",
+          "mtf_lab/ops/ctrader_pipeline.py",
+          "mtf_lab/ops/ctrader_demo_transport.py",
+          "mtf_lab/ops/ctrader_demo_composition.py",
+          "mtf_lab/runtime/consumers.py",
+          "tools/benchmark_paper.py",
+          "tools/engineering_audit.py",
+          "tools/offline_tests.py",
+          "tools/verify_offline.py",
+          "tests/test_engineering_delivery.py",
+          "tests/test_demo_composition.py",
+          "tests/test_packaging_delivery.py",
+          "tests/test_migration_delivery.py"
+        ]
+      },
+      "ruff_full_repository_advisory": {
+        "codes": [
+          "B007",
+          "B009",
+          "B015",
+          "B905",
+          "C901",
+          "E402",
+          "E701",
+          "E702",
+          "E731",
+          "F401",
+          "F841",
+          "I001",
+          "SIM102",
+          "SIM105",
+          "SIM108",
+          "SIM117",
+          "UP017",
+          "UP034",
+          "UP035",
+          "UP036",
+          "UP037",
+          "UP041",
+          "UP042",
+          "invalid-syntax"
+        ],
+        "command": [
+          ".venv-dev/bin/python",
+          "-m",
+          "ruff",
+          "check",
+          "--no-cache",
+          "--exit-zero",
+          "--output-format",
+          "json",
+          "mtf_lab",
+          "tests",
+          "tools"
+        ],
+        "completed": true,
+        "files_with_findings": 59,
+        "finding_count": 591,
+        "returncode": 0,
+        "status": "advisory"
+      },
+      "sdk_codec": {
+        "command": [
+          ".venv/bin/python",
+          "-c",
+          "\nimport importlib.metadata as metadata\nimport json\nfrom ctrader_open_api.messages import OpenApiMessages_pb2 as messages\nfrom mtf_lab.data.ctrader_protocol import SdkProtobufCodec, WireMessage, dependency_report\n\nreport = dependency_report()\nif not report.available:\n    raise RuntimeError(\"SDK/codec unavailable\")\ncodec = SdkProtobufCodec()\nheartbeat = codec.decode(codec.encode(WireMessage(\"PROTO_HEARTBEAT_EVENT\")))\norder = messages.ProtoOANewOrderReq(\n    ctidTraderAccountId=1, symbolId=1, orderType=1, tradeSide=1, volume=1\n)\ndecoded = codec.decode(codec.encode(WireMessage(\"ProtoOANewOrderReq\", order, \"offline-codec\")))\nassert heartbeat.payload_type_id == 51\nassert decoded.payload_type_id == 2106\nassert decoded.client_msg_id == \"offline-codec\"\nprint(json.dumps({\n    \"sdk_version\": metadata.version(\"ctrader-open-api\"),\n    \"protobuf_version\": metadata.version(\"protobuf\"),\n    \"codec_operational\": report.codec_operational,\n    \"heartbeat_payload_type\": heartbeat.payload_type_id,\n    \"order_payload_type\": decoded.payload_type_id,\n    \"order_message\": type(decoded.payload).__name__,\n}, sort_keys=True))\n"
+        ],
+        "duration_seconds": 4.194,
+        "metadata": {
+          "codec_operational": true,
+          "heartbeat_payload_type": 51,
+          "order_message": "ProtoOANewOrderReq",
+          "order_payload_type": 2106,
+          "protobuf_version": "3.20.1",
+          "sdk_version": "0.9.2"
+        },
+        "ok": true,
+        "returncode": 0,
+        "stderr_tail": "",
+        "stdout_tail": "{\"codec_operational\": true, \"heartbeat_payload_type\": 51, \"order_message\": \"ProtoOANewOrderReq\", \"order_payload_type\": 2106, \"protobuf_version\": \"3.20.1\", \"sdk_version\": \"0.9.2\"}\n",
+        "timed_out": false
+      },
+      "source_integrity": {
+        "added": [],
+        "after_content_sha256": "d7a8d153fee7ff594b5483e5935c39f8d82782d07fba98b20f3d5617182a2feb",
+        "before_content_sha256": "d7a8d153fee7ff594b5483e5935c39f8d82782d07fba98b20f3d5617182a2feb",
+        "changed": [],
+        "ok": true,
+        "removed": []
+      }
+    },
+    "test_counts": {
+      "consistent": true,
+      "discovered": 299,
+      "executed": 299,
+      "expected_failures": 0,
+      "failed": 0,
+      "passed": 299,
+      "skipped": 0,
+      "tests_run": 299,
+      "unexpected_successes": 0
+    }
+  },
+  "schema_version": 2,
+  "scope": {
+    "credentials_used": false,
+    "network": "No OAuth, account, broker or order access",
+    "runtime": "stdlib/offline; optional cTrader SDK checked locally",
+    "source_fingerprint": "tracked and non-ignored working-tree files, excluding generated engineering receipts"
+  },
+  "source_tree": {
+    "base_commit": "46545533992918ca44804038814f1adc19107f8b",
+    "content_sha256": "d7a8d153fee7ff594b5483e5935c39f8d82782d07fba98b20f3d5617182a2feb",
+    "file_count": 140,
+    "head_commit": "46545533992918ca44804038814f1adc19107f8b",
+    "head_tree_hash": "912c5dc10db205b07909e76b1d1bd8bd8324ab24"
+  },
+  "validation": {
+    "final_receipt": "engineering_results.json",
+    "offline_external_status": "NOT_EXECUTED"
+  }
+}

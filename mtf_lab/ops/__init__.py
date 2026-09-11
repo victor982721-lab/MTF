@@ -26,11 +26,6 @@ from .ctrader_demo_transport import (
     OfficialGateway, OfficialMessageError, OfficialSDKUnavailable, OfficialTransportError,
     VOLUME_SCALE, load_official_proto,
 )
-from .ctrader_pipeline import (
-    CTraderCapture, CTraderPipeline, CTraderPipelineError, CTraderPipelineResult,
-    PAPER_PRODUCT, PAPER_VARIANT, normalize_ctrader_capture, signal_to_cfd_signal,
-    spot_event_to_cfd_quote, synthetic_ctrader_capture, synthetic_ctrader_payloads,
-)
 from .ctrader_demo import run_ctrader_fixture
 from .ctrader_activation import (
     AccountDiscovery, ActivationProfile, ActivationMode, ActivationState, ActivationStatus, BrokerAccount,
@@ -62,7 +57,7 @@ __all__ = [
     "CFDConfig", "CFDQuote", "CFDReplayResult", "CFDSignal", "CFDSimulationError",
     "CFDSimulator", "CFDTrade", "Direction", "TradeState", "ForexCFDConfig",
     "ForexCFDQuote", "ForexCFDSignal", "ForexCFDSimulator", "ForexCFDTrade",
-    "known_fixture_eurusd_long", "run_ctrader_fixture", "CTraderDemoTransport", "CTraderOfficialDemoTransport", "CTraderDemoTransportConfig", "DEMO_PROTOBUF_ENDPOINT", "LIVE_PROTOBUF_ENDPOINT", "OfficialCorrelationError", "OfficialGateway", "OfficialMessageError", "OfficialSDKUnavailable", "OfficialTransportError", "VOLUME_SCALE", "load_official_proto", "CTraderCapture", "CTraderPipeline", "CTraderPipelineError", "CTraderPipelineResult", "PAPER_PRODUCT", "PAPER_VARIANT", "normalize_ctrader_capture", "signal_to_cfd_signal", "spot_event_to_cfd_quote", "synthetic_ctrader_capture", "synthetic_ctrader_payloads", "CTraderDemoExecutor", "DemoAccount", "DemoTransport",
+    "known_fixture_eurusd_long", "run_ctrader_fixture", "CTraderDemoTransport", "CTraderOfficialDemoTransport", "CTraderDemoTransportConfig", "DEMO_PROTOBUF_ENDPOINT", "LIVE_PROTOBUF_ENDPOINT", "OfficialCorrelationError", "OfficialGateway", "OfficialMessageError", "OfficialSDKUnavailable", "OfficialTransportError", "VOLUME_SCALE", "load_official_proto", "CTraderDemoExecutor", "DemoAccount", "DemoTransport",
     "ExecutionPolicy", "ExecutionIntent", "ExecutionEvent", "Fill", "IntentStore",
     "MemoryIntentStore", "JsonlIntentStore", "OrderResult", "OrderSnapshot", "OrderState",
     "Position", "Quote", "Side", "verify_demo_account", "ActivationProfile",
@@ -71,3 +66,6 @@ __all__ = [
     "build_authorization_url", "parse_callback_uri", "exchange_authorization_code",
     "refresh_access_token", "evaluate_activation", "select_demo_account",
 ]
+
+# Pipeline application services are imported from mtf_lab.ops.ctrader_pipeline.
+# No package-level re-export: runtime -> persistence must not import runtime again.

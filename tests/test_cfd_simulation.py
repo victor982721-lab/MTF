@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import unittest
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-import unittest
 
 from mtf_lab.ops.cfd_simulation import (
     CFDConfig,
@@ -15,11 +15,12 @@ from mtf_lab.ops.cfd_simulation import (
     known_fixture_eurusd_long,
 )
 
-
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def quote(sec: int, bid: str, ask: str, quote_id: str, *, available_sec: int | None = None, quality: str = "VALID") -> CFDQuote:
+def quote(
+    sec: int, bid: str, ask: str, quote_id: str, *, available_sec: int | None = None, quality: str = "VALID"
+) -> CFDQuote:
     return CFDQuote(
         "EUR/USD",
         T0 + timedelta(seconds=sec),
@@ -34,7 +35,15 @@ def quote(sec: int, bid: str, ask: str, quote_id: str, *, available_sec: int | N
 class CFDSimulationTests(unittest.TestCase):
     def test_known_long_fixture_uses_ask_then_bid_and_decimal_pnl(self) -> None:
         signal, quotes = known_fixture_eurusd_long()
-        sim = CFDSimulator(CFDConfig(instrument="EUR/USD", units=Decimal("1000"), pip_size=Decimal("0.0001"), price_precision=5, horizons_seconds=(Decimal("60"),)))
+        sim = CFDSimulator(
+            CFDConfig(
+                instrument="EUR/USD",
+                units=Decimal("1000"),
+                pip_size=Decimal("0.0001"),
+                price_precision=5,
+                horizons_seconds=(Decimal("60"),),
+            )
+        )
         result = sim.replay([signal], quotes)
         trade = result.trades[0]
         self.assertEqual(trade.state, TradeState.CLOSED)
@@ -50,7 +59,9 @@ class CFDSimulationTests(unittest.TestCase):
 
     def test_short_uses_bid_then_ask_and_immobile_spread_loses_spread(self) -> None:
         signal = CFDSignal("short", "EUR/USD", Direction.SHORT, T0)
-        sim = CFDSimulator(CFDConfig(instrument="EUR/USD", units="1000", pip_size="0.0001", price_precision=5, horizons_seconds=(60,)))
+        sim = CFDSimulator(
+            CFDConfig(instrument="EUR/USD", units="1000", pip_size="0.0001", price_precision=5, horizons_seconds=(60,))
+        )
         result = sim.replay(
             [signal],
             [quote(0, "1.1000", "1.1002", "entry"), quote(60, "1.1000", "1.1002", "close")],
@@ -74,7 +85,11 @@ class CFDSimulationTests(unittest.TestCase):
             commission_fixed="0.05",
             slippage_pips="1",
         )
-        trade = CFDSimulator(cfg).replay([signal], [quote(0, "1.1000", "1.1002", "entry"), quote(60, "1.1005", "1.1007", "close")]).trades[0]
+        trade = (
+            CFDSimulator(cfg)
+            .replay([signal], [quote(0, "1.1000", "1.1002", "entry"), quote(60, "1.1005", "1.1007", "close")])
+            .trades[0]
+        )
         self.assertEqual(trade.entry_price, Decimal("1.10030"))
         self.assertEqual(trade.close_price, Decimal("1.10040"))
         self.assertEqual(trade.gross_pnl_quote, Decimal("0.10000"))
@@ -112,23 +127,56 @@ class CFDSimulationTests(unittest.TestCase):
         sim = CFDSimulator(CFDConfig(instrument="EUR/USD", units="1000", horizons_seconds=(60,)))
         pending = sim.submit(signal)
         self.assertEqual(pending.state, TradeState.PENDING)
-        self.assertEqual(sim.advance(T0 + timedelta(seconds=600), capture_complete=False), ())
-        self.assertEqual(sim.trades[0].state, TradeState.PENDING)
-        unknown = sim.advance(T0 + timedelta(seconds=600), capture_complete=True)
-        self.assertEqual(unknown[0].state, TradeState.UNKNOWN)
-        self.assertEqual(unknown[0].reason, "ENTRY_QUOTE_NOT_AVAILABLE")
-        self.assertIsNone(unknown[0].net_pnl)
+        expired = sim.advance(T0 + timedelta(seconds=600), capture_complete=False)
+        self.assertEqual(expired[0].state, TradeState.UNKNOWN)
+        self.assertEqual(expired[0].reason, "ENTRY_QUOTE_WINDOW_EXPIRED")
+        self.assertEqual(sim.advance(T0 + timedelta(seconds=600), capture_complete=True), ())
+        self.assertIsNone(sim.trades[0].net_pnl)
 
     def test_missing_conversion_or_required_financing_is_unknown(self) -> None:
         signal = CFDSignal("conversion", "EUR/JPY", "LONG", T0)
-        quotes = [CFDQuote("EUR/JPY", T0, "160.00", "160.02", "e"), CFDQuote("EUR/JPY", T0 + timedelta(seconds=60), "160.10", "160.12", "c")]
-        conversion_missing = CFDSimulator(CFDConfig(instrument="EUR/JPY", account_currency="USD", units="1000", pip_size="0.01", price_precision=2, horizons_seconds=(60,))).replay([signal], quotes).trades[0]
-        self.assertEqual(conversion_missing.state, TradeState.UNKNOWN)
+        quotes = [
+            CFDQuote("EUR/JPY", T0, "160.00", "160.02", "e"),
+            CFDQuote("EUR/JPY", T0 + timedelta(seconds=60), "160.10", "160.12", "c"),
+        ]
+        conversion_missing = (
+            CFDSimulator(
+                CFDConfig(
+                    instrument="EUR/JPY",
+                    account_currency="USD",
+                    units="1000",
+                    pip_size="0.01",
+                    price_precision=2,
+                    horizons_seconds=(60,),
+                )
+            )
+            .replay([signal], quotes)
+            .trades[0]
+        )
+        self.assertEqual(conversion_missing.state, TradeState.CLOSED)
         self.assertEqual(conversion_missing.reason, "CONVERSION_RATE_MISSING")
+        self.assertTrue(conversion_missing.close_observed)
+        self.assertEqual(conversion_missing.economic_result.state.value, "INDETERMINATE")
         self.assertEqual(conversion_missing.gross_pnl_quote, Decimal("80.00"))
-        financing_missing = CFDSimulator(CFDConfig(instrument="EUR/JPY", account_currency="JPY", units="1000", pip_size="0.01", price_precision=2, horizons_seconds=(60,), financing_required=True)).replay([signal], quotes).trades[0]
-        self.assertEqual(financing_missing.state, TradeState.UNKNOWN)
+        financing_missing = (
+            CFDSimulator(
+                CFDConfig(
+                    instrument="EUR/JPY",
+                    account_currency="JPY",
+                    units="1000",
+                    pip_size="0.01",
+                    price_precision=2,
+                    horizons_seconds=(60,),
+                    financing_required=True,
+                )
+            )
+            .replay([signal], quotes)
+            .trades[0]
+        )
+        self.assertEqual(financing_missing.state, TradeState.CLOSED)
         self.assertEqual(financing_missing.reason, "FINANCING_RATE_MISSING")
+        self.assertTrue(financing_missing.close_observed)
+        self.assertEqual(financing_missing.economic_result.state.value, "INDETERMINATE")
 
     def test_stream_and_replay_share_same_state_machine(self) -> None:
         signal = CFDSignal("same", "EUR/USD", "LONG", T0)
@@ -166,10 +214,13 @@ class CFDSimulationTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
+
 class CFDHorizonTests(unittest.TestCase):
     def test_default_horizons_are_independent_trades(self) -> None:
         signal, quotes = known_fixture_eurusd_long()
         later = CFDQuote("EUR/USD", T0 + timedelta(seconds=301), "1.2000", "1.2002", "later")
         result = CFDSimulator(CFDConfig(instrument="EUR/USD", units="1000")).replay([signal], (*quotes, later))
-        self.assertEqual({trade.horizon_seconds for trade in result.trades}, {Decimal("60"), Decimal("180"), Decimal("300")})
+        self.assertEqual(
+            {trade.horizon_seconds for trade in result.trades}, {Decimal("60"), Decimal("180"), Decimal("300")}
+        )
         self.assertEqual(len(result.trades), 3)

@@ -17,3 +17,11 @@ logs/
 /data/*.jsonl
 
 *.egg-info/
+build/
+dist/
+
+# Development-only tool environment and generated tool caches
+.venv-dev/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
