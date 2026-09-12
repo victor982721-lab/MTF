@@ -6,6 +6,7 @@ que todavía no puede ocurrir queda ``PENDING`` en observación continua y sólo
 queda ``INDETERMINATE`` cuando la captura se declaró completa sin precio
 admisible. El mismo módulo sirve para replay, backtest y watch.
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -13,10 +14,10 @@ import enum
 import math
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Any, Generic, Protocol, TypeVar
+from typing import Any, Generic, Protocol, TypeVar, cast
 
 
-class Outcome(str, enum.Enum):
+class Outcome(str, enum.Enum):  # noqa: UP042 - preserve the public str/Enum representation
     WIN = "WIN"
     LOSS = "LOSS"
     TIE = "TIE"
@@ -36,15 +37,37 @@ PRICE_BASE_ALIASES = {
     "mid": "mid",
 }
 VALID_PRICE_BASES = frozenset({"traded", "bid", "ask", "mid"})
-QUALITY_ALLOWED_LABELS = frozenset({
-    "VALID", "VALIDATED", "OK", "GOOD", "SYNTHETIC", "SYNTHETIC_VALID",
-    "SYNTHETIC_VALIDATED", "VALID_DATA", "DATA_QUALITY_VALIDATED",
-    "VALIDATED_LOCAL", "PUBLIC_PROVIDER_CLOSED", "CLOSED_VALID",
-})
+QUALITY_ALLOWED_LABELS = frozenset(
+    {
+        "VALID",
+        "VALIDATED",
+        "OK",
+        "GOOD",
+        "SYNTHETIC",
+        "SYNTHETIC_VALID",
+        "SYNTHETIC_VALIDATED",
+        "VALID_DATA",
+        "DATA_QUALITY_VALIDATED",
+        "VALIDATED_LOCAL",
+        "PUBLIC_PROVIDER_CLOSED",
+        "CLOSED_VALID",
+    }
+)
 QUALITY_BLOCKED_TOKENS = (
-    "INVALID", "UNKNOWN", "DISCONNECTED", "STALE", "GAP", "PARTIAL",
-    "OPEN", "UNRECONCILED", "OUT_OF_ORDER", "DUPLICATE", "LATE",
-    "INSUFFICIENT", "PENDING", "ANOM",
+    "INVALID",
+    "UNKNOWN",
+    "DISCONNECTED",
+    "STALE",
+    "GAP",
+    "PARTIAL",
+    "OPEN",
+    "UNRECONCILED",
+    "OUT_OF_ORDER",
+    "DUPLICATE",
+    "LATE",
+    "INSUFFICIENT",
+    "PENDING",
+    "ANOM",
 )
 
 
@@ -124,7 +147,7 @@ def quality_label_is_usable(value: Any) -> bool:
     if isinstance(value, Mapping):
         value = value.get("status", value.get("quality", "UNKNOWN"))
     elif hasattr(value, "status") and not isinstance(value, (str, bytes)):
-        value = getattr(value, "status")
+        value = value.status
     label = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
     if not label or any(token in label for token in QUALITY_BLOCKED_TOKENS):
         return False
@@ -163,9 +186,9 @@ def _record(value: Any) -> dict[str, Any]:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     if hasattr(value, "model_dump"):
-        return dict(value.model_dump())
+        return dict(cast(Any, value).model_dump())
     if hasattr(value, "to_dict"):
-        result = value.to_dict()
+        result = cast(Any, value).to_dict()
         if isinstance(result, Mapping):
             return dict(result)
     if hasattr(value, "__dict__"):
@@ -189,7 +212,9 @@ def parse_ts(value: Any) -> datetime:
 
 
 def iso_ts(value: datetime | None) -> str | None:
-    return value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z") if value is not None else None
+    return (
+        value.astimezone(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z") if value is not None else None
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -249,7 +274,9 @@ class PricePoint:
 
     @property
     def identity(self) -> str:
-        return str(self.point_id or f"{self.source}:{self.instrument}:{self.timestamp.isoformat()}:{self.source_ordinal}")
+        return str(
+            self.point_id or f"{self.source}:{self.instrument}:{self.timestamp.isoformat()}:{self.source_ordinal}"
+        )
 
     @property
     def observation_id(self) -> str:
@@ -317,18 +344,30 @@ def _enum_value(value: Any) -> Any:
 def _extract_point(value: Any, ordinal: int) -> PricePoint:
     row = _record(value)
     end = row.get("end_ts", row.get("interval_end", row.get("end", row.get("close_ts", row.get("close_time")))))
-    timestamp_value = end if end is not None else row.get("event_ts", row.get("event_time", row.get("interval_start", row.get("timestamp", row.get("ts", row.get("time"))))))
+    timestamp_value = (
+        end
+        if end is not None
+        else row.get(
+            "event_ts",
+            row.get("event_time", row.get("interval_start", row.get("timestamp", row.get("ts", row.get("time"))))),
+        )
+    )
     if timestamp_value is None:
         raise ValueError("price point has no timestamp")
     available_value = row.get("available_ts", row.get("available_at", row.get("received_ts", row.get("received_at"))))
-    raw_base = _enum_value(row.get("price_base", row.get("price_basis", row.get("base_price", row.get("price_type", "")))))
+    raw_base = _enum_value(
+        row.get("price_base", row.get("price_basis", row.get("base_price", row.get("price_type", ""))))
+    )
     base = str(raw_base or "").lower()
     if "price" in row and row["price"] is not None:
-        price = row["price"]; base = base or "traded"
+        price = row["price"]
+        base = base or "traded"
     elif "close" in row and row["close"] is not None:
-        price = row["close"]; base = base or "close"
+        price = row["close"]
+        base = base or "close"
     elif "mid" in row and row["mid"] is not None:
-        price = row["mid"]; base = base or "mid"
+        price = row["mid"]
+        base = base or "mid"
     else:
         raise ValueError("price point has no explicit price/close/mid value")
     # Unspecified quality is the generic evaluator's neutral default; an
@@ -338,15 +377,23 @@ def _extract_point(value: Any, ordinal: int) -> PricePoint:
     if isinstance(quality, Mapping):
         quality = quality.get("status", "UNKNOWN")
     elif hasattr(quality, "status"):
-        quality = getattr(quality, "status")
+        quality = quality.status
     resolution = _enum_value(row.get("resolution", row.get("timeframe", row.get("interval", "UNKNOWN"))))
-    point_id = row.get("observation_id", row.get("point_id", row.get("candle_id", row.get("data_id", row.get("event_id", row.get("source_event_id"))))))
+    point_id = row.get(
+        "observation_id",
+        row.get("point_id", row.get("candle_id", row.get("data_id", row.get("event_id", row.get("source_event_id"))))),
+    )
     return PricePoint(
-        timestamp=parse_ts(timestamp_value), price=float(price),
+        timestamp=parse_ts(timestamp_value),
+        price=float(price),
         available_at=parse_ts(available_value) if available_value is not None else None,
-        source=str(row.get("source", row.get("provider", "unknown"))), base_price=base or "unknown",
-        quality=str(quality), resolution=str(resolution), closed=parse_bool(row.get("closed", row.get("is_closed", True)), name="closed"),
-        source_ordinal=int(row.get("source_ordinal", row.get("ordinal", ordinal))), point_id=str(point_id) if point_id is not None else None,
+        source=str(row.get("source", row.get("provider", "unknown"))),
+        base_price=base or "unknown",
+        quality=str(quality),
+        resolution=str(resolution),
+        closed=parse_bool(row.get("closed", row.get("is_closed", True)), name="closed"),
+        source_ordinal=int(row.get("source_ordinal", row.get("ordinal", ordinal))),
+        point_id=str(point_id) if point_id is not None else None,
         instrument=str(row.get("instrument", row.get("symbol", "UNKNOWN")) or "UNKNOWN"),
     )
 
@@ -381,7 +428,15 @@ class EvaluationSpec:
         if not horizons or any(not math.isfinite(x) or x <= 0 for x in horizons):
             raise ValueError("horizons_seconds must contain positive finite values")
         object.__setattr__(self, "horizons_seconds", horizons)
-        for name in ("entry_latency_seconds", "stake", "max_price_age_seconds", "tie_tolerance", "payout_net", "loss_amount", "costs"):
+        for name in (
+            "entry_latency_seconds",
+            "stake",
+            "max_price_age_seconds",
+            "tie_tolerance",
+            "payout_net",
+            "loss_amount",
+            "costs",
+        ):
             value = float(getattr(self, name))
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be a finite non-negative number")
@@ -439,15 +494,26 @@ class SimulationResult:
         return result
 
 
-def break_even_probability(*, payout_net: float = 0.80, loss_amount: float = 1.0, costs: float = 0.0, stake: float = 1.0) -> float:
+def break_even_probability(
+    *, payout_net: float = 0.80, loss_amount: float = 1.0, costs: float = 0.0, stake: float = 1.0
+) -> float:
     """Equilibrio sin empates: ``(S*L+C)/(S*(R+L))``.
 
     ``payout_net`` y ``loss_amount`` son multiplicadores del stake; ``costs``
     es un coste absoluto por resultado. Si no existe retorno positivo, el
     equilibrio es infinito y se devuelve ``math.inf``.
     """
-    payout_net = float(payout_net); loss_amount = float(loss_amount); costs = float(costs); stake = float(stake)
-    if any(not math.isfinite(x) for x in (payout_net, loss_amount, costs, stake)) or payout_net < 0 or loss_amount < 0 or costs < 0 or stake <= 0:
+    payout_net = float(payout_net)
+    loss_amount = float(loss_amount)
+    costs = float(costs)
+    stake = float(stake)
+    if (
+        any(not math.isfinite(x) for x in (payout_net, loss_amount, costs, stake))
+        or payout_net < 0
+        or loss_amount < 0
+        or costs < 0
+        or stake <= 0
+    ):
         raise ValueError("invalid break-even parameters")
     denominator = stake * (payout_net + loss_amount)
     return (stake * loss_amount + costs) / denominator if denominator > 0 else math.inf
@@ -458,7 +524,7 @@ _BLOCKED_QUALITY = frozenset(token.lower() for token in QUALITY_BLOCKED_TOKENS)
 
 def _quality_admissible(value: PricePointLike | Any) -> bool:
     if isinstance(value, PricePoint) or hasattr(value, "quality"):
-        return quality_label_is_usable(getattr(value, "quality"))
+        return quality_label_is_usable(value.quality)
     return quality_label_is_usable(value)
 
 
@@ -478,6 +544,21 @@ class Selection(Generic[PointT]):
 _Selection = Selection[PricePoint]
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _EvaluationContext:
+    signal_row: dict[str, Any]
+    complete: bool
+    horizon: float
+    simulation_id: str
+    signal_id: str | None
+    simulation_type: str
+    direction: str | None
+    detected: datetime
+    entry_target: datetime
+    as_of: datetime | None
+    assumptions: dict[str, Any]
+
+
 def observation_age_seconds(point: PricePointLike, target: datetime, *, rule: str) -> float:
     """Conservative age: market distance plus any availability delay."""
 
@@ -490,6 +571,71 @@ def observation_age_seconds(point: PricePointLike, target: datetime, *, rule: st
         raise ValueError(f"unsupported selection rule: {rule!r}")
     availability_delay = max(0.0, (point.available_ts - target_dt).total_seconds())
     return max(0.0, market_distance, availability_delay)
+
+
+def _selection_cutoff(
+    target: datetime,
+    *,
+    rule: str,
+    max_price_age_seconds: float,
+    as_of: datetime | None,
+) -> datetime | None:
+    if as_of is not None:
+        return parse_ts(as_of)
+    if rule == "last_observation_at_or_before" and math.isfinite(float(max_price_age_seconds)):
+        return target + timedelta(seconds=float(max_price_age_seconds))
+    return None
+
+
+def _point_is_eligible(
+    point: PricePointLike,
+    *,
+    requested_base_price: str | None,
+    require_closed: bool,
+    cutoff: datetime | None,
+    exclude_identity: str | None,
+    exclude_market_time: datetime | None,
+    instrument: str | None,
+) -> bool:
+    try:
+        if require_closed and not point.closed:
+            return False
+        if not _quality_admissible(point):
+            return False
+        # Unknown base labels remain unavailable; they never fall back.
+        normalize_price_base(point.base_price, allow_none=False)
+        if not _base_matches(point, requested_base_price):
+            return False
+        if point.identity == exclude_identity:
+            return False
+        if exclude_market_time is not None and point.timestamp <= exclude_market_time:
+            return False
+        if cutoff is not None and point.available_ts > cutoff:
+            return False
+        if instrument and point.instrument.upper() not in {"", "UNKNOWN"} and point.instrument.upper() != instrument:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _ordered_candidates(points: Sequence[PointT], target: datetime, *, rule: str) -> list[PointT]:
+    if rule == "first_observation_at_or_after":
+        candidates = [point for point in points if point.timestamp >= target]
+        candidates.sort(key=lambda point: (point.timestamp, point.available_ts, point.source_ordinal, point.identity))
+        return candidates
+    if rule == "last_observation_at_or_before":
+        candidates = [point for point in points if point.timestamp <= target]
+        candidates.sort(
+            key=lambda point: (point.timestamp, point.available_ts, point.source_ordinal, point.identity),
+            reverse=True,
+        )
+        return candidates
+    raise ValueError(f"unsupported selection rule: {rule!r}")
+
+
+def _selection_use_time(point: PricePointLike, target: datetime, *, rule: str) -> datetime:
+    return max(target, point.available_ts) if rule == "first_observation_at_or_after" else point.available_ts
 
 
 def select_price_point(
@@ -514,53 +660,39 @@ def select_price_point(
     """
 
     target_dt = parse_ts(target)
-    if as_of is not None:
-        cutoff = parse_ts(as_of)
-    elif rule == "last_observation_at_or_before" and math.isfinite(float(max_price_age_seconds)):
-        cutoff = target_dt + timedelta(seconds=float(max_price_age_seconds))
-    else:
-        cutoff = None
-    eligible: list[PointT] = []
-    for point in points:
-        try:
-            if require_closed and not point.closed:
-                continue
-            if not _quality_admissible(point):
-                continue
-            # Unknown base labels remain unavailable; they never fall back.
-            normalize_price_base(point.base_price, allow_none=False)
-            if not _base_matches(point, requested_base_price):
-                continue
-            if point.identity == exclude_identity:
-                continue
-            if exclude_market_time is not None and point.timestamp <= parse_ts(exclude_market_time):
-                continue
-            if cutoff is not None and point.available_ts > cutoff:
-                continue
-            if instrument and point.instrument.upper() not in {"", "UNKNOWN"} and point.instrument.upper() != str(instrument).upper():
-                continue
-            eligible.append(point)
-        except (TypeError, ValueError):
-            continue
-    if rule == "first_observation_at_or_after":
-        candidates = [point for point in eligible if point.timestamp >= target_dt]
-        candidates.sort(key=lambda point: (point.timestamp, point.available_ts, point.source_ordinal, point.identity))
-    elif rule == "last_observation_at_or_before":
-        candidates = [point for point in eligible if point.timestamp <= target_dt]
-        candidates.sort(key=lambda point: (point.timestamp, point.available_ts, point.source_ordinal, point.identity), reverse=True)
-    else:
-        raise ValueError(f"unsupported selection rule: {rule!r}")
+    normalized_instrument = str(instrument).upper() if instrument else None
+    excluded_market_time = parse_ts(exclude_market_time) if exclude_market_time is not None else None
+    cutoff = _selection_cutoff(
+        target_dt,
+        rule=rule,
+        max_price_age_seconds=max_price_age_seconds,
+        as_of=as_of,
+    )
+    eligible = [
+        point
+        for point in points
+        if _point_is_eligible(
+            point,
+            requested_base_price=requested_base_price,
+            require_closed=require_closed,
+            cutoff=cutoff,
+            exclude_identity=exclude_identity,
+            exclude_market_time=excluded_market_time,
+            instrument=normalized_instrument,
+        )
+    ]
+    candidates = _ordered_candidates(eligible, target_dt, rule=rule)
     for point in candidates:
         age = observation_age_seconds(point, target_dt, rule=rule)
         if age > float(max_price_age_seconds):
             return None, "MAX_PRICE_AGE_EXCEEDED"
-        use_time = max(target_dt, point.available_ts) if rule == "first_observation_at_or_after" else point.available_ts
-        return Selection(point, use_time), None
+        return Selection(point, _selection_use_time(point, target_dt, rule=rule)), None
     return None, "PRICE_NOT_AVAILABLE" if rule == "first_observation_at_or_after" else "PRICE_NOT_AVAILABLE_BY_CUTOFF"
 
 
 class DirectionalEvaluator:
     """Evalúa resultados sin seleccionar precios favorables retrospectivamente."""
+
     def __init__(self, spec: EvaluationSpec | None = None):
         self.spec = spec or EvaluationSpec()
 
@@ -591,24 +723,56 @@ class DirectionalEvaluator:
     @staticmethod
     def _direction(signal_row: Mapping[str, Any]) -> str | None:
         raw = str(signal_row.get("direction", signal_row.get("side", ""))).upper()
-        aliases = {"UP": "UP", "LONG": "UP", "BUY": "UP", "BULL": "UP", "ALCISTA": "UP", "DOWN": "DOWN", "SHORT": "DOWN", "SELL": "DOWN", "BEAR": "DOWN", "BAJISTA": "DOWN"}
+        aliases = {
+            "UP": "UP",
+            "LONG": "UP",
+            "BUY": "UP",
+            "BULL": "UP",
+            "ALCISTA": "UP",
+            "DOWN": "DOWN",
+            "SHORT": "DOWN",
+            "SELL": "DOWN",
+            "BEAR": "DOWN",
+            "BAJISTA": "DOWN",
+        }
         return aliases.get(raw)
 
     def _result(
-        self, *, sim_id: str, signal_id: str | None, simulation_type: str, horizon: float, direction: str,
-        detected: datetime, expiry: datetime, entry: _Selection | None, final: _Selection | None,
-        outcome: Outcome, reason: str | None, assumptions: dict[str, Any], net: float | None,
+        self,
+        *,
+        sim_id: str,
+        signal_id: str | None,
+        simulation_type: str,
+        horizon: float,
+        direction: str,
+        detected: datetime,
+        expiry: datetime,
+        entry: _Selection | None,
+        final: _Selection | None,
+        outcome: Outcome,
+        reason: str | None,
+        assumptions: dict[str, Any],
+        net: float | None,
     ) -> SimulationResult:
         return SimulationResult(
-            simulation_id=sim_id, signal_id=signal_id, simulation_type=simulation_type,
-            horizon_seconds=horizon, direction=direction, detected_ts=iso_ts(detected) or "",
-            entry_ts=iso_ts(entry.use_time) if entry else None, expiry_ts=iso_ts(expiry) or "",
-            entry_price=entry.point.price if entry else None, final_price=final.point.price if final else None,
-            outcome=outcome, stake=self.spec.stake, net_result=net,
+            simulation_id=sim_id,
+            signal_id=signal_id,
+            simulation_type=simulation_type,
+            horizon_seconds=horizon,
+            direction=direction,
+            detected_ts=iso_ts(detected) or "",
+            entry_ts=iso_ts(entry.use_time) if entry else None,
+            expiry_ts=iso_ts(expiry) or "",
+            entry_price=entry.point.price if entry else None,
+            final_price=final.point.price if final else None,
+            outcome=outcome,
+            stake=self.spec.stake,
+            net_result=net,
             price_base=entry.point.base_price if entry else self.spec.requested_base_price or "unknown",
             quality=(entry.point.quality if entry else final.point.quality if final else "UNKNOWN"),
             resolution=(entry.point.resolution if entry else final.point.resolution if final else "UNKNOWN"),
-            assumptions=assumptions, reason=reason,
+            assumptions=assumptions,
+            reason=reason,
             entry_market_ts=iso_ts(entry.point.timestamp) if entry else None,
             final_market_ts=iso_ts(final.point.timestamp) if final else None,
             entry_available_ts=iso_ts(entry.point.available_ts) if entry else None,
@@ -617,22 +781,31 @@ class DirectionalEvaluator:
             final_point_id=final.point.identity if final else None,
         )
 
-    def evaluate_prepared(
-        self, signal: Any, points: Sequence[PricePoint], *, horizon_seconds: float | None = None,
-        simulation_id: str | None = None, simulation_type: str = "DIRECTIONAL",
-        data_complete: bool | None = True, as_of: datetime | None = None,
-        capture_complete: bool | None = None,
-    ) -> SimulationResult:
+    def _prepare_context(
+        self,
+        signal: Any,
+        *,
+        horizon_seconds: float | None,
+        simulation_id: str | None,
+        simulation_type: str,
+        data_complete: bool | None,
+        as_of: datetime | None,
+        capture_complete: bool | None,
+    ) -> _EvaluationContext:
         signal_row = _record(signal)
         complete = normalize_completion(data_complete, capture_complete=capture_complete)
         horizon = float(horizon_seconds if horizon_seconds is not None else self.spec.horizons_seconds[0])
         if horizon <= 0 or not math.isfinite(horizon):
             raise ValueError("horizon_seconds must be positive and finite")
-        detected_value = signal_row.get("detected_ts", signal_row.get("detected_at", signal_row.get("timestamp", signal_row.get("ts"))))
+        detected_value = signal_row.get(
+            "detected_ts", signal_row.get("detected_at", signal_row.get("timestamp", signal_row.get("ts")))
+        )
         if detected_value is None:
             raise ValueError("signal has no detected timestamp")
         detected = parse_ts(detected_value)
-        signal_id = signal_row.get("signal_id", signal_row.get("id"))
+        as_of_dt = parse_ts(as_of) if as_of is not None else None
+        signal_id_value = signal_row.get("signal_id", signal_row.get("id"))
+        signal_id = str(signal_id_value) if signal_id_value is not None else None
         direction = self._direction(signal_row)
         sim_id = str(simulation_id or f"{signal_id or 'signal'}:{horizon:g}:{simulation_type}")
         entry_target = detected + timedelta(seconds=self.spec.entry_latency_seconds)
@@ -643,74 +816,299 @@ class DirectionalEvaluator:
             "target_entry_ts": iso_ts(entry_target),
             "data_complete": complete,
             "capture_complete": complete,
-            "as_of": iso_ts(parse_ts(as_of)) if as_of is not None else None,
+            "as_of": iso_ts(as_of_dt),
             "no_favorable_lookahead": True,
         }
-        if direction is None:
-            assumptions["invalid_direction"] = signal_row.get("direction", signal_row.get("side"))
-            expiry = detected + timedelta(seconds=horizon)
-            return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction="UNKNOWN", detected=detected, expiry=expiry, entry=None, final=None, outcome=Outcome.INDETERMINATE, reason="INVALID_DIRECTION", assumptions=assumptions, net=None)
+        return _EvaluationContext(
+            signal_row=signal_row,
+            complete=complete,
+            horizon=horizon,
+            simulation_id=sim_id,
+            signal_id=signal_id,
+            simulation_type=simulation_type,
+            direction=direction,
+            detected=detected,
+            entry_target=entry_target,
+            as_of=as_of_dt,
+            assumptions=assumptions,
+        )
+
+    def _early_result(self, context: _EvaluationContext, points: Sequence[PricePoint]) -> SimulationResult | None:
+        if context.direction is None:
+            context.assumptions["invalid_direction"] = context.signal_row.get(
+                "direction", context.signal_row.get("side")
+            )
+            return self._result(
+                sim_id=context.simulation_id,
+                signal_id=context.signal_id,
+                simulation_type=context.simulation_type,
+                horizon=context.horizon,
+                direction="UNKNOWN",
+                detected=context.detected,
+                expiry=context.detected + timedelta(seconds=context.horizon),
+                entry=None,
+                final=None,
+                outcome=Outcome.INDETERMINATE,
+                reason="INVALID_DIRECTION",
+                assumptions=context.assumptions,
+                net=None,
+            )
         if not points:
-            expiry = entry_target + timedelta(seconds=horizon)
-            outcome = Outcome.INDETERMINATE if complete else Outcome.PENDING
-            return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=None, final=None, outcome=outcome, reason="NO_PRICE_POINTS", assumptions=assumptions, net=None)
-        point_instruments = {point.instrument.upper() for point in points if point.instrument.upper() not in {"", "UNKNOWN"}}
-        signal_instrument = str(signal_row.get("instrument", "")).upper()
-        if len(point_instruments) > 1 or (signal_instrument and point_instruments and signal_instrument not in point_instruments):
-            expiry = entry_target + timedelta(seconds=horizon)
-            return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=None, final=None, outcome=Outcome.INDETERMINATE, reason="INSTRUMENT_MISMATCH", assumptions=assumptions, net=None)
-        entry, entry_reason = self._select(points, entry_target, rule=self.spec.entry_rule, as_of=as_of, instrument=signal_instrument or None)
-        if entry is None:
-            expiry = entry_target + timedelta(seconds=horizon)
-            outcome = Outcome.PENDING if not complete else Outcome.INDETERMINATE
-            assumptions["target_expiry_ts"] = iso_ts(expiry)
-            return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=None, final=None, outcome=outcome, reason=entry_reason, assumptions=assumptions, net=None)
-        entry_time = entry.use_time
-        expiry = (entry_time if self.spec.horizon_from == "entry" else detected) + timedelta(seconds=horizon)
-        assumptions.update({"target_expiry_ts": iso_ts(expiry), "effective_entry_ts": iso_ts(entry_time), "entry_market_ts": iso_ts(entry.point.timestamp), "entry_point_id": entry.point.identity})
-        # An open capture cannot terminalize a last-before result until the
-        # expiry plus grace period. A first-after result becomes terminal as
-        # soon as an eligible post-expiry observation is actually available.
-        if not complete and self.spec.exit_rule == "last_observation_at_or_before":
-            final_deadline = expiry + timedelta(seconds=self.spec.max_price_age_seconds)
-            if as_of is None or parse_ts(as_of) < final_deadline:
-                return self._result(
-                    sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None,
-                    simulation_type=simulation_type, horizon=horizon, direction=direction,
-                    detected=detected, expiry=expiry, entry=entry, final=None,
-                    outcome=Outcome.PENDING, reason="FINAL_PRICE_NOT_YET_DUE",
-                    assumptions=assumptions, net=None,
-                )
-        # No se permite liquidar contra la misma observación ni contra una
-        # marca de mercado anterior a la entrada efectiva.
-        final_as_of = as_of
-        if self.spec.exit_rule == "last_observation_at_or_before":
-            availability_cutoff = expiry + timedelta(seconds=self.spec.max_price_age_seconds)
-            final_as_of = min(final_as_of, availability_cutoff) if final_as_of is not None else availability_cutoff
-        final, final_reason = self._select(points, expiry, rule=self.spec.exit_rule, as_of=final_as_of, exclude_point_id=entry.point.identity, exclude_market_time=entry.point.timestamp, instrument=str(signal_row.get("instrument")) if signal_row.get("instrument") else None)
-        if final is None:
-            # En watch, un vencimiento futuro o un precio aún no disponible es
-            # trabajo pendiente; en replay completo queda indeterminado.
-            latest_available = max((point.available_ts for point in points), default=None)
-            pending_reason = final_reason or "FINAL_PRICE_NOT_AVAILABLE"
-            if not complete and (latest_available is None or latest_available < expiry or pending_reason in {"PRICE_NOT_AVAILABLE", "PRICE_NOT_AVAILABLE_BY_CUTOFF", "PRICE_AVAILABILITY_INVALID"}):
-                outcome = Outcome.PENDING
-            else:
-                outcome = Outcome.INDETERMINATE
-            assumptions["entry_point_id"] = entry.point.identity
-            return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=entry, final=None, outcome=outcome, reason=pending_reason, assumptions=assumptions, net=None)
-        assumptions.update({"final_market_ts": iso_ts(final.point.timestamp), "final_available_ts": iso_ts(final.point.available_ts), "final_point_id": final.point.identity})
+            return self._result(
+                sim_id=context.simulation_id,
+                signal_id=context.signal_id,
+                simulation_type=context.simulation_type,
+                horizon=context.horizon,
+                direction=context.direction,
+                detected=context.detected,
+                expiry=context.entry_target + timedelta(seconds=context.horizon),
+                entry=None,
+                final=None,
+                outcome=Outcome.INDETERMINATE if context.complete else Outcome.PENDING,
+                reason="NO_PRICE_POINTS",
+                assumptions=context.assumptions,
+                net=None,
+            )
+        point_instruments = {
+            point.instrument.upper() for point in points if point.instrument.upper() not in {"", "UNKNOWN"}
+        }
+        signal_instrument = str(context.signal_row.get("instrument", "")).upper()
+        if len(point_instruments) > 1 or (
+            signal_instrument and point_instruments and signal_instrument not in point_instruments
+        ):
+            return self._result(
+                sim_id=context.simulation_id,
+                signal_id=context.signal_id,
+                simulation_type=context.simulation_type,
+                horizon=context.horizon,
+                direction=context.direction,
+                detected=context.detected,
+                expiry=context.entry_target + timedelta(seconds=context.horizon),
+                entry=None,
+                final=None,
+                outcome=Outcome.INDETERMINATE,
+                reason="INSTRUMENT_MISMATCH",
+                assumptions=context.assumptions,
+                net=None,
+            )
+        return None
+
+    def _missing_entry_result(
+        self,
+        context: _EvaluationContext,
+        *,
+        entry_reason: str | None,
+    ) -> SimulationResult:
+        expiry = context.entry_target + timedelta(seconds=context.horizon)
+        context.assumptions["target_expiry_ts"] = iso_ts(expiry)
+        return self._result(
+            sim_id=context.simulation_id,
+            signal_id=context.signal_id,
+            simulation_type=context.simulation_type,
+            horizon=context.horizon,
+            direction=context.direction or "UNKNOWN",
+            detected=context.detected,
+            expiry=expiry,
+            entry=None,
+            final=None,
+            outcome=Outcome.PENDING if not context.complete else Outcome.INDETERMINATE,
+            reason=entry_reason,
+            assumptions=context.assumptions,
+            net=None,
+        )
+
+    def _final_not_due(self, context: _EvaluationContext, expiry: datetime) -> bool:
+        if context.complete or self.spec.exit_rule != "last_observation_at_or_before":
+            return False
+        deadline = expiry + timedelta(seconds=self.spec.max_price_age_seconds)
+        return context.as_of is None or context.as_of < deadline
+
+    def _final_as_of(self, context: _EvaluationContext, expiry: datetime) -> datetime | None:
+        if self.spec.exit_rule != "last_observation_at_or_before":
+            return context.as_of
+        cutoff = expiry + timedelta(seconds=self.spec.max_price_age_seconds)
+        return min(context.as_of, cutoff) if context.as_of is not None else cutoff
+
+    def _missing_final_result(
+        self,
+        context: _EvaluationContext,
+        *,
+        points: Sequence[PricePoint],
+        entry: _Selection,
+        expiry: datetime,
+        final_reason: str | None,
+    ) -> SimulationResult:
+        latest_available = max((point.available_ts for point in points), default=None)
+        pending_reason = final_reason or "FINAL_PRICE_NOT_AVAILABLE"
+        pending_reasons = {"PRICE_NOT_AVAILABLE", "PRICE_NOT_AVAILABLE_BY_CUTOFF", "PRICE_AVAILABILITY_INVALID"}
+        pending = not context.complete and (
+            latest_available is None or latest_available < expiry or pending_reason in pending_reasons
+        )
+        context.assumptions["entry_point_id"] = entry.point.identity
+        return self._result(
+            sim_id=context.simulation_id,
+            signal_id=context.signal_id,
+            simulation_type=context.simulation_type,
+            horizon=context.horizon,
+            direction=context.direction or "UNKNOWN",
+            detected=context.detected,
+            expiry=expiry,
+            entry=entry,
+            final=None,
+            outcome=Outcome.PENDING if pending else Outcome.INDETERMINATE,
+            reason=pending_reason,
+            assumptions=context.assumptions,
+            net=None,
+        )
+
+    def _resolved_result(
+        self,
+        context: _EvaluationContext,
+        *,
+        entry: _Selection,
+        final: _Selection,
+        expiry: datetime,
+    ) -> SimulationResult:
+        context.assumptions.update(
+            {
+                "final_market_ts": iso_ts(final.point.timestamp),
+                "final_available_ts": iso_ts(final.point.available_ts),
+                "final_point_id": final.point.identity,
+            }
+        )
         delta = final.point.price - entry.point.price
         if abs(delta) <= self.spec.tie_tolerance:
             outcome = Outcome.TIE
-        elif (direction == "UP" and delta > 0) or (direction == "DOWN" and delta < 0):
+        elif (context.direction == "UP" and delta > 0) or (context.direction == "DOWN" and delta < 0):
             outcome = Outcome.WIN
         else:
             outcome = Outcome.LOSS
-        return self._result(sim_id=sim_id, signal_id=str(signal_id) if signal_id is not None else None, simulation_type=simulation_type, horizon=horizon, direction=direction, detected=detected, expiry=expiry, entry=entry, final=final, outcome=outcome, reason=None, assumptions=assumptions, net=self.net_result(outcome))
+        return self._result(
+            sim_id=context.simulation_id,
+            signal_id=context.signal_id,
+            simulation_type=context.simulation_type,
+            horizon=context.horizon,
+            direction=context.direction or "UNKNOWN",
+            detected=context.detected,
+            expiry=expiry,
+            entry=entry,
+            final=final,
+            outcome=outcome,
+            reason=None,
+            assumptions=context.assumptions,
+            net=self.net_result(outcome),
+        )
 
-    def evaluate(self, signal: Any, points: Iterable[Any], *, horizon_seconds: float | None = None, simulation_id: str | None = None, simulation_type: str = "DIRECTIONAL", data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> SimulationResult:
-        return self.evaluate_prepared(signal, normalize_points(points), horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type=simulation_type, data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)
+    def evaluate_prepared(
+        self,
+        signal: Any,
+        points: Sequence[PricePoint],
+        *,
+        horizon_seconds: float | None = None,
+        simulation_id: str | None = None,
+        simulation_type: str = "DIRECTIONAL",
+        data_complete: bool | None = True,
+        as_of: datetime | None = None,
+        capture_complete: bool | None = None,
+    ) -> SimulationResult:
+        context = self._prepare_context(
+            signal,
+            horizon_seconds=horizon_seconds,
+            simulation_id=simulation_id,
+            simulation_type=simulation_type,
+            data_complete=data_complete,
+            as_of=as_of,
+            capture_complete=capture_complete,
+        )
+        early_result = self._early_result(context, points)
+        if early_result is not None:
+            return early_result
+
+        signal_instrument = str(context.signal_row.get("instrument", "")).upper()
+        entry, entry_reason = self._select(
+            points,
+            context.entry_target,
+            rule=self.spec.entry_rule,
+            as_of=context.as_of,
+            instrument=signal_instrument or None,
+        )
+        if entry is None:
+            return self._missing_entry_result(context, entry_reason=entry_reason)
+
+        entry_time = entry.use_time
+        expiry = (entry_time if self.spec.horizon_from == "entry" else context.detected) + timedelta(
+            seconds=context.horizon
+        )
+        context.assumptions.update(
+            {
+                "target_expiry_ts": iso_ts(expiry),
+                "effective_entry_ts": iso_ts(entry_time),
+                "entry_market_ts": iso_ts(entry.point.timestamp),
+                "entry_point_id": entry.point.identity,
+            }
+        )
+        # An open capture cannot terminalize a last-before result until the
+        # expiry plus grace period. A first-after result becomes terminal as
+        # soon as an eligible post-expiry observation is actually available.
+        if self._final_not_due(context, expiry):
+            return self._result(
+                sim_id=context.simulation_id,
+                signal_id=context.signal_id,
+                simulation_type=context.simulation_type,
+                horizon=context.horizon,
+                direction=context.direction or "UNKNOWN",
+                detected=context.detected,
+                expiry=expiry,
+                entry=entry,
+                final=None,
+                outcome=Outcome.PENDING,
+                reason="FINAL_PRICE_NOT_YET_DUE",
+                assumptions=context.assumptions,
+                net=None,
+            )
+        # No se permite liquidar contra la misma observación ni contra una
+        # marca de mercado anterior a la entrada efectiva.
+        final, final_reason = self._select(
+            points,
+            expiry,
+            rule=self.spec.exit_rule,
+            as_of=self._final_as_of(context, expiry),
+            exclude_point_id=entry.point.identity,
+            exclude_market_time=entry.point.timestamp,
+            instrument=signal_instrument or None,
+        )
+        if final is None:
+            return self._missing_final_result(
+                context,
+                points=points,
+                entry=entry,
+                expiry=expiry,
+                final_reason=final_reason,
+            )
+        return self._resolved_result(context, entry=entry, final=final, expiry=expiry)
+
+    def evaluate(
+        self,
+        signal: Any,
+        points: Iterable[Any],
+        *,
+        horizon_seconds: float | None = None,
+        simulation_id: str | None = None,
+        simulation_type: str = "DIRECTIONAL",
+        data_complete: bool | None = True,
+        as_of: datetime | None = None,
+        capture_complete: bool | None = None,
+    ) -> SimulationResult:
+        return self.evaluate_prepared(
+            signal,
+            normalize_points(points),
+            horizon_seconds=horizon_seconds,
+            simulation_id=simulation_id,
+            simulation_type=simulation_type,
+            data_complete=data_complete,
+            as_of=as_of,
+            capture_complete=capture_complete,
+        )
 
     def net_result(self, outcome: Outcome) -> float | None:
         if outcome in {Outcome.INDETERMINATE, Outcome.PENDING}:
@@ -721,26 +1119,75 @@ class DirectionalEvaluator:
             return -self.spec.stake * self.spec.loss_amount - self.spec.costs
         return self.spec.tie_net - self.spec.costs
 
-    def evaluate_all(self, signal: Any, points: Iterable[Any], *, signal_id_prefix: str | None = None, simulation_type: str = "DIRECTIONAL", data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> list[SimulationResult]:
+    def evaluate_all(
+        self,
+        signal: Any,
+        points: Iterable[Any],
+        *,
+        signal_id_prefix: str | None = None,
+        simulation_type: str = "DIRECTIONAL",
+        data_complete: bool | None = True,
+        as_of: datetime | None = None,
+        capture_complete: bool | None = None,
+    ) -> list[SimulationResult]:
         prepared = normalize_points(points)
         row = _record(signal)
         prefix = signal_id_prefix or str(row.get("signal_id", row.get("id", "signal")))
-        return [self.evaluate_prepared(row, prepared, horizon_seconds=horizon, simulation_id=f"{prefix}:{horizon:g}:{simulation_type}", simulation_type=simulation_type, data_complete=data_complete, as_of=as_of, capture_complete=capture_complete) for horizon in self.spec.horizons_seconds]
+        return [
+            self.evaluate_prepared(
+                row,
+                prepared,
+                horizon_seconds=horizon,
+                simulation_id=f"{prefix}:{horizon:g}:{simulation_type}",
+                simulation_type=simulation_type,
+                data_complete=data_complete,
+                as_of=as_of,
+                capture_complete=capture_complete,
+            )
+            for horizon in self.spec.horizons_seconds
+        ]
 
 
 class VirtualContract:
     """Contrato UP/DOWN virtual; nunca envía órdenes."""
-    def __init__(self, *, stake: float = 1.0, payout_net: float = 0.80, loss_amount: float = 1.0, tie_net: float = 0.0, costs: float = 0.0, tie_tolerance: float = 0.0):
-        self.stake = float(stake); self.payout_net = float(payout_net); self.loss_amount = float(loss_amount); self.tie_net = float(tie_net); self.costs = float(costs); self.tie_tolerance = float(tie_tolerance)
+
+    def __init__(
+        self,
+        *,
+        stake: float = 1.0,
+        payout_net: float = 0.80,
+        loss_amount: float = 1.0,
+        tie_net: float = 0.0,
+        costs: float = 0.0,
+        tie_tolerance: float = 0.0,
+    ):
+        self.stake = float(stake)
+        self.payout_net = float(payout_net)
+        self.loss_amount = float(loss_amount)
+        self.tie_net = float(tie_net)
+        self.costs = float(costs)
+        self.tie_tolerance = float(tie_tolerance)
         if self.stake <= 0 or self.payout_net < 0 or self.loss_amount < 0 or self.tie_tolerance < 0 or self.costs < 0:
             raise ValueError("invalid virtual contract amounts")
 
     @property
     def break_even(self) -> float:
-        return break_even_probability(payout_net=self.payout_net, loss_amount=self.loss_amount, costs=self.costs, stake=self.stake)
+        return break_even_probability(
+            payout_net=self.payout_net, loss_amount=self.loss_amount, costs=self.costs, stake=self.stake
+        )
 
     def evaluator(self, **kwargs: Any) -> DirectionalEvaluator:
-        return DirectionalEvaluator(EvaluationSpec(stake=self.stake, payout_net=self.payout_net, loss_amount=self.loss_amount, tie_net=self.tie_net, costs=self.costs, tie_tolerance=self.tie_tolerance, **kwargs))
+        return DirectionalEvaluator(
+            EvaluationSpec(
+                stake=self.stake,
+                payout_net=self.payout_net,
+                loss_amount=self.loss_amount,
+                tie_net=self.tie_net,
+                costs=self.costs,
+                tie_tolerance=self.tie_tolerance,
+                **kwargs,
+            )
+        )
 
     def settle(self, result: SimulationResult) -> SimulationResult:
         if result.outcome in {Outcome.INDETERMINATE, Outcome.PENDING}:
@@ -751,44 +1198,159 @@ class VirtualContract:
             net = -self.stake * self.loss_amount - self.costs
         else:
             net = self.tie_net - self.costs
-        return dataclasses.replace(result, stake=self.stake, net_result=net, assumptions={**result.assumptions, "virtual_contract": {"stake": self.stake, "payout_net": self.payout_net, "loss_amount": self.loss_amount, "tie_net": self.tie_net, "costs": self.costs}})
+        return dataclasses.replace(
+            result,
+            stake=self.stake,
+            net_result=net,
+            assumptions={
+                **result.assumptions,
+                "virtual_contract": {
+                    "stake": self.stake,
+                    "payout_net": self.payout_net,
+                    "loss_amount": self.loss_amount,
+                    "tie_net": self.tie_net,
+                    "costs": self.costs,
+                },
+            },
+        )
 
 
 class VirtualContractSimulator:
     def __init__(self, contract: VirtualContract | EvaluationSpec | None = None, spec: EvaluationSpec | None = None):
         if isinstance(contract, EvaluationSpec) and spec is None:
-            spec = contract; contract = None
+            spec = contract
+            contract = None
         if contract is None and spec is not None:
-            contract = VirtualContract(stake=spec.stake, payout_net=spec.payout_net, loss_amount=spec.loss_amount, tie_net=spec.tie_net, costs=spec.costs, tie_tolerance=spec.tie_tolerance)
-        self.contract = contract or VirtualContract()
-        self.spec = spec or EvaluationSpec(stake=self.contract.stake, payout_net=self.contract.payout_net, loss_amount=self.contract.loss_amount, tie_net=self.contract.tie_net, costs=self.contract.costs, tie_tolerance=self.contract.tie_tolerance)
+            contract = VirtualContract(
+                stake=spec.stake,
+                payout_net=spec.payout_net,
+                loss_amount=spec.loss_amount,
+                tie_net=spec.tie_net,
+                costs=spec.costs,
+                tie_tolerance=spec.tie_tolerance,
+            )
+        self.contract: VirtualContract = cast(VirtualContract, contract or VirtualContract())
+        self.spec = spec or EvaluationSpec(
+            stake=self.contract.stake,
+            payout_net=self.contract.payout_net,
+            loss_amount=self.contract.loss_amount,
+            tie_net=self.contract.tie_net,
+            costs=self.contract.costs,
+            tie_tolerance=self.contract.tie_tolerance,
+        )
         # Dos descripciones distintas del mismo contrato serían ambiguas.
         if contract is not None and spec is not None:
-            values = (self.contract.stake, self.contract.payout_net, self.contract.loss_amount, self.contract.tie_net, self.contract.costs, self.contract.tie_tolerance)
-            expected = (self.spec.stake, self.spec.payout_net, self.spec.loss_amount, self.spec.tie_net, self.spec.costs, self.spec.tie_tolerance)
+            values = (
+                self.contract.stake,
+                self.contract.payout_net,
+                self.contract.loss_amount,
+                self.contract.tie_net,
+                self.contract.costs,
+                self.contract.tie_tolerance,
+            )
+            expected = (
+                self.spec.stake,
+                self.spec.payout_net,
+                self.spec.loss_amount,
+                self.spec.tie_net,
+                self.spec.costs,
+                self.spec.tie_tolerance,
+            )
             if values != expected:
                 raise ValueError("VirtualContract y EvaluationSpec no son equivalentes")
         self.evaluator = DirectionalEvaluator(self.spec)
 
-    def evaluate(self, signal: Any, points: Iterable[Any], *, horizon_seconds: float | None = None, simulation_id: str | None = None, data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> SimulationResult:
-        result = self.evaluator.evaluate(signal, points, horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)
+    def evaluate(
+        self,
+        signal: Any,
+        points: Iterable[Any],
+        *,
+        horizon_seconds: float | None = None,
+        simulation_id: str | None = None,
+        data_complete: bool | None = True,
+        as_of: datetime | None = None,
+        capture_complete: bool | None = None,
+    ) -> SimulationResult:
+        result = self.evaluator.evaluate(
+            signal,
+            points,
+            horizon_seconds=horizon_seconds,
+            simulation_id=simulation_id,
+            simulation_type="VIRTUAL_CONTRACT",
+            data_complete=data_complete,
+            as_of=as_of,
+            capture_complete=capture_complete,
+        )
         return self.contract.settle(result)
 
-    def evaluate_prepared(self, signal: Any, points: Sequence[PricePoint], *, horizon_seconds: float | None = None, simulation_id: str | None = None, data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> SimulationResult:
-        result = self.evaluator.evaluate_prepared(signal, points, horizon_seconds=horizon_seconds, simulation_id=simulation_id, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)
+    def evaluate_prepared(
+        self,
+        signal: Any,
+        points: Sequence[PricePoint],
+        *,
+        horizon_seconds: float | None = None,
+        simulation_id: str | None = None,
+        data_complete: bool | None = True,
+        as_of: datetime | None = None,
+        capture_complete: bool | None = None,
+    ) -> SimulationResult:
+        result = self.evaluator.evaluate_prepared(
+            signal,
+            points,
+            horizon_seconds=horizon_seconds,
+            simulation_id=simulation_id,
+            simulation_type="VIRTUAL_CONTRACT",
+            data_complete=data_complete,
+            as_of=as_of,
+            capture_complete=capture_complete,
+        )
         return self.contract.settle(result)
 
-    def evaluate_all(self, signal: Any, points: Iterable[Any], *, data_complete: bool | None = True, as_of: datetime | None = None, capture_complete: bool | None = None) -> list[SimulationResult]:
+    def evaluate_all(
+        self,
+        signal: Any,
+        points: Iterable[Any],
+        *,
+        data_complete: bool | None = True,
+        as_of: datetime | None = None,
+        capture_complete: bool | None = None,
+    ) -> list[SimulationResult]:
         prepared = normalize_points(points)
-        return [self.contract.settle(result) for result in self.evaluator.evaluate_all(signal, prepared, simulation_type="VIRTUAL_CONTRACT", data_complete=data_complete, as_of=as_of, capture_complete=capture_complete)]
+        return [
+            self.contract.settle(result)
+            for result in self.evaluator.evaluate_all(
+                signal,
+                prepared,
+                simulation_type="VIRTUAL_CONTRACT",
+                data_complete=data_complete,
+                as_of=as_of,
+                capture_complete=capture_complete,
+            )
+        ]
 
 
 __all__ = [
-    "DirectionalEvaluator", "EvaluationSpec", "Outcome", "PricePoint", "PricePointLike", "Selection",
-    "SimulationResult", "VirtualContract", "VirtualContractSimulator",
-    "PRICE_BASE_ALIASES", "VALID_PRICE_BASES", "normalize_price_base",
-    "price_bases_match", "normalize_completion", "outcome_for_missing_price",
-    "normalize_observation_times", "observation_age_seconds",
-    "quality_label_is_usable", "select_price_point",
-    "break_even_probability", "iso_ts", "normalize_points", "parse_ts",
+    "DirectionalEvaluator",
+    "EvaluationSpec",
+    "Outcome",
+    "PricePoint",
+    "PricePointLike",
+    "Selection",
+    "SimulationResult",
+    "VirtualContract",
+    "VirtualContractSimulator",
+    "PRICE_BASE_ALIASES",
+    "VALID_PRICE_BASES",
+    "normalize_price_base",
+    "price_bases_match",
+    "normalize_completion",
+    "outcome_for_missing_price",
+    "normalize_observation_times",
+    "observation_age_seconds",
+    "quality_label_is_usable",
+    "select_price_point",
+    "break_even_probability",
+    "iso_ts",
+    "normalize_points",
+    "parse_ts",
 ]

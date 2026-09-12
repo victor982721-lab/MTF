@@ -8,16 +8,18 @@ para que persistencia e interfaz puedan explicar cada bloqueo.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from enum import Enum
 import math
-from typing import Any, Iterable, TYPE_CHECKING
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - sólo soporte de type checkers
     from .models import Candle, MarketEvent
 
 
-class QualityFlag(str, Enum):
+class QualityFlag(str, Enum):  # noqa: UP042 - preserve the public enum MRO
     VALID = "valid"
     SYNTHETIC = "synthetic"
     INVALID = "invalid"
@@ -33,7 +35,7 @@ class QualityFlag(str, Enum):
     LATE = "late"
 
 
-class QualityState(str, Enum):
+class QualityState(str, Enum):  # noqa: UP042 - preserve the public enum MRO
     """Estados de calidad que pueden viajar por una frontera de dominio.
 
     ``QualityFlag`` conserva la representación histórica de múltiples
@@ -59,7 +61,7 @@ class QualityState(str, Enum):
     BLOCKED = "blocked"
 
 
-class QualityReason(str, Enum):
+class QualityReason(str, Enum):  # noqa: UP042 - preserve the public enum MRO
     """Códigos de razón conocidos, separados de su texto de presentación.
 
     Las razones heredadas pueden seguir siendo texto descriptivo en
@@ -165,14 +167,14 @@ class DataQuality:
             object.__setattr__(self, "source", self.source)
 
     @classmethod
-    def valid(cls, *, synthetic: bool = False, source: str | None = None) -> "DataQuality":
+    def valid(cls, *, synthetic: bool = False, source: str | None = None) -> DataQuality:
         return cls(
             frozenset({QualityFlag.SYNTHETIC} if synthetic else set()),
             source=source,
         )
 
     @classmethod
-    def good(cls, *, synthetic: bool = False, source: str | None = None) -> "DataQuality":
+    def good(cls, *, synthetic: bool = False, source: str | None = None) -> DataQuality:
         """Alias legible para callers del núcleo y compatibilidad de API."""
         return cls(
             frozenset({QualityFlag.SYNTHETIC} if synthetic else set()),
@@ -186,7 +188,7 @@ class DataQuality:
         reasons: Iterable[str | QualityReason] = (),
         *,
         source: str | None = None,
-    ) -> "DataQuality":
+    ) -> DataQuality:
         """Construct quality from an exact typed state.
 
         Unknown states are conservatively represented as ``invalid`` rather
@@ -217,7 +219,7 @@ class DataQuality:
         reason: str | QualityReason = "",
         *,
         source: str | None = None,
-    ) -> "DataQuality":
+    ) -> DataQuality:
         normalized_flag = flag if isinstance(flag, QualityFlag) else QualityFlag(flag)
         return cls(frozenset({normalized_flag}), (reason,) if reason else (), source)
 
@@ -225,7 +227,7 @@ class DataQuality:
     def usable(self) -> bool:
         """Alias de ``valid`` para llamadores del detector."""
 
-        return self.valid
+        return bool(self.valid)
 
     @property
     def state(self) -> QualityState:
@@ -246,11 +248,7 @@ class DataQuality:
     def reason_codes(self) -> tuple[QualityReason, ...]:
         """Razones conocidas por coincidencia exacta, sin heurísticas de texto."""
 
-        return tuple(
-            code
-            for reason in self.reasons
-            if (code := _QUALITY_REASON_BY_VALUE.get(reason)) is not None
-        )
+        return tuple(code for reason in self.reasons if (code := _QUALITY_REASON_BY_VALUE.get(reason)) is not None)
 
     @property
     def typed_reasons(self) -> tuple[QualityReason, ...]:
@@ -288,7 +286,7 @@ class DataQuality:
         self,
         *flags: QualityFlag | str,
         reason: str | QualityReason = "",
-    ) -> "DataQuality":
+    ) -> DataQuality:
         extra: set[QualityFlag] = set()
         for flag in flags:
             if isinstance(flag, QualityFlag):
@@ -347,7 +345,7 @@ class ValidationResult:
 
     @property
     def valid(self) -> bool:
-        return self.accepted and self.quality.valid
+        return self.accepted and bool(self.quality.valid)
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,7 +376,7 @@ def _is_finite(value: Any) -> bool:
         return False
 
 
-def validate_event(event: "MarketEvent") -> ValidationResult:
+def validate_event(event: MarketEvent) -> ValidationResult:
     """Valida una instancia de :class:`MarketEvent` sin cambiarla."""
 
     issues: list[QualityIssue] = []
@@ -386,7 +384,9 @@ def validate_event(event: "MarketEvent") -> ValidationResult:
     if not getattr(event, "instrument", ""):
         issues.append(QualityIssue("instrument_missing", "Falta instrumento", record_id=event_id))
     if not getattr(event, "event_time", None) or getattr(event.event_time, "tzinfo", None) is None:
-        issues.append(QualityIssue("timestamp_invalid", "event_time debe ser consciente de zona horaria", record_id=event_id))
+        issues.append(
+            QualityIssue("timestamp_invalid", "event_time debe ser consciente de zona horaria", record_id=event_id)
+        )
     for field_name in ("price", "quantity", "bid", "ask"):
         value = getattr(event, field_name, None)
         if value is not None and not _is_finite(value):
@@ -401,21 +401,23 @@ def validate_event(event: "MarketEvent") -> ValidationResult:
                 record_id=event_id,
             )
         )
-    if getattr(event, "quantity", None) is not None and event.quantity < 0:
+    quantity = getattr(event, "quantity", None)
+    if quantity is not None and quantity < 0:
         issues.append(QualityIssue("quantity_negative", "quantity no puede ser negativa", record_id=event_id))
     quality = getattr(event, "quality", None)
     if quality is not None and getattr(quality, "flags", frozenset()) & _BLOCKING_FLAGS:
-        issues.append(QualityIssue("quality_blocked", ",".join(sorted(flag.value for flag in quality.flags)), record_id=event_id))
+        issues.append(
+            QualityIssue("quality_blocked", ",".join(sorted(flag.value for flag in quality.flags)), record_id=event_id)
+        )
     if issues:
-        return ValidationResult(False, tuple(issues), DataQuality(frozenset({QualityFlag.INVALID}), tuple(issue.code for issue in issues)))
+        return ValidationResult(
+            False, tuple(issues), DataQuality(frozenset({QualityFlag.INVALID}), tuple(issue.code for issue in issues))
+        )
     return ValidationResult(True, (), event.quality)
 
 
-def validate_candle(candle: "Candle", *, require_closed: bool = False) -> ValidationResult:
-    """Valida OHLC, intervalo, temporalidad y calidad de una vela."""
-
+def _candle_interval_issues(candle: Candle, candle_id: Any) -> list[QualityIssue]:
     issues: list[QualityIssue] = []
-    candle_id = getattr(candle, "candle_id", None)
     try:
         start = candle.start
         end = candle.end
@@ -424,26 +426,61 @@ def validate_candle(candle: "Candle", *, require_closed: bool = False) -> Valida
             issues.append(QualityIssue("timestamp_invalid", "start/end requieren zona horaria", record_id=candle_id))
         if end <= start:
             issues.append(QualityIssue("interval_invalid", "end debe ser posterior a start", record_id=candle_id))
-        if end - start != timeframe.delta:
-            issues.append(QualityIssue("timeframe_mismatch", "intervalo no coincide con timeframe", record_id=candle_id))
+        timeframe_delta = getattr(timeframe, "delta", None)
+        if timeframe_delta is None:
+            issues.append(
+                QualityIssue("candle_shape_invalid", "timeframe no tiene un intervalo válido", record_id=candle_id)
+            )
+        elif end - start != timeframe_delta:
+            issues.append(
+                QualityIssue("timeframe_mismatch", "intervalo no coincide con timeframe", record_id=candle_id)
+            )
     except Exception as exc:  # pragma: no cover - defensa para entradas externas
         issues.append(QualityIssue("candle_shape_invalid", str(exc), record_id=candle_id))
+    return issues
+
+
+def _candle_measurement_issues(candle: Candle, candle_id: Any, *, interval_valid: bool) -> list[QualityIssue]:
+    issues: list[QualityIssue] = []
     for field_name in ("open", "high", "low", "close", "volume"):
         if not _is_finite(getattr(candle, field_name, None)):
             issues.append(QualityIssue("non_finite", f"{field_name} no es finito", record_id=candle_id))
-    if not issues:
+    if interval_valid and not issues:
         if candle.high < max(candle.open, candle.close, candle.low):
             issues.append(QualityIssue("ohlc_incoherent", "high incompatible con OHLC", record_id=candle_id))
         if candle.low > min(candle.open, candle.close, candle.high):
             issues.append(QualityIssue("ohlc_incoherent", "low incompatible con OHLC", record_id=candle_id))
         if candle.volume < 0 or candle.event_count < 0:
-            issues.append(QualityIssue("negative_measure", "volume/event_count no puede ser negativo", record_id=candle_id))
+            issues.append(
+                QualityIssue("negative_measure", "volume/event_count no puede ser negativo", record_id=candle_id)
+            )
+    return issues
+
+
+def _candle_state_issues(candle: Candle, candle_id: Any, *, require_closed: bool) -> list[QualityIssue]:
+    issues: list[QualityIssue] = []
     if require_closed and not candle.closed:
         issues.append(QualityIssue("candle_open", "se requiere una vela cerrada", record_id=candle_id))
     if candle.quality.flags & _BLOCKING_FLAGS:
-        issues.append(QualityIssue("quality_blocked", ",".join(sorted(f.value for f in candle.quality.flags)), record_id=candle_id))
+        issues.append(
+            QualityIssue(
+                "quality_blocked", ",".join(sorted(f.value for f in candle.quality.flags)), record_id=candle_id
+            )
+        )
+    return issues
+
+
+def validate_candle(candle: Candle, *, require_closed: bool = False) -> ValidationResult:
+    """Valida OHLC, intervalo, temporalidad y calidad de una vela."""
+
+    candle_id = getattr(candle, "candle_id", None)
+    issues = _candle_interval_issues(candle, candle_id)
+    issues.extend(_candle_measurement_issues(candle, candle_id, interval_valid=not issues))
+    issues.extend(_candle_state_issues(candle, candle_id, require_closed=require_closed))
     if issues:
-        return ValidationResult(False, tuple(issues), DataQuality(frozenset({QualityFlag.INVALID}), tuple(issue.code for issue in issues)))
+        return ValidationResult(
+            False, tuple(issues), DataQuality(frozenset({QualityFlag.INVALID}), tuple(issue.code for issue in issues))
+        )
     return ValidationResult(True, (), candle.quality)
 
 
@@ -477,6 +514,7 @@ __all__ = [
 @dataclass(frozen=True, slots=True)
 class FreshnessAssessment:
     """Edades separadas del feed y de la última vela cerrada."""
+
     feed_age_seconds: float | None
     closed_candle_age_seconds: float | None
     quality: DataQuality
@@ -491,7 +529,7 @@ def assess_freshness(
     max_closed_candle_age_seconds: float,
 ) -> FreshnessAssessment:
     """Marca ``STALE`` sin confundir atraso de feed con edad normal de M15."""
-    from datetime import datetime, timezone
+
     def parse(value: Any | None) -> datetime | None:
         if value is None:
             return None
@@ -502,20 +540,26 @@ def assess_freshness(
             dt = datetime.fromisoformat(text)
         if dt.tzinfo is None:
             raise ValueError("freshness timestamps require timezone")
-        return dt.astimezone(timezone.utc)
+        return dt.astimezone(UTC)
+
     current = parse(now)
     if current is None:
         raise ValueError("now is required")
-    feed_dt = parse(last_received_at); candle_dt = parse(last_closed_end)
+    feed_dt = parse(last_received_at)
+    candle_dt = parse(last_closed_end)
     feed_age = (current - feed_dt).total_seconds() if feed_dt else None
     candle_age = (current - candle_dt).total_seconds() if candle_dt else None
     if feed_age is not None and feed_age < 0 or candle_age is not None and candle_age < 0:
         raise ValueError("freshness timestamps cannot be in the future")
-    flags: set[QualityFlag] = set(); reasons: list[str] = []
+    flags: set[QualityFlag] = set()
+    reasons: list[str] = []
     if feed_age is None or feed_age > float(max_feed_age_seconds):
-        flags.add(QualityFlag.STALE); reasons.append(f"feed_age_seconds={feed_age!r} > {max_feed_age_seconds}")
+        flags.add(QualityFlag.STALE)
+        reasons.append(f"feed_age_seconds={feed_age!r} > {max_feed_age_seconds}")
     if candle_age is None or candle_age > float(max_closed_candle_age_seconds):
-        flags.add(QualityFlag.LATE); reasons.append(f"closed_candle_age_seconds={candle_age!r} > {max_closed_candle_age_seconds}")
+        flags.add(QualityFlag.LATE)
+        reasons.append(f"closed_candle_age_seconds={candle_age!r} > {max_closed_candle_age_seconds}")
     return FreshnessAssessment(feed_age, candle_age, DataQuality(frozenset(flags), tuple(reasons)))
+
 
 __all__.extend(["FreshnessAssessment", "assess_freshness"])

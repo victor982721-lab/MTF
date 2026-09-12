@@ -7,20 +7,18 @@ aceptados deben ser conscientes de zona horaria y se almacenan como UTC.
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
 import hashlib
 import math
+from collections.abc import Mapping
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from enum import Enum
 from types import MappingProxyType
-from typing import Any, Mapping
+from typing import Any
 
 from .canonical import canonical_json
-from .quality import DataQuality
-
-
-UTC = timezone.utc
+from .quality import DataQuality, QualityFlag
 
 
 def normalize_utc(value: datetime, field_name: str = "timestamp") -> datetime:
@@ -37,7 +35,7 @@ def normalize_utc(value: datetime, field_name: str = "timestamp") -> datetime:
     return value.astimezone(UTC)
 
 
-class OperationMode(str, Enum):
+class OperationMode(str, Enum):  # noqa: UP042 - preserve the public enum MRO
     """Modo de procedencia que debe aparecer en todas las salidas."""
 
     LIVE = "LIVE"
@@ -49,7 +47,7 @@ class OperationMode(str, Enum):
 Mode = OperationMode
 
 
-class PriceBase(str, Enum):
+class PriceBase(str, Enum):  # noqa: UP042 - preserve the public enum MRO
     """Base de precio, sin conversiones implícitas entre quote/trade/native."""
 
     TRADED = "traded"
@@ -92,7 +90,7 @@ def normalize_price_base(value: PriceBase | str) -> PriceBase:
     return _coerce_price_base(value)
 
 
-class EventKind(str, Enum):
+class EventKind(str, Enum):  # noqa: UP042 - preserve the public enum MRO
     TRADE = "trade"
     OHLC = "ohlc"
     QUOTE = "quote"
@@ -235,6 +233,73 @@ def _event_identity_payload(
     return canonical_json(payload).encode("utf-8")
 
 
+def _normalize_candle_identity(
+    instrument: str,
+    timeframe: Timeframe | str,
+    start: datetime,
+    end: datetime,
+) -> tuple[str, Timeframe, datetime, datetime]:
+    normalized_instrument = str(instrument).strip()
+    if not normalized_instrument:
+        raise ValueError("instrument no puede estar vacío")
+    normalized_timeframe = parse_timeframe(timeframe)
+    normalized_start = normalize_utc(start, "start")
+    normalized_end = normalize_utc(end, "end")
+    if normalized_end <= normalized_start:
+        raise ValueError("end debe ser posterior a start")
+    if normalized_end - normalized_start != normalized_timeframe.delta:
+        raise ValueError("el intervalo de la vela no coincide con timeframe")
+    return normalized_instrument, normalized_timeframe, normalized_start, normalized_end
+
+
+def _normalize_candle_measurements(
+    open_value: float,
+    high_value: float,
+    low_value: float,
+    close_value: float,
+    volume_value: float,
+    event_count: int,
+) -> tuple[dict[str, float], float, int]:
+    values: dict[str, float] = {}
+    for name, value in (
+        ("open", open_value),
+        ("high", high_value),
+        ("low", low_value),
+        ("close", close_value),
+    ):
+        normalized = _finite(value, name, allow_none=False)
+        assert normalized is not None
+        values[name] = normalized
+    if values["high"] < max(values["open"], values["close"], values["low"]):
+        raise ValueError("high debe ser mayor o igual que OHLC")
+    if values["low"] > min(values["open"], values["close"], values["high"]):
+        raise ValueError("low debe ser menor o igual que OHLC")
+    normalized_volume = _finite(volume_value, "volume", allow_none=False)
+    assert normalized_volume is not None
+    if normalized_volume < 0:
+        raise ValueError("volume no puede ser negativo")
+    if isinstance(event_count, bool) or int(event_count) < 0:
+        raise ValueError("event_count debe ser entero no negativo")
+    return values, normalized_volume, int(event_count)
+
+
+def _normalize_candle_availability(
+    closed: bool,
+    end: datetime,
+    available_at: datetime | None,
+    received_at: datetime | None,
+) -> tuple[datetime | None, datetime | None]:
+    normalized_available = normalize_utc(available_at, "available_at") if available_at else None
+    normalized_received = normalize_utc(received_at, "received_at") if received_at else None
+    if closed and normalized_available is None:
+        normalized_available = end
+    if normalized_available is not None and closed and normalized_available < end:
+        # Una vela cerrada no puede estar disponible antes del cierre de su
+        # intervalo; eventos tardíos pueden moverla después, nunca antes.
+        raise ValueError("available_at no puede preceder al cierre de una vela cerrada")
+    return normalized_available, normalized_received
+
+
 @dataclass(frozen=True, slots=True)
 class MarketEvent:
     """Evento de mercado normalizado.
@@ -292,22 +357,25 @@ class MarketEvent:
         object.__setattr__(self, "metadata", _mapping(self.metadata))
         event_id = self.event_id
         if event_id is None:
-            event_id = "evt_" + hashlib.sha256(
-                _event_identity_payload(
-                    instrument=instrument,
-                    source=self.source,
-                    event_kind=self.event_kind,
-                    event_time=event_time,
-                    received_at=received_at,
-                    available_at=available_at,
-                    sequence=self.sequence,
-                    source_event_id=self.source_event_id,
-                    price=self.price,
-                    quantity=self.quantity,
-                    bid=self.bid,
-                    ask=self.ask,
-                )
-            ).hexdigest()[:32]
+            event_id = (
+                "evt_"
+                + hashlib.sha256(
+                    _event_identity_payload(
+                        instrument=instrument,
+                        source=self.source,
+                        event_kind=self.event_kind,
+                        event_time=event_time,
+                        received_at=received_at,
+                        available_at=available_at,
+                        sequence=self.sequence,
+                        source_event_id=self.source_event_id,
+                        price=self.price,
+                        quantity=self.quantity,
+                        bid=self.bid,
+                        ask=self.ask,
+                    )
+                ).hexdigest()[:32]
+            )
         event_id = str(event_id).strip()
         if not event_id:
             raise ValueError("event_id no puede estar vacío")
@@ -377,36 +445,20 @@ class Candle:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        instrument = str(self.instrument).strip()
-        if not instrument:
-            raise ValueError("instrument no puede estar vacío")
-        timeframe = parse_timeframe(self.timeframe)
-        start = normalize_utc(self.start, "start")
-        end = normalize_utc(self.end, "end")
-        if end <= start:
-            raise ValueError("end debe ser posterior a start")
-        if end - start != timeframe.delta:
-            raise ValueError("el intervalo de la vela no coincide con timeframe")
-        values = {name: _finite(getattr(self, name), name, allow_none=False) for name in ("open", "high", "low", "close")}
-        assert all(value is not None for value in values.values())
-        if values["high"] < max(values["open"], values["close"], values["low"]):
-            raise ValueError("high debe ser mayor o igual que OHLC")
-        if values["low"] > min(values["open"], values["close"], values["high"]):
-            raise ValueError("low debe ser menor o igual que OHLC")
-        volume = _finite(self.volume, "volume", allow_none=False)
-        assert volume is not None
-        if volume < 0:
-            raise ValueError("volume no puede ser negativo")
-        if isinstance(self.event_count, bool) or int(self.event_count) < 0:
-            raise ValueError("event_count debe ser entero no negativo")
-        available_at = normalize_utc(self.available_at, "available_at") if self.available_at else None
-        received_at = normalize_utc(self.received_at, "received_at") if self.received_at else None
-        if self.closed and available_at is None:
-            available_at = end
-        if available_at is not None and self.closed and available_at < end:
-            # Una vela cerrada no puede estar disponible antes del cierre de su
-            # intervalo; eventos tardíos pueden moverla después, nunca antes.
-            raise ValueError("available_at no puede preceder al cierre de una vela cerrada")
+        instrument, timeframe, start, end = _normalize_candle_identity(
+            self.instrument, self.timeframe, self.start, self.end
+        )
+        values, volume, event_count = _normalize_candle_measurements(
+            self.open,
+            self.high,
+            self.low,
+            self.close,
+            self.volume,
+            self.event_count,
+        )
+        available_at, received_at = _normalize_candle_availability(
+            self.closed, end, self.available_at, self.received_at
+        )
         object.__setattr__(self, "instrument", instrument)
         object.__setattr__(self, "timeframe", timeframe)
         object.__setattr__(self, "start", start)
@@ -414,7 +466,7 @@ class Candle:
         for name, value in values.items():
             object.__setattr__(self, name, value)
         object.__setattr__(self, "volume", volume)
-        object.__setattr__(self, "event_count", int(self.event_count))
+        object.__setattr__(self, "event_count", event_count)
         object.__setattr__(self, "available_at", available_at)
         object.__setattr__(self, "received_at", received_at)
         object.__setattr__(self, "source", str(self.source).strip() or "unknown")
@@ -443,7 +495,7 @@ class Candle:
 
     @property
     def timeframe_name(self) -> str:
-        return self.timeframe.name
+        return parse_timeframe(self.timeframe).name
 
     @property
     def effective_available_at(self) -> datetime | None:
@@ -463,13 +515,7 @@ class Candle:
 
     @property
     def is_synthetic(self) -> bool:
-        return self.mode is OperationMode.SYNTHETIC or self.quality.has(QualityFlagLike.SYNTHETIC)
-
-
-# Import diferido sólo para no crear una dependencia circular en la anotación
-#/propiedad anterior.  ``QualityFlagLike`` también permite que DataQuality sea
-# extendido en el futuro sin cambiar el modelo.
-from .quality import QualityFlag as QualityFlagLike  # noqa: E402  (circular-safe)
+        return self.mode is OperationMode.SYNTHETIC or self.quality.has(QualityFlag.SYNTHETIC)
 
 
 # Nombres cortos solicitados por la integración.

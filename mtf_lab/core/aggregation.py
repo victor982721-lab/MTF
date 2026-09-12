@@ -2,17 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from collections import deque
-from datetime import datetime, timezone
 import math
-from typing import Iterable, Sequence
+from collections import deque
+from collections.abc import Iterable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 
 from .models import Candle, MarketEvent, OperationMode, PriceBase, Timeframe, normalize_utc, parse_timeframe
-from .quality import DataQuality, QualityFlag, QualityIssue, QualityReport, ValidationResult, merge_quality, validate_event
-
-
-UTC = timezone.utc
+from .quality import QualityFlag, QualityIssue, QualityReport, merge_quality, validate_event
 
 
 def interval_start(timestamp: datetime, timeframe: Timeframe | str) -> datetime:
@@ -39,7 +36,9 @@ class AggregationResult:
 
     @property
     def partial(self) -> bool:
-        return any(candle.quality.has(QualityFlag.PARTIAL) or bool(candle.metadata.get("partial")) for candle in self.emitted)
+        return any(
+            candle.quality.has(QualityFlag.PARTIAL) or bool(candle.metadata.get("partial")) for candle in self.emitted
+        )
 
 
 @dataclass(slots=True)
@@ -92,7 +91,11 @@ class CandleAggregator:
         if max_issues is not None and (isinstance(max_issues, bool) or int(max_issues) <= 0):
             raise ValueError("max_issues debe ser entero positivo")
         self.max_seen_event_ids = int(max_seen_event_ids) if max_seen_event_ids is not None else None
-        self.max_issues = int(max_issues) if max_issues is not None else (self.max_seen_event_ids if self.max_seen_event_ids is not None else None)
+        self.max_issues = (
+            int(max_issues)
+            if max_issues is not None
+            else (self.max_seen_event_ids if self.max_seen_event_ids is not None else None)
+        )
         self._bucket: _Bucket | None = None
         self._closed_through: datetime | None = None
         self._seen_event_ids: set[str] = set()
@@ -115,80 +118,121 @@ class CandleAggregator:
         sequence = event.sequence
         # Mezcla tipos no comparables convirtiendo sólo la clave de orden, no
         # la identidad persistida. event_id es el desempate final estable.
-        seq_key = (0, sequence) if isinstance(sequence, (int, float)) and not isinstance(sequence, bool) else (1, str(sequence or ""))
+        seq_key = (
+            (0, sequence)
+            if isinstance(sequence, (int, float)) and not isinstance(sequence, bool)
+            else (1, str(sequence or ""))
+        )
         return event.event_time, available, received, seq_key, event.event_id or ""
 
     def _new_issue(self, code: str, message: str, event: MarketEvent | None = None) -> QualityIssue:
-        issue = QualityIssue(code, message, record_id=event.event_id if event else None, timestamp=event.event_time if event else None)
+        issue = QualityIssue(
+            code, message, record_id=event.event_id if event else None, timestamp=event.event_time if event else None
+        )
         self._issues.append(issue)
         return issue
+
+    def _admit_event(self, event: MarketEvent) -> tuple[bool, QualityIssue | None]:
+        validation = validate_event(event)
+        if not validation.accepted:
+            issue = self._new_issue("invalid_event", "; ".join(item.message for item in validation.issues), event)
+            return False, issue
+        if self.instrument is None:
+            self.instrument = event.instrument
+        if event.instrument != self.instrument:
+            issue = self._new_issue(
+                "instrument_mismatch", f"Se esperaba {self.instrument}, llegó {event.instrument}", event
+            )
+            return False, issue
+        if event.price_base is not self.price_base:
+            issue = self._new_issue(
+                "price_base_mismatch",
+                f"Se esperaba {self.price_base.value}, llegó {event.price_base.value}",
+                event,
+            )
+            return False, issue
+        if event.event_id in self._seen_event_ids:
+            issue = self._new_issue("duplicate_event", f"Evento duplicado: {event.event_id}", event)
+            return False, issue
+        order_key = self._event_order_key(event)
+        if self._last_order_key is not None and order_key < self._last_order_key:
+            issue = self._new_issue("out_of_order", f"Evento fuera de orden: {event.event_id}", event)
+            if self.reject_out_of_order:
+                return False, issue
+        return True, None
+
+    def _record_event(self, event: MarketEvent) -> None:
+        order_key = self._event_order_key(event)
+        event_id = event.event_id or ""
+        self._seen_event_ids.add(event_id)
+        self._seen_event_order.append(event_id)
+        if self.max_seen_event_ids is not None:
+            while len(self._seen_event_order) > self.max_seen_event_ids:
+                evicted_id = self._seen_event_order.popleft()
+                self._seen_event_ids.discard(evicted_id)
+        self._last_order_key = max(self._last_order_key, order_key) if self._last_order_key is not None else order_key
+        self._last_event_time = (
+            max(self._last_event_time, event.event_time) if self._last_event_time else event.event_time
+        )
 
     def add(self, event: MarketEvent) -> AggregationResult:
         """Añade un evento y emite cualquier vela anterior ya cerrada."""
 
         if not isinstance(event, MarketEvent):
             raise TypeError("CandleAggregator.add requiere MarketEvent")
-        validation = validate_event(event)
-        if not validation.accepted:
-            issue = self._new_issue("invalid_event", "; ".join(item.message for item in validation.issues), event)
+        accepted, issue = self._admit_event(event)
+        if not accepted:
+            assert issue is not None
             return AggregationResult((), False, (issue,))
-        if self.instrument is None:
-            self.instrument = event.instrument
-        if event.instrument != self.instrument:
-            issue = self._new_issue("instrument_mismatch", f"Se esperaba {self.instrument}, llegó {event.instrument}", event)
-            return AggregationResult((), False, (issue,))
-        if event.price_base is not self.price_base:
-            issue = self._new_issue("price_base_mismatch", f"Se esperaba {self.price_base.value}, llegó {event.price_base.value}", event)
-            return AggregationResult((), False, (issue,))
-        if event.event_id in self._seen_event_ids:
-            issue = self._new_issue("duplicate_event", f"Evento duplicado: {event.event_id}", event)
-            return AggregationResult((), False, (issue,))
-        order_key = self._event_order_key(event)
-        if self._last_order_key is not None and order_key < self._last_order_key:
-            issue = self._new_issue("out_of_order", f"Evento fuera de orden: {event.event_id}", event)
-            if self.reject_out_of_order:
-                return AggregationResult((), False, (issue,))
-        self._seen_event_ids.add(event.event_id)
-        self._seen_event_order.append(event.event_id)
-        if self.max_seen_event_ids is not None:
-            while len(self._seen_event_order) > self.max_seen_event_ids:
-                evicted_id = self._seen_event_order.popleft()
-                self._seen_event_ids.discard(evicted_id)
-        self._last_order_key = max(self._last_order_key, order_key) if self._last_order_key is not None else order_key
-        self._last_event_time = max(self._last_event_time, event.event_time) if self._last_event_time else event.event_time
+        self._record_event(event)
+        return self._insert_event(event)
 
+    def _insert_event(self, event: MarketEvent) -> AggregationResult:
         start = interval_start(event.event_time, self.timeframe)
         end = start + self.timeframe.delta
-        emitted: list[Candle] = []
         if self._closed_through is not None and start < self._closed_through:
             issue = self._new_issue("late_closed_interval", "El evento pertenece a un intervalo ya cerrado", event)
             # No se integra en la observación original, aunque conserva el
             # event_id como visto para que un retry no duplique más evidencia.
             return AggregationResult((), False, (issue,))
         if self._bucket is None:
-            self._bucket = _Bucket(start, end, partial=event.event_time > start)
-            if event.event_time > start:
-                issue = self._new_issue("partial_bucket", "El arranque ocurrió a mitad de intervalo; la cobertura no es completa", event)
-                self._bucket.events.append(event)
-                return AggregationResult((), True, (issue,))
-        elif start < self._bucket.start:
+            return self._start_bucket(event, start, end)
+        if start < self._bucket.start:
             issue = self._new_issue("out_of_order_interval", "El intervalo retrocede respecto al bucket activo", event)
             return AggregationResult((), False, (issue,))
-        elif start > self._bucket.start:
-            emitted.append(self._build_candle(self._bucket, closed=True, emitted_at=event.effective_available_at))
-            self._closed_through = self._bucket.end
-            gap_issue: QualityIssue | None = None
-            if start > self._bucket.end:
-                gap_issue = self._new_issue("gap", f"Sin eventos entre {self._bucket.end.isoformat()} y {start.isoformat()}", event)
-            partial = event.event_time > start
-            self._bucket = _Bucket(start, end, partial=partial)
-            self._bucket.events.append(event)
-            if partial:
-                partial_issue = self._new_issue("partial_bucket", "El nuevo intervalo comenzó a mitad de intervalo", event)
-                return AggregationResult(tuple(emitted), True, tuple(item for item in (gap_issue, partial_issue) if item is not None))
-            return AggregationResult(tuple(emitted), True, (gap_issue,) if gap_issue is not None else ())
+        if start > self._bucket.start:
+            return self._advance_bucket(event, start, end)
         self._bucket.events.append(event)
-        return AggregationResult(tuple(emitted), True, ())
+        return AggregationResult()
+
+    def _start_bucket(self, event: MarketEvent, start: datetime, end: datetime) -> AggregationResult:
+        partial = event.event_time > start
+        self._bucket = _Bucket(start, end, partial=partial)
+        self._bucket.events.append(event)
+        if not partial:
+            return AggregationResult()
+        issue = self._new_issue(
+            "partial_bucket", "El arranque ocurrió a mitad de intervalo; la cobertura no es completa", event
+        )
+        return AggregationResult((), True, (issue,))
+
+    def _advance_bucket(self, event: MarketEvent, start: datetime, end: datetime) -> AggregationResult:
+        assert self._bucket is not None
+        emitted = [self._build_candle(self._bucket, closed=True, emitted_at=event.effective_available_at)]
+        self._closed_through = self._bucket.end
+        gap_issue: QualityIssue | None = None
+        if start > self._bucket.end:
+            gap_issue = self._new_issue(
+                "gap", f"Sin eventos entre {self._bucket.end.isoformat()} y {start.isoformat()}", event
+            )
+        partial = event.event_time > start
+        self._bucket = _Bucket(start, end, partial=partial)
+        self._bucket.events.append(event)
+        if not partial:
+            return AggregationResult(tuple(emitted), True, (gap_issue,) if gap_issue is not None else ())
+        partial_issue = self._new_issue("partial_bucket", "El nuevo intervalo comenzó a mitad de intervalo", event)
+        issues = tuple(item for item in (gap_issue, partial_issue) if item is not None)
+        return AggregationResult(tuple(emitted), True, issues)
 
     def close_until(self, watermark: datetime, *, include_current: bool = True) -> AggregationResult:
         """Cierra buckets cuyo ``end`` no supera el watermark.
@@ -280,7 +324,11 @@ def _event_sort_key(event: MarketEvent) -> tuple:
     received = event.received_at or event.event_time
     available = event.available_at or received
     sequence = event.sequence
-    seq_key = (0, sequence) if isinstance(sequence, (int, float)) and not isinstance(sequence, bool) else (1, str(sequence or ""))
+    seq_key = (
+        (0, sequence)
+        if isinstance(sequence, (int, float)) and not isinstance(sequence, bool)
+        else (1, str(sequence or ""))
+    )
     return event.event_time, available, received, seq_key, event.event_id or ""
 
 
@@ -321,18 +369,26 @@ def aggregate_events(
     # aplicar el orden determinista de reproducción. No se descarta por
     # sorpresa en lote: ``reject_invalid`` controla sólo la inserción.
     input_keys = [_event_sort_key(event) for event in valid_events]
-    if any(right < left for left, right in zip(input_keys, input_keys[1:])):
+    if any(right < left for left, right in zip(input_keys, input_keys[1:], strict=False)):
         issues.append(QualityIssue("out_of_order", "La entrada contenía eventos fuera de orden"))
     valid_events.sort(key=_event_sort_key)
     unique: list[MarketEvent] = []
     seen: set[str] = set()
     duplicates = 0
     for event in valid_events:
-        if event.event_id in seen:
+        event_id = event.event_id or ""
+        if event_id in seen:
             duplicates += 1
-            issues.append(QualityIssue("duplicate_event", f"Evento duplicado: {event.event_id}", record_id=event.event_id, timestamp=event.event_time))
+            issues.append(
+                QualityIssue(
+                    "duplicate_event",
+                    f"Evento duplicado: {event_id}",
+                    record_id=event_id,
+                    timestamp=event.event_time,
+                )
+            )
             continue
-        seen.add(event.event_id)
+        seen.add(event_id)
         unique.append(event)
     aggregator = CandleAggregator(
         timeframe,

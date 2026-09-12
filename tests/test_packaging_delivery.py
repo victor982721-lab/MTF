@@ -38,7 +38,17 @@ class PackagingDeliveryTests(unittest.TestCase):
             metadata["optional-dependencies"]["ctrader"],
             ["ctrader-open-api==0.9.2", "service-identity==24.2.0"],
         )
-        self.assertEqual(metadata["optional-dependencies"]["dev"], ["ruff==0.16.7", "mypy==2.3.1"])
+        self.assertEqual(
+            metadata["optional-dependencies"]["dev"],
+            [
+                "build==1.6.1",
+                "coverage==7.16.0",
+                "mypy==2.3.1",
+                "pyright==1.1.414",
+                "ruff==0.16.7",
+            ],
+        )
+        self.assertEqual(metadata["readme"], "README.md")
         self.assertEqual(project["tool"]["setuptools"]["package-data"]["mtf_lab"], ["resources/config/*.toml"])
 
     def test_all_source_configs_have_byte_equal_wheel_resources(self) -> None:
@@ -126,6 +136,49 @@ class PackagingDeliveryTests(unittest.TestCase):
             code = cli.main(["ctrader", "query", "--fixture"])
         self.assertEqual(code, 0)
         self.assertIn('"network_performed": false', output.getvalue())
+
+    def test_wheel_installer_builds_and_runs_outside_checkout(self) -> None:
+        installer = ROOT / "install-mtf-lab-wheel.sh"
+        self.assertTrue(installer.is_file())
+        self.assertTrue(os.access(installer, os.X_OK))
+        with tempfile.TemporaryDirectory(prefix="mtf-wheel-install-") as directory:
+            isolated = Path(directory)
+            target = isolated / "venv"
+            env = dict(os.environ)
+            env.update(
+                {
+                    "PYTHONPATH": "",
+                    "HOME": str(isolated / "home"),
+                    "XDG_STATE_HOME": str(isolated / "state"),
+                    "MTF_LAB_STATE_DIR": str(isolated / "mtf-state"),
+                    "MTF_LAB_BUILD_PYTHON": str(ROOT / ".venv-dev" / "bin" / "python"),
+                }
+            )
+            result = subprocess.run(
+                [str(installer), "--venv", str(target)],
+                cwd=isolated,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=120,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("INSTALLED_WHEEL=mtf_lab-0.1.0-py3-none-any.whl", result.stdout)
+            self.assertRegex(result.stdout, r"WHEEL_SHA256=[0-9a-f]{64}")
+            launcher = target / "bin" / "mtf-lab"
+            self.assertTrue(launcher.is_file())
+            smoke = subprocess.run(
+                [str(launcher), "--help"],
+                cwd=isolated,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            self.assertEqual(smoke.returncode, 0, smoke.stderr)
+            self.assertIn("usage: mtf-lab", smoke.stdout)
 
 
 if __name__ == "__main__":

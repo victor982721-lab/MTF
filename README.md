@@ -10,6 +10,10 @@ El núcleo no llama a un LLM ni a OpenAI. Las señales, simulaciones y fixtures
 son hipótesis y datos sintéticos: **no son recomendaciones, órdenes ni
 prueba de rentabilidad**.
 
+## Contexto durable (sin memoria nativa)
+
+Este README y los documentos enlazados son la fuente persistente del proyecto. Los límites de activación están en `docs/activation_boundaries.md`, el estado de cTrader en `docs/ctrader_integration_status.md` y los parámetros efectivos en `config/*.toml`; no agregues texto libre ni una sección `[knowledge]` a los TOML porque el cargador rechaza claves desconocidas.
+
 ## Estado actual
 
 ### IMPLEMENTADO Y COMPROBADO OFFLINE
@@ -86,6 +90,30 @@ La instalación anterior es la instalación **base**. Si no se desea instalar el
 paquete, los lanzadores `./mtf-lab` y `./bin/mtf-lab` ejecutan directamente el
 checkout con `python3` (o con el intérprete indicado por `PYTHON`).
 
+### Wheel oficial del proyecto
+
+Para instalar el artefacto PEP 517 fuera del checkout, prepara primero el
+entorno de tooling y usa el instalador local. El instalador construye un wheel
+con el backend fijado, no publica nada ni consulta un índice de paquetes:
+
+```bash
+.venv-dev/bin/python -m pip install --requirement requirements-dev.lock
+./install-mtf-lab-wheel.sh --python .venv-dev/bin/python --venv "$HOME/.venvs/mtf-lab"
+"$HOME/.venvs/mtf-lab/bin/python" -m mtf_lab --help
+```
+
+También puede instalarse un wheel ya construido sin recompilarlo:
+
+```bash
+SOURCE_DATE_EPOCH=0 .venv-dev/bin/python -m build --wheel --no-isolation --outdir dist
+./install-mtf-lab-wheel.sh --wheel dist/mtf_lab-0.1.0-py3-none-any.whl \
+  --venv "$HOME/.venvs/mtf-lab"
+```
+
+El script imprime el nombre y SHA-256 del wheel instalado. El estado de
+ejecución queda fuera de `site-packages`, en `MTF_LAB_STATE_DIR` o en la ruta
+XDG del usuario; las credenciales y OAuth no forman parte de esta instalación.
+
 ### Extra cTrader reproducible
 
 El SDK oficial es opcional para el núcleo. Para reproducir exactamente el
@@ -114,8 +142,30 @@ python3 -m venv .venv-dev
 .venv-dev/bin/python -m pip install --no-build-isolation --no-deps --editable '.[dev]'
 ```
 
-`.venv/` y `.venv-dev/` no se versionan. `requirements-dev.lock` fija Ruff y
-mypy y sus transitivas para el tooling; no sustituye el lock cTrader.
+`.venv/` y `.venv-dev/` no se versionan. `requirements-dev.lock` fija Ruff,
+mypy, Pyright, Coverage.py y el frontend `build` con sus transitivas para el
+tooling; no sustituye el lock cTrader.
+
+### Calidad local
+
+El alcance mantenido de lint y tipos está declarado en el propio checkout:
+
+```bash
+.venv-dev/bin/python tools/quality_gate.py \
+  --runtime-python .venv/bin/python \
+  --dev-python .venv-dev/bin/python \
+  --json runtime/verification/quality.json
+```
+
+El gate ejecuta Ruff y formato sobre los módulos refactorizados, mypy estricto
+en el contrato tipado, Pyright según `pyrightconfig.json`, la auditoría de
+arquitectura y una cobertura de ramas mínima del 60 %. El informe completo de
+Ruff sobre el legado se conserva como diagnóstico advisory; no se relajan sus
+hallazgos para ocultarlos ni se confunden con la puerta mantenida.
+
+La corrida de esta revisión observó 342 pruebas (3 omitidas), 74 % de cobertura
+de ramas y cero fallos en todas esas puertas. El detalle, los límites y la deuda
+advisory se conservan en [`docs/refactor_quality.md`](docs/refactor_quality.md).
 
 ## Arranque y comandos locales
 

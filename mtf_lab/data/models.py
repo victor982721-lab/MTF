@@ -9,18 +9,17 @@ caller cannot accidentally use receipt time as market time.
 
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import hashlib
 import math
+from collections.abc import Iterable, Mapping, Sequence
+from copy import deepcopy
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Literal
 
 from ..core.canonical import canonical_json
 
-
-UTC = timezone.utc
 PriceBasis = Literal["traded", "bid", "ask", "mid", "native"]
 DataMode = Literal["SYNTHETIC", "REPLAY", "OBSERVACIÓN EN DIRECTO", "OBSERVATION_EN_DIRECTO", "IMPORT"]
 PRICE_BASES = frozenset({"traded", "bid", "ask", "mid", "native"})
@@ -133,6 +132,134 @@ def _canonical_json(value: Any) -> str:
     return canonical_json(value)
 
 
+def _event_times(
+    event_time: datetime,
+    received_at: datetime | None,
+    available_at: datetime | None,
+) -> tuple[datetime, datetime | None, datetime | None]:
+    normalized_event = ensure_utc(event_time, field_name="event_time")
+    normalized_available = ensure_utc(available_at, field_name="available_at") if available_at is not None else None
+    if normalized_available is not None and normalized_available < normalized_event:
+        raise ValueError("available_at must not precede event_time")
+    normalized_received = ensure_utc(received_at, field_name="received_at") if received_at is not None else None
+    if normalized_received is not None and normalized_received < normalized_event:
+        raise ValueError("received_at must not precede event_time")
+    return normalized_event, normalized_received, normalized_available
+
+
+def _normalize_event_values(event: Event) -> None:
+    object.__setattr__(event, "price", _finite(event.price, "price", allow_zero=False))
+    for name in ("bid", "ask", "mid"):
+        value = getattr(event, name)
+        if value is not None:
+            object.__setattr__(event, name, _finite(value, name, allow_zero=False))
+    if event.quantity is not None:
+        object.__setattr__(event, "quantity", _finite(event.quantity, "quantity"))
+        if event.quantity < 0:
+            raise ValueError("quantity must not be negative")
+
+
+def _normalize_event_state(event: Event) -> None:
+    if event.side is not None:
+        if not isinstance(event.side, str) or event.side.strip().lower() not in {"buy", "sell", "unknown"}:
+            raise ValueError(f"unsupported side: {event.side!r}")
+        object.__setattr__(event, "side", event.side.strip().lower())
+    for name in ("is_snapshot", "synthetic"):
+        if not isinstance(getattr(event, name), bool):
+            raise TypeError(f"{name} must be boolean")
+
+
+def _normalize_event_identity(event: Event) -> None:
+    if event.source_event_id is not None:
+        if not isinstance(event.source_event_id, str) or not event.source_event_id.strip():
+            raise ValueError("source_event_id must be a non-empty string")
+        object.__setattr__(event, "source_event_id", event.source_event_id.strip())
+    sequence = event.source_sequence
+    if sequence is not None and (
+        isinstance(sequence, bool)
+        or not isinstance(sequence, (int, str))
+        or (isinstance(sequence, str) and not sequence.strip())
+    ):
+        raise TypeError("source_sequence must be a non-empty string or integer")
+
+
+def _bar_window(bar: Bar) -> tuple[str, datetime, datetime]:
+    if not isinstance(bar.instrument, str) or not bar.instrument.strip():
+        raise ValueError("instrument must not be empty")
+    instrument = bar.instrument.strip()
+    start = ensure_utc(bar.interval_start, field_name="interval_start")
+    end = ensure_utc(bar.interval_end, field_name="interval_end")
+    if end <= start:
+        raise ValueError("interval_end must be after interval_start")
+    if isinstance(bar.resolution_seconds, bool) or not isinstance(bar.resolution_seconds, int):
+        raise TypeError("resolution_seconds must be an integer")
+    if bar.resolution_seconds <= 0:
+        raise ValueError("resolution_seconds must be positive")
+    if int((end - start).total_seconds()) != bar.resolution_seconds:
+        raise ValueError("interval length must equal resolution_seconds")
+    return instrument, start, end
+
+
+def _bar_values(bar: Bar) -> dict[str, float]:
+    values = {name: _finite(getattr(bar, name), name, allow_zero=False) for name in ("open", "high", "low", "close")}
+    if values["high"] < max(values["open"], values["close"], values["low"]):
+        raise ValueError("high must be >= open, close and low")
+    if values["low"] > min(values["open"], values["close"], values["high"]):
+        raise ValueError("low must be <= open, close and high")
+    return values
+
+
+def _bar_availability(bar: Bar, start: datetime, end: datetime) -> tuple[datetime | None, datetime | None]:
+    received_at = None
+    if bar.received_at is not None:
+        received_at = ensure_utc(bar.received_at, field_name="received_at")
+        if received_at < start:
+            raise ValueError("received_at must not precede interval_start")
+    available_at = None
+    if bar.available_at is not None:
+        available_at = ensure_utc(bar.available_at, field_name="available_at")
+        if available_at < start or (bar.closed and available_at < end):
+            raise ValueError("available_at must not precede interval_start/end for a closed bar")
+    return received_at, available_at
+
+
+def _bar_volume(bar: Bar) -> float | None:
+    if bar.volume is None:
+        return None
+    volume = _finite(bar.volume, "volume")
+    if volume < 0:
+        raise ValueError("volume must not be negative")
+    return volume
+
+
+def _bar_trade_count(bar: Bar) -> int | None:
+    if bar.trade_count is None:
+        return None
+    if isinstance(bar.trade_count, bool) or int(bar.trade_count) != bar.trade_count:
+        raise ValueError("trade_count must be an integer")
+    if bar.trade_count < 0:
+        raise ValueError("trade_count must not be negative")
+    return int(bar.trade_count)
+
+
+def _normalize_provenance_text(value: Any, *, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must not be empty")
+    return value.strip()
+
+
+def _normalize_provenance_resolutions(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise TypeError("resolutions must contain non-empty strings")
+    return tuple(item.strip() for item in value)
+
+
+def _normalize_provenance_notes(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, (list, tuple)) or any(not isinstance(note, str) for note in value):
+        raise TypeError("notes must contain strings")
+    return tuple(value)
+
+
 @dataclass(frozen=True, slots=True)
 class Event:
     """A normalized market event, normally a trade or a quote observation."""
@@ -160,44 +287,14 @@ class Event:
             raise ValueError("instrument must not be empty")
         instrument = self.instrument.strip()
         object.__setattr__(self, "instrument", instrument)
-        event_time = ensure_utc(self.event_time, field_name="event_time")
+        event_time, received_at, available_at = _event_times(self.event_time, self.received_at, self.available_at)
         object.__setattr__(self, "event_time", event_time)
-        if self.received_at is not None:
-            object.__setattr__(self, "received_at", ensure_utc(self.received_at, field_name="received_at"))
-        if self.available_at is not None:
-            available = ensure_utc(self.available_at, field_name="available_at")
-            if available < event_time:
-                raise ValueError("available_at must not precede event_time")
-            object.__setattr__(self, "available_at", available)
-        if self.received_at is not None and self.received_at < event_time:
-            raise ValueError("received_at must not precede event_time")
+        object.__setattr__(self, "received_at", received_at)
+        object.__setattr__(self, "available_at", available_at)
         object.__setattr__(self, "price_basis", normalize_price_basis(self.price_basis))
-        object.__setattr__(self, "price", _finite(self.price, "price", allow_zero=False))
-        for name in ("bid", "ask", "mid"):
-            value = getattr(self, name)
-            if value is not None:
-                object.__setattr__(self, name, _finite(value, name, allow_zero=False))
-        if self.quantity is not None:
-            object.__setattr__(self, "quantity", _finite(self.quantity, "quantity"))
-            if self.quantity < 0:
-                raise ValueError("quantity must not be negative")
-        if self.side is not None:
-            if not isinstance(self.side, str) or self.side.strip().lower() not in {"buy", "sell", "unknown"}:
-                raise ValueError(f"unsupported side: {self.side!r}")
-            object.__setattr__(self, "side", self.side.strip().lower())
-        for name in ("is_snapshot", "synthetic"):
-            if not isinstance(getattr(self, name), bool):
-                raise TypeError(f"{name} must be boolean")
-        if self.source_event_id is not None:
-            if not isinstance(self.source_event_id, str) or not self.source_event_id.strip():
-                raise ValueError("source_event_id must be a non-empty string")
-            object.__setattr__(self, "source_event_id", self.source_event_id.strip())
-        if self.source_sequence is not None and (
-            isinstance(self.source_sequence, bool)
-            or not isinstance(self.source_sequence, (int, str))
-            or (isinstance(self.source_sequence, str) and not self.source_sequence.strip())
-        ):
-            raise TypeError("source_sequence must be a non-empty string or integer")
+        _normalize_event_values(self)
+        _normalize_event_state(self)
+        _normalize_event_identity(self)
         object.__setattr__(self, "metadata", _copy_metadata(self.metadata))
 
     @property
@@ -237,7 +334,7 @@ class Event:
         """Stable identity that does not depend only on price/timestamp."""
 
         if self.source_event_id:
-            identity = {
+            identity: dict[str, Any] = {
                 "source": self.source,
                 "instrument": self.instrument,
                 "source_event_id": self.source_event_id,
@@ -310,57 +407,23 @@ class Bar:
     metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.instrument, str) or not self.instrument.strip():
-            raise ValueError("instrument must not be empty")
-        object.__setattr__(self, "instrument", self.instrument.strip())
-        start = ensure_utc(self.interval_start, field_name="interval_start")
-        end = ensure_utc(self.interval_end, field_name="interval_end")
-        if end <= start:
-            raise ValueError("interval_end must be after interval_start")
-        if isinstance(self.resolution_seconds, bool) or not isinstance(self.resolution_seconds, int):
-            raise TypeError("resolution_seconds must be an integer")
-        if self.resolution_seconds <= 0:
-            raise ValueError("resolution_seconds must be positive")
-        if int((end - start).total_seconds()) != self.resolution_seconds:
-            raise ValueError("interval length must equal resolution_seconds")
+        instrument, start, end = _bar_window(self)
+        object.__setattr__(self, "instrument", instrument)
         object.__setattr__(self, "interval_start", start)
         object.__setattr__(self, "interval_end", end)
-        if self.received_at is not None:
-            received = ensure_utc(self.received_at, field_name="received_at")
-            if received < start:
-                raise ValueError("received_at must not precede interval_start")
-            object.__setattr__(self, "received_at", received)
-        if self.available_at is not None:
-            available = ensure_utc(self.available_at, field_name="available_at")
-            if available < start or (self.closed and available < end):
-                raise ValueError("available_at must not precede interval_start/end for a closed bar")
-            object.__setattr__(self, "available_at", available)
+        received_at, available_at = _bar_availability(self, start, end)
+        object.__setattr__(self, "received_at", received_at)
+        object.__setattr__(self, "available_at", available_at)
         object.__setattr__(self, "price_basis", normalize_price_basis(self.price_basis))
         if not isinstance(self.closed, bool) or not isinstance(self.synthetic, bool):
             raise TypeError("closed and synthetic must be boolean")
-        values = {
-            "open": _finite(self.open, "open", allow_zero=False),
-            "high": _finite(self.high, "high", allow_zero=False),
-            "low": _finite(self.low, "low", allow_zero=False),
-            "close": _finite(self.close, "close", allow_zero=False),
-        }
-        if values["high"] < max(values["open"], values["close"], values["low"]):
-            raise ValueError("high must be >= open, close and low")
-        if values["low"] > min(values["open"], values["close"], values["high"]):
-            raise ValueError("low must be <= open, close and high")
+        values = _bar_values(self)
         for name, value in values.items():
             object.__setattr__(self, name, value)
-        if self.volume is not None:
-            volume = _finite(self.volume, "volume")
-            if volume < 0:
-                raise ValueError("volume must not be negative")
-            object.__setattr__(self, "volume", volume)
-        if self.trade_count is not None:
-            if isinstance(self.trade_count, bool) or int(self.trade_count) != self.trade_count:
-                raise ValueError("trade_count must be an integer")
-            if self.trade_count < 0:
-                raise ValueError("trade_count must not be negative")
-            object.__setattr__(self, "trade_count", int(self.trade_count))
+        volume = _bar_volume(self)
+        object.__setattr__(self, "volume", volume)
+        trade_count = _bar_trade_count(self)
+        object.__setattr__(self, "trade_count", trade_count)
         if isinstance(self.revision, bool) or not isinstance(self.revision, int) or self.revision < 0:
             raise ValueError("revision must be a non-negative integer")
         if self.source_record_id is not None:
@@ -494,8 +557,7 @@ class DataValidationError(ValueError):
         self.issues = tuple(issues)
         if self.issues:
             detail = "; ".join(
-                f"{i.code}{f' row={i.row}' if i.row is not None else ''}: {i.message}"
-                for i in self.issues[:8]
+                f"{i.code}{f' row={i.row}' if i.row is not None else ''}: {i.message}" for i in self.issues[:8]
             )
             if len(self.issues) > 8:
                 detail += f"; ... {len(self.issues) - 8} more"
@@ -565,34 +627,34 @@ class Provenance:
     notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.provider, str) or not self.provider.strip():
-            raise ValueError("provider must not be empty")
-        if not isinstance(self.instrument, str) or not self.instrument.strip():
-            raise ValueError("instrument must not be empty")
-        object.__setattr__(self, "provider", self.provider.strip())
-        object.__setattr__(self, "instrument", self.instrument.strip())
-        if not isinstance(self.mode, str) or not self.mode.strip():
-            raise ValueError("mode must not be empty")
-        object.__setattr__(self, "mode", self.mode.strip())
+        provider = _normalize_provenance_text(self.provider, name="provider")
+        instrument = _normalize_provenance_text(self.instrument, name="instrument")
+        mode = _normalize_provenance_text(self.mode, name="mode")
+        object.__setattr__(self, "provider", provider)
+        object.__setattr__(self, "instrument", instrument)
+        object.__setattr__(self, "mode", mode)
         object.__setattr__(self, "price_basis", normalize_price_basis(self.price_basis))
-        if not isinstance(self.resolutions, (list, tuple)) or any(not isinstance(item, str) or not item.strip() for item in self.resolutions):
-            raise TypeError("resolutions must contain non-empty strings")
-        object.__setattr__(self, "resolutions", tuple(item.strip() for item in self.resolutions))
+        resolutions = _normalize_provenance_resolutions(self.resolutions)
+        object.__setattr__(self, "resolutions", resolutions)
         if self.coverage_start is not None:
             object.__setattr__(self, "coverage_start", ensure_utc(self.coverage_start, field_name="coverage_start"))
         if self.coverage_end is not None:
             object.__setattr__(self, "coverage_end", ensure_utc(self.coverage_end, field_name="coverage_end"))
-        if self.coverage_start is not None and self.coverage_end is not None and self.coverage_end < self.coverage_start:
+        if (
+            self.coverage_start is not None
+            and self.coverage_end is not None
+            and self.coverage_end < self.coverage_start
+        ):
             raise ValueError("coverage_end must not precede coverage_start")
-        if self.generated_seed is not None and (isinstance(self.generated_seed, bool) or not isinstance(self.generated_seed, int)):
+        if self.generated_seed is not None and (
+            isinstance(self.generated_seed, bool) or not isinstance(self.generated_seed, int)
+        ):
             raise TypeError("generated_seed must be an integer")
         if not isinstance(self.synthetic, bool):
             raise TypeError("synthetic must be boolean")
         if self.retrieved_at is not None:
             object.__setattr__(self, "retrieved_at", ensure_utc(self.retrieved_at, field_name="retrieved_at"))
-        if not isinstance(self.notes, (list, tuple)) or any(not isinstance(note, str) for note in self.notes):
-            raise TypeError("notes must contain strings")
-        object.__setattr__(self, "notes", tuple(self.notes))
+        object.__setattr__(self, "notes", _normalize_provenance_notes(self.notes))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -631,7 +693,9 @@ class DataSet:
             raise TypeError("provenance must be Provenance")
         if not isinstance(self.quality, DataQuality):
             raise TypeError("quality must be DataQuality")
-        if not isinstance(self.issues, (list, tuple)) or any(not isinstance(issue, ValidationIssue) for issue in self.issues):
+        if not isinstance(self.issues, (list, tuple)) or any(
+            not isinstance(issue, ValidationIssue) for issue in self.issues
+        ):
             raise TypeError("issues must contain ValidationIssue values")
         object.__setattr__(self, "issues", tuple(self.issues))
 
@@ -673,20 +737,19 @@ def infer_quality(records: Iterable[Event | Bar], issues: Sequence[ValidationIss
     duplicate_count = sum(1 for i in issues if i.code == "DUPLICATE")
     out_of_order_count = sum(1 for i in issues if i.code == "OUT_OF_ORDER")
     invalid_count = sum(1 for i in issues if i.code.startswith("INVALID") or i.code in {"PARSE_ERROR", "MISSING_FIELD"})
-    times = [
-        record.event_time if isinstance(record, Event) else record.interval_start
-        for record in values
-    ]
+    times = [record.event_time if isinstance(record, Event) else record.interval_start for record in values]
     ordered = sorted(times)
     coverage_end = (
         max((record.interval_end for record in values if isinstance(record, Bar)), default=None)
         if values and all(isinstance(record, Bar) for record in values)
-        else (max((record.event_time for record in values if isinstance(record, Event)), default=None) if values else None)
+        else (
+            max((record.event_time for record in values if isinstance(record, Event)), default=None) if values else None
+        )
     )
     gap_count = 0
     if values and all(isinstance(record, Bar) for record in values):
         bars = sorted((record for record in values if isinstance(record, Bar)), key=lambda item: item.interval_start)
-        for previous, current in zip(bars, bars[1:]):
+        for previous, current in zip(bars, bars[1:], strict=False):
             if current.interval_start > previous.interval_start + (current.interval_end - current.interval_start):
                 gap_count += 1
     quality_notes = [issue.message for issue in issues if issue.severity == "WARNING"]

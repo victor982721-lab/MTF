@@ -44,6 +44,16 @@ class QueryPage:
         }
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _SimulationQueryOptions:
+    start_ts: Any | None
+    end_ts: Any | None
+    limit: int
+    recent: bool
+    cursor: Any | None
+    revisions: str
+
+
 _TABLES: dict[str, tuple[str, str, str]] = {
     "events": ("events", "event_ts", "event_row_id"),
     "candles": ("candles", "start_ts", "candle_row_id"),
@@ -71,6 +81,10 @@ def _decode_json(value: Any, default: Any = None) -> Any:
         return default
 
 
+def _as_mapping(value: Any) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
+
+
 def _text(value: Any) -> str:
     return str(value) if value is not None else ""
 
@@ -94,7 +108,9 @@ def _resolve_query_state(state: object | None, alias: object | None) -> object |
 
 
 def _append_query_equals(
-    clauses: list[str], params: list[Any], pairs: tuple[tuple[str, object | None], ...],
+    clauses: list[str],
+    params: list[Any],
+    pairs: tuple[tuple[str, object | None], ...],
 ) -> None:
     for column, value in pairs:
         if value is not None:
@@ -103,8 +119,11 @@ def _append_query_equals(
 
 
 def _append_query_cfd_options(
-    clauses: list[str], params: list[Any], state: object | None,
-    horizon_seconds: object | None, terminal: bool | None,
+    clauses: list[str],
+    params: list[Any],
+    state: object | None,
+    horizon_seconds: object | None,
+    terminal: bool | None,
 ) -> None:
     if state is not None:
         clauses.append("state=?")
@@ -120,7 +139,10 @@ def _append_query_cfd_options(
 
 
 def _append_query_cfd_ranges(
-    clauses: list[str], params: list[Any], start_ts: Any | None, end_ts: Any | None,
+    clauses: list[str],
+    params: list[Any],
+    start_ts: Any | None,
+    end_ts: Any | None,
 ) -> None:
     if start_ts is not None:
         clauses.append("detected_at>=?")
@@ -146,15 +168,35 @@ def _cfd_query_where(
     end_ts: Any | None,
 ) -> tuple[list[str], list[Any], dict[str, Any]]:
     filters: dict[str, Any] = {
-        "session_id": session_id, "analysis_id": analysis_id, "trade_id": trade_id,
-        "signal_id": signal_id, "state": str(getattr(state, "value", state)).upper() if state is not None else None,
-        "instrument": instrument, "product": product, "variant": variant,
-        "partition": partition, "horizon_seconds": str(horizon_seconds) if horizon_seconds is not None else None,
-        "terminal": terminal, "start_ts": _parse_time(start_ts), "end_ts": _parse_time(end_ts),
+        "session_id": session_id,
+        "analysis_id": analysis_id,
+        "trade_id": trade_id,
+        "signal_id": signal_id,
+        "state": str(getattr(state, "value", state)).upper() if state is not None else None,
+        "instrument": instrument,
+        "product": product,
+        "variant": variant,
+        "partition": partition,
+        "horizon_seconds": str(horizon_seconds) if horizon_seconds is not None else None,
+        "terminal": terminal,
+        "start_ts": _parse_time(start_ts),
+        "end_ts": _parse_time(end_ts),
     }
     clauses = ["session_id=?"]
     params: list[Any] = [session_id]
-    _append_query_equals(clauses, params, (("analysis_id", analysis_id), ("trade_id", trade_id), ("signal_id", signal_id), ("instrument", instrument), ("product", product), ("variant", variant), ("partition", partition)))
+    _append_query_equals(
+        clauses,
+        params,
+        (
+            ("analysis_id", analysis_id),
+            ("trade_id", trade_id),
+            ("signal_id", signal_id),
+            ("instrument", instrument),
+            ("product", product),
+            ("variant", variant),
+            ("partition", partition),
+        ),
+    )
     _append_query_cfd_options(clauses, params, state, horizon_seconds, terminal)
     _append_query_cfd_ranges(clauses, params, start_ts, end_ts)
     return clauses, params, filters
@@ -164,9 +206,13 @@ def _query_cursor_condition(decoded: Mapping[str, Any] | None, order: str) -> tu
     if not decoded:
         return "", [], False
     op = str(decoded["op"])
-    operator = ">" if ((order == "asc" and op == "after") or (order == "desc" and op == "before")) else "<"
+    operator = _cursor_operator(order, op)
     sql = f" AND (detected_at {operator} ? OR (detected_at=? AND cfd_trade_row_id {operator} ?))"
     return sql, [decoded["ts"], decoded["ts"], int(decoded["row_id"])], op == "before"
+
+
+def _cursor_operator(order: str, op: str) -> str:
+    return ">" if ((order == "asc" and op == "after") or (order == "desc" and op == "before")) else "<"
 
 
 def _query_cfd_cursor_pair(
@@ -180,23 +226,51 @@ def _query_cfd_cursor_pair(
     if not items:
         return None, None
     first, last = items[0], items[-1]
-    next_cursor = service._cursor(table="cfd_trades", filters=filters, order=order, op="after", ts=str(last["detected_at"]), row_id=int(last["cfd_trade_row_id"])) if has_more or (decoded and decoded.get("op") == "before") else None
-    prev_cursor = service._cursor(table="cfd_trades", filters=filters, order=order, op="before", ts=str(first["detected_at"]), row_id=int(first["cfd_trade_row_id"])) if decoded else None
+    next_cursor = (
+        service._cursor(
+            table="cfd_trades",
+            filters=filters,
+            order=order,
+            op="after",
+            ts=str(last["detected_at"]),
+            row_id=int(last["cfd_trade_row_id"]),
+        )
+        if has_more or (decoded and decoded.get("op") == "before")
+        else None
+    )
+    prev_cursor = (
+        service._cursor(
+            table="cfd_trades",
+            filters=filters,
+            order=order,
+            op="before",
+            ts=str(first["detected_at"]),
+            row_id=int(first["cfd_trade_row_id"]),
+        )
+        if decoded
+        else None
+    )
     return next_cursor, prev_cursor
 
 
 def _snapshot_context(status: dict[str, Any], session: Mapping[str, Any]) -> None:
-    session_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
-    ctrader = session_config.get("ctrader") if isinstance(session_config.get("ctrader"), Mapping) else {}
-    execution = session_config.get("execution") if isinstance(session_config.get("execution"), Mapping) else {}
-    status.update({
-        "provider_environment": ctrader.get("environment") or session.get("mode"),
-        "provider_account_id": ctrader.get("account_id") or None,
-        "provider_symbol": ctrader.get("symbol") or session.get("instrument"),
-        "execution_environment": execution.get("environment") or None,
-        "execution_destination": execution.get("endpoint") or None,
-        "permissions": {"scopes": ctrader.get("required_scopes", []), "account_selected": ctrader.get("account_selected", False), "executor_enabled": execution.get("enabled", False)},
-    })
+    session_config = _as_mapping(session.get("config"))
+    ctrader = _as_mapping(session_config.get("ctrader"))
+    execution = _as_mapping(session_config.get("execution"))
+    status.update(
+        {
+            "provider_environment": ctrader.get("environment") or session.get("mode"),
+            "provider_account_id": ctrader.get("account_id") or None,
+            "provider_symbol": ctrader.get("symbol") or session.get("instrument"),
+            "execution_environment": execution.get("environment") or None,
+            "execution_destination": execution.get("endpoint") or None,
+            "permissions": {
+                "scopes": ctrader.get("required_scopes", []),
+                "account_selected": ctrader.get("account_selected", False),
+                "executor_enabled": execution.get("enabled", False),
+            },
+        }
+    )
     if str(status.get("mode", "")).upper() in {"SYNTHETIC", "REPLAY"}:
         status.setdefault("connection", "OFFLINE")
         status.setdefault("analysis_enabled", False)
@@ -209,12 +283,20 @@ def _snapshot_coverage(store: SQLiteStore, session_id: str) -> dict[str, dict[st
         (session_id,),
     )
     for row in rows:
-        coverage[str(row[0])] = {"start_ts": row[1], "end_ts": row[2], "open_count": int(row[3] or 0), "count": int(row[4] or 0)}
+        coverage[str(row[0])] = {
+            "start_ts": row[1],
+            "end_ts": row[2],
+            "open_count": int(row[3] or 0),
+            "count": int(row[4] or 0),
+        }
     return coverage
 
 
 def _snapshot_cfd_lifecycle(store: SQLiteStore, session_id: str) -> dict[str, Any]:
-    empty = {"cfd_lifecycle": {"pending_or_filled": 0, "closed": 0, "terminal_unknown_or_rejected": 0}, "pending_cfd_trades": 0}
+    empty = {
+        "cfd_lifecycle": {"pending_or_filled": 0, "closed": 0, "terminal_unknown_or_rejected": 0},
+        "pending_cfd_trades": 0,
+    }
     if not store._table_exists("cfd_trades"):
         return empty
     counts = store.conn.execute(
@@ -222,7 +304,14 @@ def _snapshot_cfd_lifecycle(store: SQLiteStore, session_id: str) -> dict[str, An
         (session_id,),
     ).fetchone()
     pending = int(counts[0] or 0)
-    return {"cfd_lifecycle": {"pending_or_filled": pending, "closed": int(counts[1] or 0), "terminal_unknown_or_rejected": int(counts[2] or 0)}, "pending_cfd_trades": pending}
+    return {
+        "cfd_lifecycle": {
+            "pending_or_filled": pending,
+            "closed": int(counts[1] or 0),
+            "terminal_unknown_or_rejected": int(counts[2] or 0),
+        },
+        "pending_cfd_trades": pending,
+    }
 
 
 def _apply_checkpoint_projection(store: SQLiteStore, status: dict[str, Any], session_id: str) -> None:
@@ -230,14 +319,37 @@ def _apply_checkpoint_projection(store: SQLiteStore, status: dict[str, Any], ses
         checkpoint = store.get_checkpoint(session_id, name)
         if not checkpoint:
             continue
-        state = checkpoint.get("state") if isinstance(checkpoint.get("state"), Mapping) else {}
-        runtime_status = state.get("status") if isinstance(state.get("status"), Mapping) else {}
-        processor = state.get("processor") if isinstance(state.get("processor"), Mapping) else {}
+        state = _as_mapping(checkpoint.get("state"))
+        runtime_status = _as_mapping(state.get("status"))
+        processor = _as_mapping(state.get("processor"))
         if runtime_status:
-            status.update({key: runtime_status[key] for key in ("connection", "analysis_enabled", "analysis_blocked_reasons", "pending_simulations", "completed_simulations") if key in runtime_status})
+            status.update(
+                {
+                    key: runtime_status[key]
+                    for key in (
+                        "connection",
+                        "analysis_enabled",
+                        "analysis_blocked_reasons",
+                        "pending_simulations",
+                        "completed_simulations",
+                    )
+                    if key in runtime_status
+                }
+            )
         if processor:
             status["warmup_pending"] = processor.get("warmup_pending", {})
-            status["runtime_processor"] = {key: processor.get(key) for key in ("events_processed", "candles_processed", "signals", "evaluations", "errors", "last_event_time", "last_available_at")}
+            status["runtime_processor"] = {
+                key: processor.get(key)
+                for key in (
+                    "events_processed",
+                    "candles_processed",
+                    "signals",
+                    "evaluations",
+                    "errors",
+                    "last_event_time",
+                    "last_available_at",
+                )
+            }
         break
 
 
@@ -258,14 +370,38 @@ class QueryService:
         payload = canonical_json({"table": table, **dict(filters)})
         return hashlib.sha256(payload.encode()).hexdigest()[:24]
 
-    def _cursor(self, *, table: str, filters: Mapping[str, Any], order: str, op: str, ts: str, row_id: int, condition_ordinal: int | None = None) -> str:
-        raw = {"v": 1, "table": table, "filter_hash": self._filter_hash(table, filters), "order": order, "op": op, "ts": ts, "row_id": int(row_id)}
+    def _cursor(
+        self,
+        *,
+        table: str,
+        filters: Mapping[str, Any],
+        order: str,
+        op: str,
+        ts: str,
+        row_id: int,
+        condition_ordinal: int | None = None,
+    ) -> str:
+        raw = {
+            "v": 1,
+            "table": table,
+            "filter_hash": self._filter_hash(table, filters),
+            "order": order,
+            "op": op,
+            "ts": ts,
+            "row_id": int(row_id),
+        }
         if condition_ordinal is not None:
             raw["condition_ordinal"] = int(condition_ordinal)
-        encoded = base64.urlsafe_b64encode(json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()).decode().rstrip("=")
+        encoded = (
+            base64.urlsafe_b64encode(json.dumps(raw, sort_keys=True, separators=(",", ":")).encode())
+            .decode()
+            .rstrip("=")
+        )
         return encoded
 
-    def _read_cursor(self, cursor: str | None, *, table: str, filters: Mapping[str, Any], order: str) -> dict[str, Any] | None:
+    def _read_cursor(
+        self, cursor: str | None, *, table: str, filters: Mapping[str, Any], order: str
+    ) -> dict[str, Any] | None:
         if not cursor:
             return None
         try:
@@ -273,7 +409,12 @@ class QueryService:
             data = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
         except Exception as exc:
             raise ValueError("cursor inválido") from exc
-        if data.get("v") != 1 or data.get("table") != table or data.get("order") != order or data.get("filter_hash") != self._filter_hash(table, filters):
+        if (
+            data.get("v") != 1
+            or data.get("table") != table
+            or data.get("order") != order
+            or data.get("filter_hash") != self._filter_hash(table, filters)
+        ):
             raise ValueError("cursor no corresponde a la consulta actual")
         if data.get("op") not in {"after", "before"} or not isinstance(data.get("row_id"), int):
             raise ValueError("cursor inválido")
@@ -285,47 +426,147 @@ class QueryService:
     def _row_dict(row: Any) -> dict[str, Any]:
         return dict(row)
 
+    def _decode_candle(self, result: dict[str, Any]) -> dict[str, Any]:
+        result["provenance"] = _decode_json(result.pop("provenance_json", None), {})
+        latest = self.store.conn.execute(
+            "SELECT MAX(revision) FROM candles WHERE session_id=? AND instrument=? AND timeframe=? AND start_ts=?",
+            (result["session_id"], result["instrument"], result["timeframe"], result["start_ts"]),
+        ).fetchone()[0]
+        result["is_latest_revision"] = int(result.get("revision", 0)) == int(latest or 0)
+        provenance = result.get("provenance")
+        indicators: Any = {}
+        if isinstance(provenance, Mapping):
+            for key in ("indicators", "indicator_values", "indicator", "values"):
+                if isinstance(provenance.get(key), Mapping):
+                    indicators = dict(provenance[key])
+                    break
+        result["indicator_values"] = indicators
+        return result
+
+    @staticmethod
+    def _decode_payload(result: dict[str, Any]) -> dict[str, Any]:
+        result["payload"] = _decode_json(result.pop("payload_json", None), {})
+        return result
+
+    @staticmethod
+    def _decode_simulation(result: dict[str, Any]) -> dict[str, Any]:
+        result["assumptions"] = _decode_json(result.pop("assumptions_json", None), {})
+        result["payload"] = _decode_json(result.pop("payload_json", None), {})
+        return result
+
+    @staticmethod
+    def _economic_state(result: Mapping[str, Any]) -> str:
+        if result.get("economic_state"):
+            return str(result["economic_state"]).upper()
+        if result.get("state") in {"PENDING", "FILLED"}:
+            return "NOT_SETTLED"
+        return "DETERMINED" if result.get("net_pnl") is not None else "INDETERMINATE"
+
+    @classmethod
+    def _decode_cfd_trade(cls, result: dict[str, Any]) -> dict[str, Any]:
+        result["lineage"] = _decode_json(result.pop("lineage_json", None), {}) or {}
+        result["payload"] = _decode_json(result.pop("payload_json", None), {}) or {}
+        result["terminal"] = bool(int(result.get("terminal", 0)))
+        result["close_observed"] = bool(int(result.get("close_observed", 0)))
+        result["lifecycle_state"] = result.get("state")
+        # CFD lifecycle and economic knowledge are separate dimensions;
+        # never project them to binary WIN/LOSS/TIE labels.
+        economic_state = cls._economic_state(result)
+        result["economic_state"] = economic_state
+        result["economic_result_state"] = economic_state
+        result["economic_status"] = {
+            "NOT_SETTLED": "NOT_SETTLED",
+            "DETERMINED": "KNOWN",
+            "INDETERMINATE": "UNKNOWN",
+        }.get(economic_state, "UNKNOWN")
+        result["economic_result"] = {
+            "state": economic_state,
+            "net_pnl": result.get("net_pnl"),
+            "gross_pnl_quote": result.get("gross_pnl_quote"),
+            "costs_quote": result.get("costs_quote"),
+            "gross_pnl_account": result.get("gross_pnl_account"),
+            "costs_account": result.get("costs_account"),
+            "reason": result.get("economic_reason"),
+        }
+        return result
+
+    @staticmethod
+    def _decode_capture_envelope(result: dict[str, Any]) -> dict[str, Any]:
+        envelope = _decode_json(result.pop("envelope_json", None), {}) or {}
+        result["payload"] = envelope.get("payload")
+        for field in (
+            "capture_schema",
+            "event_time",
+            "received_at",
+            "available_at",
+            "ingest_sequence",
+            "connection_generation",
+            "source_identity",
+            "message_class",
+            "availability_policy",
+        ):
+            if field in envelope:
+                result[field] = envelope[field]
+        return result
+
     def _decode_row(self, table: str, row: Mapping[str, Any]) -> dict[str, Any]:
         result = dict(row)
         if table == "candles":
-            result["provenance"] = _decode_json(result.pop("provenance_json", None), {})
-            latest = self.store.conn.execute(
-                "SELECT MAX(revision) FROM candles WHERE session_id=? AND instrument=? AND timeframe=? AND start_ts=?",
-                (result["session_id"], result["instrument"], result["timeframe"], result["start_ts"]),
-            ).fetchone()[0]
-            result["is_latest_revision"] = int(result.get("revision", 0)) == int(latest or 0)
-            provenance = result.get("provenance")
-            indicators: Any = {}
-            if isinstance(provenance, Mapping):
-                for key in ("indicators", "indicator_values", "indicator", "values"):
-                    if isinstance(provenance.get(key), Mapping):
-                        indicators = dict(provenance[key]); break
-            result["indicator_values"] = indicators
-        elif table in {"events", "decisions", "signals", "discards"}:
-            result["payload"] = _decode_json(result.pop("payload_json", None), {})
-        elif table == "simulations":
-            result["assumptions"] = _decode_json(result.pop("assumptions_json", None), {})
-            result["payload"] = _decode_json(result.pop("payload_json", None), {})
-        elif table == "cfd_trades":
-            result["lineage"] = _decode_json(result.pop("lineage_json", None), {}) or {}
-            result["payload"] = _decode_json(result.pop("payload_json", None), {}) or {}
-            result["terminal"] = bool(int(result.get("terminal", 0)))
-            result["close_observed"] = bool(int(result.get("close_observed", 0)))
-            result["lifecycle_state"] = result.get("state")
-            # CFD lifecycle and economic knowledge are separate dimensions;
-            # never project them to binary WIN/LOSS/TIE labels.
-            economic_state = str(result.get("economic_state") or ("NOT_SETTLED" if result.get("state") in {"PENDING", "FILLED"} else ("DETERMINED" if result.get("net_pnl") is not None else "INDETERMINATE"))).upper()
-            result["economic_state"] = economic_state
-            result["economic_result_state"] = economic_state
-            result["economic_status"] = {"NOT_SETTLED": "NOT_SETTLED", "DETERMINED": "KNOWN", "INDETERMINATE": "UNKNOWN"}.get(economic_state, "UNKNOWN")
-            result["economic_result"] = {"state": economic_state, "net_pnl": result.get("net_pnl"), "gross_pnl_quote": result.get("gross_pnl_quote"), "costs_quote": result.get("costs_quote"), "gross_pnl_account": result.get("gross_pnl_account"), "costs_account": result.get("costs_account"), "reason": result.get("economic_reason")}
-        elif table == "capture_envelopes":
-            envelope = _decode_json(result.pop("envelope_json", None), {}) or {}
-            result["payload"] = envelope.get("payload")
-            for field in ("capture_schema", "event_time", "received_at", "available_at", "ingest_sequence", "connection_generation", "source_identity", "message_class", "availability_policy"):
-                if field in envelope:
-                    result[field] = envelope[field]
+            return self._decode_candle(result)
+        if table in {"events", "decisions", "signals", "discards"}:
+            return self._decode_payload(result)
+        if table == "simulations":
+            return self._decode_simulation(result)
+        if table == "cfd_trades":
+            return self._decode_cfd_trade(result)
+        if table == "capture_envelopes":
+            return self._decode_capture_envelope(result)
         return result
+
+    @staticmethod
+    def _append_time_filters(
+        clauses: list[str], params: list[Any], time_col: str, start_ts: Any | None, end_ts: Any | None
+    ) -> tuple[str | None, str | None]:
+        start = _parse_time(start_ts)
+        end = _parse_time(end_ts)
+        if start is not None:
+            clauses.append(f"{time_col}>=?")
+            params.append(start)
+        if end is not None:
+            clauses.append(f"{time_col}<?")
+            params.append(end)
+        return start, end
+
+    @staticmethod
+    def _append_dimension_filters(
+        clauses: list[str],
+        params: list[Any],
+        table: str,
+        *,
+        instrument: str | None,
+        timeframe: str | None,
+        closed: bool | None,
+    ) -> None:
+        if instrument is not None and table in {"candles", "signals", "events"}:
+            clauses.append("instrument=?")
+            params.append(str(instrument))
+        if timeframe is not None and table == "candles":
+            clauses.append("timeframe=?")
+            params.append(str(timeframe).upper())
+        if closed is not None and table == "candles":
+            clauses.append("closed=?")
+            params.append(int(bool(closed)))
+
+    @staticmethod
+    def _append_revision_filter(clauses: list[str], table: str, revisions: str) -> None:
+        if table != "candles":
+            return
+        if revisions not in {"latest", "all"}:
+            raise ValueError("revisions debe ser latest o all")
+        if revisions == "latest":
+            clauses.append(
+                "revision=(SELECT MAX(c2.revision) FROM candles c2 WHERE c2.session_id=candles.session_id AND c2.instrument=candles.instrument AND c2.timeframe=candles.timeframe AND c2.start_ts=candles.start_ts)"
+            )
 
     def _base_where(
         self,
@@ -346,23 +587,25 @@ class QueryService:
         time_col = _TABLES[table][1]
         clauses = ["session_id=?"]
         params: list[Any] = [session_id]
-        start = _parse_time(start_ts); end = _parse_time(end_ts)
-        if start is not None:
-            clauses.append(f"{time_col}>=?"); params.append(start)
-        if end is not None:
-            clauses.append(f"{time_col}<?"); params.append(end)
-        if instrument is not None and table in {"candles", "signals", "events"}:
-            clauses.append("instrument=?"); params.append(str(instrument))
-        if timeframe is not None and table == "candles":
-            clauses.append("timeframe=?"); params.append(str(timeframe).upper())
-        if closed is not None and table == "candles":
-            clauses.append("closed=?"); params.append(int(bool(closed)))
-        if table == "candles":
-            if revisions not in {"latest", "all"}:
-                raise ValueError("revisions debe ser latest o all")
-            if revisions == "latest":
-                clauses.append("revision=(SELECT MAX(c2.revision) FROM candles c2 WHERE c2.session_id=candles.session_id AND c2.instrument=candles.instrument AND c2.timeframe=candles.timeframe AND c2.start_ts=candles.start_ts)")
-        filters = {"session_id": session_id, "start_ts": start, "end_ts": end, "instrument": instrument, "timeframe": timeframe, "closed": closed, "revisions": revisions}
+        start, end = self._append_time_filters(clauses, params, time_col, start_ts, end_ts)
+        self._append_dimension_filters(
+            clauses,
+            params,
+            table,
+            instrument=instrument,
+            timeframe=timeframe,
+            closed=closed,
+        )
+        self._append_revision_filter(clauses, table, revisions)
+        filters = {
+            "session_id": session_id,
+            "start_ts": start,
+            "end_ts": end,
+            "instrument": instrument,
+            "timeframe": timeframe,
+            "closed": closed,
+            "revisions": revisions,
+        }
         return " AND ".join(clauses), params, filters
 
     def _page_table(
@@ -382,7 +625,16 @@ class QueryService:
         revision_only: bool = False,
     ) -> QueryPage:
         limit = min(self.max_limit, max(1, int(limit)))
-        where, params, filters = self._base_where(table, session_id, start_ts=start_ts, end_ts=end_ts, instrument=instrument, timeframe=timeframe, closed=closed, revisions=revisions)
+        where, params, filters = self._base_where(
+            table,
+            session_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            instrument=instrument,
+            timeframe=timeframe,
+            closed=closed,
+            revisions=revisions,
+        )
         if revision_only:
             if table != "candles":
                 raise ValueError("revision_only sólo aplica a candles")
@@ -396,30 +648,65 @@ class QueryService:
         if decoded:
             op = decoded["op"]
             ts, row_id = decoded["ts"], int(decoded["row_id"])
-            if (order == "asc" and op == "after") or (order == "desc" and op == "before"):
-                operator = ">"
-            else:
-                operator = "<"
+            operator = _cursor_operator(order, op)
             where += f" AND ({time_col} {operator} ? OR ({time_col}=? AND {row_col} {operator} ?))"
             query_params.extend([ts, ts, row_id])
             if op == "before":
                 reverse_page = True
         sql_order = "DESC" if ((order == "desc") != reverse_page) else "ASC"
-        rows = self.store.conn.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY {time_col} {sql_order}, {row_col} {sql_order} LIMIT ?", (*query_params, limit + 1)).fetchall()
+        rows = self.store.conn.execute(
+            f"SELECT * FROM {table} WHERE {where} ORDER BY {time_col} {sql_order}, {row_col} {sql_order} LIMIT ?",
+            (*query_params, limit + 1),
+        ).fetchall()
         has_more = len(rows) > limit
         rows = rows[:limit]
         if reverse_page:
             rows.reverse()
         items = [self._decode_row(table, self._row_dict(row)) for row in rows]
-        base_where, _base_params, _ = self._base_where(table, session_id, start_ts=start_ts, end_ts=end_ts, instrument=instrument, timeframe=timeframe, closed=closed, revisions=revisions)
+        base_where, _base_params, _ = self._base_where(
+            table,
+            session_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            instrument=instrument,
+            timeframe=timeframe,
+            closed=closed,
+            revisions=revisions,
+        )
         if revision_only:
             base_where += " AND revision>0"
-        total = int(self.store.conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {base_where}", tuple(params[:len(_base_params)])).fetchone()[0])
+        total = int(
+            self.store.conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE {base_where}", tuple(params[: len(_base_params)])
+            ).fetchone()[0]
+        )
         next_cursor = prev_cursor = None
         if items:
             first, last = items[0], items[-1]
-            next_cursor = self._cursor(table=table, filters=filters, order=order, op="after", ts=str(last[time_col]), row_id=int(last[row_col])) if has_more or not decoded or decoded.get("op") == "before" else None
-            prev_cursor = self._cursor(table=table, filters=filters, order=order, op="before", ts=str(first[time_col]), row_id=int(first[row_col])) if decoded or (has_more and len(items) == limit) else None
+            next_cursor = (
+                self._cursor(
+                    table=table,
+                    filters=filters,
+                    order=order,
+                    op="after",
+                    ts=str(last[time_col]),
+                    row_id=int(last[row_col]),
+                )
+                if has_more or not decoded or decoded.get("op") == "before"
+                else None
+            )
+            prev_cursor = (
+                self._cursor(
+                    table=table,
+                    filters=filters,
+                    order=order,
+                    op="before",
+                    ts=str(first[time_col]),
+                    row_id=int(first[row_col]),
+                )
+                if decoded or (has_more and len(items) == limit)
+                else None
+            )
         return QueryPage(items, limit, order, total, next_cursor, prev_cursor, has_more)
 
     def query_events(self, session_id: str, **kwargs: Any) -> QueryPage:
@@ -437,24 +724,173 @@ class QueryService:
     def query_discards(self, session_id: str, **kwargs: Any) -> QueryPage:
         return self._page_table("discards", session_id, **kwargs)
 
-    def _simulation_dimensions(self, row: Mapping[str, Any], session: Mapping[str, Any], signal_instruments: Mapping[str, str]) -> dict[str, str]:
-        payload = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
-        if isinstance(payload, Mapping) and not any(key in payload for key in ("analysis", "analysis_name", "variant", "variant_name", "instrument", "partition", "contract")) and isinstance(payload.get("payload"), Mapping):
+    def _simulation_dimensions(
+        self, row: Mapping[str, Any], session: Mapping[str, Any], signal_instruments: Mapping[str, str]
+    ) -> dict[str, str]:
+        payload = _as_mapping(row.get("payload"))
+        if (
+            isinstance(payload, Mapping)
+            and not any(
+                key in payload
+                for key in (
+                    "analysis",
+                    "analysis_name",
+                    "variant",
+                    "variant_name",
+                    "instrument",
+                    "partition",
+                    "contract",
+                )
+            )
+            and isinstance(payload.get("payload"), Mapping)
+        ):
             payload = payload["payload"]
-        assumptions = row.get("assumptions") if isinstance(row.get("assumptions"), Mapping) else {}
-        session_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
-        metadata = session.get("metadata") if isinstance(session.get("metadata"), Mapping) else {}
-        virtual = assumptions.get("virtual_contract") if isinstance(assumptions.get("virtual_contract"), Mapping) else {}
-        variant = payload.get("variant") or payload.get("variant_name") or row.get("variant") or str(row.get("simulation_id", "UNKNOWN")).split(":", 1)[0]
-        analysis = payload.get("analysis") or payload.get("analysis_name") or payload.get("strategy") or session_config.get("strategy") or "UNKNOWN"
-        instrument = payload.get("instrument") or signal_instruments.get(str(row.get("signal_id")), session.get("instrument", "UNKNOWN"))
+        assumptions = _as_mapping(row.get("assumptions"))
+        session_config = _as_mapping(session.get("config"))
+        metadata = _as_mapping(session.get("metadata"))
+        virtual = _as_mapping(assumptions.get("virtual_contract"))
+        variant = (
+            payload.get("variant")
+            or payload.get("variant_name")
+            or row.get("variant")
+            or str(row.get("simulation_id", "UNKNOWN")).split(":", 1)[0]
+        )
+        analysis = (
+            payload.get("analysis")
+            or payload.get("analysis_name")
+            or payload.get("strategy")
+            or session_config.get("strategy")
+            or "UNKNOWN"
+        )
+        instrument = payload.get("instrument") or signal_instruments.get(
+            str(row.get("signal_id")), session.get("instrument", "UNKNOWN")
+        )
         partition = payload.get("partition") or assumptions.get("partition") or metadata.get("partition") or "UNKNOWN"
-        contract = payload.get("contract") or assumptions.get("contract") or ("VIRTUAL_CONTRACT" if str(row.get("simulation_type", "")).upper() == "VIRTUAL_CONTRACT" else row.get("simulation_type", "UNKNOWN"))
+        contract = (
+            payload.get("contract")
+            or assumptions.get("contract")
+            or (
+                "VIRTUAL_CONTRACT"
+                if str(row.get("simulation_type", "")).upper() == "VIRTUAL_CONTRACT"
+                else row.get("simulation_type", "UNKNOWN")
+            )
+        )
         if isinstance(contract, Mapping):
             contract = contract.get("name") or contract.get("type") or "VIRTUAL_CONTRACT"
-        return {"analysis": str(analysis), "variant": str(variant), "instrument": str(instrument), "horizon_seconds": str(row.get("horizon_seconds", "UNKNOWN")), "partition": str(partition), "contract": str(contract), "contract_stake": str(virtual.get("stake", row.get("stake", ""))), "contract_payout_net": str(virtual.get("payout_net", ""))}
+        return {
+            "analysis": str(analysis),
+            "variant": str(variant),
+            "instrument": str(instrument),
+            "horizon_seconds": str(row.get("horizon_seconds", "UNKNOWN")),
+            "partition": str(partition),
+            "contract": str(contract),
+            "contract_stake": str(virtual.get("stake", row.get("stake", ""))),
+            "contract_payout_net": str(virtual.get("payout_net", "")),
+        }
 
-    def query_simulations(self, session_id: str, *, analysis: str | None = None, variant: str | None = None, partition: str | None = None, contract: str | None = None, horizon_seconds: float | None = None, instrument: str | None = None, **kwargs: Any) -> QueryPage:
+    def _simulation_options(self, kwargs: dict[str, Any]) -> _SimulationQueryOptions:
+        start_ts = kwargs.pop("start_ts", None)
+        end_ts = kwargs.pop("end_ts", None)
+        limit = min(self.max_limit, max(1, int(kwargs.pop("limit", 100))))
+        recent = bool(kwargs.pop("recent", False))
+        cursor = kwargs.pop("cursor", None)
+        revisions = kwargs.pop("revisions", "latest")
+        if kwargs:
+            raise TypeError(f"unknown simulation query options: {sorted(kwargs)}")
+        return _SimulationQueryOptions(start_ts, end_ts, limit, recent, cursor, revisions)
+
+    def _simulation_where(
+        self,
+        session_id: str,
+        *,
+        analysis: str | None,
+        variant: str | None,
+        partition: str | None,
+        contract: str | None,
+        horizon_seconds: float | None,
+        instrument: str | None,
+        start_ts: Any | None,
+        end_ts: Any | None,
+        revisions: str,
+    ) -> tuple[str, list[Any], dict[str, Any]]:
+        where, params, filters = self._base_where(
+            "simulations",
+            session_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            instrument=None,
+            timeframe=None,
+            revisions=revisions,
+        )
+        filters.update(
+            {
+                "analysis": analysis,
+                "variant": variant,
+                "partition": partition,
+                "contract": contract,
+                "instrument_dimension": instrument,
+                "horizon_seconds": None,
+            }
+        )
+        if horizon_seconds is not None:
+            normalized_horizon = float(horizon_seconds)
+            where += " AND horizon_seconds=?"
+            params.append(normalized_horizon)
+            filters["horizon_seconds"] = normalized_horizon
+        return where, params, filters
+
+    def _match_simulation(
+        self,
+        raw: Any,
+        *,
+        session: Mapping[str, Any],
+        signal_instruments: Mapping[str, str],
+        wanted: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        item = self._decode_row("simulations", self._row_dict(raw))
+        dimensions = self._simulation_dimensions(item, session, signal_instruments)
+        item["dimensions"] = dimensions
+        if any(value is not None and dimensions[key] != str(value) for key, value in wanted.items()):
+            return None
+        return item
+
+    def _scan_simulations(
+        self,
+        rows: Any,
+        *,
+        session: Mapping[str, Any],
+        signal_instruments: Mapping[str, str],
+        wanted: Mapping[str, Any],
+        max_items: int | None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        matched: list[dict[str, Any]] = []
+        total = 0
+        for raw in rows:
+            item = self._match_simulation(
+                raw,
+                session=session,
+                signal_instruments=signal_instruments,
+                wanted=wanted,
+            )
+            if item is None:
+                continue
+            total += 1
+            if max_items is None or len(matched) < max_items:
+                matched.append(item)
+        return matched, total
+
+    def query_simulations(
+        self,
+        session_id: str,
+        *,
+        analysis: str | None = None,
+        variant: str | None = None,
+        partition: str | None = None,
+        contract: str | None = None,
+        horizon_seconds: float | None = None,
+        instrument: str | None = None,
+        **kwargs: Any,
+    ) -> QueryPage:
         """Query simulations with report dimensions extracted from payloads.
 
         Dimension extraction is intentionally read-only and uses bounded page
@@ -464,60 +900,96 @@ class QueryService:
         # The SQLite schema stores the numeric horizon directly, so retain a
         # SQL filter before the payload dimension scan.
         table = "simulations"
-        start_ts = kwargs.pop("start_ts", None); end_ts = kwargs.pop("end_ts", None)
-        limit = min(self.max_limit, max(1, int(kwargs.pop("limit", 100))))
-        recent = bool(kwargs.pop("recent", False)); cursor = kwargs.pop("cursor", None)
-        revisions = kwargs.pop("revisions", "latest")
-        if kwargs:
-            raise TypeError(f"unknown simulation query options: {sorted(kwargs)}")
-        where, params, filters = self._base_where(table, session_id, start_ts=start_ts, end_ts=end_ts, instrument=None, timeframe=None, revisions=revisions)
-        filters.update({"analysis": analysis, "variant": variant, "partition": partition, "contract": contract, "instrument_dimension": instrument})
-        if horizon_seconds is not None:
-            where += " AND horizon_seconds=?"; params.append(float(horizon_seconds)); filters["horizon_seconds"] = float(horizon_seconds)
-        else:
-            filters["horizon_seconds"] = None
+        options = self._simulation_options(kwargs)
+        where, params, filters = self._simulation_where(
+            session_id,
+            analysis=analysis,
+            variant=variant,
+            partition=partition,
+            contract=contract,
+            horizon_seconds=horizon_seconds,
+            instrument=instrument,
+            start_ts=options.start_ts,
+            end_ts=options.end_ts,
+            revisions=options.revisions,
+        )
         base_where = where
         base_params = tuple(params)
-        order = "desc" if recent else "asc"
-        decoded = self._read_cursor(cursor, table=table, filters=filters, order=order)
+        order = "desc" if options.recent else "asc"
+        decoded = self._read_cursor(options.cursor, table=table, filters=filters, order=order)
         time_col, row_col = _TABLES[table][1], _TABLES[table][2]
         query_params = list(params)
         if decoded:
-            op = decoded["op"]; operator = ">" if ((order == "asc" and op == "after") or (order == "desc" and op == "before")) else "<"
-            where += f" AND ({time_col}{operator}? OR ({time_col}=? AND {row_col}{operator}?))"; query_params.extend([decoded["ts"], decoded["ts"], decoded["row_id"]])
+            operator = _cursor_operator(order, str(decoded["op"]))
+            where += f" AND ({time_col}{operator}? OR ({time_col}=? AND {row_col}{operator}?))"
+            query_params.extend([decoded["ts"], decoded["ts"], decoded["row_id"]])
         sql_order = "DESC" if order == "desc" else "ASC"
-        # Scan in chunks to avoid loading an unbounded history into memory.
-        rows = self.store.conn.execute(f"SELECT * FROM {table} WHERE {where} ORDER BY {time_col} {sql_order}, {row_col} {sql_order}", tuple(query_params))
+        rows = self.store.conn.execute(
+            f"SELECT * FROM {table} WHERE {where} ORDER BY {time_col} {sql_order}, {row_col} {sql_order}",
+            tuple(query_params),
+        )
         session = self.store.get_session(session_id) or {}
         signal_rows = self.store.list_signals(session_id)
         signal_instruments = {str(x.get("signal_id")): str(x.get("instrument", "UNKNOWN")) for x in signal_rows}
-        matched: list[dict[str, Any]] = []; total_after_cursor = 0
-        wanted = {"analysis": analysis, "variant": variant, "partition": partition, "contract": contract, "instrument": instrument}
-        def matches(raw: Any) -> dict[str, Any] | None:
-            item = self._decode_row(table, self._row_dict(raw)); dimensions = self._simulation_dimensions(item, session, signal_instruments); item["dimensions"] = dimensions
-            if any(value is not None and dimensions[key] != str(value) for key, value in wanted.items()): return None
-            return item
-        for raw in rows:
-            item = matches(raw)
-            if item is None: continue
-            total_after_cursor += 1
-            if len(matched) < limit + 1: matched.append(item)
-        has_more = len(matched) > limit; matched = matched[:limit]
+        wanted = {
+            "analysis": analysis,
+            "variant": variant,
+            "partition": partition,
+            "contract": contract,
+            "instrument": instrument,
+        }
+        matched, total_after_cursor = self._scan_simulations(
+            rows,
+            session=session,
+            signal_instruments=signal_instruments,
+            wanted=wanted,
+            max_items=options.limit + 1,
+        )
+        has_more = len(matched) > options.limit
+        matched = matched[: options.limit]
         # ``total`` is the count for the complete filtered query, not the
-        # remaining suffix after a cursor.  This is a second bounded streaming
-        # scan only when a cursor is supplied; it keeps pagination metadata
-        # honest without loading history into a list.
+        # remaining suffix after a cursor.  This second streaming scan runs
+        # only when a cursor is supplied.
         total = total_after_cursor
         if decoded:
-            base_rows = self.store.conn.execute(f"SELECT * FROM {table} WHERE {base_where} ORDER BY {time_col} {sql_order}, {row_col} {sql_order}", base_params)
-            total = 0
-            for raw in base_rows:
-                if matches(raw) is not None: total += 1
+            base_rows = self.store.conn.execute(
+                f"SELECT * FROM {table} WHERE {base_where} ORDER BY {time_col} {sql_order}, {row_col} {sql_order}",
+                base_params,
+            )
+            _unused, total = self._scan_simulations(
+                base_rows,
+                session=session,
+                signal_instruments=signal_instruments,
+                wanted=wanted,
+                max_items=0,
+            )
         next_cursor = prev_cursor = None
         if matched:
-            next_cursor = self._cursor(table=table, filters=filters, order=order, op="after", ts=str(matched[-1][time_col]), row_id=int(matched[-1][row_col])) if has_more else None
-            prev_cursor = self._cursor(table=table, filters=filters, order=order, op="before", ts=str(matched[0][time_col]), row_id=int(matched[0][row_col])) if decoded else None
-        return QueryPage(matched, limit, order, total, next_cursor, prev_cursor, has_more)
+            next_cursor = (
+                self._cursor(
+                    table=table,
+                    filters=filters,
+                    order=order,
+                    op="after",
+                    ts=str(matched[-1][time_col]),
+                    row_id=int(matched[-1][row_col]),
+                )
+                if has_more
+                else None
+            )
+            prev_cursor = (
+                self._cursor(
+                    table=table,
+                    filters=filters,
+                    order=order,
+                    op="before",
+                    ts=str(matched[0][time_col]),
+                    row_id=int(matched[0][row_col]),
+                )
+                if decoded
+                else None
+            )
+        return QueryPage(matched, options.limit, order, total, next_cursor, prev_cursor, has_more)
 
     def query_cfd_trades(
         self,
@@ -545,10 +1017,21 @@ class QueryService:
 
         bounded = min(self.max_limit, max(1, int(limit)))
         analysis_id = _resolve_query_alias(analysis_id, analysis, "analysis")
-        state = _resolve_query_state(state, lifecycle_state)
+        resolved_state = _resolve_query_state(state, lifecycle_state)
         clauses, params, filters = _cfd_query_where(
-            session_id, analysis_id, trade_id, signal_id, state, instrument, product,
-            variant, partition, horizon_seconds, terminal, start_ts, end_ts,
+            session_id,
+            analysis_id,
+            trade_id,
+            signal_id,
+            resolved_state,
+            instrument,
+            product,
+            variant,
+            partition,
+            horizon_seconds,
+            terminal,
+            start_ts,
+            end_ts,
         )
         if not self.store._table_exists("cfd_trades"):
             return QueryPage([], bounded, "desc" if recent else "asc", 0)
@@ -565,7 +1048,11 @@ class QueryService:
         items = [self._decode_row("cfd_trades", dict(row)) for row in rows[:bounded]]
         if reverse_page:
             items.reverse()
-        total = int(self.store.conn.execute(f"SELECT COUNT(*) FROM cfd_trades WHERE {' AND '.join(clauses)}", tuple(params)).fetchone()[0])
+        total = int(
+            self.store.conn.execute(
+                f"SELECT COUNT(*) FROM cfd_trades WHERE {' AND '.join(clauses)}", tuple(params)
+            ).fetchone()[0]
+        )
         next_cursor, prev_cursor = _query_cfd_cursor_pair(self, items, filters, order, decoded, has_more)
         return QueryPage(items, bounded, order, total, next_cursor, prev_cursor, has_more)
 
@@ -591,18 +1078,20 @@ class QueryService:
                 raise ValueError("use cursor o after_cursor, no ambos")
             after_cursor = cursor
         bounded = min(self.max_limit, max(1, int(limit)))
-        rows = list(self.store.iter_capture_envelopes(
-            session_id,
-            after_cursor=after_cursor,
-            after_sequence=after_sequence,
-            start_ts=start_ts,
-            end_ts=end_ts,
-            available_start=available_start,
-            available_end=available_end,
-            connection_generation=connection_generation,
-            message_class=message_class,
-            limit=bounded + 1,
-        ))
+        rows = list(
+            self.store.iter_capture_envelopes(
+                session_id,
+                after_cursor=after_cursor,
+                after_sequence=after_sequence,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                available_start=available_start,
+                available_end=available_end,
+                connection_generation=connection_generation,
+                message_class=message_class,
+                limit=bounded + 1,
+            )
+        )
         has_more = len(rows) > bounded
         rows = rows[:bounded]
         next_cursor = rows[-1].get("cursor_token") if has_more and rows else None
@@ -616,53 +1105,157 @@ class QueryService:
     def query_indicators(self, session_id: str, **kwargs: Any) -> QueryPage:
         return self.query_candles(session_id, **kwargs)
 
-    def query_gaps(self, session_id: str, *, timeframe: str | None = None, instrument: str | None = None, start_ts: Any | None = None, end_ts: Any | None = None, revisions: str = "latest", include_open: bool = True) -> list[dict[str, Any]]:
+    def query_gaps(
+        self,
+        session_id: str,
+        *,
+        timeframe: str | None = None,
+        instrument: str | None = None,
+        start_ts: Any | None = None,
+        end_ts: Any | None = None,
+        revisions: str = "latest",
+        include_open: bool = True,
+    ) -> list[dict[str, Any]]:
         """Return observed missing intervals; never inserts a synthetic bar."""
-        where, params, _ = self._base_where("candles", session_id, timeframe=timeframe, instrument=instrument, start_ts=start_ts, end_ts=end_ts, revisions=revisions, closed=None if include_open else True)
-        raw_rows = self.store.conn.execute(f"SELECT * FROM candles WHERE {where} ORDER BY timeframe ASC, start_ts ASC, candle_row_id ASC", tuple(params)).fetchall()
+        where, params, _ = self._base_where(
+            "candles",
+            session_id,
+            timeframe=timeframe,
+            instrument=instrument,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            revisions=revisions,
+            closed=None if include_open else True,
+        )
+        raw_rows = self.store.conn.execute(
+            f"SELECT * FROM candles WHERE {where} ORDER BY timeframe ASC, start_ts ASC, candle_row_id ASC",
+            tuple(params),
+        ).fetchall()
         candles = [self._decode_row("candles", self._row_dict(row)) for row in raw_rows]
         gaps: list[dict[str, Any]] = []
-        for previous, current in zip(candles, candles[1:]):
-            if previous.get("timeframe") != current.get("timeframe") or previous.get("instrument") != current.get("instrument"): continue
-            prev_end = datetime.fromisoformat(str(previous["end_ts"]).replace("Z", "+00:00")); next_start = datetime.fromisoformat(str(current["start_ts"]).replace("Z", "+00:00"))
+        for previous, current in zip(candles, candles[1:], strict=False):
+            if previous.get("timeframe") != current.get("timeframe") or previous.get("instrument") != current.get(
+                "instrument"
+            ):
+                continue
+            prev_end = datetime.fromisoformat(str(previous["end_ts"]).replace("Z", "+00:00"))
+            next_start = datetime.fromisoformat(str(current["start_ts"]).replace("Z", "+00:00"))
             if next_start > prev_end:
-                gaps.append({"session_id": session_id, "instrument": current.get("instrument"), "timeframe": current.get("timeframe"), "gap_start": previous.get("end_ts"), "gap_end": current.get("start_ts"), "duration_seconds": (next_start - prev_end).total_seconds(), "previous_candle_id": previous.get("candle_id"), "next_candle_id": current.get("candle_id"), "quality": "GAP_OBSERVED", "filled": False})
+                gaps.append(
+                    {
+                        "session_id": session_id,
+                        "instrument": current.get("instrument"),
+                        "timeframe": current.get("timeframe"),
+                        "gap_start": previous.get("end_ts"),
+                        "gap_end": current.get("start_ts"),
+                        "duration_seconds": (next_start - prev_end).total_seconds(),
+                        "previous_candle_id": previous.get("candle_id"),
+                        "next_candle_id": current.get("candle_id"),
+                        "quality": "GAP_OBSERVED",
+                        "filled": False,
+                    }
+                )
         return gaps
 
-    def query_conditions(self, session_id: str, *, start_ts: Any | None = None, end_ts: Any | None = None, recent: bool = False, limit: int = 100, cursor: str | None = None) -> QueryPage:
+    def query_conditions(
+        self,
+        session_id: str,
+        *,
+        start_ts: Any | None = None,
+        end_ts: Any | None = None,
+        recent: bool = False,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> QueryPage:
         """Flatten persisted decision conditions with decision/ordinal tie-breaks."""
         # Decisions are already bounded by the query; the condition rows are a
         # transparent projection of their payload and retain the parent ID.
         where, params, _filters = self._base_where("decisions", session_id, start_ts=start_ts, end_ts=end_ts)
-        raw_rows = self.store.conn.execute(f"SELECT * FROM decisions WHERE {where} ORDER BY observed_ts ASC, decision_row_id ASC", tuple(params)).fetchall()
+        raw_rows = self.store.conn.execute(
+            f"SELECT * FROM decisions WHERE {where} ORDER BY observed_ts ASC, decision_row_id ASC", tuple(params)
+        ).fetchall()
         items: list[dict[str, Any]] = []
         for raw in raw_rows:
-            decision = self._decode_row("decisions", self._row_dict(raw)); payload = decision.get("payload") or {}
+            decision = self._decode_row("decisions", self._row_dict(raw))
+            payload = decision.get("payload") or {}
             # SQLite stores the complete decision record in payload_json.  A
             # caller may itself have put the core decision payload under a
             # nested ``payload`` key; unwrap that transparently while keeping
             # the parent decision id/timestamp as the audit tie-break.
-            if isinstance(payload, Mapping) and not payload.get("conditions") and isinstance(payload.get("payload"), Mapping):
+            if (
+                isinstance(payload, Mapping)
+                and not payload.get("conditions")
+                and isinstance(payload.get("payload"), Mapping)
+            ):
                 payload = payload["payload"]
             conditions = payload.get("conditions", []) if isinstance(payload, Mapping) else []
-            if not conditions and isinstance(payload, Mapping): conditions = payload.get("condition_results", []) or []
+            if not conditions and isinstance(payload, Mapping):
+                conditions = payload.get("condition_results", []) or []
             for ordinal, condition in enumerate(conditions):
-                if not isinstance(condition, Mapping): continue
-                items.append({"decision_row_id": decision.get("decision_row_id"), "decision_id": decision.get("decision_id"), "observed_ts": decision.get("observed_ts"), "decision": decision.get("status"), "condition_ordinal": ordinal, "name": condition.get("name"), "state": condition.get("state", condition.get("status")), "observed": condition.get("observed"), "expected": condition.get("expected"), "reason": condition.get("reason"), "mandatory": condition.get("mandatory", True), "mode": payload.get("mode") if isinstance(payload, Mapping) else None})
-        items.sort(key=lambda row: (row["observed_ts"], int(row["decision_row_id"]), int(row["condition_ordinal"])), reverse=bool(recent))
+                if not isinstance(condition, Mapping):
+                    continue
+                items.append(
+                    {
+                        "decision_row_id": decision.get("decision_row_id"),
+                        "decision_id": decision.get("decision_id"),
+                        "observed_ts": decision.get("observed_ts"),
+                        "decision": decision.get("status"),
+                        "condition_ordinal": ordinal,
+                        "name": condition.get("name"),
+                        "state": condition.get("state", condition.get("status")),
+                        "observed": condition.get("observed"),
+                        "expected": condition.get("expected"),
+                        "reason": condition.get("reason"),
+                        "mandatory": condition.get("mandatory", True),
+                        "mode": payload.get("mode") if isinstance(payload, Mapping) else None,
+                    }
+                )
+        items.sort(
+            key=lambda row: (row["observed_ts"], int(row["decision_row_id"]), int(row["condition_ordinal"])),
+            reverse=bool(recent),
+        )
         total_count = len(items)
-        order = "desc" if recent else "asc"; filt = {"session_id": session_id, "start_ts": _parse_time(start_ts), "end_ts": _parse_time(end_ts)}; decoded = self._read_cursor(cursor, table="conditions", filters=filt, order=order) if cursor else None
+        order = "desc" if recent else "asc"
+        filt = {"session_id": session_id, "start_ts": _parse_time(start_ts), "end_ts": _parse_time(end_ts)}
+        decoded = self._read_cursor(cursor, table="conditions", filters=filt, order=order) if cursor else None
         if decoded:
-            key = (decoded["ts"], int(decoded["row_id"]), int(decoded.get("condition_ordinal", 0))); keep_after = []
+            key = (decoded["ts"], int(decoded["row_id"]), int(decoded.get("condition_ordinal", 0)))
+            keep_after = []
             for row in items:
                 row_key = (row["observed_ts"], int(row["decision_row_id"]), int(row["condition_ordinal"]))
                 keep_after.append(row_key < key if recent else row_key > key)
-            items = [row for row, keep in zip(items, keep_after) if keep]
-        limit = min(self.max_limit, max(1, int(limit))); has_more = len(items) > limit; items = items[:limit]
+            items = [row for row, keep in zip(items, keep_after, strict=True) if keep]
+        limit = min(self.max_limit, max(1, int(limit)))
+        has_more = len(items) > limit
+        items = items[:limit]
         next_cursor = prev_cursor = None
         if items:
-            next_cursor = self._cursor(table="conditions", filters=filt, order=order, op="after", ts=str(items[-1]["observed_ts"]), row_id=int(items[-1]["decision_row_id"]), condition_ordinal=int(items[-1]["condition_ordinal"])) if has_more else None
-            prev_cursor = self._cursor(table="conditions", filters=filt, order=order, op="before", ts=str(items[0]["observed_ts"]), row_id=int(items[0]["decision_row_id"]), condition_ordinal=int(items[0]["condition_ordinal"])) if decoded else None
+            next_cursor = (
+                self._cursor(
+                    table="conditions",
+                    filters=filt,
+                    order=order,
+                    op="after",
+                    ts=str(items[-1]["observed_ts"]),
+                    row_id=int(items[-1]["decision_row_id"]),
+                    condition_ordinal=int(items[-1]["condition_ordinal"]),
+                )
+                if has_more
+                else None
+            )
+            prev_cursor = (
+                self._cursor(
+                    table="conditions",
+                    filters=filt,
+                    order=order,
+                    op="before",
+                    ts=str(items[0]["observed_ts"]),
+                    row_id=int(items[0]["decision_row_id"]),
+                    condition_ordinal=int(items[0]["condition_ordinal"]),
+                )
+                if decoded
+                else None
+            )
         return QueryPage(items, limit, order, total_count, next_cursor, prev_cursor, has_more)
 
     def poll(self, session_id: str, *, limit: int = 100) -> dict[str, Any]:
@@ -682,12 +1275,15 @@ class QueryService:
         session = self.store.get_session(session_id) or {}
         _snapshot_context(status, session)
         status["coverage"] = _snapshot_coverage(self.store, session_id)
-        status["revisions_count"] = int(self.store.conn.execute("SELECT COUNT(*) FROM candles WHERE session_id=? AND revision>0", (session_id,)).fetchone()[0])
+        status["revisions_count"] = int(
+            self.store.conn.execute(
+                "SELECT COUNT(*) FROM candles WHERE session_id=? AND revision>0", (session_id,)
+            ).fetchone()[0]
+        )
         status.update(_snapshot_cfd_lifecycle(self.store, session_id))
         status["gaps"] = self.query_gaps(session_id)
         _apply_checkpoint_projection(self.store, status, session_id)
         return status
-
 
 
 __all__ = ["QueryPage", "QueryService"]

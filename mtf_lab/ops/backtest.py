@@ -6,10 +6,10 @@ import dataclasses
 import hashlib
 import json
 import math
-from collections import Counter, defaultdict
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import UTC, datetime, timedelta
-from typing import Any
+from datetime import datetime
+from typing import Any, cast
 
 from .simulation import (
     DirectionalEvaluator,
@@ -29,7 +29,7 @@ def _row(value: Any) -> dict[str, Any]:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     if hasattr(value, "model_dump"):
-        return dict(value.model_dump())
+        return dict(cast(Any, value).model_dump())
     if hasattr(value, "__dict__"):
         return {k: v for k, v in vars(value).items() if not k.startswith("_")}
     raise TypeError(f"expected record-like signal, got {type(value)!r}")
@@ -68,7 +68,13 @@ class VariantSpec:
         return bool(self.signal_filter(_row(signal))) if self.signal_filter else True
 
     def to_dict(self) -> dict[str, Any]:
-        return {"name": self.name, "description": self.description, "config": dict(self.config), "config_hash": self.config_hash, "mode": self.mode}
+        return {
+            "name": self.name,
+            "description": self.description,
+            "config": dict(self.config),
+            "config_hash": self.config_hash,
+            "mode": self.mode,
+        }
 
 
 @dataclasses.dataclass(slots=True)
@@ -94,7 +100,11 @@ class BacktestResult:
 
     @property
     def resolved_count(self) -> int:
-        return self.outcomes.get(Outcome.WIN.value, 0) + self.outcomes.get(Outcome.LOSS.value, 0) + self.outcomes.get(Outcome.TIE.value, 0)
+        return (
+            self.outcomes.get(Outcome.WIN.value, 0)
+            + self.outcomes.get(Outcome.LOSS.value, 0)
+            + self.outcomes.get(Outcome.TIE.value, 0)
+        )
 
     @property
     def pending_count(self) -> int:
@@ -105,7 +115,7 @@ class BacktestResult:
         return self.outcomes.get(Outcome.WIN.value, 0) / self.resolved_count if self.resolved_count else None
 
     def to_dict(self, *, include_simulations: bool = True) -> dict[str, Any]:
-        data = {
+        data: dict[str, Any] = {
             "variant": self.variant,
             "config_hash": self.config_hash,
             "mode": self.mode,
@@ -135,7 +145,24 @@ class BacktestResult:
 def _fingerprint_points(points: Sequence[PricePoint]) -> str:
     h = hashlib.sha256()
     for p in points:
-        h.update(json.dumps({"timestamp": p.timestamp.isoformat(), "available_at": p.available_ts.isoformat(), "price": p.price, "base": p.base_price, "quality": p.quality, "resolution": p.resolution, "closed": p.closed, "source_ordinal": p.source_ordinal, "point_id": p.identity, "instrument": p.instrument}, sort_keys=True, separators=(",", ":")).encode())
+        h.update(
+            json.dumps(
+                {
+                    "timestamp": p.timestamp.isoformat(),
+                    "available_at": p.available_ts.isoformat(),
+                    "price": p.price,
+                    "base": p.base_price,
+                    "quality": p.quality,
+                    "resolution": p.resolution,
+                    "closed": p.closed,
+                    "source_ordinal": p.source_ordinal,
+                    "point_id": p.identity,
+                    "instrument": p.instrument,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        )
         h.update(b"\n")
     return h.hexdigest()
 
@@ -143,6 +170,7 @@ def _fingerprint_points(points: Sequence[PricePoint]) -> str:
 @dataclasses.dataclass(slots=True)
 class PortfolioResult:
     """Cartera virtual opcional, separada de la evaluación independiente."""
+
     mode: str
     max_positions: int
     accepted_count: int
@@ -154,10 +182,14 @@ class PortfolioResult:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "mode": self.mode, "max_positions": self.max_positions,
-            "accepted_count": self.accepted_count, "skipped_overlap": self.skipped_overlap,
-            "balance": self.balance, "max_drawdown": self.max_drawdown,
-            "simulations": [item.to_dict() for item in self.simulations], "notes": list(self.notes),
+            "mode": self.mode,
+            "max_positions": self.max_positions,
+            "accepted_count": self.accepted_count,
+            "skipped_overlap": self.skipped_overlap,
+            "balance": self.balance,
+            "max_drawdown": self.max_drawdown,
+            "simulations": [item.to_dict() for item in self.simulations],
+            "notes": list(self.notes),
         }
 
 
@@ -187,19 +219,53 @@ class BacktestRunner:
         self.simulator = simulator or DirectionalEvaluator(self.spec)
         self.store = store
         self.session_id = session_id
-        self.dependency_window_seconds = float(dependency_window_seconds if dependency_window_seconds is not None else max(self.spec.horizons_seconds))
+        self.dependency_window_seconds = float(
+            dependency_window_seconds if dependency_window_seconds is not None else max(self.spec.horizons_seconds)
+        )
         self.logger = logger
 
-    def _simulate(self, signal: Any, points: Sequence[Any], *, horizon: float, simulation_id: str, data_complete: bool = True, as_of: datetime | None = None) -> SimulationResult:
+    def _simulate(
+        self,
+        signal: Any,
+        points: Sequence[Any],
+        *,
+        horizon: float,
+        simulation_id: str,
+        data_complete: bool = True,
+        as_of: datetime | None = None,
+    ) -> SimulationResult:
         evaluator = getattr(self.simulator, "evaluate_prepared", None)
         if callable(evaluator) and points and isinstance(points[0], PricePoint):
-            return evaluator(signal, points, horizon_seconds=horizon, simulation_id=simulation_id, data_complete=data_complete, as_of=as_of)
-        return self.simulator.evaluate(signal, points, horizon_seconds=horizon, simulation_id=simulation_id, data_complete=data_complete, as_of=as_of)
+            return cast(Callable[..., SimulationResult], evaluator)(
+                signal,
+                points,
+                horizon_seconds=horizon,
+                simulation_id=simulation_id,
+                data_complete=data_complete,
+                as_of=as_of,
+            )
+        return self.simulator.evaluate(
+            signal,
+            points,
+            horizon_seconds=horizon,
+            simulation_id=simulation_id,
+            data_complete=data_complete,
+            as_of=as_of,
+        )
 
-    def _boundary_filter(self, signals: Sequence[Any], boundary: datetime | None, *, partition: str, points: Sequence[PricePoint], max_horizon: float) -> tuple[list[Any], int]:
+    def _boundary_filter(
+        self,
+        signals: Sequence[Any],
+        boundary: datetime | None,
+        *,
+        partition: str,
+        points: Sequence[PricePoint],
+        max_horizon: float,
+    ) -> tuple[list[Any], int]:
         if boundary is None:
             return list(signals), 0
-        selected: list[Any] = []; excluded = 0
+        selected: list[Any] = []
+        excluded = 0
         for signal in signals:
             detected = _signal_ts(signal)
             if partition == "evaluation":
@@ -207,16 +273,176 @@ class BacktestRunner:
             elif partition == "exploration":
                 # Ejecuta el mismo contrato para conocer entrada/vencimiento
                 # efectivos; no filtra sólo con detected+teoría.
-                probe = self._simulate(signal, points, horizon=max_horizon, simulation_id=f"boundary:{detected.isoformat()}", data_complete=True)
+                probe = self._simulate(
+                    signal,
+                    points,
+                    horizon=max_horizon,
+                    simulation_id=f"boundary:{detected.isoformat()}",
+                    data_complete=True,
+                )
                 final_available = parse_ts(probe.final_available_ts) if probe.final_available_ts else None
-                keep = bool(probe.entry_ts and probe.expiry_ts and parse_ts(probe.expiry_ts) <= boundary and (final_available is None or final_available <= boundary))
+                keep = bool(
+                    probe.entry_ts
+                    and probe.expiry_ts
+                    and parse_ts(probe.expiry_ts) <= boundary
+                    and (final_available is None or final_available <= boundary)
+                )
             elif partition == "all":
                 keep = True
             else:
                 raise ValueError("partition must be exploration, evaluation, or all")
-            if keep: selected.append(signal)
-            else: excluded += 1
+            if keep:
+                selected.append(signal)
+            else:
+                excluded += 1
         return selected, excluded
+
+    def _persist_simulation(
+        self,
+        result: SimulationResult,
+        variant: VariantSpec,
+        *,
+        persist: bool,
+        analysis_id: str | None,
+        analysis_name: str | None,
+        analysis_config_hash: str | None,
+        contract_hash: str | None,
+        partition: str,
+    ) -> None:
+        if self.store is None or not self.session_id or not persist:
+            return
+        sim_row = result.to_dict()
+        # Conserva la variante y su hash junto a cada resultado para segmentar
+        # por configuración sin depender sólo del nombre del reporte.
+        sim_row["variant"] = variant.name
+        sim_row["variant_config_hash"] = variant.config_hash
+        sim_row["analysis"] = analysis_name or "backtest"
+        sim_row["partition"] = partition
+        sim_row["contract"] = result.simulation_type
+        self.store.save_simulation(
+            self.session_id,
+            sim_row,
+            analysis_id=analysis_id,
+            variant=variant.name,
+            analysis_config_hash=analysis_config_hash or variant.config_hash,
+            contract_hash=contract_hash,
+            partition=partition,
+        )
+
+    def _run_variant(
+        self,
+        variant: VariantSpec,
+        selected: Sequence[Any],
+        point_rows: Sequence[PricePoint],
+        *,
+        persist: bool,
+        analysis_id: str | None,
+        analysis_name: str | None,
+        analysis_config_hash: str | None,
+        contract_hash: str | None,
+        partition: str,
+    ) -> list[SimulationResult]:
+        simulations: list[SimulationResult] = []
+        analysis_token = str(analysis_id or "adhoc")[:32]
+        for ordinal, signal in enumerate(sorted(selected, key=_signal_ts)):
+            row = _row(signal)
+            base_id = str(row.get("signal_id", row.get("id", f"signal-{ordinal}")))
+            # Each variant gets an isolated simulation identity, allowing the
+            # same source signal to be compared without collisions.
+            for horizon in self.spec.horizons_seconds:
+                result = self._simulate(
+                    row,
+                    point_rows,
+                    horizon=horizon,
+                    simulation_id=f"{analysis_token}:{variant.name}:{base_id}:{horizon:g}",
+                    data_complete=True,
+                )
+                simulations.append(result)
+                self._persist_simulation(
+                    result,
+                    variant,
+                    persist=persist,
+                    analysis_id=analysis_id,
+                    analysis_name=analysis_name,
+                    analysis_config_hash=analysis_config_hash,
+                    contract_hash=contract_hash,
+                    partition=partition,
+                )
+        return simulations
+
+    def _summarize_results(self, results: Sequence[SimulationResult], selected: Sequence[Any]) -> dict[str, Any]:
+        counts = Counter(result.outcome.value for result in results)
+        settled = sorted(
+            (result for result in results if result.net_result is not None), key=lambda item: item.detected_ts
+        )
+        equity = 0.0
+        peak = 0.0
+        drawdown = 0.0
+        for result in settled:
+            equity += float(result.net_result or 0)
+            peak = max(peak, equity)
+            drawdown = max(drawdown, peak - equity)
+        groups: list[datetime] = []
+        for signal in sorted(selected, key=_signal_ts):
+            timestamp = _signal_ts(signal)
+            if not groups or (timestamp - groups[-1]).total_seconds() > self.dependency_window_seconds:
+                groups.append(timestamp)
+        return {
+            "counts": counts,
+            "net": equity,
+            "gross_wins": sum(max(0.0, float(result.net_result or 0)) for result in results),
+            "gross_losses": sum(min(0.0, float(result.net_result or 0)) for result in results),
+            "drawdown": drawdown,
+            "groups": groups,
+            "start": min((_signal_ts(signal) for signal in selected), default=None),
+            "end": max((_signal_ts(signal) for signal in selected), default=None),
+        }
+
+    def _build_variant_result(
+        self,
+        variant: VariantSpec,
+        selected: Sequence[Any],
+        excluded: int,
+        point_rows: Sequence[PricePoint],
+        results: Sequence[SimulationResult],
+        *,
+        discarded_count: int,
+        boundary: datetime | None,
+        partition: str,
+        data_quality: str,
+        resolution: str,
+    ) -> BacktestResult:
+        metrics = self._summarize_results(results, selected)
+        notes = [
+            "Resultados virtuales; no son órdenes ni validación de rentabilidad.",
+            f"datos={_fingerprint_points(point_rows)[:16]} calidad={data_quality} resolución={resolution}",
+            "La muestra bruta puede contener dependencia entre señales cercanas; se informa una agrupación conservadora.",
+        ]
+        if boundary is not None:
+            notes.append(f"partición={partition}; frontera={boundary.isoformat()}; señales excluidas={excluded}")
+        if not point_rows:
+            notes.append("Sin puntos de precio: todos los resultados quedan INDETERMINATE.")
+        counts = metrics["counts"]
+        return BacktestResult(
+            variant=variant.name,
+            config_hash=variant.config_hash,
+            mode="BACKTEST",
+            start_ts=metrics["start"].isoformat().replace("+00:00", "Z") if metrics["start"] else None,
+            end_ts=metrics["end"].isoformat().replace("+00:00", "Z") if metrics["end"] else None,
+            signal_count=len(selected),
+            discarded_count=int(discarded_count) + excluded,
+            coverage_count=len(point_rows),
+            outcomes={key: counts.get(key, 0) for key in ("WIN", "LOSS", "TIE", "INDETERMINATE", "PENDING")},
+            net_result=metrics["net"],
+            gross_wins=metrics["gross_wins"],
+            gross_losses=metrics["gross_losses"],
+            max_drawdown=metrics["drawdown"] if results else None,
+            unresolved_count=counts.get("INDETERMINATE", 0) + counts.get("PENDING", 0),
+            independent_sample_count=len(metrics["groups"]),
+            dependency_window_seconds=self.dependency_window_seconds,
+            simulations=list(results),
+            notes=notes,
+        )
 
     def run(
         self,
@@ -242,78 +468,67 @@ class BacktestRunner:
         all_results: list[BacktestResult] = []
         for variant in variants:
             filtered = [signal for signal in signal_rows if variant.accepts(signal)]
-            selected, excluded = self._boundary_filter(filtered, boundary_dt, partition=partition, points=point_rows, max_horizon=max(self.spec.horizons_seconds))
-            results: list[SimulationResult] = []
-            for ordinal, signal in enumerate(sorted(selected, key=_signal_ts)):
-                row = _row(signal)
-                base_id = str(row.get("signal_id", row.get("id", f"signal-{ordinal}")))
-                # Each variant gets an isolated simulation identity, allowing
-                # the same source signal to be compared without collisions.
-                for horizon in self.spec.horizons_seconds:
-                    # El análisis forma parte de la identidad de la
-                    # simulación: un nuevo contrato/configuración no puede
-                    # colisionar con una liquidación anterior de la misma señal.
-                    analysis_token = str(analysis_id or "adhoc")[:32]
-                    result = self._simulate(row, point_rows, horizon=horizon, simulation_id=f"{analysis_token}:{variant.name}:{base_id}:{horizon:g}", data_complete=True)
-                    results.append(result)
-                    if self.store is not None and self.session_id and persist:
-                        sim_row = result.to_dict()
-                        # Conserva la variante y su hash junto a cada resultado
-                        # para segmentar por configuración sin depender sólo del
-                        # nombre de un archivo de reporte.
-                        sim_row["variant"] = variant.name
-                        sim_row["variant_config_hash"] = variant.config_hash
-                        sim_row["analysis"] = analysis_name or "backtest"
-                        sim_row["partition"] = partition
-                        sim_row["contract"] = result.simulation_type
-                        self.store.save_simulation(self.session_id, sim_row, analysis_id=analysis_id, variant=variant.name, analysis_config_hash=analysis_config_hash or variant.config_hash, contract_hash=contract_hash, partition=partition)
-            counts = Counter(result.outcome.value for result in results)
-            equity = 0.0; peak = 0.0; drawdown = 0.0
-            for result in sorted((r for r in results if r.net_result is not None), key=lambda x: x.detected_ts):
-                equity += float(result.net_result or 0)
-                peak = max(peak, equity)
-                drawdown = max(drawdown, peak - equity)
-            groups: list[datetime] = []
-            for signal in sorted(selected, key=_signal_ts):
-                ts = _signal_ts(signal)
-                if not groups or (ts - groups[-1]).total_seconds() > self.dependency_window_seconds:
-                    groups.append(ts)
-            start = min((_signal_ts(s) for s in selected), default=None)
-            end = max((_signal_ts(s) for s in selected), default=None)
-            notes = [
-                "Resultados virtuales; no son órdenes ni validación de rentabilidad.",
-                f"datos={_fingerprint_points(point_rows)[:16]} calidad={data_quality} resolución={resolution}",
-                "La muestra bruta puede contener dependencia entre señales cercanas; se informa una agrupación conservadora.",
-            ]
-            if boundary_dt is not None:
-                notes.append(f"partición={partition}; frontera={boundary_dt.isoformat()}; señales excluidas={excluded}")
-            if not point_rows:
-                notes.append("Sin puntos de precio: todos los resultados quedan INDETERMINATE.")
-            result = BacktestResult(
-                variant=variant.name,
-                config_hash=variant.config_hash,
-                mode="BACKTEST",
-                start_ts=start.isoformat().replace("+00:00", "Z") if start else None,
-                end_ts=end.isoformat().replace("+00:00", "Z") if end else None,
-                signal_count=len(selected),
-                discarded_count=int(discarded_count) + excluded,
-                coverage_count=len(point_rows),
-                outcomes={key: counts.get(key, 0) for key in ("WIN", "LOSS", "TIE", "INDETERMINATE", "PENDING")},
-                net_result=equity,
-                gross_wins=sum(max(0.0, float(r.net_result or 0)) for r in results),
-                gross_losses=sum(min(0.0, float(r.net_result or 0)) for r in results),
-                max_drawdown=drawdown if results else None,
-                unresolved_count=counts.get("INDETERMINATE", 0) + counts.get("PENDING", 0),
-                independent_sample_count=len(groups),
-                dependency_window_seconds=self.dependency_window_seconds,
-                simulations=results,
-                notes=notes,
+            selected, excluded = self._boundary_filter(
+                filtered,
+                boundary_dt,
+                partition=partition,
+                points=point_rows,
+                max_horizon=max(self.spec.horizons_seconds),
+            )
+            simulations = self._run_variant(
+                variant,
+                selected,
+                point_rows,
+                persist=persist,
+                analysis_id=analysis_id,
+                analysis_name=analysis_name,
+                analysis_config_hash=analysis_config_hash,
+                contract_hash=contract_hash,
+                partition=partition,
+            )
+            result = self._build_variant_result(
+                variant,
+                selected,
+                excluded,
+                point_rows,
+                simulations,
+                discarded_count=discarded_count,
+                boundary=boundary_dt,
+                partition=partition,
+                data_quality=data_quality,
+                resolution=resolution,
             )
             all_results.append(result)
             if self.logger:
-                self.logger.info("backtest_variant_complete", variant=variant.name, metrics=result.to_dict(include_simulations=False))
+                self.logger.info(
+                    "backtest_variant_complete", variant=variant.name, metrics=result.to_dict(include_simulations=False)
+                )
         return all_results
 
+    @staticmethod
+    def _record_net_result(
+        item: SimulationResult, balance: float, peak: float, drawdown: float
+    ) -> tuple[float, float, float]:
+        if item.net_result is None:
+            return balance, peak, drawdown
+        balance += float(item.net_result)
+        peak = max(peak, balance)
+        drawdown = max(drawdown, peak - balance)
+        return balance, peak, drawdown
+
+    def _settle_active(
+        self,
+        active: list[tuple[datetime, SimulationResult]],
+        cutoff: datetime | None,
+        balance: float,
+        peak: float,
+        drawdown: float,
+    ) -> tuple[list[tuple[datetime, SimulationResult]], float, float, float]:
+        due = active if cutoff is None else [item for item in active if item[0] <= cutoff]
+        remaining = active if cutoff is None else [item for item in active if item[0] > cutoff]
+        for _expiry, item in sorted(due, key=lambda pair: (pair[0], pair[1].detected_ts)):
+            balance, peak, drawdown = self._record_net_result(item, balance, peak, drawdown)
+        return remaining, balance, peak, drawdown
 
     def run_portfolio(
         self,
@@ -343,16 +558,6 @@ class BacktestRunner:
         peak = balance
         drawdown = 0.0
 
-        def settle_until(cutoff: datetime) -> None:
-            nonlocal balance, peak, drawdown, active
-            due = [item for item in active if item[0] <= cutoff]
-            active = [item for item in active if item[0] > cutoff]
-            for _expiry, item in sorted(due, key=lambda pair: (pair[0], pair[1].detected_ts)):
-                if item.net_result is not None:
-                    balance += float(item.net_result)
-                    peak = max(peak, balance)
-                    drawdown = max(drawdown, peak - balance)
-
         for ordinal, signal in enumerate(sorted(list(signals), key=_signal_ts)):
             result = self._simulate(
                 signal,
@@ -361,7 +566,7 @@ class BacktestRunner:
                 simulation_id=f"portfolio:{ordinal}",
             )
             entry = parse_ts(result.entry_ts) if result.entry_ts else _signal_ts(signal)
-            settle_until(entry)
+            active, balance, peak, drawdown = self._settle_active(active, entry, balance, peak, drawdown)
             if result.entry_ts is not None and len(active) >= max_positions:
                 skipped += 1
                 continue
@@ -372,17 +577,22 @@ class BacktestRunner:
                 # No effective entry means this is not a position, but keep the
                 # accounting deterministic for custom evaluators that return a
                 # settled result without entry metadata.
-                balance += float(result.net_result)
-                peak = max(peak, balance)
-                drawdown = max(drawdown, peak - balance)
-        for expiry, item in sorted(active, key=lambda pair: (pair[0], pair[1].detected_ts)):
-            if item.net_result is not None:
-                balance += float(item.net_result)
-                peak = max(peak, balance)
-                drawdown = max(drawdown, peak - balance)
+                balance, peak, drawdown = self._record_net_result(result, balance, peak, drawdown)
+        _active, balance, _peak, drawdown = self._settle_active(active, None, balance, peak, drawdown)
         return PortfolioResult(
-            "VIRTUAL_PORTFOLIO", max_positions, len(accepted), skipped, balance, drawdown, accepted,
-            ["saldo se actualiza al vencimiento, no al detectar la señal", "stake/capital son supuestos virtuales fijos; sin martingala", "las señales solapadas se omiten explícitamente", "no es ejecución ni conexión a broker"],
+            "VIRTUAL_PORTFOLIO",
+            max_positions,
+            len(accepted),
+            skipped,
+            balance,
+            drawdown,
+            accepted,
+            [
+                "saldo se actualiza al vencimiento, no al detectar la señal",
+                "stake/capital son supuestos virtuales fijos; sin martingala",
+                "las señales solapadas se omiten explícitamente",
+                "no es ejecución ni conexión a broker",
+            ],
         )
 
     def run_from_engine(
@@ -402,7 +612,14 @@ class BacktestRunner:
         ``None``.  A pre-existing ``engine.signals`` collection is also
         accepted after all events.  Unknown engines fail loudly.
         """
-        method = next((getattr(engine, name, None) for name in ("process_event", "update", "on_event") if callable(getattr(engine, name, None))), None)
+        method = next(
+            (
+                getattr(engine, name, None)
+                for name in ("process_event", "update", "on_event")
+                if callable(getattr(engine, name, None))
+            ),
+            None,
+        )
         if method is None:
             raise TypeError("engine must expose process_event, update or on_event")
         signals: list[Any] = []
@@ -419,10 +636,19 @@ class BacktestRunner:
             except TypeError:
                 signals.append(returned)
             if self.store is not None and self.session_id and persist_decisions:
-                decision = returned if isinstance(returned, Mapping) else {"observed_ts": _row(event).get("event_ts", _row(event).get("timestamp")), "status": "PROCESSED", "signals_emitted": len(signals), "ordinal": ordinal}
+                decision = (
+                    returned
+                    if isinstance(returned, Mapping)
+                    else {
+                        "observed_ts": _row(event).get("event_ts", _row(event).get("timestamp")),
+                        "status": "PROCESSED",
+                        "signals_emitted": len(signals),
+                        "ordinal": ordinal,
+                    }
+                )
                 self.store.save_decision(self.session_id, decision, ordinal=ordinal)
         if not signals and hasattr(engine, "signals"):
-            signals = list(getattr(engine, "signals"))
+            signals = list(engine.signals)
         return self.run(signals, points, variants=variants)
 
     def partitioned_run(
@@ -434,8 +660,13 @@ class BacktestRunner:
         variants: Sequence[VariantSpec] | None = None,
     ) -> dict[str, list[BacktestResult]]:
         """Return leakage-safe exploration/evaluation result sets."""
-        signal_rows = list(signals); point_rows = list(points)
+        signal_rows = list(signals)
+        point_rows = list(points)
         return {
-            "exploration": self.run(signal_rows, point_rows, variants=variants, boundary=boundary, partition="exploration"),
-            "evaluation": self.run(signal_rows, point_rows, variants=variants, boundary=boundary, partition="evaluation"),
+            "exploration": self.run(
+                signal_rows, point_rows, variants=variants, boundary=boundary, partition="exploration"
+            ),
+            "evaluation": self.run(
+                signal_rows, point_rows, variants=variants, boundary=boundary, partition="evaluation"
+            ),
         }

@@ -226,7 +226,7 @@ class CaptureIndex:
     """Reusable disk index; source is decoded once, ranges use bounded memory."""
 
     def __init__(self, envelopes: Iterable[CaptureEnvelope], *, mode: CaptureOrder = "as_observed") -> None:
-        self.mode = mode
+        self.mode: CaptureOrder = mode
         self._directory = TemporaryDirectory(prefix="mtf-capture-order-")
         self._conn = sqlite3.connect(str(Path(self._directory.name) / "capture.sqlite3"))
         try:

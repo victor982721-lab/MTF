@@ -8,14 +8,15 @@ returns valid rows plus a complete issue list for inspection.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
-from datetime import datetime, timedelta, timezone
 import csv
 import hashlib
 import json
 import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, fields
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping, Sequence
+from typing import Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import (
@@ -27,12 +28,9 @@ from .models import (
     Provenance,
     ValidationIssue,
     infer_quality,
-    resolution_name,
     resolution_to_seconds,
 )
 
-
-UTC = timezone.utc
 RecordKind = Literal["bar", "candle", "event"]
 _TIMESTAMP_UNITS = {"iso8601", "s", "ms", "us", "ns"}
 _PRICE_BASES = {"traded", "bid", "ask", "mid"}
@@ -75,7 +73,7 @@ class ColumnMapping:
     side: str | None = "side"
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ColumnMapping":
+    def from_dict(cls, value: Mapping[str, Any]) -> ColumnMapping:
         allowed = {item.name for item in fields(cls)}
         unknown = set(value) - allowed
         if unknown:
@@ -116,7 +114,7 @@ class ImportConfig:
     drop_duplicates: bool = False
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ImportConfig":
+    def from_dict(cls, value: Mapping[str, Any]) -> ImportConfig:
         allowed = {item.name for item in fields(cls)}
         unknown = set(value) - allowed
         if unknown:
@@ -144,7 +142,16 @@ class _Parsed:
     source_hash: str
 
 
-def _nonempty(row: Mapping[str, Any], column: str | None, *, row_number: int, field_name: str, required: bool = False) -> Any:
+@dataclass(frozen=True, slots=True)
+class _ParsedRow:
+    record: Event | Bar
+    timestamp: datetime
+    identity_key: tuple[Any, ...]
+
+
+def _nonempty(
+    row: Mapping[str, Any], column: str | None, *, row_number: int, field_name: str, required: bool = False
+) -> Any:
     if column is None:
         if required:
             raise ValueError(f"no column mapping for {field_name}")
@@ -211,7 +218,9 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_headers(rows: Sequence[Mapping[str, Any]], mapping: ColumnMapping, config: ImportConfig) -> list[ValidationIssue]:
+def _validate_headers(
+    rows: Sequence[Mapping[str, Any]], mapping: ColumnMapping, config: ImportConfig
+) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     if not rows:
         return issues
@@ -224,8 +233,11 @@ def _validate_headers(rows: Sequence[Mapping[str, Any]], mapping: ColumnMapping,
         if config.resolution is None and mapping.resolution is not None:
             required.append(mapping.resolution)
     else:
-        source_column = {"traded": mapping.price, "bid": mapping.bid, "ask": mapping.ask, "mid": mapping.mid}[config.price_basis]
-        required.append(source_column)
+        source_column = {"traded": mapping.price, "bid": mapping.bid, "ask": mapping.ask, "mid": mapping.mid}[
+            config.price_basis
+        ]
+        if source_column is not None:
+            required.append(source_column)
     for column in required:
         if column is None:
             continue
@@ -243,6 +255,276 @@ def _validate_headers(rows: Sequence[Mapping[str, Any]], mapping: ColumnMapping,
     return issues
 
 
+def _row_instrument(row: Mapping[str, Any], mapping: ColumnMapping, config: ImportConfig, *, row_number: int) -> str:
+    value = config.instrument
+    if value is None:
+        value = _nonempty(row, mapping.instrument, row_number=row_number, field_name="instrument", required=True)
+    instrument = str(value).strip()
+    if not instrument:
+        raise ValueError("instrument is empty")
+    return instrument
+
+
+def _row_resolution(
+    row: Mapping[str, Any],
+    mapping: ColumnMapping,
+    config: ImportConfig,
+    *,
+    row_number: int,
+) -> int | None:
+    if mapping.record_kind not in {"candle", "bar"}:
+        return None
+    value = config.resolution
+    if value is None:
+        value = _nonempty(row, mapping.resolution, row_number=row_number, field_name="resolution", required=True)
+    return resolution_to_seconds(value) if value is not None else None
+
+
+def _row_times(
+    row: Mapping[str, Any],
+    mapping: ColumnMapping,
+    *,
+    row_number: int,
+    timestamp_unit: str,
+) -> tuple[datetime | None, datetime | None]:
+    received_raw = _nonempty(row, mapping.received_at, row_number=row_number, field_name="received_at")
+    available_raw = _nonempty(row, mapping.available_at, row_number=row_number, field_name="available_at")
+    return (
+        parse_timestamp(received_raw, unit=timestamp_unit, assume_timezone=mapping.assume_timezone)
+        if received_raw is not None
+        else None,
+        parse_timestamp(available_raw, unit=timestamp_unit, assume_timezone=mapping.assume_timezone)
+        if available_raw is not None
+        else None,
+    )
+
+
+def _row_identity(
+    row: Mapping[str, Any],
+    mapping: ColumnMapping,
+    *,
+    row_number: int,
+) -> tuple[str, int | str | None, bool]:
+    source_id_raw = _nonempty(row, mapping.event_id, row_number=row_number, field_name="event_id")
+    source_id = str(source_id_raw) if source_id_raw is not None else f"line:{row_number}"
+    sequence_raw = _nonempty(row, mapping.sequence, row_number=row_number, field_name="sequence")
+    sequence: int | str | None = None
+    if sequence_raw is not None:
+        try:
+            sequence = _parse_int(sequence_raw, name="sequence")
+        except ValueError:
+            sequence = str(sequence_raw)
+    return source_id, sequence, source_id_raw is not None
+
+
+def _parse_bar_row(
+    row: Mapping[str, Any],
+    mapping: ColumnMapping,
+    config: ImportConfig,
+    *,
+    timestamp: datetime,
+    instrument: str,
+    resolution_seconds: int,
+    received_at: datetime | None,
+    available_at: datetime | None,
+    source_id: str,
+    source_uri: str,
+    row_number: int,
+) -> Bar:
+    prices = {
+        name: _parse_number(
+            _nonempty(row, getattr(mapping, name), row_number=row_number, field_name=name, required=True),
+            name=name,
+        )
+        for name in ("open", "high", "low", "close")
+    }
+    volume_raw = _nonempty(row, mapping.volume, row_number=row_number, field_name="volume")
+    count_raw = _nonempty(row, mapping.trade_count, row_number=row_number, field_name="trade_count")
+    return Bar(
+        instrument=instrument,
+        interval_start=timestamp,
+        interval_end=timestamp + timedelta(seconds=resolution_seconds),
+        open=prices["open"],
+        high=prices["high"],
+        low=prices["low"],
+        close=prices["close"],
+        resolution_seconds=resolution_seconds,
+        volume=_parse_number(volume_raw, name="volume") if volume_raw is not None else None,
+        trade_count=_parse_int(count_raw, name="trade_count") if count_raw is not None else None,
+        price_basis=config.price_basis,
+        source=config.source,
+        source_record_id=source_id,
+        received_at=received_at,
+        available_at=available_at,
+        closed=True,
+        synthetic=False,
+        metadata={"source_uri": source_uri, "source_row": row_number},
+    )
+
+
+def _parse_event_row(
+    row: Mapping[str, Any],
+    mapping: ColumnMapping,
+    config: ImportConfig,
+    *,
+    timestamp: datetime,
+    instrument: str,
+    received_at: datetime | None,
+    available_at: datetime | None,
+    source_id: str,
+    sequence: int | str | None,
+    source_uri: str,
+    row_number: int,
+) -> Event:
+    basis_column = {"traded": mapping.price, "bid": mapping.bid, "ask": mapping.ask, "mid": mapping.mid}[
+        config.price_basis
+    ]
+    price = _parse_number(
+        _nonempty(row, basis_column, row_number=row_number, field_name=config.price_basis, required=True),
+        name=config.price_basis,
+    )
+    optional_prices: dict[str, float | None] = {}
+    for name, column in (("bid", mapping.bid), ("ask", mapping.ask), ("mid", mapping.mid)):
+        raw = _nonempty(row, column, row_number=row_number, field_name=name)
+        optional_prices[name] = _parse_number(raw, name=name) if raw is not None else None
+    quantity_raw = _nonempty(row, mapping.quantity, row_number=row_number, field_name="quantity")
+    side_raw = _nonempty(row, mapping.side, row_number=row_number, field_name="side")
+    side = str(side_raw).strip().lower() if side_raw is not None else None
+    if side is not None and side not in {"buy", "sell", "unknown"}:
+        raise ValueError("side must be buy, sell or unknown")
+    return Event(
+        instrument=instrument,
+        event_time=timestamp,
+        price=price,
+        bid=optional_prices["bid"],
+        ask=optional_prices["ask"],
+        mid=optional_prices["mid"],
+        price_basis=config.price_basis,
+        quantity=_parse_number(quantity_raw, name="quantity") if quantity_raw is not None else None,
+        received_at=received_at,
+        available_at=available_at,
+        source=config.source,
+        source_event_id=source_id,
+        source_sequence=sequence,
+        side=side,
+        synthetic=False,
+        metadata={"source_uri": source_uri, "source_row": row_number},
+    )
+
+
+def _parse_row(
+    row: Mapping[str, Any],
+    mapping: ColumnMapping,
+    config: ImportConfig,
+    *,
+    source_uri: str,
+    row_number: int,
+) -> _ParsedRow:
+    timestamp = parse_timestamp(
+        _nonempty(row, mapping.timestamp, row_number=row_number, field_name="timestamp", required=True),
+        unit=mapping.timestamp_unit,
+        assume_timezone=mapping.assume_timezone,
+    )
+    instrument = _row_instrument(row, mapping, config, row_number=row_number)
+    resolution_seconds = _row_resolution(row, mapping, config, row_number=row_number)
+    received_at, available_at = _row_times(
+        row,
+        mapping,
+        row_number=row_number,
+        timestamp_unit=mapping.timestamp_unit,
+    )
+    source_id, sequence, has_explicit_source_id = _row_identity(row, mapping, row_number=row_number)
+    if mapping.record_kind in {"candle", "bar"}:
+        assert resolution_seconds is not None
+        record: Event | Bar = _parse_bar_row(
+            row,
+            mapping,
+            config,
+            timestamp=timestamp,
+            instrument=instrument,
+            resolution_seconds=resolution_seconds,
+            received_at=received_at,
+            available_at=available_at,
+            source_id=source_id,
+            source_uri=source_uri,
+            row_number=row_number,
+        )
+        identity_key: tuple[Any, ...] = ("bar", instrument, resolution_seconds, timestamp)
+    else:
+        record = _parse_event_row(
+            row,
+            mapping,
+            config,
+            timestamp=timestamp,
+            instrument=instrument,
+            received_at=received_at,
+            available_at=available_at,
+            source_id=source_id,
+            sequence=sequence,
+            source_uri=source_uri,
+            row_number=row_number,
+        )
+        identity_key = (
+            "event",
+            instrument,
+            source_id if mapping.event_id is not None and has_explicit_source_id else timestamp,
+            sequence,
+        )
+    return _ParsedRow(record=record, timestamp=timestamp, identity_key=identity_key)
+
+
+def _row_issues(
+    parsed_row: _ParsedRow,
+    *,
+    mapping: ColumnMapping,
+    config: ImportConfig,
+    row_number: int,
+    previous_time: datetime | None,
+    identity_keys: set[tuple[Any, ...]],
+) -> tuple[list[ValidationIssue], bool]:
+    issues: list[ValidationIssue] = []
+    if previous_time is not None and parsed_row.timestamp < previous_time:
+        issues.append(
+            ValidationIssue(
+                "OUT_OF_ORDER",
+                f"timestamp {parsed_row.timestamp.isoformat()} precedes prior row",
+                severity="ERROR" if not config.reorder else "WARNING",
+                row=row_number,
+                field=mapping.timestamp,
+            )
+        )
+    if parsed_row.identity_key in identity_keys:
+        instrument = parsed_row.record.instrument
+        issues.append(
+            ValidationIssue(
+                "DUPLICATE",
+                f"duplicate identity for {instrument} at {parsed_row.timestamp.isoformat()}",
+                severity="ERROR" if not config.drop_duplicates else "WARNING",
+                row=row_number,
+            )
+        )
+        if config.drop_duplicates:
+            return issues, True
+    return issues, False
+
+
+def _gap_issues(records: Sequence[Event | Bar]) -> list[ValidationIssue]:
+    bars = sorted((record for record in records if isinstance(record, Bar)), key=lambda item: item.interval_start)
+    issues: list[ValidationIssue] = []
+    for previous, current in zip(bars, bars[1:], strict=False):
+        if current.instrument != previous.instrument or current.resolution_seconds != previous.resolution_seconds:
+            continue
+        if current.interval_start > previous.interval_end:
+            issues.append(
+                ValidationIssue(
+                    "GAP",
+                    f"sin datos entre {previous.interval_end.isoformat()} y {current.interval_start.isoformat()}; no se interpoló y la continuidad queda impedida",
+                    severity="WARNING",
+                )
+            )
+    return issues
+
+
 def _parse_rows(
     rows: Sequence[Mapping[str, Any]],
     raw_bytes: bytes,
@@ -256,167 +538,35 @@ def _parse_rows(
         return _Parsed((), tuple(issues), hashlib.sha256(raw_bytes).hexdigest())
 
     records: list[Event | Bar] = []
-    times: list[datetime] = []
     identity_keys: set[tuple[Any, ...]] = set()
     previous_time: datetime | None = None
     for row_number, row in enumerate(rows, start=1):
         try:
-            timestamp = parse_timestamp(
-                _nonempty(row, mapping.timestamp, row_number=row_number, field_name="timestamp", required=True),
-                unit=mapping.timestamp_unit,
-                assume_timezone=mapping.assume_timezone,
-            )
-            instrument_value = config.instrument
-            if instrument_value is None:
-                instrument_value = _nonempty(row, mapping.instrument, row_number=row_number, field_name="instrument", required=True)
-            instrument = str(instrument_value).strip()
-            if not instrument:
-                raise ValueError("instrument is empty")
-            resolution_value = config.resolution
-            resolution_seconds = None
-            if mapping.record_kind in {"candle", "bar"}:
-                if resolution_value is None:
-                    resolution_value = _nonempty(row, mapping.resolution, row_number=row_number, field_name="resolution", required=True)
-                resolution_seconds = resolution_to_seconds(resolution_value) if resolution_value is not None else None
-            received_raw = _nonempty(row, mapping.received_at, row_number=row_number, field_name="received_at")
-            available_raw = _nonempty(row, mapping.available_at, row_number=row_number, field_name="available_at")
-            received_at = (
-                parse_timestamp(received_raw, unit=mapping.timestamp_unit, assume_timezone=mapping.assume_timezone)
-                if received_raw is not None
-                else None
-            )
-            available_at = (
-                parse_timestamp(available_raw, unit=mapping.timestamp_unit, assume_timezone=mapping.assume_timezone)
-                if available_raw is not None
-                else None
-            )
-            source_id_raw = _nonempty(row, mapping.event_id, row_number=row_number, field_name="event_id")
-            source_id = str(source_id_raw) if source_id_raw is not None else f"line:{row_number}"
-            sequence_raw = _nonempty(row, mapping.sequence, row_number=row_number, field_name="sequence")
-            sequence: int | str | None = None
-            if sequence_raw is not None:
-                try:
-                    sequence = _parse_int(sequence_raw, name="sequence")
-                except ValueError:
-                    sequence = str(sequence_raw)
-
-            if mapping.record_kind in {"candle", "bar"}:
-                assert resolution_seconds is not None
-                open_price = _parse_number(_nonempty(row, mapping.open, row_number=row_number, field_name="open", required=True), name="open")
-                high_price = _parse_number(_nonempty(row, mapping.high, row_number=row_number, field_name="high", required=True), name="high")
-                low_price = _parse_number(_nonempty(row, mapping.low, row_number=row_number, field_name="low", required=True), name="low")
-                close_price = _parse_number(_nonempty(row, mapping.close, row_number=row_number, field_name="close", required=True), name="close")
-                volume_raw = _nonempty(row, mapping.volume, row_number=row_number, field_name="volume")
-                count_raw = _nonempty(row, mapping.trade_count, row_number=row_number, field_name="trade_count")
-                volume = _parse_number(volume_raw, name="volume") if volume_raw is not None else None
-                trade_count = _parse_int(count_raw, name="trade_count") if count_raw is not None else None
-                record: Event | Bar = Bar(
-                    instrument=instrument,
-                    interval_start=timestamp,
-                    interval_end=timestamp + timedelta(seconds=resolution_seconds),
-                    open=open_price,
-                    high=high_price,
-                    low=low_price,
-                    close=close_price,
-                    resolution_seconds=resolution_seconds,
-                    volume=volume,
-                    trade_count=trade_count,
-                    price_basis=config.price_basis,
-                    source=config.source,
-                    source_record_id=source_id,
-                    received_at=received_at,
-                    available_at=available_at,
-                    closed=True,
-                    synthetic=False,
-                    metadata={"source_uri": source_uri, "source_row": row_number},
-                )
-                identity_key = ("bar", instrument, resolution_seconds, timestamp)
-            else:
-                basis_column = {"traded": mapping.price, "bid": mapping.bid, "ask": mapping.ask, "mid": mapping.mid}[config.price_basis]
-                price = _parse_number(
-                    _nonempty(row, basis_column, row_number=row_number, field_name=config.price_basis, required=True),
-                    name=config.price_basis,
-                )
-                bid_raw = _nonempty(row, mapping.bid, row_number=row_number, field_name="bid")
-                ask_raw = _nonempty(row, mapping.ask, row_number=row_number, field_name="ask")
-                mid_raw = _nonempty(row, mapping.mid, row_number=row_number, field_name="mid")
-                bid = _parse_number(bid_raw, name="bid") if bid_raw is not None else None
-                ask = _parse_number(ask_raw, name="ask") if ask_raw is not None else None
-                mid = _parse_number(mid_raw, name="mid") if mid_raw is not None else None
-                quantity_raw = _nonempty(row, mapping.quantity, row_number=row_number, field_name="quantity")
-                side_raw = _nonempty(row, mapping.side, row_number=row_number, field_name="side")
-                side = str(side_raw).strip().lower() if side_raw is not None else None
-                if side is not None and side not in {"buy", "sell", "unknown"}:
-                    raise ValueError("side must be buy, sell or unknown")
-                record = Event(
-                    instrument=instrument,
-                    event_time=timestamp,
-                    price=price,
-                    bid=bid,
-                    ask=ask,
-                    mid=mid,
-                    price_basis=config.price_basis,
-                    quantity=_parse_number(quantity_raw, name="quantity") if quantity_raw is not None else None,
-                    received_at=received_at,
-                    available_at=available_at,
-                    source=config.source,
-                    source_event_id=source_id,
-                    source_sequence=sequence,
-                    side=side,
-                    synthetic=False,
-                    metadata={"source_uri": source_uri, "source_row": row_number},
-                )
-                identity_key = (
-                    "event",
-                    instrument,
-                    source_id if mapping.event_id is not None and source_id_raw is not None else timestamp,
-                    sequence,
-                )
-            if previous_time is not None and timestamp < previous_time:
-                issues.append(
-                    ValidationIssue(
-                        "OUT_OF_ORDER",
-                        f"timestamp {timestamp.isoformat()} precedes prior row",
-                        severity="ERROR" if not config.reorder else "WARNING",
-                        row=row_number,
-                        field=mapping.timestamp,
-                    )
-                )
-            previous_time = timestamp
-            if identity_key in identity_keys:
-                issues.append(
-                    ValidationIssue(
-                        "DUPLICATE",
-                        f"duplicate identity for {instrument} at {timestamp.isoformat()}",
-                        severity="ERROR" if not config.drop_duplicates else "WARNING",
-                        row=row_number,
-                    )
-                )
-                if config.drop_duplicates:
-                    continue
-            identity_keys.add(identity_key)
-            records.append(record)
-            times.append(timestamp)
+            parsed_row = _parse_row(row, mapping, config, source_uri=source_uri, row_number=row_number)
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             issues.append(ValidationIssue("PARSE_ERROR", str(exc), row=row_number))
+            continue
+        row_issues, dropped = _row_issues(
+            parsed_row,
+            mapping=mapping,
+            config=config,
+            row_number=row_number,
+            previous_time=previous_time,
+            identity_keys=identity_keys,
+        )
+        issues.extend(row_issues)
+        previous_time = parsed_row.timestamp
+        if dropped:
+            continue
+        identity_keys.add(parsed_row.identity_key)
+        records.append(parsed_row.record)
 
     if config.reorder:
         records.sort(key=lambda item: item.event_time if isinstance(item, Event) else item.interval_start)
     # A gap is a coverage fact, not proof that the venue was inactive.  Keep it
     # as a warning so strict ingestion does not fabricate continuity; the core
     # can block any analysis that requires a continuous window.
-    bars = sorted((record for record in records if isinstance(record, Bar)), key=lambda item: item.interval_start)
-    for previous, current in zip(bars, bars[1:]):
-        if current.instrument != previous.instrument or current.resolution_seconds != previous.resolution_seconds:
-            continue
-        if current.interval_start > previous.interval_end:
-            issues.append(
-                ValidationIssue(
-                    "GAP",
-                    f"sin datos entre {previous.interval_end.isoformat()} y {current.interval_start.isoformat()}; no se interpoló y la continuidad queda impedida",
-                    severity="WARNING",
-                )
-            )
+    issues.extend(_gap_issues(records))
     return _Parsed(tuple(records), tuple(issues), hashlib.sha256(raw_bytes).hexdigest())
 
 
@@ -427,7 +577,9 @@ def _result(parsed: _Parsed, *, config: ImportConfig, source_uri: str, path: Pat
     times = [record.event_time if isinstance(record, Event) else record.interval_start for record in records]
     coverage_end = None
     if records:
-        coverage_end = max(record.event_time if isinstance(record, Event) else record.interval_end for record in records)
+        coverage_end = max(
+            record.event_time if isinstance(record, Event) else record.interval_end for record in records
+        )
     provenance = Provenance(
         provider=config.source,
         mode="IMPORT",
@@ -514,7 +666,9 @@ def import_jsonl(
                 structural_issues.append(ValidationIssue("PARSE_ERROR", str(exc), row=line_number))
     parsed = _parse_rows(rows, raw_bytes, mapping_obj, config_obj, source_uri=path_obj.resolve().as_uri())
     parsed = _Parsed(parsed.records, tuple(structural_issues) + parsed.issues, parsed.source_hash)
-    return _result(parsed, config=config_obj, source_uri=path_obj.resolve().as_uri(), path=path_obj, mapping=mapping_obj)
+    return _result(
+        parsed, config=config_obj, source_uri=path_obj.resolve().as_uri(), path=path_obj, mapping=mapping_obj
+    )
 
 
 def _coerce_mapping(mapping: ColumnMapping | Mapping[str, Any] | None) -> ColumnMapping:
