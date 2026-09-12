@@ -26,7 +26,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, cast
 
 from ..core.canonical import canonical_json as _strict_canonical_json
 from ..core.canonical import fingerprint as _strict_fingerprint
@@ -45,53 +45,167 @@ _CFD_TRANSITIONS = {
     "FILLED": frozenset({"CLOSED", "UNKNOWN"}),
 }
 _CFD_DECIMAL_FIELDS = (
-    "units", "horizon_seconds", "pip_size", "entry_price", "close_price",
-    "pips", "gross_pnl_quote", "costs_quote", "commission_quote", "slippage_quote",
-    "financing_quote", "gross_pnl_account", "costs_account", "net_pnl",
+    "units",
+    "horizon_seconds",
+    "pip_size",
+    "entry_price",
+    "close_price",
+    "pips",
+    "gross_pnl_quote",
+    "costs_quote",
+    "commission_quote",
+    "slippage_quote",
+    "financing_quote",
+    "gross_pnl_account",
+    "costs_account",
+    "net_pnl",
     "conversion_rate",
 )
 _CFD_TIME_FIELDS = (
-    "detected_at", "signal_available_at", "decision_at", "entry_target_at",
-    "entry_market_at", "entry_available_at", "close_target_at",
-    "close_market_at", "close_available_at",
+    "detected_at",
+    "signal_available_at",
+    "decision_at",
+    "entry_target_at",
+    "entry_market_at",
+    "entry_available_at",
+    "close_target_at",
+    "close_market_at",
+    "close_available_at",
 )
 _CFD_SEMANTIC_FIELDS = (
-    "product", "trade_id", "signal_id", "instrument", "direction", "units",
-    "horizon_seconds", "state", "detected_at", "signal_available_at",
-    "decision_at", "entry_target_at", "fill_policy", "close_policy",
-    "pip_size", "price_precision", "account_currency", "quote_currency",
-    "entry_market_at", "entry_available_at", "entry_quote_id", "entry_price",
-    "entry_side", "close_target_at", "close_market_at", "close_available_at",
-    "close_quote_id", "close_price", "pips", "gross_pnl_quote",
-    "commission_quote", "slippage_quote", "financing_quote",
-    "gross_pnl_account", "costs_account", "net_pnl", "conversion_rate",
-    "close_observed", "economic_state", "costs_quote", "economic_reason",
-    "quality", "reason",
+    "product",
+    "trade_id",
+    "signal_id",
+    "instrument",
+    "direction",
+    "units",
+    "horizon_seconds",
+    "state",
+    "detected_at",
+    "signal_available_at",
+    "decision_at",
+    "entry_target_at",
+    "fill_policy",
+    "close_policy",
+    "pip_size",
+    "price_precision",
+    "account_currency",
+    "quote_currency",
+    "entry_market_at",
+    "entry_available_at",
+    "entry_quote_id",
+    "entry_price",
+    "entry_side",
+    "close_target_at",
+    "close_market_at",
+    "close_available_at",
+    "close_quote_id",
+    "close_price",
+    "pips",
+    "gross_pnl_quote",
+    "commission_quote",
+    "slippage_quote",
+    "financing_quote",
+    "gross_pnl_account",
+    "costs_account",
+    "net_pnl",
+    "conversion_rate",
+    "close_observed",
+    "economic_state",
+    "costs_quote",
+    "economic_reason",
+    "quality",
+    "reason",
 )
 _CFD_STATIC_FIELDS = (
-    "product", "trade_id", "signal_id", "instrument", "direction", "units",
-    "horizon_seconds", "detected_at", "signal_available_at", "decision_at",
-    "entry_target_at", "fill_policy", "close_policy", "pip_size", "price_precision",
-    "account_currency", "quote_currency", "variant", "partition",
-    "analysis_config_hash", "contract_hash",
+    "product",
+    "trade_id",
+    "signal_id",
+    "instrument",
+    "direction",
+    "units",
+    "horizon_seconds",
+    "detected_at",
+    "signal_available_at",
+    "decision_at",
+    "entry_target_at",
+    "fill_policy",
+    "close_policy",
+    "pip_size",
+    "price_precision",
+    "account_currency",
+    "quote_currency",
+    "variant",
+    "partition",
+    "analysis_config_hash",
+    "contract_hash",
 )
 _CFD_ROW_COLUMNS = (
-    "session_id", "analysis_id", "trade_id", "signal_id", "product", "variant", "partition",
-    "analysis_config_hash", "contract_hash", "instrument", "direction", "units", "horizon_seconds",
-    "state", "detected_at", "signal_available_at", "decision_at", "entry_target_at", "fill_policy",
-    "close_policy", "pip_size", "price_precision", "account_currency", "quote_currency",
-    "entry_market_at", "entry_available_at", "entry_quote_id", "entry_price", "entry_side",
-    "close_target_at", "close_market_at", "close_available_at", "close_quote_id", "close_price",
-    "pips", "gross_pnl_quote", "commission_quote", "slippage_quote", "financing_quote",
-    "gross_pnl_account", "costs_account", "net_pnl", "conversion_rate", "close_observed",
-    "economic_state", "costs_quote", "economic_reason", "quality", "reason", "lineage_json",
-    "semantic_hash", "payload_json", "terminal", "created_at", "updated_at",
+    "session_id",
+    "analysis_id",
+    "trade_id",
+    "signal_id",
+    "product",
+    "variant",
+    "partition",
+    "analysis_config_hash",
+    "contract_hash",
+    "instrument",
+    "direction",
+    "units",
+    "horizon_seconds",
+    "state",
+    "detected_at",
+    "signal_available_at",
+    "decision_at",
+    "entry_target_at",
+    "fill_policy",
+    "close_policy",
+    "pip_size",
+    "price_precision",
+    "account_currency",
+    "quote_currency",
+    "entry_market_at",
+    "entry_available_at",
+    "entry_quote_id",
+    "entry_price",
+    "entry_side",
+    "close_target_at",
+    "close_market_at",
+    "close_available_at",
+    "close_quote_id",
+    "close_price",
+    "pips",
+    "gross_pnl_quote",
+    "commission_quote",
+    "slippage_quote",
+    "financing_quote",
+    "gross_pnl_account",
+    "costs_account",
+    "net_pnl",
+    "conversion_rate",
+    "close_observed",
+    "economic_state",
+    "costs_quote",
+    "economic_reason",
+    "quality",
+    "reason",
+    "lineage_json",
+    "semantic_hash",
+    "payload_json",
+    "terminal",
+    "created_at",
+    "updated_at",
 )
 _CFD_UPDATE_COLUMNS = tuple(column for column in _CFD_ROW_COLUMNS[3:] if column != "created_at")
 
 
 class IdempotencyConflict(RuntimeError):
     """Misma identidad persistente con contenido/configuración distinta."""
+
+
+class _ModelDumpRecord(Protocol):
+    def model_dump(self) -> Mapping[str, Any]: ...
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -103,17 +217,13 @@ def _mapping(value: Any) -> dict[str, Any]:
         return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     if hasattr(value, "model_dump"):
         try:
-            result = value.model_dump()
+            result = cast(_ModelDumpRecord, value).model_dump()
             if isinstance(result, Mapping):
                 return dict(result)
         except Exception:  # pragma: no cover - defensive adapter boundary
             pass
     if hasattr(value, "__dict__"):
-        return {
-            key: val
-            for key, val in vars(value).items()
-            if not key.startswith("_")
-        }
+        return {key: val for key, val in vars(value).items() if not key.startswith("_")}
     raise TypeError(f"record must be a mapping/dataclass/object, got {type(value)!r}")
 
 
@@ -224,11 +334,17 @@ def _cfd_source(trade: Any) -> dict[str, Any]:
 
 def _cfd_aliases(source: Mapping[str, Any]) -> dict[str, Any]:
     aliases = {
-        "id": "trade_id", "identity": "trade_id", "detected_ts": "detected_at",
-        "signal_available_ts": "signal_available_at", "decision_ts": "decision_at",
-        "entry_target_ts": "entry_target_at", "entry_market_ts": "entry_market_at",
-        "entry_available_ts": "entry_available_at", "close_target_ts": "close_target_at",
-        "close_market_ts": "close_market_at", "close_available_ts": "close_available_at",
+        "id": "trade_id",
+        "identity": "trade_id",
+        "detected_ts": "detected_at",
+        "signal_available_ts": "signal_available_at",
+        "decision_ts": "decision_at",
+        "entry_target_ts": "entry_target_at",
+        "entry_market_ts": "entry_market_at",
+        "entry_available_ts": "entry_available_at",
+        "close_target_ts": "close_target_at",
+        "close_market_ts": "close_market_at",
+        "close_available_ts": "close_available_at",
     }
     record = dict(source)
     for alias, canonical in aliases.items():
@@ -250,7 +366,15 @@ def _cfd_extract_economic(record: dict[str, Any]) -> None:
     economic = record.get("economic_result")
     if not isinstance(economic, Mapping):
         return
-    fields = ("economic_state", "gross_pnl_quote", "costs_quote", "gross_pnl_account", "costs_account", "net_pnl", "economic_reason")
+    fields = (
+        "economic_state",
+        "gross_pnl_quote",
+        "costs_quote",
+        "gross_pnl_account",
+        "costs_account",
+        "net_pnl",
+        "economic_reason",
+    )
     for field in fields:
         if field not in record and field in economic:
             record[field] = economic[field]
@@ -294,7 +418,11 @@ def _cfd_close_observed(record: Mapping[str, Any]) -> bool:
 def _cfd_economic_state(record: Mapping[str, Any]) -> str:
     value = record.get("economic_state")
     if value is None:
-        return "NOT_SETTLED" if record.get("state") in {"PENDING", "FILLED"} else ("DETERMINED" if record.get("net_pnl") is not None else "INDETERMINATE")
+        return (
+            "NOT_SETTLED"
+            if record.get("state") in {"PENDING", "FILLED"}
+            else ("DETERMINED" if record.get("net_pnl") is not None else "INDETERMINATE")
+        )
     return str(getattr(value, "value", value)).upper()
 
 
@@ -325,7 +453,9 @@ def _cfd_normalize_metadata(record: dict[str, Any]) -> None:
     quality_value = record.get("quality") or "UNKNOWN"
     record["quality"] = str(getattr(quality_value, "value", quality_value)).upper()
     record["reason"] = str(record["reason"]) if record.get("reason") is not None else None
-    record["economic_reason"] = str(record["economic_reason"]) if record.get("economic_reason") is not None else record["reason"]
+    record["economic_reason"] = (
+        str(record["economic_reason"]) if record.get("economic_reason") is not None else record["reason"]
+    )
     lineage = record.get("lineage")
     if lineage is None:
         record["lineage"] = {}
@@ -373,7 +503,9 @@ def _capture_mapping(envelope: Any, *, sequence: int | None = None) -> dict[str,
         if not isinstance(envelope, Mapping):
             raise TypeError("capture envelope debe ser CaptureEnvelope o mapping")
     source = dict(envelope)
-    if "capture_schema" in source or {"ingest_sequence", "connection_generation", "message_class", "payload"}.issubset(source):
+    if "capture_schema" in source or {"ingest_sequence", "connection_generation", "message_class", "payload"}.issubset(
+        source
+    ):
         source.setdefault("capture_schema", 1)
         return CaptureEnvelope.from_mapping(source).to_dict()
     if sequence is None:
@@ -387,10 +519,19 @@ def _capture_cursor_pair(value: tuple[object, ...] | list[object]) -> tuple[str 
     available = value[0]
     available_text = None if available is None else utc_iso(available)
     try:
-        sequence = int(value[1]); row_id = int(value[2]) if len(value) == 3 else -1
+        sequence = _coerce_cursor_int(value[1])
+        row_id = _coerce_cursor_int(value[2]) if len(value) == 3 else -1
     except (TypeError, ValueError) as exc:
         raise ValueError("cursor de captura inválido") from exc
     return (available_text, sequence, row_id)
+
+
+def _coerce_cursor_int(value: object) -> int:
+    if isinstance(value, bool):
+        raise ValueError("cursor de captura inválido")
+    if isinstance(value, (int, float, str, bytes, bytearray)):
+        return int(value)
+    raise ValueError("cursor de captura inválido")
 
 
 def _capture_cursor_mapping(value: Mapping[str, Any]) -> tuple[str | None, int, int]:
@@ -447,7 +588,7 @@ def _trade_cursor_pair(value: tuple[object, ...] | list[object]) -> tuple[str, i
     if len(value) != 2:
         raise ValueError("cursor CFD requiere (detected_at, row_id)")
     try:
-        return utc_iso(value[0]), int(value[1])
+        return utc_iso(value[0]), _coerce_cursor_int(value[1])
     except (TypeError, ValueError) as exc:
         raise ValueError("cursor CFD inválido") from exc
 
@@ -507,19 +648,23 @@ def _cfd_apply_scope(
     resolved_config = resolved_config if resolved_config is not None else record.get("analysis_config_hash")
     resolved_contract = contract_hash if contract_hash is not None else contract
     resolved_contract = resolved_contract if resolved_contract is not None else record.get("contract_hash")
-    record.update({
-        "variant": _optional_text(variant if variant is not None else record.get("variant")),
-        "partition": _optional_text(partition if partition is not None else record.get("partition")),
-        "analysis_config_hash": _optional_text(resolved_config),
-        "contract_hash": _optional_text(resolved_contract),
-    })
-    semantic.update({
-        "analysis_id": analysis_id,
-        "variant": record["variant"],
-        "partition": record["partition"],
-        "analysis_config_hash": record["analysis_config_hash"],
-        "contract_hash": record["contract_hash"],
-    })
+    record.update(
+        {
+            "variant": _optional_text(variant if variant is not None else record.get("variant")),
+            "partition": _optional_text(partition if partition is not None else record.get("partition")),
+            "analysis_config_hash": _optional_text(resolved_config),
+            "contract_hash": _optional_text(resolved_contract),
+        }
+    )
+    semantic.update(
+        {
+            "analysis_id": analysis_id,
+            "variant": record["variant"],
+            "partition": record["partition"],
+            "analysis_config_hash": record["analysis_config_hash"],
+            "contract_hash": record["contract_hash"],
+        }
+    )
 
 
 def _cfd_row_values(
@@ -532,19 +677,61 @@ def _cfd_row_values(
 ) -> tuple[Any, ...]:
     state = str(record["state"])
     return (
-        session_id, analysis_id, record["trade_id"], record["signal_id"], record["product"], record["variant"],
-        record["partition"], record["analysis_config_hash"], record["contract_hash"], record["instrument"],
-        record["direction"], record["units"], record["horizon_seconds"], state, record["detected_at"],
-        record["signal_available_at"], record["decision_at"], record["entry_target_at"], record["fill_policy"],
-        record["close_policy"], record["pip_size"], record["price_precision"], record["account_currency"],
-        record["quote_currency"], record["entry_market_at"], record["entry_available_at"], record["entry_quote_id"],
-        record["entry_price"], record["entry_side"], record["close_target_at"], record["close_market_at"],
-        record["close_available_at"], record["close_quote_id"], record["close_price"], record["pips"],
-        record["gross_pnl_quote"], record["commission_quote"], record["slippage_quote"], record["financing_quote"],
-        record["gross_pnl_account"], record["costs_account"], record["net_pnl"], record["conversion_rate"],
-        int(record["close_observed"]), record["economic_state"], record["costs_quote"], record["economic_reason"],
-        record["quality"], record["reason"], canonical_json(record["lineage"]), semantic_hash, payload_text,
-        int(state in CFD_TERMINAL_STATES), now, now,
+        session_id,
+        analysis_id,
+        record["trade_id"],
+        record["signal_id"],
+        record["product"],
+        record["variant"],
+        record["partition"],
+        record["analysis_config_hash"],
+        record["contract_hash"],
+        record["instrument"],
+        record["direction"],
+        record["units"],
+        record["horizon_seconds"],
+        state,
+        record["detected_at"],
+        record["signal_available_at"],
+        record["decision_at"],
+        record["entry_target_at"],
+        record["fill_policy"],
+        record["close_policy"],
+        record["pip_size"],
+        record["price_precision"],
+        record["account_currency"],
+        record["quote_currency"],
+        record["entry_market_at"],
+        record["entry_available_at"],
+        record["entry_quote_id"],
+        record["entry_price"],
+        record["entry_side"],
+        record["close_target_at"],
+        record["close_market_at"],
+        record["close_available_at"],
+        record["close_quote_id"],
+        record["close_price"],
+        record["pips"],
+        record["gross_pnl_quote"],
+        record["commission_quote"],
+        record["slippage_quote"],
+        record["financing_quote"],
+        record["gross_pnl_account"],
+        record["costs_account"],
+        record["net_pnl"],
+        record["conversion_rate"],
+        int(record["close_observed"]),
+        record["economic_state"],
+        record["costs_quote"],
+        record["economic_reason"],
+        record["quality"],
+        record["reason"],
+        canonical_json(record["lineage"]),
+        semantic_hash,
+        payload_text,
+        int(state in CFD_TERMINAL_STATES),
+        now,
+        now,
     )
 
 
@@ -627,7 +814,11 @@ def _persist_cfd_row(
 def _cfd_resolve_state(state: str | None, lifecycle_state: str | None) -> str | None:
     if lifecycle_state is None:
         return state
-    if state is not None and str(getattr(state, "value", state)).upper() != str(getattr(lifecycle_state, "value", lifecycle_state)).upper():
+    if (
+        state is not None
+        and str(getattr(state, "value", state)).upper()
+        != str(getattr(lifecycle_state, "value", lifecycle_state)).upper()
+    ):
         raise ValueError("state y lifecycle_state no pueden diferir")
     return lifecycle_state
 
@@ -645,7 +836,10 @@ def _append_cfd_equals(
 
 
 def _append_cfd_time_ranges(
-    clauses: list[str], params: list[Any], start_ts: Any | None, end_ts: Any | None,
+    clauses: list[str],
+    params: list[Any],
+    start_ts: Any | None,
+    end_ts: Any | None,
 ) -> None:
     if start_ts is not None:
         clauses.append("detected_at>=?")
@@ -673,7 +867,19 @@ def _cfd_list_where(
     state = _cfd_resolve_state(state, lifecycle_state)
     clauses = ["session_id=?"]
     params: list[Any] = [session_id]
-    _append_cfd_equals(clauses, params, (("analysis_id", analysis_id), ("trade_id", trade_id), ("signal_id", signal_id), ("instrument", instrument), ("product", product), ("variant", variant), ("partition", partition)))
+    _append_cfd_equals(
+        clauses,
+        params,
+        (
+            ("analysis_id", analysis_id),
+            ("trade_id", trade_id),
+            ("signal_id", signal_id),
+            ("instrument", instrument),
+            ("product", product),
+            ("variant", variant),
+            ("partition", partition),
+        ),
+    )
     if state is not None:
         clauses.append("state=?")
         params.append(str(getattr(state, "value", state)).upper())
@@ -687,7 +893,11 @@ def _cfd_list_where(
 
 
 def _append_capture_time_range(
-    clauses: list[str], params: list[Any], column: str, operator: str, value: Any | None,
+    clauses: list[str],
+    params: list[Any],
+    column: str,
+    operator: str,
+    value: Any | None,
 ) -> None:
     if value is not None:
         clauses.append(f"{column}{operator}?")
@@ -707,7 +917,9 @@ def _capture_base_where(
 ) -> tuple[list[str], list[Any]]:
     clauses = ["session_id=?"]
     params: list[Any] = [session_id]
-    _append_cfd_equals(clauses, params, (("connection_generation", connection_generation), ("message_class", message_class)))
+    _append_cfd_equals(
+        clauses, params, (("connection_generation", connection_generation), ("message_class", message_class))
+    )
     if after_sequence is not None:
         if isinstance(after_sequence, bool) or int(after_sequence) < 0:
             raise ValueError("after_sequence inválida")
@@ -730,8 +942,15 @@ def _capture_after_clause(after_cursor: object) -> tuple[str, list[Any]]:
     if available is None:
         return "ingest_sequence>?", [sequence_value]
     if row_id < 0:
-        return "(available_at>? OR (available_at=? AND ingest_sequence>?) OR available_at IS NULL)", [available, available, sequence_value]
-    return "(available_at>? OR (available_at=? AND ingest_sequence>?) OR (available_at=? AND ingest_sequence=? AND capture_row_id>?) OR available_at IS NULL)", [available, available, sequence_value, available, sequence_value, row_id]
+        return "(available_at>? OR (available_at=? AND ingest_sequence>?) OR available_at IS NULL)", [
+            available,
+            available,
+            sequence_value,
+        ]
+    return (
+        "(available_at>? OR (available_at=? AND ingest_sequence>?) OR (available_at=? AND ingest_sequence=? AND capture_row_id>?) OR available_at IS NULL)",
+        [available, available, sequence_value, available, sequence_value, row_id],
+    )
 
 
 def _decode_capture_row(row: sqlite3.Row) -> dict[str, Any]:
@@ -739,7 +958,17 @@ def _decode_capture_row(row: sqlite3.Row) -> dict[str, Any]:
     record = _json_load(result.pop("envelope_json"), {}) or {}
     result["envelope_hash"] = str(result.get("envelope_hash"))
     result["payload"] = record.get("payload")
-    fields = ("capture_schema", "event_time", "received_at", "available_at", "ingest_sequence", "connection_generation", "source_identity", "message_class", "availability_policy")
+    fields = (
+        "capture_schema",
+        "event_time",
+        "received_at",
+        "available_at",
+        "ingest_sequence",
+        "connection_generation",
+        "source_identity",
+        "message_class",
+        "availability_policy",
+    )
     for field in fields:
         if field in record:
             result[field] = record[field]
@@ -748,7 +977,9 @@ def _decode_capture_row(row: sqlite3.Row) -> dict[str, Any]:
         "ingest_sequence": int(result["ingest_sequence"]),
         "capture_row_id": int(result["capture_row_id"]),
     }
-    result["cursor_token"] = _capture_cursor_token(result.get("available_at"), int(result["ingest_sequence"]), int(result["capture_row_id"]))
+    result["cursor_token"] = _capture_cursor_token(
+        result.get("available_at"), int(result["ingest_sequence"]), int(result["capture_row_id"])
+    )
     return result
 
 
@@ -777,7 +1008,7 @@ class SQLiteStore:
         with self._lock:
             self.conn.close()
 
-    def __enter__(self) -> "SQLiteStore":
+    def __enter__(self) -> SQLiteStore:
         return self
 
     def __exit__(self, *_: Any) -> None:
@@ -827,17 +1058,11 @@ class SQLiteStore:
 
     def _migrate(self) -> None:
         with self._lock:
-            self.conn.execute(
-                "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-            )
-            current = self.conn.execute(
-                "SELECT value FROM schema_meta WHERE key='schema_version'"
-            ).fetchone()
+            self.conn.execute("CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            current = self.conn.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
             version = int(current[0]) if current else 0
             if version > SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"database schema {version} is newer than supported {SCHEMA_VERSION}"
-                )
+                raise RuntimeError(f"database schema {version} is newer than supported {SCHEMA_VERSION}")
             if version < 1:
                 self._create_v1()
                 version = 1
@@ -1036,7 +1261,6 @@ class SQLiteStore:
             """
         )
 
-
     def _migrate_v2(self) -> None:
         """Add analysis/variant lineage without rewriting existing captures."""
         self.conn.executescript(
@@ -1079,9 +1303,7 @@ class SQLiteStore:
             checkpoint_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(checkpoints)")}
             if "analysis_id" not in checkpoint_columns:
                 if legacy_exists:
-                    raise RuntimeError(
-                        "migración v3 ambigua: existen checkpoints v2 y checkpoints_v2_legacy"
-                    )
+                    raise RuntimeError("migración v3 ambigua: existen checkpoints v2 y checkpoints_v2_legacy")
                 conn.execute("ALTER TABLE checkpoints RENAME TO checkpoints_v2_legacy")
                 legacy_exists = True
                 checkpoints_exists = False
@@ -1105,8 +1327,14 @@ class SQLiteStore:
             )
         checkpoint_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(checkpoints)")}
         required_checkpoint_columns = {
-            "session_id", "checkpoint_name", "analysis_id", "updated_at",
-            "cursor_json", "events_processed", "last_event_id", "state_json",
+            "session_id",
+            "checkpoint_name",
+            "analysis_id",
+            "updated_at",
+            "cursor_json",
+            "events_processed",
+            "last_event_id",
+            "state_json",
         }
         missing_checkpoint_columns = required_checkpoint_columns - checkpoint_columns
         if missing_checkpoint_columns:
@@ -1132,8 +1360,13 @@ class SQLiteStore:
         legacy_name = "checkpoints_v2_legacy"
         legacy_columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({legacy_name})")}
         required_legacy_columns = {
-            "session_id", "checkpoint_name", "updated_at", "cursor_json",
-            "events_processed", "last_event_id", "state_json",
+            "session_id",
+            "checkpoint_name",
+            "updated_at",
+            "cursor_json",
+            "events_processed",
+            "last_event_id",
+            "state_json",
         }
         missing_legacy_columns = required_legacy_columns - legacy_columns
         if missing_legacy_columns:
@@ -1150,8 +1383,14 @@ class SQLiteStore:
             if not analysis_id and isinstance(state.get("processor"), Mapping):
                 analysis_id = state["processor"].get("analysis_id")
             candidate = (
-                row[0], row[1], str(analysis_id or ""), row[2],
-                row[3], row[4], row[5], row[6],
+                row[0],
+                row[1],
+                str(analysis_id or ""),
+                row[2],
+                row[3],
+                row[4],
+                row[5],
+                row[6],
             )
             existing = conn.execute(
                 "SELECT session_id,checkpoint_name,analysis_id,updated_at,cursor_json,"
@@ -1367,9 +1606,19 @@ class SQLiteStore:
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(session_id) DO NOTHING""",
                 (
-                    session_id, created, utc_iso(started_at) if started_at else created,
-                    status, mode, str(provider), str(instrument), code_version, seed,
-                    dataset_ref, payload_hash(config), config_text, canonical_json(metadata),
+                    session_id,
+                    created,
+                    utc_iso(started_at) if started_at else created,
+                    status,
+                    mode,
+                    str(provider),
+                    str(instrument),
+                    code_version,
+                    seed,
+                    dataset_ref,
+                    payload_hash(config),
+                    config_text,
+                    canonical_json(metadata),
                 ),
             )
         return session_id
@@ -1402,14 +1651,17 @@ class SQLiteStore:
             explicit = f"generated:{ordinal if ordinal is not None else record.get('source_ordinal', '')}:{payload_hash(record)}"
         return str(explicit), record
 
-
-    def _check_idempotency(self, table: str, identity_columns: tuple[str, ...], identity_values: tuple[Any, ...], payload: str) -> bool:
+    def _check_idempotency(
+        self, table: str, identity_columns: tuple[str, ...], identity_values: tuple[Any, ...], payload: str
+    ) -> bool:
         where = " AND ".join(f"{column}=?" for column in identity_columns)
         row = self.conn.execute(f"SELECT payload_json FROM {table} WHERE {where}", identity_values).fetchone()
         if row is None:
             return False
         if str(row[0]) != payload:
-            raise IdempotencyConflict(f"conflicto de idempotencia en {table}: identidad={identity_values!r} ya tiene contenido distinto")
+            raise IdempotencyConflict(
+                f"conflicto de idempotencia en {table}: identidad={identity_values!r} ya tiene contenido distinto"
+            )
         return True
 
     def create_analysis(
@@ -1431,26 +1683,56 @@ class SQLiteStore:
         if not dataset_hash or not config_hash or not variant:
             raise ValueError("dataset_hash, config_hash y variant son obligatorios")
         partition = str(partition or "all")
-        identity = {"session_id": session_id, "dataset_hash": str(dataset_hash), "config_hash": str(config_hash), "variant": str(variant), "contract_hash": str(contract_hash or ""), "partition": partition, "code_version": str(code_version or ""), "identity_extra": dict(identity_extra or {})}
+        identity = {
+            "session_id": session_id,
+            "dataset_hash": str(dataset_hash),
+            "config_hash": str(config_hash),
+            "variant": str(variant),
+            "contract_hash": str(contract_hash or ""),
+            "partition": partition,
+            "code_version": str(code_version or ""),
+            "identity_extra": dict(identity_extra or {}),
+        }
         analysis_id = analysis_id or "an_" + payload_hash(identity)[:32]
         metadata_text = canonical_json(metadata or {})
         with self.transaction(immediate=True) as conn:
-            existing = conn.execute("SELECT session_id,dataset_hash,config_hash,variant,contract_hash,partition,metadata_json FROM analyses WHERE analysis_id=?", (analysis_id,)).fetchone()
+            existing = conn.execute(
+                "SELECT session_id,dataset_hash,config_hash,variant,contract_hash,partition,metadata_json FROM analyses WHERE analysis_id=?",
+                (analysis_id,),
+            ).fetchone()
             if existing is not None:
                 expected = (session_id, str(dataset_hash), str(config_hash), str(variant), contract_hash, partition)
                 actual = tuple(existing[:6])
                 if actual != expected:
                     raise IdempotencyConflict(f"analysis_id {analysis_id} ya existe con identidad distinta")
                 return analysis_id
-            conn.execute("""INSERT INTO analyses(analysis_id,session_id,dataset_hash,config_hash,code_version,variant,contract_hash,partition,status,created_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)""", (analysis_id, session_id, str(dataset_hash), str(config_hash), code_version, str(variant), contract_hash, partition, status, utc_iso(), metadata_text))
+            conn.execute(
+                """INSERT INTO analyses(analysis_id,session_id,dataset_hash,config_hash,code_version,variant,contract_hash,partition,status,created_at,metadata_json) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    analysis_id,
+                    session_id,
+                    str(dataset_hash),
+                    str(config_hash),
+                    code_version,
+                    str(variant),
+                    contract_hash,
+                    partition,
+                    status,
+                    utc_iso(),
+                    metadata_text,
+                ),
+            )
         return analysis_id
 
     def get_analysis(self, analysis_id: str) -> dict[str, Any] | None:
         if not self._table_exists("analyses"):
             return None
         rows = self._rows("SELECT * FROM analyses WHERE analysis_id=?", (analysis_id,))
-        if not rows: return None
-        row = rows[0]; row["metadata"] = _json_load(row.pop("metadata_json"), {}); return row
+        if not rows:
+            return None
+        row = rows[0]
+        row["metadata"] = _json_load(row.pop("metadata_json"), {})
+        return row
 
     def analyses(self, session_id: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
         if not self._table_exists("analyses"):
@@ -1458,7 +1740,9 @@ class SQLiteStore:
         if session_id is None:
             rows = self._rows("SELECT * FROM analyses ORDER BY created_at DESC LIMIT ?", (int(limit),))
         else:
-            rows = self._rows("SELECT * FROM analyses WHERE session_id=? ORDER BY created_at DESC LIMIT ?", (session_id, int(limit)))
+            rows = self._rows(
+                "SELECT * FROM analyses WHERE session_id=? ORDER BY created_at DESC LIMIT ?", (session_id, int(limit))
+            )
         for row in rows:
             row["metadata"] = _json_load(row.pop("metadata_json", None), {})
         return rows
@@ -1472,8 +1756,12 @@ class SQLiteStore:
             str(_get(record, "source", "provider", default="unknown")),
             str(_get(record, "instrument", "symbol", default="unknown")),
             utc_iso(_get(record, "event_ts", "event_time", "timestamp", "ts", "time")),
-            utc_iso(_get(record, "received_ts", "received_at", "receipt_ts", "receipt_at", default=None)) if _get(record, "received_ts", "received_at", "receipt_ts", "receipt_at") is not None else None,
-            utc_iso(_get(record, "available_ts", "available_at", default=None)) if _get(record, "available_ts", "available_at") is not None else None,
+            utc_iso(_get(record, "received_ts", "received_at", "receipt_ts", "receipt_at", default=None))
+            if _get(record, "received_ts", "received_at", "receipt_ts", "receipt_at") is not None
+            else None,
+            utc_iso(_get(record, "available_ts", "available_at", default=None))
+            if _get(record, "available_ts", "available_at") is not None
+            else None,
             str(_get(record, "kind", "event_kind", "type", default="event")),
             str(_get(record, "price_base", "price_basis", "price_type", "base_price", default="unknown")),
             payload,
@@ -1497,13 +1785,17 @@ class SQLiteStore:
         start = utc_iso(_get(record, "start_ts", "interval_start", "start", "open_time", "timestamp", "ts"))
         end = utc_iso(_get(record, "end_ts", "interval_end", "end", "close_time"))
         timeframe_value = _get(record, "timeframe", "resolution", "resolution_seconds", "interval")
-        if isinstance(timeframe_value, (int, float)) and float(timeframe_value) >= 60 and float(timeframe_value) % 60 == 0:
+        if (
+            isinstance(timeframe_value, (int, float))
+            and float(timeframe_value) >= 60
+            and float(timeframe_value) % 60 == 0
+        ):
             timeframe = f"M{int(float(timeframe_value) // 60)}"
         else:
             timeframe = str(timeframe_value)
         revision = int(_get(record, "revision", default=0))
         if explicit is None:
-            explicit = f"candle:{_get(record, 'instrument','symbol',default='unknown')}:{timeframe}:{start}:r{revision}:{ordinal if ordinal is not None else ''}"
+            explicit = f"candle:{_get(record, 'instrument', 'symbol', default='unknown')}:{timeframe}:{start}:r{revision}:{ordinal if ordinal is not None else ''}"
         values = (
             session_id,
             str(explicit),
@@ -1511,8 +1803,12 @@ class SQLiteStore:
             timeframe,
             start,
             end,
-            utc_iso(_get(record, "available_ts", "available_at")) if _get(record, "available_ts", "available_at") is not None else None,
-            utc_iso(_get(record, "received_ts", "received_at", "receipt_ts", "receipt_at")) if _get(record, "received_ts", "received_at", "receipt_ts", "receipt_at") is not None else None,
+            utc_iso(_get(record, "available_ts", "available_at"))
+            if _get(record, "available_ts", "available_at") is not None
+            else None,
+            utc_iso(_get(record, "received_ts", "received_at", "receipt_ts", "receipt_at"))
+            if _get(record, "received_ts", "received_at", "receipt_ts", "receipt_at") is not None
+            else None,
             float(_get(record, "open", "o")),
             float(_get(record, "high", "h")),
             float(_get(record, "low", "l")),
@@ -1540,7 +1836,18 @@ class SQLiteStore:
             )
         return cur.rowcount == 1
 
-    def save_decision(self, session_id: str, decision: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
+    def save_decision(
+        self,
+        session_id: str,
+        decision: Any,
+        *,
+        ordinal: int | None = None,
+        analysis_id: str | None = None,
+        variant: str | None = None,
+        analysis_config_hash: str | None = None,
+        contract_hash: str | None = None,
+        partition: str | None = None,
+    ) -> bool:
         record = _mapping(decision)
         analysis_id = analysis_id or _get(record, "analysis_id")
         variant = variant or _get(record, "variant", "variant_name")
@@ -1549,17 +1856,24 @@ class SQLiteStore:
         partition = partition or _get(record, "partition")
         decision_id = _get(record, "decision_id", "id", "uid")
         if decision_id is None:
-            decision_id = f"decision:{_get(record,'observed_ts','timestamp','ts')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
+            decision_id = f"decision:{_get(record, 'observed_ts', 'timestamp', 'ts')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
         observed = utc_iso(_get(record, "observed_ts", "observed_at", "timestamp", "available_at", "ts"))
         values = (
-            session_id, str(decision_id), observed,
-            utc_iso(_get(record, "available_ts", "available_at")) if _get(record, "available_ts", "available_at") is not None else None,
+            session_id,
+            str(decision_id),
+            observed,
+            utc_iso(_get(record, "available_ts", "available_at"))
+            if _get(record, "available_ts", "available_at") is not None
+            else None,
             str(_get(record, "kind", "type", "stage", default="strategy_evaluation")),
-            str(_get(record, "status", "decision", default="UNKNOWN")), canonical_json(record),
+            str(_get(record, "status", "decision", default="UNKNOWN")),
+            canonical_json(record),
         )
         payload = canonical_json(record)
         with self.transaction() as conn:
-            if self._check_idempotency("decisions", ("session_id", "decision_id"), (session_id, str(decision_id)), payload):
+            if self._check_idempotency(
+                "decisions", ("session_id", "decision_id"), (session_id, str(decision_id)), payload
+            ):
                 return False
             cur = conn.execute(
                 """INSERT INTO decisions(session_id,decision_id,observed_ts,available_ts,kind,status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
@@ -1568,7 +1882,18 @@ class SQLiteStore:
             )
         return cur.rowcount == 1
 
-    def save_signal(self, session_id: str, signal: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
+    def save_signal(
+        self,
+        session_id: str,
+        signal: Any,
+        *,
+        ordinal: int | None = None,
+        analysis_id: str | None = None,
+        variant: str | None = None,
+        analysis_config_hash: str | None = None,
+        contract_hash: str | None = None,
+        partition: str | None = None,
+    ) -> bool:
         """Persist a signal and its analysis membership independently.
 
         ``signals`` remains the capture-level canonical row for backwards
@@ -1586,22 +1911,31 @@ class SQLiteStore:
         partition = partition or _get(record, "partition")
         signal_id = _get(record, "signal_id", "id", "uid")
         if signal_id is None:
-            signal_id = f"signal:{_get(record,'detected_ts','detected_at','timestamp','ts')}:{_get(record,'direction','side',default='UNKNOWN')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
+            signal_id = f"signal:{_get(record, 'detected_ts', 'detected_at', 'timestamp', 'ts')}:{_get(record, 'direction', 'side', default='UNKNOWN')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
         signal_id = str(signal_id)
         detected = utc_iso(_get(record, "detected_ts", "detected_at", "timestamp", "ts"))
         values = (
-            session_id, signal_id, _get(record, "episode_id", "episode"), detected,
-            utc_iso(_get(record, "available_ts", "available_at")) if _get(record, "available_ts", "available_at") is not None else None,
+            session_id,
+            signal_id,
+            _get(record, "episode_id", "episode"),
+            detected,
+            utc_iso(_get(record, "available_ts", "available_at"))
+            if _get(record, "available_ts", "available_at") is not None
+            else None,
             str(_get(record, "instrument", "symbol", default="unknown")),
             str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
-            str(_get(record, "status", default="VALID")), canonical_json(record),
+            str(_get(record, "status", default="VALID")),
+            canonical_json(record),
         )
         payload = canonical_json(record)
         inserted_signal = False
         inserted_membership = False
         membership_analysis = analysis_id or ""
         with self.transaction() as conn:
-            existing = conn.execute("SELECT payload_json,analysis_id FROM signals WHERE session_id=? AND signal_id=?", (session_id, signal_id)).fetchone()
+            existing = conn.execute(
+                "SELECT payload_json,analysis_id FROM signals WHERE session_id=? AND signal_id=?",
+                (session_id, signal_id),
+            ).fetchone()
             if existing is None:
                 cur = conn.execute(
                     """INSERT INTO signals(session_id,signal_id,episode_id,detected_ts,available_ts,instrument,direction,status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
@@ -1616,38 +1950,80 @@ class SQLiteStore:
                 # its own identity.
                 existing_analysis = str(existing[1] or "")
                 if not membership_analysis or existing_analysis == membership_analysis:
-                    raise IdempotencyConflict(f"conflicto de idempotencia en signals: identidad={(session_id, signal_id)!r} ya tiene contenido distinto dentro del mismo namespace")
+                    raise IdempotencyConflict(
+                        f"conflicto de idempotencia en signals: identidad={(session_id, signal_id)!r} ya tiene contenido distinto dentro del mismo namespace"
+                    )
             if membership_analysis:
-                membership_id = "sm_" + payload_hash({"session_id": session_id, "signal_id": signal_id, "analysis_id": membership_analysis})[:32]
-                member = conn.execute("SELECT payload_json,variant,analysis_config_hash,contract_hash,partition FROM signal_analysis_membership WHERE session_id=? AND signal_id=? AND analysis_id=?", (session_id, signal_id, membership_analysis)).fetchone()
+                membership_id = (
+                    "sm_"
+                    + payload_hash(
+                        {"session_id": session_id, "signal_id": signal_id, "analysis_id": membership_analysis}
+                    )[:32]
+                )
+                member = conn.execute(
+                    "SELECT payload_json,variant,analysis_config_hash,contract_hash,partition FROM signal_analysis_membership WHERE session_id=? AND signal_id=? AND analysis_id=?",
+                    (session_id, signal_id, membership_analysis),
+                ).fetchone()
                 if member is not None:
                     expected_meta = (variant, analysis_config_hash, contract_hash, partition)
                     actual_meta = tuple(member[index] for index in range(1, 5))
                     if str(member[0]) != payload or actual_meta != expected_meta:
-                        raise IdempotencyConflict(f"conflicto de idempotencia en signal membership: identidad={(session_id, signal_id, membership_analysis)!r} ya tiene contenido distinto")
+                        raise IdempotencyConflict(
+                            f"conflicto de idempotencia en signal membership: identidad={(session_id, signal_id, membership_analysis)!r} ya tiene contenido distinto"
+                        )
                 else:
                     conn.execute(
                         """INSERT INTO signal_analysis_membership(membership_id,session_id,signal_id,analysis_id,variant,analysis_config_hash,contract_hash,partition,created_at,payload_json)
                         VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                        (membership_id, session_id, signal_id, membership_analysis, variant, analysis_config_hash, contract_hash, partition, utc_iso(), payload),
+                        (
+                            membership_id,
+                            session_id,
+                            signal_id,
+                            membership_analysis,
+                            variant,
+                            analysis_config_hash,
+                            contract_hash,
+                            partition,
+                            utc_iso(),
+                            payload,
+                        ),
                     )
                     inserted_membership = True
         return inserted_signal or inserted_membership
 
-    def list_signal_memberships(self, session_id: str, *, signal_id: str | None = None, analysis_id: str | None = None, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_signal_memberships(
+        self, session_id: str, *, signal_id: str | None = None, analysis_id: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
         """Return lineage memberships, preserving capture signal rows."""
-        clauses = ["session_id=?"]; params: list[Any] = [session_id]
+        clauses = ["session_id=?"]
+        params: list[Any] = [session_id]
         if signal_id is not None:
-            clauses.append("signal_id=?"); params.append(str(signal_id))
+            clauses.append("signal_id=?")
+            params.append(str(signal_id))
         if analysis_id is not None:
-            clauses.append("analysis_id=?"); params.append(str(analysis_id))
+            clauses.append("analysis_id=?")
+            params.append(str(analysis_id))
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
-        rows = self._rows(f"SELECT * FROM signal_analysis_membership WHERE {' AND '.join(clauses)} ORDER BY created_at,membership_id{lim}", params)
+        rows = self._rows(
+            f"SELECT * FROM signal_analysis_membership WHERE {' AND '.join(clauses)} ORDER BY created_at,membership_id{lim}",
+            params,
+        )
         for row in rows:
             row["payload"] = _json_load(row.pop("payload_json"), {})
         return rows
 
-    def save_discard(self, session_id: str, discard: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None) -> bool:
+    def save_discard(
+        self,
+        session_id: str,
+        discard: Any,
+        *,
+        ordinal: int | None = None,
+        analysis_id: str | None = None,
+        variant: str | None = None,
+        analysis_config_hash: str | None = None,
+        contract_hash: str | None = None,
+        partition: str | None = None,
+    ) -> bool:
         record = _mapping(discard)
         analysis_id = analysis_id or _get(record, "analysis_id")
         variant = variant or _get(record, "variant", "variant_name")
@@ -1656,10 +2032,13 @@ class SQLiteStore:
         partition = partition or _get(record, "partition")
         discard_id = _get(record, "discard_id", "id", "uid")
         if discard_id is None:
-            discard_id = f"discard:{_get(record,'observed_ts','timestamp','ts')}:{_get(record,'reason_code','reason',default='UNKNOWN')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
+            discard_id = f"discard:{_get(record, 'observed_ts', 'timestamp', 'ts')}:{_get(record, 'reason_code', 'reason', default='UNKNOWN')}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
         observed = utc_iso(_get(record, "observed_ts", "observed_at", "timestamp", "available_at", "ts"))
         values = (
-            session_id, str(discard_id), _get(record, "decision_id"), observed,
+            session_id,
+            str(discard_id),
+            _get(record, "decision_id"),
+            observed,
             str(_get(record, "reason_code", "reason", default="UNKNOWN")),
             int(bool(_get(record, "required", default=True))),
             str(_get(record, "condition_status", "status", default="UNSATISFIED")),
@@ -1667,7 +2046,9 @@ class SQLiteStore:
         )
         payload = canonical_json(record)
         with self.transaction() as conn:
-            if self._check_idempotency("discards", ("session_id", "discard_id"), (session_id, str(discard_id)), payload):
+            if self._check_idempotency(
+                "discards", ("session_id", "discard_id"), (session_id, str(discard_id)), payload
+            ):
                 return False
             cur = conn.execute(
                 """INSERT INTO discards(session_id,discard_id,decision_id,observed_ts,reason_code,required,condition_status,payload_json,analysis_id,variant,analysis_config_hash,contract_hash,partition)
@@ -1676,35 +2057,69 @@ class SQLiteStore:
             )
         return cur.rowcount == 1
 
-    def save_simulation(self, session_id: str, simulation: Any, *, ordinal: int | None = None, analysis_id: str | None = None, variant: str | None = None, analysis_config_hash: str | None = None, contract_hash: str | None = None, partition: str | None = None, allow_update: bool = False, ignore_pending_terminal: bool = False) -> bool:
+    def save_simulation(
+        self,
+        session_id: str,
+        simulation: Any,
+        *,
+        ordinal: int | None = None,
+        analysis_id: str | None = None,
+        variant: str | None = None,
+        analysis_config_hash: str | None = None,
+        contract_hash: str | None = None,
+        partition: str | None = None,
+        allow_update: bool = False,
+        ignore_pending_terminal: bool = False,
+    ) -> bool:
         record = _mapping(simulation)
         analysis_id = analysis_id or _get(record, "analysis_id")
         variant = variant or _get(record, "variant", "variant_name")
-        analysis_config_hash = analysis_config_hash or _get(record, "analysis_config_hash", "config_hash", "variant_config_hash")
+        analysis_config_hash = analysis_config_hash or _get(
+            record, "analysis_config_hash", "config_hash", "variant_config_hash"
+        )
         contract_hash = contract_hash or _get(record, "contract_hash")
         partition = partition or _get(record, "partition")
         sim_id = _get(record, "simulation_id", "id", "uid")
         if sim_id is None:
-            sim_id = f"simulation:{_get(record,'signal_id',default='none')}:{_get(record,'horizon_seconds','horizon',default=0)}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
+            sim_id = f"simulation:{_get(record, 'signal_id', default='none')}:{_get(record, 'horizon_seconds', 'horizon', default=0)}:{ordinal if ordinal is not None else payload_hash(record)[:16]}"
         detected = utc_iso(_get(record, "detected_ts", "detected_at", "timestamp", "ts"))
         expiry = utc_iso(_get(record, "expiry_ts", "expiry_at", "expires_at", "expiry", default=detected))
         values = (
-            session_id, str(sim_id), _get(record, "signal_id"), str(_get(record, "simulation_type", "type", default="DIRECTIONAL")),
-            float(_get(record, "horizon_seconds", "horizon", default=0)), str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
-            detected, utc_iso(_get(record, "entry_ts", "entry_at")) if _get(record, "entry_ts", "entry_at") is not None else None,
-            expiry, float(_get(record, "entry_price")) if _get(record, "entry_price") is not None else None,
+            session_id,
+            str(sim_id),
+            _get(record, "signal_id"),
+            str(_get(record, "simulation_type", "type", default="DIRECTIONAL")),
+            float(_get(record, "horizon_seconds", "horizon", default=0)),
+            str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
+            detected,
+            utc_iso(_get(record, "entry_ts", "entry_at")) if _get(record, "entry_ts", "entry_at") is not None else None,
+            expiry,
+            float(_get(record, "entry_price")) if _get(record, "entry_price") is not None else None,
             float(_get(record, "final_price")) if _get(record, "final_price") is not None else None,
-            str((getattr(_get(record, "outcome", default="INDETERMINATE"), "value", _get(record, "outcome", default="INDETERMINATE")))).upper(), float(_get(record, "stake", default=0)),
+            str(
+                getattr(
+                    _get(record, "outcome", default="INDETERMINATE"),
+                    "value",
+                    _get(record, "outcome", default="INDETERMINATE"),
+                )
+            ).upper(),
+            float(_get(record, "stake", default=0)),
             float(_get(record, "net_result")) if _get(record, "net_result") is not None else None,
-            str(_get(record, "price_base", "base_price", default="unknown")), str(_get(record, "quality", default="UNKNOWN")),
-            str(_get(record, "resolution", default="UNKNOWN")), canonical_json(_get(record, "assumptions", "assumptions_json", default={})), canonical_json(record),
+            str(_get(record, "price_base", "base_price", default="unknown")),
+            str(_get(record, "quality", default="UNKNOWN")),
+            str(_get(record, "resolution", default="UNKNOWN")),
+            canonical_json(_get(record, "assumptions", "assumptions_json", default={})),
+            canonical_json(record),
         )
         payload = canonical_json(record)
         incoming_outcome = str(values[11]).upper()
         if incoming_outcome not in TERMINAL_SIMULATION_OUTCOMES and incoming_outcome != "PENDING":
             raise ValueError(f"outcome de simulación no soportado: {incoming_outcome!r}")
         with self.transaction() as conn:
-            existing = conn.execute("SELECT payload_json,outcome,signal_id,simulation_type,horizon_seconds,direction,detected_ts,entry_ts,expiry_ts,entry_price,final_price,stake,net_result,price_base,resolution FROM simulations WHERE session_id=? AND simulation_id=?", (session_id, str(sim_id))).fetchone()
+            existing = conn.execute(
+                "SELECT payload_json,outcome,signal_id,simulation_type,horizon_seconds,direction,detected_ts,entry_ts,expiry_ts,entry_price,final_price,stake,net_result,price_base,resolution FROM simulations WHERE session_id=? AND simulation_id=?",
+                (session_id, str(sim_id)),
+            ).fetchone()
             if existing is not None:
                 if str(existing[0]) == payload:
                     return False
@@ -1716,24 +2131,87 @@ class SQLiteStore:
                     if incoming_outcome == "PENDING":
                         if ignore_pending_terminal:
                             return False
-                        raise IdempotencyConflict(f"simulación terminal inmutable: identidad={(session_id, str(sim_id))!r} no admite volver a PENDING")
+                        raise IdempotencyConflict(
+                            f"simulación terminal inmutable: identidad={(session_id, str(sim_id))!r} no admite volver a PENDING"
+                        )
                     incoming_semantic = (
-                        incoming_outcome, _get(record, "signal_id"), str(_get(record, "simulation_type", "type", default="DIRECTIONAL")),
-                        float(_get(record, "horizon_seconds", "horizon", default=0)), str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
-                        detected, utc_iso(_get(record, "entry_ts", "entry_at")) if _get(record, "entry_ts", "entry_at") is not None else None,
-                        expiry, float(_get(record, "entry_price")) if _get(record, "entry_price") is not None else None,
+                        incoming_outcome,
+                        _get(record, "signal_id"),
+                        str(_get(record, "simulation_type", "type", default="DIRECTIONAL")),
+                        float(_get(record, "horizon_seconds", "horizon", default=0)),
+                        str(_get(record, "direction", "side", default="UNKNOWN")).upper(),
+                        detected,
+                        utc_iso(_get(record, "entry_ts", "entry_at"))
+                        if _get(record, "entry_ts", "entry_at") is not None
+                        else None,
+                        expiry,
+                        float(_get(record, "entry_price")) if _get(record, "entry_price") is not None else None,
                         float(_get(record, "final_price")) if _get(record, "final_price") is not None else None,
-                        float(_get(record, "stake", default=0)), float(_get(record, "net_result")) if _get(record, "net_result") is not None else None,
-                        str(_get(record, "price_base", "base_price", default="unknown")), str(_get(record, "resolution", default="UNKNOWN")),
+                        float(_get(record, "stake", default=0)),
+                        float(_get(record, "net_result")) if _get(record, "net_result") is not None else None,
+                        str(_get(record, "price_base", "base_price", default="unknown")),
+                        str(_get(record, "resolution", default="UNKNOWN")),
                     )
                     existing_semantic = (existing_outcome, *tuple(existing[index] for index in range(2, 15)))
                     if existing_semantic == incoming_semantic:
                         return False
-                    raise IdempotencyConflict(f"simulación terminal inmutable: identidad={(session_id, str(sim_id))!r} ya está en {existing_outcome}")
+                    raise IdempotencyConflict(
+                        f"simulación terminal inmutable: identidad={(session_id, str(sim_id))!r} ya está en {existing_outcome}"
+                    )
                 if not allow_update:
-                    raise IdempotencyConflict(f"conflicto de idempotencia en simulations: identidad={(session_id, str(sim_id))!r} ya tiene contenido distinto")
-                (_sid, _sim_id, signal_id, simulation_type, horizon, direction, detected_ts, entry_ts, expiry_ts, entry_price, final_price, outcome, stake, net_result, price_base, quality, resolution, assumptions_json, payload_json) = values
-                conn.execute("""UPDATE simulations SET signal_id=?,simulation_type=?,horizon_seconds=?,direction=?,detected_ts=?,entry_ts=?,expiry_ts=?,entry_price=?,final_price=?,outcome=?,stake=?,net_result=?,price_base=?,quality=?,resolution=?,assumptions_json=?,payload_json=?,analysis_id=?,variant=?,analysis_config_hash=?,contract_hash=?,partition=? WHERE session_id=? AND simulation_id=?""", (signal_id, simulation_type, horizon, direction, detected_ts, entry_ts, expiry_ts, entry_price, final_price, outcome, stake, net_result, price_base, quality, resolution, assumptions_json, payload_json, analysis_id, variant, analysis_config_hash, contract_hash, partition, session_id, str(sim_id)))
+                    raise IdempotencyConflict(
+                        f"conflicto de idempotencia en simulations: identidad={(session_id, str(sim_id))!r} ya tiene contenido distinto"
+                    )
+                (
+                    _sid,
+                    _sim_id,
+                    signal_id,
+                    simulation_type,
+                    horizon,
+                    direction,
+                    detected_ts,
+                    entry_ts,
+                    expiry_ts,
+                    entry_price,
+                    final_price,
+                    outcome,
+                    stake,
+                    net_result,
+                    price_base,
+                    quality,
+                    resolution,
+                    assumptions_json,
+                    payload_json,
+                ) = values
+                conn.execute(
+                    """UPDATE simulations SET signal_id=?,simulation_type=?,horizon_seconds=?,direction=?,detected_ts=?,entry_ts=?,expiry_ts=?,entry_price=?,final_price=?,outcome=?,stake=?,net_result=?,price_base=?,quality=?,resolution=?,assumptions_json=?,payload_json=?,analysis_id=?,variant=?,analysis_config_hash=?,contract_hash=?,partition=? WHERE session_id=? AND simulation_id=?""",
+                    (
+                        signal_id,
+                        simulation_type,
+                        horizon,
+                        direction,
+                        detected_ts,
+                        entry_ts,
+                        expiry_ts,
+                        entry_price,
+                        final_price,
+                        outcome,
+                        stake,
+                        net_result,
+                        price_base,
+                        quality,
+                        resolution,
+                        assumptions_json,
+                        payload_json,
+                        analysis_id,
+                        variant,
+                        analysis_config_hash,
+                        contract_hash,
+                        partition,
+                        session_id,
+                        str(sim_id),
+                    ),
+                )
                 return True
             cur = conn.execute(
                 """INSERT INTO simulations(
@@ -1744,7 +2222,9 @@ class SQLiteStore:
             )
         return cur.rowcount == 1
 
-    def _decode_cfd_trade(self, row: sqlite3.Row | Mapping[str, Any], *, include_payload: bool = True) -> dict[str, Any]:
+    def _decode_cfd_trade(
+        self, row: sqlite3.Row | Mapping[str, Any], *, include_payload: bool = True
+    ) -> dict[str, Any]:
         result = dict(row)
         result["terminal"] = bool(int(result.get("terminal", 0)))
         result["close_observed"] = bool(int(result.get("close_observed", 0)))
@@ -1754,10 +2234,21 @@ class SQLiteStore:
         else:
             result.pop("payload_json", None)
         result["lifecycle_state"] = result.get("state")
-        economic_state = str(result.get("economic_state") or ("NOT_SETTLED" if result.get("state") in {"PENDING", "FILLED"} else ("DETERMINED" if result.get("net_pnl") is not None else "INDETERMINATE"))).upper()
+        economic_state = str(
+            result.get("economic_state")
+            or (
+                "NOT_SETTLED"
+                if result.get("state") in {"PENDING", "FILLED"}
+                else ("DETERMINED" if result.get("net_pnl") is not None else "INDETERMINATE")
+            )
+        ).upper()
         result["economic_state"] = economic_state
         result["economic_result_state"] = economic_state
-        result["economic_status"] = {"NOT_SETTLED": "NOT_SETTLED", "DETERMINED": "KNOWN", "INDETERMINATE": "UNKNOWN"}.get(economic_state, "UNKNOWN")
+        result["economic_status"] = {
+            "NOT_SETTLED": "NOT_SETTLED",
+            "DETERMINED": "KNOWN",
+            "INDETERMINATE": "UNKNOWN",
+        }.get(economic_state, "UNKNOWN")
         result["economic_result"] = {
             "state": economic_state,
             "gross_pnl_quote": result.get("gross_pnl_quote"),
@@ -1791,8 +2282,15 @@ class SQLiteStore:
             raise ValueError("analysis_id es obligatorio para un CFD")
         record, semantic = _normalise_cfd_trade(trade)
         _cfd_apply_scope(
-            record, semantic, namespace, variant, partition, analysis_config_hash,
-            contract_hash, config_hash, contract,
+            record,
+            semantic,
+            namespace,
+            variant,
+            partition,
+            analysis_config_hash,
+            contract_hash,
+            config_hash,
+            contract,
         )
         semantic_hash = payload_hash(semantic)
         payload_text = canonical_json(record)
@@ -1824,8 +2322,19 @@ class SQLiteStore:
         if not self._table_exists("cfd_trades"):
             return []
         clauses, params = _cfd_list_where(
-            session_id, analysis_id, trade_id, signal_id, state, lifecycle_state, terminal,
-            instrument, product, variant, partition, start_ts, end_ts,
+            session_id,
+            analysis_id,
+            trade_id,
+            signal_id,
+            state,
+            lifecycle_state,
+            terminal,
+            instrument,
+            product,
+            variant,
+            partition,
+            start_ts,
+            end_ts,
         )
         if after_cursor is not None:
             detected, row_id = _trade_cursor(after_cursor)
@@ -1865,9 +2374,18 @@ class SQLiteStore:
         envelope_text = canonical_json(record)
         envelope_hash = payload_hash(record)
         values = (
-            session_id, ingest_sequence, generation, record.get("event_time"), record.get("received_at"),
-            record.get("available_at"), record.get("source_identity"), str(record["message_class"]),
-            str(record["availability_policy"]), envelope_hash, envelope_text, utc_iso(),
+            session_id,
+            ingest_sequence,
+            generation,
+            record.get("event_time"),
+            record.get("received_at"),
+            record.get("available_at"),
+            record.get("source_identity"),
+            str(record["message_class"]),
+            str(record["availability_policy"]),
+            envelope_hash,
+            envelope_text,
+            utc_iso(),
         )
         with self.transaction() as conn:
             existing = conn.execute(
@@ -1911,8 +2429,15 @@ class SQLiteStore:
         if after_cursor is not None and after_sequence is not None:
             raise ValueError("use after_cursor o after_sequence, no ambos")
         clauses, params = _capture_base_where(
-            session_id, after_sequence, before_sequence, connection_generation, message_class,
-            start_ts, end_ts, available_start, available_end,
+            session_id,
+            after_sequence,
+            before_sequence,
+            connection_generation,
+            message_class,
+            start_ts,
+            end_ts,
+            available_start,
+            available_end,
         )
         if after_cursor is not None:
             cursor_sql, cursor_params = _capture_after_clause(after_cursor)
@@ -1968,11 +2493,25 @@ class SQLiteStore:
                 VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(session_id,checkpoint_name,analysis_id) DO UPDATE SET
                 updated_at=excluded.updated_at,cursor_json=excluded.cursor_json,events_processed=excluded.events_processed,
                 last_event_id=excluded.last_event_id,state_json=excluded.state_json""",
-                (session_id, str(checkpoint_name), resolved_analysis, utc_iso(), canonical_json(cursor_payload), int(events_processed), last_event_id, canonical_json(state_payload)),
+                (
+                    session_id,
+                    str(checkpoint_name),
+                    resolved_analysis,
+                    utc_iso(),
+                    canonical_json(cursor_payload),
+                    int(events_processed),
+                    last_event_id,
+                    canonical_json(state_payload),
+                ),
             )
 
     def save_metric(
-        self, session_id: str, metric_name: str, segment: Mapping[str, Any], value: float | None, payload: Mapping[str, Any] | None = None
+        self,
+        session_id: str,
+        metric_name: str,
+        segment: Mapping[str, Any],
+        value: float | None,
+        payload: Mapping[str, Any] | None = None,
     ) -> None:
         segment_text = canonical_json(segment)
         with self.transaction() as conn:
@@ -2017,7 +2556,14 @@ class SQLiteStore:
             result["is_alternate"] = False
         return result
 
-    def get_checkpoint(self, session_id: str, checkpoint_name: str = "default", *, analysis_id: str | None = None, allow_alternate: bool = True) -> dict[str, Any] | None:
+    def get_checkpoint(
+        self,
+        session_id: str,
+        checkpoint_name: str = "default",
+        *,
+        analysis_id: str | None = None,
+        allow_alternate: bool = True,
+    ) -> dict[str, Any] | None:
         """Load a checkpoint, preferring an exact analysis namespace.
 
         If an exact namespace is absent and ``allow_alternate`` is true, the
@@ -2029,80 +2575,125 @@ class SQLiteStore:
         logical_name = str(checkpoint_name)
         requested = str(analysis_id) if analysis_id is not None else None
         if requested is not None:
-            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id=?", (session_id, logical_name, requested)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id=?",
+                (session_id, logical_name, requested),
+            ).fetchone()
             if row is not None:
                 return self._decode_checkpoint(row, requested_analysis_id=requested)
             if not allow_alternate:
                 return None
-            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id<>'' ORDER BY updated_at DESC, analysis_id DESC LIMIT 1", (session_id, logical_name)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id<>'' ORDER BY updated_at DESC, analysis_id DESC LIMIT 1",
+                (session_id, logical_name),
+            ).fetchone()
             return self._decode_checkpoint(row, requested_analysis_id=requested) if row is not None else None
         if allow_alternate:
-            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? ORDER BY (analysis_id='') ASC, updated_at DESC, analysis_id DESC LIMIT 1", (session_id, logical_name)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? ORDER BY (analysis_id='') ASC, updated_at DESC, analysis_id DESC LIMIT 1",
+                (session_id, logical_name),
+            ).fetchone()
         else:
-            row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id='' ORDER BY updated_at DESC LIMIT 1", (session_id, logical_name)).fetchone()
+            row = self.conn.execute(
+                "SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id='' ORDER BY updated_at DESC LIMIT 1",
+                (session_id, logical_name),
+            ).fetchone()
         return self._decode_checkpoint(row) if row is not None else None
 
-    def load_alternate_checkpoint(self, session_id: str, checkpoint_name: str = "default", *, analysis_id: str) -> dict[str, Any] | None:
+    def load_alternate_checkpoint(
+        self, session_id: str, checkpoint_name: str = "default", *, analysis_id: str
+    ) -> dict[str, Any] | None:
         """Load the newest *other* analysis checkpoint explicitly."""
         target = str(analysis_id)
-        row = self.conn.execute("SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id<>'' AND analysis_id<>? ORDER BY updated_at DESC, analysis_id DESC LIMIT 1", (session_id, str(checkpoint_name), target)).fetchone()
+        row = self.conn.execute(
+            "SELECT * FROM checkpoints WHERE session_id=? AND checkpoint_name=? AND analysis_id<>'' AND analysis_id<>? ORDER BY updated_at DESC, analysis_id DESC LIMIT 1",
+            (session_id, str(checkpoint_name), target),
+        ).fetchone()
         return self._decode_checkpoint(row, requested_analysis_id=target) if row is not None else None
 
-    def list_checkpoints(self, session_id: str, checkpoint_name: str | None = None, *, limit: int = 100) -> list[dict[str, Any]]:
+    def list_checkpoints(
+        self, session_id: str, checkpoint_name: str | None = None, *, limit: int = 100
+    ) -> list[dict[str, Any]]:
         params: list[Any] = [session_id]
         where = "session_id=?"
         if checkpoint_name is not None:
-            where += " AND checkpoint_name=?"; params.append(str(checkpoint_name))
+            where += " AND checkpoint_name=?"
+            params.append(str(checkpoint_name))
         params.append(max(1, int(limit)))
-        rows = self.conn.execute(f"SELECT * FROM checkpoints WHERE {where} ORDER BY updated_at DESC, checkpoint_name, analysis_id LIMIT ?", tuple(params)).fetchall()
+        rows = self.conn.execute(
+            f"SELECT * FROM checkpoints WHERE {where} ORDER BY updated_at DESC, checkpoint_name, analysis_id LIMIT ?",
+            tuple(params),
+        ).fetchall()
         return [self._decode_checkpoint(row) for row in rows]
 
-    def list_candles(self, session_id: str, *, instrument: str | None = None, timeframe: str | None = None, closed_only: bool = False, limit: int | None = None) -> list[dict[str, Any]]:
+    def list_candles(
+        self,
+        session_id: str,
+        *,
+        instrument: str | None = None,
+        timeframe: str | None = None,
+        closed_only: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
         clauses = ["session_id=?"]
         params: list[Any] = [session_id]
         if instrument is not None:
-            clauses.append("instrument=?"); params.append(instrument)
+            clauses.append("instrument=?")
+            params.append(instrument)
         if timeframe is not None:
-            clauses.append("timeframe=?"); params.append(timeframe)
+            clauses.append("timeframe=?")
+            params.append(timeframe)
         if closed_only:
             clauses.append("closed=1")
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
-        rows = self._rows(f"SELECT * FROM candles WHERE {' AND '.join(clauses)} ORDER BY start_ts, timeframe, revision{lim}", params)
+        rows = self._rows(
+            f"SELECT * FROM candles WHERE {' AND '.join(clauses)} ORDER BY start_ts, timeframe, revision{lim}", params
+        )
         for row in rows:
             row["provenance"] = _json_load(row.pop("provenance_json"), {})
         return rows
 
     def list_events(self, session_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
-        rows = self._rows(f"SELECT * FROM events WHERE session_id=? ORDER BY event_ts, event_row_id{lim}", (session_id,))
+        rows = self._rows(
+            f"SELECT * FROM events WHERE session_id=? ORDER BY event_ts, event_row_id{lim}", (session_id,)
+        )
         for row in rows:
             row["payload"] = _json_load(row.pop("payload_json"), {})
         return rows
 
     def list_decisions(self, session_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
-        rows = self._rows(f"SELECT * FROM decisions WHERE session_id=? ORDER BY observed_ts, decision_row_id{lim}", (session_id,))
+        rows = self._rows(
+            f"SELECT * FROM decisions WHERE session_id=? ORDER BY observed_ts, decision_row_id{lim}", (session_id,)
+        )
         for row in rows:
             row["payload"] = _json_load(row.pop("payload_json"), {})
         return rows
 
     def list_signals(self, session_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
-        rows = self._rows(f"SELECT * FROM signals WHERE session_id=? ORDER BY detected_ts, signal_row_id{lim}", (session_id,))
+        rows = self._rows(
+            f"SELECT * FROM signals WHERE session_id=? ORDER BY detected_ts, signal_row_id{lim}", (session_id,)
+        )
         for row in rows:
             row["payload"] = _json_load(row.pop("payload_json"), {})
         return rows
 
     def list_discards(self, session_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
-        rows = self._rows(f"SELECT * FROM discards WHERE session_id=? ORDER BY observed_ts, discard_row_id{lim}", (session_id,))
+        rows = self._rows(
+            f"SELECT * FROM discards WHERE session_id=? ORDER BY observed_ts, discard_row_id{lim}", (session_id,)
+        )
         for row in rows:
             row["payload"] = _json_load(row.pop("payload_json"), {})
         return rows
 
     def list_simulations(self, session_id: str, *, limit: int | None = None) -> list[dict[str, Any]]:
         lim = f" LIMIT {int(limit)}" if limit is not None else ""
-        rows = self._rows(f"SELECT * FROM simulations WHERE session_id=? ORDER BY detected_ts, simulation_row_id{lim}", (session_id,))
+        rows = self._rows(
+            f"SELECT * FROM simulations WHERE session_id=? ORDER BY detected_ts, simulation_row_id{lim}", (session_id,)
+        )
         for row in rows:
             row["assumptions"] = _json_load(row.pop("assumptions_json"), {})
             row["payload"] = _json_load(row.pop("payload_json"), {})
@@ -2111,27 +2702,47 @@ class SQLiteStore:
     def status(self, session_id: str) -> dict[str, Any]:
         session = self.get_session(session_id) or {"session_id": session_id, "status": "UNKNOWN"}
         counts = {}
-        for table in ("events", "candles", "decisions", "signals", "discards", "simulations", "analyses", "cfd_trades", "capture_envelopes"):
+        for table in (
+            "events",
+            "candles",
+            "decisions",
+            "signals",
+            "discards",
+            "simulations",
+            "analyses",
+            "cfd_trades",
+            "capture_envelopes",
+        ):
             if not self._table_exists(table):
                 counts[table] = 0
                 continue
             row = self.conn.execute(f"SELECT COUNT(*) FROM {table} WHERE session_id=?", (session_id,)).fetchone()
             counts[table] = int(row[0])
         if self._table_exists("signal_analysis_membership"):
-            counts["signal_memberships"] = int(self.conn.execute("SELECT COUNT(*) FROM signal_analysis_membership WHERE session_id=?", (session_id,)).fetchone()[0])
+            counts["signal_memberships"] = int(
+                self.conn.execute(
+                    "SELECT COUNT(*) FROM signal_analysis_membership WHERE session_id=?", (session_id,)
+                ).fetchone()[0]
+            )
         # ``counts.signals`` is the primary MTF detector count for terminal
         # compatibility; the complete capture count (including the independent
         # M1 reference variant) remains explicit as ``signals_total``.
-        if self._table_exists("signals") and "variant" in {str(row[1]) for row in self.conn.execute("PRAGMA table_info(signals)")}:
+        if self._table_exists("signals") and "variant" in {
+            str(row[1]) for row in self.conn.execute("PRAGMA table_info(signals)")
+        }:
             total_signals = counts.get("signals", 0)
-            primary = self.conn.execute("SELECT COUNT(*) FROM signals WHERE session_id=? AND (variant IS NULL OR variant <> 'm1_trigger_reference')", (session_id,)).fetchone()[0]
+            primary = self.conn.execute(
+                "SELECT COUNT(*) FROM signals WHERE session_id=? AND (variant IS NULL OR variant <> 'm1_trigger_reference')",
+                (session_id,),
+            ).fetchone()[0]
             counts["signals_total"] = total_signals
             counts["signals"] = int(primary)
-        latest = self.conn.execute(
-            "SELECT MAX(event_ts) FROM events WHERE session_id=?", (session_id,)
-        ).fetchone()[0]
+        latest = self.conn.execute("SELECT MAX(event_ts) FROM events WHERE session_id=?", (session_id,)).fetchone()[0]
         session.update({"counts": counts, "last_event_ts": latest, "schema_version": self.schema_version})
         return session
 
     def sessions(self, *, limit: int = 50) -> list[dict[str, Any]]:
-        return self._rows("SELECT session_id,created_at,started_at,ended_at,status,mode,provider,instrument,code_version,seed,dataset_ref FROM sessions ORDER BY created_at DESC LIMIT ?", (int(limit),))
+        return self._rows(
+            "SELECT session_id,created_at,started_at,ended_at,status,mode,provider,instrument,code_version,seed,dataset_ref FROM sessions ORDER BY created_at DESC LIMIT ?",
+            (int(limit),),
+        )

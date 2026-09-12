@@ -9,19 +9,18 @@ que el flujo aporta observaciones causales suficientes.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
-from collections import deque
-from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
-from typing import Any, Iterable, Mapping, Sequence
+from collections import deque
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
+from typing import Any
 
 from ..core import (
     Candle,
     CandleAggregator,
-    DataQuality,
-    IndicatorConfig,
     IndicatorPoint,
     IndicatorSeries,
     MarketEvent,
@@ -32,12 +31,10 @@ from ..core import (
     StrategyResult,
     Timeframe,
     TrendPullbackStrategy,
-    aggregate_events,
-    compute_indicators,
     parse_timeframe,
 )
 from ..core.aggregation import _Bucket, interval_start
-from ..core.quality import QualityFlag, merge_quality
+from ..core.quality import merge_quality
 from .consumers import (
     BinarySimulationConsumer,
     SignalConsumer,
@@ -59,7 +56,6 @@ from .state import (
     iso,
     mode_from,
     quality_from,
-    quality_label_is_usable,
     signal_dict,
     signal_from_dict,
     to_core_candle,
@@ -67,14 +63,53 @@ from .state import (
     utc,
 )
 
+_BLOCKING_RUNTIME_ISSUES = frozenset(
+    {
+        "out_of_order_event",
+        "out_of_order_candle",
+        "event_invalid",
+        "invalid_event",
+        "candle_invalid",
+        "price_base_mismatch",
+        "quality_blocked",
+        "partial_bucket",
+        "gap",
+        "out_of_order",
+        "out_of_order_interval",
+        "late_closed_interval",
+        "mode_mismatch",
+        "timeframe_not_configured",
+    }
+)
 
-UTC = timezone.utc
-_BLOCKING_RUNTIME_ISSUES = frozenset({
-    "out_of_order_event", "out_of_order_candle", "event_invalid", "invalid_event",
-    "candle_invalid", "price_base_mismatch", "quality_blocked", "partial_bucket",
-    "gap", "out_of_order", "out_of_order_interval", "late_closed_interval",
-    "mode_mismatch", "timeframe_not_configured",
-})
+
+def _timeframe(value: Timeframe | str | int) -> Timeframe:
+    """Resolve the union accepted by core models at runtime boundaries."""
+
+    return parse_timeframe(value)
+
+
+def _timeframe_name(value: Timeframe | str | int) -> str:
+    return _timeframe(value).name
+
+
+def _strategy_timeframe_names(strategy: StrategyConfig) -> tuple[str, str, str]:
+    return (
+        _timeframe_name(strategy.context_timeframe),
+        _timeframe_name(strategy.preparation_timeframe),
+        _timeframe_name(strategy.trigger_timeframe),
+    )
+
+
+def _container(max_candles: int | None) -> deque[Any] | list[Any]:
+    return deque(maxlen=max_candles) if max_candles is not None else []
+
+
+def _event_identity(event: MarketEvent) -> str:
+    event_id = event.event_id
+    if event_id is None:
+        raise ValueError("evento sin event_id")
+    return event_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +120,12 @@ class RuntimeIssue:
     record_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"code": self.code, "message": self.message, "timestamp": iso(self.timestamp), "record_id": self.record_id}
+        return {
+            "code": self.code,
+            "message": self.message,
+            "timestamp": iso(self.timestamp),
+            "record_id": self.record_id,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,7 +200,9 @@ class IncrementalProcessor:
         self.instrument = instrument.strip() if instrument else None
         self.source = str(source).strip() or "runtime"
         self.price_base = price_base if isinstance(price_base, PriceBase) else PriceBase(str(price_base).lower())
-        self.timeframes = tuple(parse_timeframe(item) for item in (timeframes or self.DEFAULT_TIMEFRAMES))
+        self.timeframes: tuple[Timeframe, ...] = tuple(
+            parse_timeframe(item) for item in (timeframes or self.DEFAULT_TIMEFRAMES)
+        )
         if len(set(tf.name for tf in self.timeframes)) != len(self.timeframes):
             raise ValueError("timeframes no puede contener duplicados")
         if not self.timeframes:
@@ -170,7 +212,9 @@ class IncrementalProcessor:
             strategy_cfg = replace(strategy_cfg, mode=self.mode)
         self.strategy_config = strategy_cfg
         self.strategy = TrendPullbackStrategy(strategy_cfg)
-        self.simulation_config = simulation if isinstance(simulation, SimulationConfig) else SimulationConfig.from_mapping(simulation)
+        self.simulation_config = (
+            simulation if isinstance(simulation, SimulationConfig) else SimulationConfig.from_mapping(simulation)
+        )
         if signal_consumer is None:
             signal_consumer = BinarySimulationConsumer(self.simulation_config)
         if not isinstance(signal_consumer, SignalConsumer):
@@ -180,9 +224,7 @@ class IncrementalProcessor:
         # consumers intentionally expose no book object.
         self._simulation_book = getattr(signal_consumer, "book", None)
         self._consumer_pending: tuple[PendingSimulation, ...] = ()
-        self._consumer_events: deque[SignalConsumerEvent] = deque(
-            maxlen=max(256, max_candles or 4096)
-        )
+        self._consumer_events: deque[SignalConsumerEvent] = deque(maxlen=max(256, max_candles or 4096))
         self._consumer_event_count = 0
         self._transition_consumer_events: list[SignalConsumerEvent] = []
         self.max_candles = max_candles
@@ -190,9 +232,13 @@ class IncrementalProcessor:
             raise ValueError("max_candles debe ser positivo")
         self.aggregators: dict[str, CandleAggregator] = {
             tf.name: CandleAggregator(
-                tf, instrument=self.instrument, price_base=self.price_base,
-                source=f"{self.source}:aggregated", mode=self.mode,
-                max_seen_event_ids=max_candles, max_issues=max_candles,
+                tf,
+                instrument=self.instrument,
+                price_base=self.price_base,
+                source=f"{self.source}:aggregated",
+                mode=self.mode,
+                max_seen_event_ids=max_candles,
+                max_issues=max_candles,
             )
             for tf in self.timeframes
         }
@@ -200,16 +246,18 @@ class IncrementalProcessor:
         for tf in self.timeframes:
             from ..core.indicators import IncrementalIndicatorEngine
 
-            self.indicator_engines[tf.name] = IncrementalIndicatorEngine(strategy_cfg.indicators, max_points=max_candles)
-        def _container():
-            return deque(maxlen=self.max_candles) if self.max_candles is not None else []
+            self.indicator_engines[tf.name] = IncrementalIndicatorEngine(
+                strategy_cfg.indicators, max_points=max_candles
+            )
 
-        self.candles: dict[str, Any] = {tf.name: _container() for tf in self.timeframes}
-        self.indicator_points: dict[str, Any] = {tf.name: _container() for tf in self.timeframes}
+        self.candles: dict[str, Any] = {tf.name: _container(self.max_candles) for tf in self.timeframes}
+        self.indicator_points: dict[str, Any] = {tf.name: _container(self.max_candles) for tf in self.timeframes}
         self._logical_candle_keys: dict[str, set[tuple[str, datetime]]] = {tf.name: set() for tf in self.timeframes}
         self._candle_by_key: dict[str, dict[tuple[str, datetime], Candle]] = {tf.name: {} for tf in self.timeframes}
-        self._resample_buffers: dict[str, dict[datetime, dict[datetime, Candle]]] = {tf.name: {} for tf in self.timeframes}
-        self._candle_ids: set[str] = set()
+        self._resample_buffers: dict[str, dict[datetime, dict[datetime, Candle]]] = {
+            tf.name: {} for tf in self.timeframes
+        }
+        self._candle_ids: set[str | None] = set()
         self._candle_id_counts: dict[str, int] = {}
         self._processed_candle_starts: dict[str, set[datetime]] = {tf.name: set() for tf in self.timeframes}
         # Absolute indices avoid rebuilding a max-sized mapping on every
@@ -273,7 +321,7 @@ class IncrementalProcessor:
         if completed:
             self.completed_simulations.extend(completed)
             if self.max_candles is not None:
-                del self.completed_simulations[:-self.max_candles]
+                del self.completed_simulations[: -self.max_candles]
         return completed
 
     def _dispatch_signal(self, signal: Signal) -> SignalConsumerResult:
@@ -285,9 +333,7 @@ class IncrementalProcessor:
         *,
         watermark: datetime,
     ) -> tuple[PendingSimulation, ...]:
-        return self._apply_consumer_result(
-            self.signal_consumer.on_observation(observation, watermark=watermark)
-        )
+        return self._apply_consumer_result(self.signal_consumer.on_observation(observation, watermark=watermark))
 
     def _dispatch_advance(
         self,
@@ -295,11 +341,7 @@ class IncrementalProcessor:
         *,
         capture_complete: bool,
     ) -> tuple[PendingSimulation, ...]:
-        return self._apply_consumer_result(
-            self.signal_consumer.advance(
-                watermark, capture_complete=capture_complete
-            )
-        )
+        return self._apply_consumer_result(self.signal_consumer.advance(watermark, capture_complete=capture_complete))
 
     @property
     def status(self) -> dict[str, Any]:
@@ -312,7 +354,7 @@ class IncrementalProcessor:
             "consumer_product": getattr(self.signal_consumer, "product", self.signal_consumer.consumer_type),
             "consumer_event_count": self._consumer_event_count,
             "max_candles": self.max_candles,
-            "timeframes": [tf.name for tf in self.timeframes],
+            "timeframes": [_timeframe_name(tf) for tf in self.timeframes],
             "last_event_time": iso(self.last_event_time),
             "last_event_id": self.last_event_id,
             "last_available_at": iso(self.last_available_at),
@@ -335,10 +377,16 @@ class IncrementalProcessor:
         points = self.indicator_points.get(timeframe, ())
         if points and points[-1].ready:
             return 0
-        required = max(self.strategy_config.indicators.ema_slow, self.strategy_config.indicators.rsi_period + 1, self.strategy_config.indicators.atr_period)
+        required = max(
+            self.strategy_config.indicators.ema_slow,
+            self.strategy_config.indicators.rsi_period + 1,
+            self.strategy_config.indicators.atr_period,
+        )
         return max(1, required - len(points))
 
-    def _issue(self, code: str, message: str, *, record: Any | None = None, timestamp: datetime | None = None) -> RuntimeIssue:
+    def _issue(
+        self, code: str, message: str, *, record: Any | None = None, timestamp: datetime | None = None
+    ) -> RuntimeIssue:
         record_id = _attr_id(record)
         issue = RuntimeIssue(code, message, timestamp or _attr_time(record), record_id)
         self._append_issue(issue)
@@ -356,7 +404,10 @@ class IncrementalProcessor:
         return candle.instrument, candle.start
 
     def _is_derived(self, candle: Candle) -> bool:
-        return str(candle.origin).lower() in {"aggregated", "derived", "resampled_ohlc", "runtime_aggregate"} or "aggregated" in str(candle.source).lower()
+        return (
+            str(candle.origin).lower() in {"aggregated", "derived", "resampled_ohlc", "runtime_aggregate"}
+            or "aggregated" in str(candle.source).lower()
+        )
 
     def _rebuild_indicator_engine(self, name: str) -> None:
         """Rebuild only after a late native replacement, never per event."""
@@ -374,7 +425,7 @@ class IncrementalProcessor:
     def _resample_from_candle(self, base_candle: Candle) -> list[ProcessResult]:
         """Build compatible higher OHLC bars; never creates ticks or prices."""
         results: list[ProcessResult] = []
-        base_tf = base_candle.timeframe
+        base_tf = base_candle.normalized_timeframe
         for target in sorted(self.timeframes, key=lambda item: item.seconds, reverse=True):
             if target.seconds <= base_tf.seconds or target.seconds % base_tf.seconds:
                 continue
@@ -394,11 +445,11 @@ class IncrementalProcessor:
                 # A bounded buffer prevents a long data interruption from
                 # becoming an unbounded in-memory historical cache.
                 if self.max_candles is not None and len(buckets) > self.max_candles:
-                    for oldest in sorted(buckets)[:-self.max_candles]:
+                    for oldest in sorted(buckets)[: -self.max_candles]:
                         buckets.pop(oldest, None)
                 continue
             group = [bucket[start] for start in expected]
-            if any(not item.closed or not item.quality.valid for item in group):
+            if any(not item.closed or not item.quality.usable for item in group):
                 buckets.pop(bucket_start, None)
                 continue
             derived = Candle(
@@ -420,7 +471,12 @@ class IncrementalProcessor:
                 received_at=max(item.received_at or item.end for item in group),
                 quality=merge_quality(*(item.quality for item in group), source=f"{self.source}:resampled"),
                 origin="resampled_ohlc",
-                metadata={"built_from": "closed_ohlc_bars", "base_timeframe": base_tf.name, "ratio": ratio, "no_ticks_invented": True},
+                metadata={
+                    "built_from": "closed_ohlc_bars",
+                    "base_timeframe": base_tf.name,
+                    "ratio": ratio,
+                    "no_ticks_invented": True,
+                },
             )
             buckets.pop(bucket_start, None)
             results.append(self._accept_candle(derived, native=False, evaluate_strategy=False))
@@ -440,8 +496,14 @@ class IncrementalProcessor:
     def _prune_episodes(self) -> None:
         if self.max_candles is None or len(self.episodes) <= self.max_candles:
             return
-        active = [item for item in self.episodes.values() if not getattr(item, "invalidated", False) and not getattr(item, "used", False)]
-        keep_ids = {item.episode_id for item in sorted(active, key=lambda item: item.registered_at)[-self.max_candles:]}
+        active = [
+            item
+            for item in self.episodes.values()
+            if not getattr(item, "invalidated", False) and not getattr(item, "used", False)
+        ]
+        keep_ids = {
+            item.episode_id for item in sorted(active, key=lambda item: item.registered_at)[-self.max_candles :]
+        }
         ordered = sorted(self.episodes.values(), key=lambda item: item.registered_at)
         for item in ordered:
             if len(self.episodes) <= self.max_candles or item.episode_id in keep_ids:
@@ -504,17 +566,137 @@ class IncrementalProcessor:
             del self.issues[0]
         self.issues.append(issue)
 
-    def _accept_candle(self, candle: Candle, *, native: bool, evaluate_strategy: bool = True) -> ProcessResult:
-        tf_name = candle.timeframe.name
-        if tf_name not in self.candles:
-            return ProcessResult(False, issues=(self._issue("timeframe_not_configured", f"Temporalidad no configurada: {tf_name}", record=candle),))
+    def _candle_acceptance_issue(self, candle: Candle, timeframe: str) -> RuntimeIssue | None:
+        if timeframe not in self.candles:
+            return self._issue(
+                "timeframe_not_configured",
+                f"Temporalidad no configurada: {timeframe}",
+                record=candle,
+            )
         if not self._ensure_instrument(candle.instrument):
-            return ProcessResult(False, issues=(self._issue("instrument_mismatch", f"Se esperaba {self.instrument}, llegó {candle.instrument}", record=candle),))
+            return self._issue(
+                "instrument_mismatch",
+                f"Se esperaba {self.instrument}, llegó {candle.instrument}",
+                record=candle,
+            )
         if candle.price_base is not self.price_base:
-            return ProcessResult(False, issues=(self._issue("price_base_mismatch", f"Se esperaba {self.price_base.value}, llegó {candle.price_base.value}", record=candle),))
+            return self._issue(
+                "price_base_mismatch",
+                f"Se esperaba {self.price_base.value}, llegó {candle.price_base.value}",
+                record=candle,
+            )
+        return None
+
+    def _replace_existing_candle(
+        self,
+        timeframe: str,
+        logical_key: tuple[str, datetime],
+        existing: Candle,
+        candle: Candle,
+    ) -> None:
+        rows = self.candles[timeframe]
+        for index, previous in enumerate(rows):
+            if self._logical_key(previous) == logical_key:
+                rows[index] = candle
+                break
+        self._replace_candle_id(existing.candle_id, candle.candle_id)
+        self._native_candle_keys.add(logical_key)
+        self._derived_candle_keys.discard(logical_key)
+        self._candle_by_key[timeframe][logical_key] = candle
+        self._rebuild_indicator_engine(timeframe)
+        self.indicator_updates[timeframe] = self.indicator_updates.get(timeframe, 0) + 1
+
+    def _replacement_result(
+        self,
+        candle: Candle,
+        *,
+        timeframe: str,
+        logical_key: tuple[str, datetime],
+        existing: Candle,
+        native: bool,
+        evaluate_strategy: bool,
+    ) -> ProcessResult:
+        existing_revision = int(existing.metadata.get("revision", 0) or 0)
+        new_revision = int(candle.metadata.get("revision", 0) or 0)
+        if native and not self._is_derived(candle) and new_revision > existing_revision:
+            issue_code = "candle_revision"
+            issue_message = (
+                f"Revisión nativa {new_revision} reemplazó {existing_revision} en {timeframe}: "
+                f"{candle.start.isoformat()}"
+            )
+        elif native and self._is_derived(existing) and not self._is_derived(candle):
+            issue_code = "native_preferred"
+            issue_message = f"Vela nativa reemplazó derivada en {timeframe}: {candle.start.isoformat()}"
+        else:
+            issue = self._issue(
+                "duplicate_candle", f"Vela duplicada o revisión ya observada: {candle.candle_id}", record=candle
+            )
+            return ProcessResult(False, issues=(issue,))
+        self._replace_existing_candle(timeframe, logical_key, existing, candle)
+        evaluations, signals = self._evaluate_trigger(candle, timeframe, evaluate_strategy)
+        issue = self._issue(issue_code, issue_message, record=candle)
+        return ProcessResult(
+            True,
+            candles=(candle,),
+            evaluations=evaluations,
+            signals=signals,
+            pending_simulations=self.pending_simulations,
+            issues=(issue,),
+        )
+
+    def _evaluate_trigger(
+        self, candle: Candle, timeframe: str, evaluate_strategy: bool
+    ) -> tuple[tuple[Any, ...], tuple[Signal, ...]]:
+        trigger_timeframe = _timeframe_name(self.strategy_config.trigger_timeframe)
+        if evaluate_strategy and timeframe == trigger_timeframe and candle.closed:
+            return self._evaluate_strategy()
+        return (), ()
+
+    def _append_new_candle(
+        self,
+        candle: Candle,
+        *,
+        timeframe: str,
+        logical_key: tuple[str, datetime],
+        native: bool,
+        evaluate_strategy: bool,
+        quality_issue: RuntimeIssue | None,
+    ) -> ProcessResult:
+        self._logical_candle_keys[timeframe].add(logical_key)
+        self._add_candle_id(candle.candle_id)
+        (self._native_candle_keys if native else self._derived_candle_keys).add(logical_key)
+        self.candles_processed += 1
+        point = self.indicator_engines[timeframe].update(candle)
+        self._append_bounded(timeframe, candle, point)
+        self._point_index_by_start[timeframe][candle.start] = (
+            self._point_base_index[timeframe] + len(self.indicator_points[timeframe]) - 1
+        )
+        self.indicator_updates[timeframe] = self.indicator_updates.get(timeframe, 0) + 1
+        context_timeframe, preparation_timeframe, _trigger_timeframe = _strategy_timeframe_names(self.strategy_config)
+        if timeframe in {context_timeframe, preparation_timeframe}:
+            self._strategy_dirty = True
+        evaluations, signals = self._evaluate_trigger(candle, timeframe, evaluate_strategy and quality_issue is None)
+        return ProcessResult(
+            True,
+            candles=(candle,),
+            evaluations=evaluations,
+            signals=signals,
+            pending_simulations=self.pending_simulations,
+            issues=(quality_issue,) if quality_issue is not None else (),
+        )
+
+    def _accept_candle(self, candle: Candle, *, native: bool, evaluate_strategy: bool = True) -> ProcessResult:
+        tf_name = candle.timeframe_name
+        rejection = self._candle_acceptance_issue(candle, tf_name)
+        if rejection is not None:
+            return ProcessResult(False, issues=(rejection,))
         quality_issue: RuntimeIssue | None = None
-        if not candle.quality.valid:
-            quality_issue = self._issue("quality_blocked", f"Calidad no admisible en {candle.timeframe.name}: {candle.quality.status}", record=candle)
+        if not candle.quality.usable:
+            quality_issue = self._issue(
+                "quality_blocked",
+                f"Calidad no admisible en {tf_name}: {candle.quality.status}",
+                record=candle,
+            )
         logical_key = self._logical_key(candle)
         existing = self._candle_by_key[tf_name].get(logical_key)
         if existing is not None:
@@ -522,66 +704,32 @@ class IncrementalProcessor:
             # it arrives after a derived bar, replace the effective value for
             # future calculations and rebuild that timeframe once; prior
             # decisions remain immutable and are not rewritten.
-            existing_revision = int((existing.metadata.get("revision", 0) if hasattr(existing.metadata, "get") else 0) or 0)
-            new_revision = int((candle.metadata.get("revision", 0) if hasattr(candle.metadata, "get") else 0) or 0)
-            if native and not self._is_derived(candle) and new_revision > existing_revision:
-                rows = self.candles[tf_name]
-                for index, previous in enumerate(rows):
-                    if self._logical_key(previous) == logical_key:
-                        rows[index] = candle
-                        break
-                self._replace_candle_id(existing.candle_id, candle.candle_id)
-                self._native_candle_keys.add(logical_key)
-                self._derived_candle_keys.discard(logical_key)
-                self._candle_by_key[tf_name][logical_key] = candle
-                self._rebuild_indicator_engine(tf_name)
-                self.indicator_updates[tf_name] = self.indicator_updates.get(tf_name, 0) + 1
-                evaluations: tuple[Any, ...] = ()
-                signals: tuple[Signal, ...] = ()
-                if evaluate_strategy and tf_name == self.strategy_config.trigger_timeframe.name and candle.closed:
-                    evaluations, signals = self._evaluate_strategy()
-                issue = self._issue("candle_revision", f"Revisión nativa {new_revision} reemplazó {existing_revision} en {tf_name}: {candle.start.isoformat()}", record=candle)
-                return ProcessResult(True, candles=(candle,), evaluations=evaluations, signals=signals, pending_simulations=self.pending_simulations, issues=(issue,))
-            if native and self._is_derived(existing) and not self._is_derived(candle):
-                rows = self.candles[tf_name]
-                for index, previous in enumerate(rows):
-                    if self._logical_key(previous) == logical_key:
-                        rows[index] = candle
-                        break
-                self._replace_candle_id(existing.candle_id, candle.candle_id)
-                self._native_candle_keys.add(logical_key)
-                self._derived_candle_keys.discard(logical_key)
-                self._candle_by_key[tf_name][logical_key] = candle
-                self._rebuild_indicator_engine(tf_name)
-                evaluations: tuple[Any, ...] = ()
-                signals: tuple[Signal, ...] = ()
-                if evaluate_strategy and tf_name == self.strategy_config.trigger_timeframe.name and candle.closed:
-                    evaluations, signals = self._evaluate_strategy()
-                issue = self._issue("native_preferred", f"Vela nativa reemplazó derivada en {tf_name}: {candle.start.isoformat()}", record=candle)
-                return ProcessResult(True, candles=(candle,), evaluations=evaluations, signals=signals, pending_simulations=self.pending_simulations, issues=(issue,))
-            issue = self._issue("duplicate_candle", f"Vela duplicada o revisión ya observada: {candle.candle_id}", record=candle)
-            return ProcessResult(False, issues=(issue,))
+            return self._replacement_result(
+                candle,
+                timeframe=tf_name,
+                logical_key=logical_key,
+                existing=existing,
+                native=native,
+                evaluate_strategy=evaluate_strategy,
+            )
         if candle.candle_id in self._candle_ids:
-            issue = self._issue("duplicate_candle", f"Vela duplicada o revisión ya observada: {candle.candle_id}", record=candle)
+            issue = self._issue(
+                "duplicate_candle", f"Vela duplicada o revisión ya observada: {candle.candle_id}", record=candle
+            )
             return ProcessResult(False, issues=(issue,))
         if self.candles[tf_name] and candle.start <= self.candles[tf_name][-1].start:
-            issue = self._issue("out_of_order_candle", f"Vela fuera de orden en {tf_name}: {candle.start.isoformat()}", record=candle)
+            issue = self._issue(
+                "out_of_order_candle", f"Vela fuera de orden en {tf_name}: {candle.start.isoformat()}", record=candle
+            )
             return ProcessResult(False, issues=(issue,))
-        self._logical_candle_keys[tf_name].add(logical_key)
-        self._add_candle_id(candle.candle_id)
-        (self._native_candle_keys if native else self._derived_candle_keys).add(logical_key)
-        self.candles_processed += 1
-        point = self.indicator_engines[tf_name].update(candle)
-        self._append_bounded(tf_name, candle, point)
-        self._point_index_by_start[tf_name][candle.start] = self._point_base_index[tf_name] + len(self.indicator_points[tf_name]) - 1
-        self.indicator_updates[tf_name] = self.indicator_updates.get(tf_name, 0) + 1
-        if tf_name in {self.strategy_config.context_timeframe.name, self.strategy_config.preparation_timeframe.name}:
-            self._strategy_dirty = True
-        evaluations: tuple[Any, ...] = ()
-        signals: tuple[Signal, ...] = ()
-        if quality_issue is None and evaluate_strategy and tf_name == self.strategy_config.trigger_timeframe.name and candle.closed:
-            evaluations, signals = self._evaluate_strategy()
-        return ProcessResult(True, candles=(candle,), evaluations=evaluations, signals=signals, pending_simulations=self.pending_simulations, issues=(quality_issue,) if quality_issue is not None else ())
+        return self._append_new_candle(
+            candle,
+            timeframe=tf_name,
+            logical_key=logical_key,
+            native=native,
+            evaluate_strategy=evaluate_strategy,
+            quality_issue=quality_issue,
+        )
 
     def _strategy_window_indices(self, name: str, as_of: datetime, *, lookback: int) -> list[int]:
         points = self.indicator_points.get(name, ())
@@ -590,7 +738,10 @@ class IncrementalProcessor:
         # Runtime input is monotonic, so inspect only the short future tail
         # rather than scanning the complete historical series per trigger.
         latest = len(points) - 1
-        while latest >= 0 and point_available(points[latest]) is not None and point_available(points[latest]) > as_of:
+        while latest >= 0:
+            available = point_available(points[latest])
+            if available is None or available <= as_of:
+                break
             latest -= 1
         if latest < 0:
             return []
@@ -599,7 +750,11 @@ class IncrementalProcessor:
         # conservar todos los episodios usados volvería a ampliar la ventana
         # hasta el inicio del histórico.
         by_start = self._point_index_by_start.get(name, {})
-        current = [episode for episode in self.episodes.values() if not episode.invalidated and episode.registered_at <= as_of and episode.expires_at >= as_of]
+        current = [
+            episode
+            for episode in self.episodes.values()
+            if not episode.invalidated and episode.registered_at <= as_of and episode.expires_at >= as_of
+        ]
         if current:
             episode = max(current, key=lambda item: item.registered_at)
             absolute_index = by_start.get(episode.preparation_start)
@@ -609,12 +764,11 @@ class IncrementalProcessor:
         return list(range(first, latest + 1))
 
     def _bounded_strategy_streams(self, as_of: datetime) -> dict[str, IndicatorSeries]:
-        context_tf = self.strategy_config.context_timeframe.name
-        preparation_tf = self.strategy_config.preparation_timeframe.name
-        trigger_tf = self.strategy_config.trigger_timeframe.name
+        context_tf, preparation_tf, trigger_tf = _strategy_timeframe_names(self.strategy_config)
         requests = {
             context_tf: self.strategy_config.context_lookback,
-            preparation_tf: max(self.strategy_config.preparation_lookback, self.strategy_config.preparation_ttl_bars) + self.strategy_config.preparation_lookback,
+            preparation_tf: max(self.strategy_config.preparation_lookback, self.strategy_config.preparation_ttl_bars)
+            + self.strategy_config.preparation_lookback,
             trigger_tf: 1,
         }
         streams: dict[str, IndicatorSeries] = {}
@@ -627,15 +781,22 @@ class IncrementalProcessor:
                 continue
             engine = self.indicator_engines[name]
             points = tuple(self.indicator_points[name][index] for index in indices)
-            streams[name] = IndicatorSeries(engine.series.timeframe, engine.series.instrument, self.strategy_config.indicators, points)
+            streams[name] = IndicatorSeries(
+                engine.series.timeframe, engine.series.instrument, self.strategy_config.indicators, points
+            )
             self.last_strategy_window_sizes[name] = len(points)
         return streams
 
     def _strategy_warmup_ready(self) -> bool:
-        context = self.indicator_points.get(self.strategy_config.context_timeframe.name, ())
-        preparation = self.indicator_points.get(self.strategy_config.preparation_timeframe.name, ())
-        trigger = self.indicator_points.get(self.strategy_config.trigger_timeframe.name, ())
-        if len(context) <= self.strategy_config.context_lookback or len(preparation) <= self.strategy_config.preparation_lookback or len(trigger) < 2:
+        context_tf, preparation_tf, trigger_tf = _strategy_timeframe_names(self.strategy_config)
+        context = self.indicator_points.get(context_tf, ())
+        preparation = self.indicator_points.get(preparation_tf, ())
+        trigger = self.indicator_points.get(trigger_tf, ())
+        if (
+            len(context) <= self.strategy_config.context_lookback
+            or len(preparation) <= self.strategy_config.preparation_lookback
+            or len(trigger) < 2
+        ):
             return False
         context_latest = context[-1]
         context_lag = context[-1 - self.strategy_config.context_lookback]
@@ -647,7 +808,7 @@ class IncrementalProcessor:
         return all(point.ready and point.closed for point in relevant)
 
     def _trigger_candidate(self) -> bool:
-        trigger = self.indicator_points.get(self.strategy_config.trigger_timeframe.name, ())
+        trigger = self.indicator_points.get(_timeframe_name(self.strategy_config.trigger_timeframe), ())
         if len(trigger) < 2:
             return False
         current, previous = trigger[-1], trigger[-2]
@@ -655,24 +816,12 @@ class IncrementalProcessor:
             return False
         if any(value is None for value in (current.close, current.ema_fast, previous.close, previous.ema_fast)):
             return False
-        return (previous.close <= previous.ema_fast < current.close) or (previous.close >= previous.ema_fast > current.close)
+        return bool(
+            (previous.close <= previous.ema_fast < current.close)
+            or (previous.close >= previous.ema_fast > current.close)
+        )
 
-    def _evaluate_strategy(self) -> tuple[tuple[Any, ...], tuple[Signal, ...]]:
-        trigger_points = self.indicator_points.get(self.strategy_config.trigger_timeframe.name, ())
-        if not trigger_points:
-            return (), ()
-        # Before warmup, and on ordinary M1 bars that cannot cross EMA20, the
-        # state is unchanged. A dirty context/preparation update still forces
-        # one evaluation when the prerequisites become ready.
-        if not self._strategy_warmup_ready() or (not self._strategy_dirty and not self._trigger_candidate()):
-            self.strategy_skipped += 1
-            return (), ()
-        self._strategy_dirty = False
-        latest_trigger = trigger_points[-1]
-        as_of = point_available(latest_trigger) or latest_trigger.end
-        streams = self._bounded_strategy_streams(as_of)
-        self.strategy_evaluations += 1
-        result = self.strategy.evaluate(streams)
+    def _record_strategy_evaluations(self, result: StrategyResult) -> tuple[Any, ...]:
         new_evaluations: list[Any] = []
         for evaluation in result.evaluations:
             decision_id = _decision_id(evaluation)
@@ -681,12 +830,19 @@ class IncrementalProcessor:
             self._remember_id(decision_id, self._decision_ids, self._decision_order)
             self._append_evaluation(evaluation)
             new_evaluations.append(evaluation)
+        return tuple(new_evaluations)
+
+    def _merge_strategy_episodes(self, result: StrategyResult) -> None:
         # Conservar primero los episodios que el nuevo resultado reobserva;
         # después las señales marcan ``used`` sin que un snapshot posterior lo
         # vuelva a poner en falso.
         for episode in result.episodes:
             previous = self.episodes.get(episode.episode_id)
-            self.episodes[episode.episode_id] = replace(episode, used=True) if previous is not None and previous.used else episode
+            self.episodes[episode.episode_id] = (
+                replace(episode, used=True) if previous is not None and previous.used else episode
+            )
+
+    def _record_strategy_signals(self, result: StrategyResult) -> tuple[Signal, ...]:
         new_signals: list[Signal] = []
         for signal in result.signals:
             if signal.signal_id in self._signal_ids:
@@ -703,19 +859,64 @@ class IncrementalProcessor:
             self._apply_consumer_result(self._dispatch_signal(signal))
             if signal.episode_id in self.episodes:
                 self.episodes[signal.episode_id] = replace(self.episodes[signal.episode_id], used=True)
+        return tuple(new_signals)
+
+    def _update_strategy_context(self, result: StrategyResult) -> None:
         # A compact current-context view for status/UI; detailed decisions stay
         # in ``evaluations``.
-        latest = next((item for item in reversed(result.evaluations) if item.stage == "trigger" and item.values.get("context") is not None), None)
+        latest = next(
+            (
+                item
+                for item in reversed(result.evaluations)
+                if item.stage == "trigger" and item.values.get("context") is not None
+            ),
+            None,
+        )
         if latest is not None:
-            self.context = {"direction": latest.direction, "values": latest.values.get("context"), "timestamp": latest.timestamp}
+            self.context = {
+                "direction": latest.direction,
+                "values": latest.values.get("context"),
+                "timestamp": latest.timestamp,
+            }
+
+    def _evaluate_strategy(self) -> tuple[tuple[Any, ...], tuple[Signal, ...]]:
+        trigger_timeframe = _timeframe_name(self.strategy_config.trigger_timeframe)
+        trigger_points = self.indicator_points.get(trigger_timeframe, ())
+        if not trigger_points:
+            return (), ()
+        # Before warmup, and on ordinary M1 bars that cannot cross EMA20, the
+        # state is unchanged. A dirty context/preparation update still forces
+        # one evaluation when the prerequisites become ready.
+        if not self._strategy_warmup_ready() or (not self._strategy_dirty and not self._trigger_candidate()):
+            self.strategy_skipped += 1
+            return (), ()
+        self._strategy_dirty = False
+        latest_trigger = trigger_points[-1]
+        as_of = point_available(latest_trigger) or latest_trigger.end
+        streams = self._bounded_strategy_streams(as_of)
+        self.strategy_evaluations += 1
+        result = self.strategy.evaluate(streams)
+        new_evaluations = self._record_strategy_evaluations(result)
+        self._merge_strategy_episodes(result)
+        new_signals = self._record_strategy_signals(result)
+        self._update_strategy_context(result)
         self._prune_episodes()
-        return tuple(new_evaluations), tuple(new_signals)
+        return new_evaluations, new_signals
 
     def register_signal(self, signal: Signal) -> tuple[PendingSimulation, ...]:
         """Registra una señal ya validada y crea sus horizontes virtuales."""
         if not isinstance(signal, Signal):
             raise TypeError("register_signal requiere core.Signal")
-        aliases = {"UP": "UP", "LONG": "UP", "BUY": "UP", "BULL": "UP", "DOWN": "DOWN", "SHORT": "DOWN", "SELL": "DOWN", "BEAR": "DOWN"}
+        aliases = {
+            "UP": "UP",
+            "LONG": "UP",
+            "BUY": "UP",
+            "BULL": "UP",
+            "DOWN": "DOWN",
+            "SHORT": "DOWN",
+            "SELL": "DOWN",
+            "BEAR": "DOWN",
+        }
         direction = aliases.get(str(signal.direction).upper())
         if direction is None:
             raise ValueError(f"dirección desconocida: {signal.direction!r}")
@@ -751,9 +952,128 @@ class IncrementalProcessor:
             observation_id=event.event_id,
             source_sequence=event.sequence,
         )
-        return self._dispatch_observation(
-            observation, watermark=observation.available_at
+        return self._dispatch_observation(observation, watermark=observation.available_at)
+
+    def _validate_event(self, event: MarketEvent) -> ProcessResult | None:
+        event_id = _event_identity(event)
+        if not self._ensure_instrument(event.instrument):
+            issue = self._issue(
+                "instrument_mismatch", f"Se esperaba {self.instrument}, llegó {event.instrument}", record=event
+            )
+            return ProcessResult(False, events=(event,), issues=(issue,))
+        if event.mode is not self.mode:
+            issue = self._issue(
+                "mode_mismatch", f"Se esperaba modo {self.mode.value}, llegó {event.mode.value}", record=event
+            )
+            return ProcessResult(False, events=(event,), issues=(issue,))
+        if event_id in self._seen_event_ids:
+            issue = self._issue("duplicate_event", f"Evento repetido: {event_id}", record=event)
+            return ProcessResult(False, events=(event,), issues=(issue,))
+        if self.last_event_time is not None and event.event_time < self.last_event_time:
+            issue = self._issue(
+                "out_of_order_event", f"Evento fuera de orden: {event.event_time.isoformat()}", record=event
+            )
+            return ProcessResult(False, events=(event,), issues=(issue,))
+        return None
+
+    def _remember_event(self, event: MarketEvent) -> None:
+        event_id = _event_identity(event)
+        self._seen_event_ids.add(event_id)
+        self._events[event_id] = event
+        if self.max_candles is not None and len(self._events) > self.max_candles * max(1, len(self.timeframes)):
+            oldest_id = next(iter(self._events))
+            self._events.pop(oldest_id, None)
+            self._seen_event_ids.discard(oldest_id)
+        self.events_processed += 1
+        self.last_event_id = event_id
+        self.last_event_time = (
+            event.event_time if self.last_event_time is None else max(self.last_event_time, event.event_time)
         )
+        self.last_available_at = (
+            event.effective_available_at
+            if self.last_available_at is None
+            else max(self.last_available_at, event.effective_available_at)
+        )
+
+    def _collect_aggregation_issues(
+        self,
+        raw_issues: Iterable[Any],
+        seen_keys: set[tuple[str, str, str | None]],
+    ) -> tuple[list[RuntimeIssue], bool]:
+        issues: list[RuntimeIssue] = []
+        blocked = False
+        for item in raw_issues:
+            issue_key = (item.code, item.message, item.record_id)
+            if issue_key in seen_keys:
+                continue
+            seen_keys.add(issue_key)
+            issue = RuntimeIssue(item.code, item.message, item.timestamp, item.record_id)
+            issues.append(issue)
+            self._append_issue(issue)
+            blocked = blocked or issue.code in _BLOCKING_RUNTIME_ISSUES
+        return issues, blocked
+
+    def _collect_aggregation_candles(
+        self, raw_candles: Iterable[Candle], *, trigger_timeframe: str
+    ) -> tuple[list[Candle], list[RuntimeIssue], bool, bool]:
+        emitted: list[Candle] = []
+        issues: list[RuntimeIssue] = []
+        blocked = False
+        trigger_closed = False
+        for candle in raw_candles:
+            accepted = self._accept_candle(candle, native=False, evaluate_strategy=False)
+            if accepted.accepted:
+                emitted.extend(accepted.candles)
+                if candle.timeframe_name == trigger_timeframe and candle.closed:
+                    trigger_closed = True
+            issues.extend(accepted.issues)
+            blocked = blocked or any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in accepted.issues)
+        return emitted, issues, blocked, trigger_closed
+
+    def _aggregate_timeframe(
+        self,
+        event: MarketEvent,
+        timeframe: Timeframe,
+        seen_issue_keys: set[tuple[str, str, str | None]],
+        *,
+        trigger_timeframe: str,
+    ) -> tuple[bool, list[Candle], list[RuntimeIssue], bool, bool]:
+        result = self.aggregators[timeframe.name].add(event)
+        aggregation_issues, issue_blocked = self._collect_aggregation_issues(result.issues, seen_issue_keys)
+        emitted, candle_issues, candle_blocked, trigger_closed = self._collect_aggregation_candles(
+            result.emitted, trigger_timeframe=trigger_timeframe
+        )
+        return (
+            result.accepted,
+            emitted,
+            [*aggregation_issues, *candle_issues],
+            issue_blocked or candle_blocked,
+            trigger_closed,
+        )
+
+    def _aggregate_event(self, event: MarketEvent) -> tuple[bool, bool, bool, list[Candle], list[RuntimeIssue]]:
+        aggregation_accepted = True
+        aggregation_blocked = False
+        trigger_closed = False
+        emitted: list[Candle] = []
+        issues: list[RuntimeIssue] = []
+        seen_issue_keys: set[tuple[str, str, str | None]] = set()
+        trigger_timeframe = _timeframe_name(self.strategy_config.trigger_timeframe)
+        # Contexto primero (M15 > M5 > M1) cuando varias temporalidades
+        # cierran al recibir un evento de frontera.
+        for timeframe in sorted(self.timeframes, key=lambda item: item.seconds, reverse=True):
+            accepted, candles, current_issues, blocked, closed = self._aggregate_timeframe(
+                event,
+                timeframe,
+                seen_issue_keys,
+                trigger_timeframe=trigger_timeframe,
+            )
+            aggregation_accepted = aggregation_accepted and accepted
+            aggregation_blocked = aggregation_blocked or blocked
+            trigger_closed = trigger_closed or closed
+            emitted.extend(candles)
+            issues.extend(current_issues)
+        return aggregation_accepted, aggregation_blocked, trigger_closed, emitted, issues
 
     def process_event(self, record: Any, *, evaluate_strategy: bool = True) -> ProcessResult:
         """Consume one event; aggregate all temporalities in close order.
@@ -763,69 +1083,20 @@ class IncrementalProcessor:
         not emit historical decisions or signals.
         """
         self._begin_transition()
-
         try:
             event = to_core_event(record, mode=self.mode)
         except Exception as exc:
             issue = self._issue("event_invalid", str(exc), record=record)
             return ProcessResult(False, issues=(issue,))
-        if not self._ensure_instrument(event.instrument):
-            issue = self._issue("instrument_mismatch", f"Se esperaba {self.instrument}, llegó {event.instrument}", record=event)
-            return ProcessResult(False, events=(event,), issues=(issue,))
-        if event.mode is not self.mode:
-            issue = self._issue("mode_mismatch", f"Se esperaba modo {self.mode.value}, llegó {event.mode.value}", record=event)
-            return ProcessResult(False, events=(event,), issues=(issue,))
-        if event.event_id in self._seen_event_ids:
-            issue = self._issue("duplicate_event", f"Evento repetido: {event.event_id}", record=event)
-            return ProcessResult(False, events=(event,), issues=(issue,))
-        if self.last_event_time is not None and event.event_time < self.last_event_time:
-            issue = self._issue("out_of_order_event", f"Evento fuera de orden: {event.event_time.isoformat()}", record=event)
-            return ProcessResult(False, events=(event,), issues=(issue,))
-        self._seen_event_ids.add(event.event_id)
-        self._events[event.event_id] = event
-        if self.max_candles is not None and len(self._events) > self.max_candles * max(1, len(self.timeframes)):
-            oldest_id = next(iter(self._events))
-            self._events.pop(oldest_id, None)
-            self._seen_event_ids.discard(oldest_id)
-        self.events_processed += 1
-        self.last_event_id = event.event_id
-        self.last_event_time = event.event_time if self.last_event_time is None else max(self.last_event_time, event.event_time)
-        self.last_available_at = event.effective_available_at if self.last_available_at is None else max(self.last_available_at, event.effective_available_at)
-        emitted: list[Candle] = []
-        evaluations: list[Any] = []
-        signals: list[Signal] = []
-        issues: list[RuntimeIssue] = []
-        aggregation_accepted = True
-        aggregation_blocked = False
-        trigger_closed = False
-        aggregation_issue_keys: set[tuple[str, str, str | None]] = set()
-        # Contexto primero (M15 > M5 > M1) cuando varias temporalidades
-        # cierran al recibir un evento de frontera.
-        for tf in sorted(self.timeframes, key=lambda item: item.seconds, reverse=True):
-            result = self.aggregators[tf.name].add(event)
-            if not result.accepted:
-                aggregation_accepted = False
-            for item in result.issues:
-                issue_key = (item.code, item.message, item.record_id)
-                if issue_key in aggregation_issue_keys:
-                    continue
-                aggregation_issue_keys.add(issue_key)
-                issue = RuntimeIssue(item.code, item.message, item.timestamp, item.record_id)
-                issues.append(issue)
-                self._append_issue(issue)
-                aggregation_blocked = aggregation_blocked or issue.code in _BLOCKING_RUNTIME_ISSUES
-            for candle in result.emitted:
-                accepted = self._accept_candle(candle, native=False, evaluate_strategy=False)
-                if accepted.accepted:
-                    emitted.extend(accepted.candles)
-                    if candle.timeframe.name == self.strategy_config.trigger_timeframe.name and candle.closed:
-                        trigger_closed = True
-                issues.extend(accepted.issues)
-                aggregation_blocked = aggregation_blocked or any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in accepted.issues)
+        rejection = self._validate_event(event)
+        if rejection is not None:
+            return rejection
+        self._remember_event(event)
+        aggregation_accepted, aggregation_blocked, trigger_closed, emitted, issues = self._aggregate_event(event)
+        evaluations: tuple[Any, ...] = ()
+        signals: tuple[Signal, ...] = ()
         if evaluate_strategy and aggregation_accepted and not aggregation_blocked and trigger_closed:
-            new_evaluations, new_signals = self._evaluate_strategy()
-            evaluations.extend(new_evaluations)
-            signals.extend(new_signals)
+            evaluations, signals = self._evaluate_strategy()
         # Un evento que no pudo entrar de forma coherente en todas las
         # temporalidades no puede resolver simulaciones ni contarse como
         # entrada aceptada, aunque se conserve como evidencia capturada.
@@ -834,8 +1105,8 @@ class IncrementalProcessor:
             aggregation_accepted,
             events=(event,),
             candles=tuple(emitted),
-            evaluations=tuple(evaluations),
-            signals=tuple(signals),
+            evaluations=evaluations,
+            signals=signals,
             simulations=tuple(completed),
             pending_simulations=self.pending_simulations,
             issues=tuple(issues),
@@ -860,7 +1131,9 @@ class IncrementalProcessor:
             issue = self._issue("candle_invalid", str(exc), record=record)
             return ProcessResult(False, issues=(issue,))
         if candle.mode is not self.mode:
-            issue = self._issue("mode_mismatch", f"Se esperaba modo {self.mode.value}, llegó {candle.mode.value}", record=candle)
+            issue = self._issue(
+                "mode_mismatch", f"Se esperaba modo {self.mode.value}, llegó {candle.mode.value}", record=candle
+            )
             return ProcessResult(False, issues=(issue,))
         accepted = self._accept_candle(candle, native=True, evaluate_strategy=False)
         if not accepted.accepted:
@@ -883,14 +1156,27 @@ class IncrementalProcessor:
         self.last_available_at = available if self.last_available_at is None else max(self.last_available_at, available)
         # Evaluate once, after all same-watermark context/preparation bars have
         # been installed. This is the same order used by event aggregation.
-        if evaluate_strategy and candle.timeframe.name == self.strategy_config.trigger_timeframe.name and candle.closed and not any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in all_issues):
+        if (
+            evaluate_strategy
+            and candle.timeframe_name == _timeframe_name(self.strategy_config.trigger_timeframe)
+            and candle.closed
+            and not any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in all_issues)
+        ):
             evaluations, signals = self._evaluate_strategy()
             all_evaluations.extend(evaluations)
             all_signals.extend(signals)
         obs = PriceObservation(
-            candle.end, max(available, candle.end), candle.close, candle.price_base.value,
-            candle.source, candle.timeframe.name, candle.closed, candle.quality.status,
-            instrument=candle.instrument, observation_id=candle.candle_id, source_ordinal=self.candles_processed,
+            candle.end,
+            max(available, candle.end),
+            candle.close,
+            candle.price_base.value,
+            candle.source,
+            candle.timeframe_name,
+            candle.closed,
+            candle.quality.status,
+            instrument=candle.instrument,
+            observation_id=candle.candle_id,
+            source_ordinal=self.candles_processed,
         )
         completed = self._dispatch_observation(obs, watermark=obs.available_at)
         return ProcessResult(
@@ -912,7 +1198,9 @@ class IncrementalProcessor:
     feed_event = process_event
     feed_bar = process_bar
 
-    def finalize(self, watermark: datetime | None = None, *, evaluate_strategy: bool = True, capture_complete: bool = True) -> ProcessResult:
+    def finalize(
+        self, watermark: datetime | None = None, *, evaluate_strategy: bool = True, capture_complete: bool = True
+    ) -> ProcessResult:
         """Close active buckets at an explicit watermark; no empty candle is made."""
         self._begin_transition()
 
@@ -939,11 +1227,7 @@ class IncrementalProcessor:
                 issue = RuntimeIssue(item.code, item.message, item.timestamp, item.record_id)
                 issues.append(issue)
                 self._append_issue(issue)
-        completed = list(
-            self._dispatch_advance(
-                watermark, capture_complete=capture_complete
-            )
-        )
+        completed = list(self._dispatch_advance(watermark, capture_complete=capture_complete))
         return ProcessResult(
             True,
             candles=tuple(emitted),
@@ -979,8 +1263,22 @@ class IncrementalProcessor:
             completed += len(result.completed_simulations)
             issues.extend(result.issues)
         final = self.finalize()
-        candles += len(final.candles); signals += len(final.signals); evaluations += len(final.evaluations); completed += len(final.completed_simulations); issues.extend(final.issues)
-        return ReplayResult(accepted, duplicate, rejected, candles, signals, evaluations, completed, len(self.pending_simulations), tuple(issues))
+        candles += len(final.candles)
+        signals += len(final.signals)
+        evaluations += len(final.evaluations)
+        completed += len(final.completed_simulations)
+        issues.extend(final.issues)
+        return ReplayResult(
+            accepted,
+            duplicate,
+            rejected,
+            candles,
+            signals,
+            evaluations,
+            completed,
+            len(self.pending_simulations),
+            tuple(issues),
+        )
 
     def checkpoint(self) -> dict[str, Any]:
         """Return a JSON-compatible snapshot; no pickle or live objects."""
@@ -997,13 +1295,16 @@ class IncrementalProcessor:
                     "start": iso(bucket.start),
                     "end": iso(bucket.end),
                     "events": [event_dict(event) for event in bucket.events],
-                } if bucket is not None else None,
+                }
+                if bucket is not None
+                else None,
             }
+        context_timeframe, preparation_timeframe, trigger_timeframe = _strategy_timeframe_names(self.strategy_config)
         strategy_data = {
             "name": self.strategy_config.name,
-            "context_timeframe": self.strategy_config.context_timeframe.name,
-            "preparation_timeframe": self.strategy_config.preparation_timeframe.name,
-            "trigger_timeframe": self.strategy_config.trigger_timeframe.name,
+            "context_timeframe": context_timeframe,
+            "preparation_timeframe": preparation_timeframe,
+            "trigger_timeframe": trigger_timeframe,
             "context_lookback": self.strategy_config.context_lookback,
             "preparation_lookback": self.strategy_config.preparation_lookback,
             "max_distance_atr": self.strategy_config.max_distance_atr,
@@ -1026,14 +1327,12 @@ class IncrementalProcessor:
             if self._simulation_book is not None
             else [item.simulation_id for item in self.completed_simulations]
         )
-        observations = (
-            self._simulation_book.observations
-            if self._simulation_book is not None
-            else ()
-        )
+        observations = self._simulation_book.observations if self._simulation_book is not None else ()
         return {
             "checkpoint_version": self.CHECKPOINT_VERSION,
-            "config_hash": config_hash(self.strategy_config, self.simulation_config, self.timeframes, self.mode, self.price_base),
+            "config_hash": config_hash(
+                self.strategy_config, self.simulation_config, self.timeframes, self.mode, self.price_base
+            ),
             "mode": self.mode.value,
             "instrument": self.instrument,
             "source": self.source,
@@ -1048,11 +1347,17 @@ class IncrementalProcessor:
             "events": [event_dict(event) for event in self._events.values()],
             "aggregators": aggregator_state,
             "resample_buffers": {
-                name: {iso(bucket_start): {iso(base_start): candle_dict(candle) for base_start, candle in bucket.items()} for bucket_start, bucket in buckets.items()}
+                name: {
+                    iso(bucket_start): {iso(base_start): candle_dict(candle) for base_start, candle in bucket.items()}
+                    for bucket_start, bucket in buckets.items()
+                }
                 for name, buckets in self._resample_buffers.items()
             },
             "candles": {name: [candle_dict(candle) for candle in values] for name, values in self.candles.items()},
-            "indicator_points": {name: [_indicator_point_dict(point) for point in values] for name, values in self.indicator_points.items()},
+            "indicator_points": {
+                name: [_indicator_point_dict(point) for point in values]
+                for name, values in self.indicator_points.items()
+            },
             "indicator_engines": {name: _engine_state(engine) for name, engine in self.indicator_engines.items()},
             "evaluations": [evaluation_dict(item) for item in self.evaluations],
             "signals": [signal_dict(item) for item in self.signals],
@@ -1070,6 +1375,7 @@ class IncrementalProcessor:
             "consumer_events": [event.to_dict() for event in self._consumer_events],
             "consumer_event_count": self._consumer_event_count,
             "last_event_time": iso(self.last_event_time),
+            "last_event_id": self.last_event_id,
             "last_available_at": iso(self.last_available_at),
             "events_processed": self.events_processed,
             "candles_processed": self.candles_processed,
@@ -1088,7 +1394,13 @@ class IncrementalProcessor:
     snapshot_json = checkpoint_json
 
     @classmethod
-    def from_checkpoint(cls, snapshot: Mapping[str, Any] | str, *, allow_config_mismatch: bool = False, signal_consumer: SignalConsumer | None = None) -> "IncrementalProcessor":
+    def from_checkpoint(
+        cls,
+        snapshot: Mapping[str, Any] | str,
+        *,
+        allow_config_mismatch: bool = False,
+        signal_consumer: SignalConsumer | None = None,
+    ) -> IncrementalProcessor:
         if isinstance(snapshot, str):
             snapshot = json.loads(snapshot)
         if not isinstance(snapshot, Mapping):
@@ -1114,7 +1426,13 @@ class IncrementalProcessor:
             max_candles=snapshot.get("max_candles"),
             signal_consumer=signal_consumer,
         )
-        expected_hash = config_hash(processor.strategy_config, processor.simulation_config, processor.timeframes, processor.mode, processor.price_base)
+        expected_hash = config_hash(
+            processor.strategy_config,
+            processor.simulation_config,
+            processor.timeframes,
+            processor.mode,
+            processor.price_base,
+        )
         if not allow_config_mismatch and snapshot.get("config_hash") != expected_hash:
             raise ValueError("config_hash del checkpoint no coincide")
         _restore_capture_history(processor, snapshot)
@@ -1226,23 +1544,39 @@ def _restore_detector_state(
     processor: IncrementalProcessor,
     snapshot: Mapping[str, Any],
 ) -> None:
-    processor.candles_processed = int(snapshot.get("candles_processed", sum(len(rows) for rows in processor.candles.values())))
+    processor.candles_processed = int(
+        snapshot.get("candles_processed", sum(len(rows) for rows in processor.candles.values()))
+    )
     processor.strategy_evaluations = int(snapshot.get("strategy_evaluations", 0))
     processor.strategy_skipped = int(snapshot.get("strategy_skipped", 0))
     processor._strategy_dirty = bool(snapshot.get("strategy_dirty", True))
-    processor.last_strategy_window_sizes = {str(key): int(value) for key, value in dict(snapshot.get("last_strategy_window_sizes", {})).items()}
-    processor.indicator_updates = {str(key): int(value) for key, value in dict(snapshot.get("indicator_updates", {})).items()}
+    processor.last_strategy_window_sizes = {
+        str(key): int(value) for key, value in dict(snapshot.get("last_strategy_window_sizes", {})).items()
+    }
+    processor.indicator_updates = {
+        str(key): int(value) for key, value in dict(snapshot.get("indicator_updates", {})).items()
+    }
     processor.events_processed = int(snapshot.get("events_processed", len(processor._events)))
     processor.last_event_time = utc(snapshot.get("last_event_time"))
     processor.last_event_id = snapshot.get("last_event_id")
     processor.last_available_at = utc(snapshot.get("last_available_at"))
     processor.evaluations = [evaluation_from_dict(item) for item in snapshot.get("evaluations", ())]
     processor._decision_ids = {_decision_id(item) for item in processor.evaluations}
-    processor._decision_order = deque(str(item) for item in snapshot.get("decision_id_order", processor._decision_ids) if str(item) in processor._decision_ids)
+    processor._decision_order = deque(
+        str(item)
+        for item in snapshot.get("decision_id_order", processor._decision_ids)
+        if str(item) in processor._decision_ids
+    )
     processor.signals = [signal_from_dict(item) for item in snapshot.get("signals", ())]
     processor._signal_ids = {item.signal_id for item in processor.signals}
-    processor._signal_order = deque(str(item) for item in snapshot.get("signal_id_order", processor._signal_ids) if str(item) in processor._signal_ids)
-    processor.episodes = {item.episode_id: item for item in (_episode_from_dict(raw) for raw in snapshot.get("episodes", ()))}
+    processor._signal_order = deque(
+        str(item)
+        for item in snapshot.get("signal_id_order", processor._signal_ids)
+        if str(item) in processor._signal_ids
+    )
+    processor.episodes = {
+        item.episode_id: item for item in (_episode_from_dict(raw) for raw in snapshot.get("episodes", ()))
+    }
     raw_context = snapshot.get("context")
     if isinstance(raw_context, Mapping):
         processor.context = dict(raw_context)
@@ -1321,28 +1655,16 @@ def _restore_legacy_binary_book(
         return
     book.pending = {
         item.simulation_id: item
-        for item in (
-            PendingSimulation.from_dict(raw)
-            for raw in snapshot.get("pending_simulations", ())
-        )
+        for item in (PendingSimulation.from_dict(raw) for raw in snapshot.get("pending_simulations", ()))
     }
-    completed = [
-        PendingSimulation.from_dict(raw)
-        for raw in snapshot.get("completed_simulations", ())
-    ]
+    completed = [PendingSimulation.from_dict(raw) for raw in snapshot.get("completed_simulations", ())]
     book.completed = {item.simulation_id: item for item in completed}
-    book.completed_ids = {
-        str(item)
-        for item in snapshot.get("completed_simulation_ids", book.completed)
-    }
+    book.completed_ids = {str(item) for item in snapshot.get("completed_simulation_ids", book.completed)}
     book.completed_ids.update(book.completed)
-    book.completed_order = deque(
-        item for item in book.completed_ids if item in book.completed
-    )
-    book.observations = [
-        PriceObservation.from_dict(raw)
-        for raw in snapshot.get("simulation_observations", ())
-    ][-book.max_observations :]
+    book.completed_order = deque(item for item in book.completed_ids if item in book.completed)
+    book.observations = [PriceObservation.from_dict(raw) for raw in snapshot.get("simulation_observations", ())][
+        -book.max_observations :
+    ]
     book._observation_ids = {item.identity for item in book.observations}
 
 
@@ -1355,25 +1677,21 @@ def _restore_checkpoint_consumer(
         processor.signal_consumer.restore(raw_checkpoint)
     else:
         _restore_legacy_binary_book(processor, snapshot)
-    processor._consumer_pending = tuple(
-        getattr(processor.signal_consumer, "pending_simulations", ())
-    )
+    processor._consumer_pending = tuple(getattr(processor.signal_consumer, "pending_simulations", ()))
     processor.completed_simulations = [
-        PendingSimulation.from_dict(raw)
-        for raw in snapshot.get("completed_simulations", ())
+        PendingSimulation.from_dict(raw) for raw in snapshot.get("completed_simulations", ())
     ]
     processor._consumer_events.clear()
     for raw in snapshot.get("consumer_events", ()):
         if isinstance(raw, Mapping):
             processor._consumer_events.append(SignalConsumerEvent.from_mapping(raw))
-    processor._consumer_event_count = int(
-        snapshot.get("consumer_event_count", len(processor._consumer_events))
-    )
+    processor._consumer_event_count = int(snapshot.get("consumer_event_count", len(processor._consumer_events)))
     processor._transition_consumer_events = []
 
 
 def _bucket_from_dict(raw: Mapping[str, Any], events: Sequence[MarketEvent]) -> Any:
-    start = utc(raw.get("start")); end = utc(raw.get("end"))
+    start = utc(raw.get("start"))
+    end = utc(raw.get("end"))
     if start is None or end is None:
         raise ValueError("bucket de checkpoint sin start/end")
     return _Bucket(start, end, list(events))
@@ -1423,11 +1741,11 @@ def _replay_key(record: Any, ordinal: int) -> tuple[Any, int, int, int]:
         available_dt = utc(available) or utc(timestamp) or datetime.fromtimestamp(0, UTC)
     except Exception:
         available_dt = datetime.fromtimestamp(0, UTC)
-    try:
-        timestamp_dt = utc(timestamp) or datetime.fromtimestamp(0, UTC)
-    except Exception:
-        timestamp_dt = datetime.fromtimestamp(0, UTC)
-    tf = parse_timeframe(_attr(record, "timeframe", "resolution", "resolution_seconds", default="M1")) if is_bar else None
+    tf = (
+        parse_timeframe(_attr(record, "timeframe", "resolution", "resolution_seconds", default="M1"))
+        if is_bar
+        else None
+    )
     # Native bars at same availability are ingested before events; larger
     # native temporalities first, then event aggregation closes M15/M5/M1 in
     # the same deterministic order.
@@ -1454,6 +1772,7 @@ def _episode_dict(episode: Any) -> dict[str, Any]:
 
 def _episode_from_dict(value: Mapping[str, Any]) -> Any:
     from ..core.strategy import PreparationEpisode
+
     return PreparationEpisode(
         episode_id=str(value["episode_id"]),
         instrument=str(value["instrument"]),
@@ -1480,7 +1799,11 @@ def _indicator_point_dict(point: IndicatorPoint) -> dict[str, Any]:
         "rsi": point.rsi,
         "atr": point.atr,
         "closed": point.closed,
-        "quality": {"flags": sorted(flag.value for flag in point.quality.flags), "reasons": list(point.quality.reasons), "source": point.quality.source},
+        "quality": {
+            "flags": sorted(flag.value for flag in point.quality.flags),
+            "reasons": list(point.quality.reasons),
+            "source": point.quality.source,
+        },
         "candle_id": point.candle_id,
         "index": point.index,
     }
@@ -1506,20 +1829,36 @@ def _indicator_point_from_dict(value: Mapping[str, Any]) -> IndicatorPoint:
 def _engine_state(engine: Any) -> dict[str, Any]:
     def series_state(state: Any) -> dict[str, Any]:
         return {"values": list(state.values), "current": state.current, "period": state.period}
+
     return {
-        "previous_end": iso(engine._previous_end) if isinstance(engine._previous_end, datetime) else engine._previous_end,
+        "previous_end": iso(engine._previous_end)
+        if isinstance(engine._previous_end, datetime)
+        else engine._previous_end,
         "timeframe": engine._timeframe.name if engine._timeframe is not None else None,
         "instrument": engine._instrument,
         "index": engine._index,
         "ema_fast": series_state(engine._ema_fast),
         "ema_slow": series_state(engine._ema_slow),
-        "rsi": {"previous_close": engine._rsi.previous_close, "gains": list(engine._rsi.gains), "losses": list(engine._rsi.losses), "average_gain": engine._rsi.average_gain, "average_loss": engine._rsi.average_loss, "period": engine._rsi.period},
-        "atr": {"previous_close": engine._atr.previous_close, "true_ranges": list(engine._atr.true_ranges), "current": engine._atr.current, "period": engine._atr.period},
+        "rsi": {
+            "previous_close": engine._rsi.previous_close,
+            "gains": list(engine._rsi.gains),
+            "losses": list(engine._rsi.losses),
+            "average_gain": engine._rsi.average_gain,
+            "average_loss": engine._rsi.average_loss,
+            "period": engine._rsi.period,
+        },
+        "atr": {
+            "previous_close": engine._atr.previous_close,
+            "true_ranges": list(engine._atr.true_ranges),
+            "current": engine._atr.current,
+            "period": engine._atr.period,
+        },
     }
 
 
 def _restore_engine_state(engine: Any, value: Mapping[str, Any]) -> None:
     from collections import deque as _deque
+
     previous_end = value.get("previous_end")
     engine._previous_end = utc(previous_end) if previous_end else None
     raw_tf = value.get("timeframe")
@@ -1543,25 +1882,26 @@ def _restore_engine_state(engine: Any, value: Mapping[str, Any]) -> None:
     raw = value.get("atr")
     if isinstance(raw, Mapping):
         engine._atr.previous_close = float(raw["previous_close"]) if raw.get("previous_close") is not None else None
-        engine._atr.true_ranges = _deque((float(item) for item in raw.get("true_ranges", ())), maxlen=engine._atr.period)
+        engine._atr.true_ranges = _deque(
+            (float(item) for item in raw.get("true_ranges", ())), maxlen=engine._atr.period
+        )
         engine._atr.current = float(raw["current"]) if raw.get("current") is not None else None
 
 
 def point_available(point: IndicatorPoint) -> datetime | None:
     if not point.closed:
         return None
-    available = point.available_at or point.end
+    end = point.end
+    if not isinstance(end, datetime) or end.tzinfo is None:
+        return None
+    available = point.available_at or end
     if not isinstance(available, datetime) or available.tzinfo is None:
         return None
-    end = point.end.astimezone(UTC)
-    return max(available.astimezone(UTC), end)
+    return max(available.astimezone(UTC), end.astimezone(UTC))
 
 
 def _decision_id(evaluation: Any) -> str:
-    if hasattr(evaluation, "as_dict"):
-        payload = evaluation.as_dict()
-    else:
-        payload = str(evaluation)
+    payload = evaluation.as_dict() if hasattr(evaluation, "as_dict") else str(evaluation)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str, separators=(",", ":")).encode()).hexdigest()
 
 

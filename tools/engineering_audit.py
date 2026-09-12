@@ -407,8 +407,8 @@ def _collect_functions(tree: ast.AST) -> list[dict[str, Any]]:
             for child in node.body:
                 walk(child, new_scope)
             return
-        for child in ast.iter_child_nodes(node):
-            walk(child, scope)
+        for nested_node in ast.iter_child_nodes(node):
+            walk(nested_node, scope)
 
     walk(tree, [])
     return functions

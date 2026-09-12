@@ -7,13 +7,11 @@ optional connectivity check.
 
 from __future__ import annotations
 
-import csv
-import io
 import json
-from datetime import datetime, timezone
+import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
+from typing import Literal
 from unittest.mock import patch
 
 from .importer import ColumnMapping, ImportConfig, import_csv, import_jsonl
@@ -46,12 +44,11 @@ class ImportTests(unittest.TestCase):
             root = Path(temp)
             csv_path = root / "bars.csv"
             csv_path.write_text(
-                "timestamp,instrument,resolution,open,high,low,close\n"
-                "2024-01-01T00:00:00Z,SYNTH/USD,M1,10,12,9,11\n",
+                "timestamp,instrument,resolution,open,high,low,close\n2024-01-01T00:00:00Z,SYNTH/USD,M1,10,12,9,11\n",
                 encoding="utf-8",
             )
             bars = import_csv(csv_path)
-            self.assertEqual(bars[0].price_basis, "traded")
+            self.assertEqual(bars.bars[0].price_basis, "traded")
             json_path = root / "events.jsonl"
             json_path.write_text(
                 json.dumps({"ts": 1704067200, "bid": 10, "ask": 12, "mid": 11, "id": "e1"}) + "\n",
@@ -72,17 +69,16 @@ class ImportTests(unittest.TestCase):
                 }
             )
             events = import_jsonl(json_path, mapping, config=ImportConfig(instrument="SYNTH/USD", price_basis="mid"))
-            self.assertEqual(events[0].price, 11.0)
-            self.assertEqual(events[0].price_basis, "mid")
-            self.assertEqual(events[0].bid, 10.0)
-            self.assertEqual(events[0].ask, 12.0)
+            self.assertEqual(events.events[0].price, 11.0)
+            self.assertEqual(events.events[0].price_basis, "mid")
+            self.assertEqual(events.events[0].bid, 10.0)
+            self.assertEqual(events.events[0].ask, 12.0)
 
     def test_naive_timestamp_requires_explicit_timezone(self) -> None:
         with TemporaryDirectory() as temp:
             path = Path(temp) / "naive.csv"
             path.write_text(
-                "timestamp,instrument,resolution,open,high,low,close\n"
-                "2024-01-01T00:00:00,SYNTH/USD,M1,10,12,9,11\n",
+                "timestamp,instrument,resolution,open,high,low,close\n2024-01-01T00:00:00,SYNTH/USD,M1,10,12,9,11\n",
                 encoding="utf-8",
             )
             with self.assertRaises(ValueError):
@@ -103,36 +99,36 @@ class KrakenTests(unittest.TestCase):
         }
 
         class Response:
-            def __enter__(self):
+            def __enter__(self) -> object:
                 return self
 
-            def __exit__(self, *args):
+            def __exit__(self, *args: object) -> Literal[False]:
                 return False
 
-            def read(self):
+            def read(self) -> bytes:
                 return json.dumps(payload).encode()
 
         with patch("mtf_lab.data.kraken.urlopen", return_value=Response()):
             result = KrakenPublicAdapter(rest_min_interval_seconds=0).fetch_ohlc(1)
         self.assertEqual(len(result), 1)
         self.assertIsNotNone(result.open_bar)
+        assert result.open_bar is not None
         self.assertFalse(result.open_bar.closed)
-        self.assertEqual(result[0].resolution, "M1")
+        self.assertEqual(result.bars[0].resolution, "M1")
 
     def test_rest_body_error_is_not_ignored(self) -> None:
         class Response:
-            def __enter__(self):
+            def __enter__(self) -> object:
                 return self
 
-            def __exit__(self, *args):
+            def __exit__(self, *args: object) -> Literal[False]:
                 return False
 
-            def read(self):
+            def read(self) -> bytes:
                 return json.dumps({"error": ["EGeneral:Invalid arguments"], "result": {}}).encode()
 
-        with patch("mtf_lab.data.kraken.urlopen", return_value=Response()):
-            with self.assertRaises(KrakenAPIError):
-                KrakenPublicAdapter(rest_min_interval_seconds=0).fetch_ohlc(1)
+        with patch("mtf_lab.data.kraken.urlopen", return_value=Response()), self.assertRaises(KrakenAPIError):
+            KrakenPublicAdapter(rest_min_interval_seconds=0).fetch_ohlc(1)
 
     def test_trade_wire_payload_normalizes_multiple_required_fields(self) -> None:
         event = KrakenPublicAdapter(rest_min_interval_seconds=0)._normalize_trade(

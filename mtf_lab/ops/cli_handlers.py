@@ -4,6 +4,7 @@ Handlers only adapt ``argparse.Namespace`` values to application services and
 render their response.  Business rules, persistence composition and provider
 selection live in the service modules.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -17,8 +18,8 @@ from .application_services import (
     DemoService,
     DoctorService,
     ImportService,
-    ReportService,
     ReplayService,
+    ReportService,
     WatchService,
 )
 from .importer import ImportValidationError
@@ -100,8 +101,8 @@ def cmd_cfd_paper(args: argparse.Namespace) -> int:
 
 
 def cmd_ui(args: argparse.Namespace) -> int:
-    from .ui import serve
     from .application_services import _config_for, _db_for
+    from .ui import serve
 
     config = _config_for(args)
     db = _db_for(args, config)
@@ -121,6 +122,7 @@ __all__ = [
     "cmd_cfd_paper",
     "cmd_ui",
 ]
+
 
 # cTrader handlers are kept here so parser callbacks have one presentation
 # boundary, while their use cases remain in ctrader_cli_services.py.

@@ -744,10 +744,10 @@ def _persist_signals(
             contract_hash=contract_hash,
             partition="all",
         )
-    for ordinal, signal in enumerate(baseline_signals):
+    for ordinal, baseline_signal in enumerate(baseline_signals):
         store.save_signal(
             session_id,
-            signal,
+            baseline_signal,
             ordinal=ordinal,
             analysis_id=baseline_analysis_id,
             variant="m1_trigger_reference",
@@ -1014,7 +1014,7 @@ def run_synthetic_pipeline(
     result = PipelineResult(dataset, streams, indicators, strategy)
     # El mapa de gaps es visible aunque el dataset sintético esperado sea
     # continuo; el runtime no crea velas vacías para cubrirlos.
-    gaps = {name: [] for name in streams if name != "M1"}
+    gaps: dict[str, list[Any]] = {name: [] for name in streams if name != "M1"}
     result = persist_pipeline(
         result,
         db_path,

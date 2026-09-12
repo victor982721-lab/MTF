@@ -35,7 +35,8 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
   empaquetadas, lanzadores, fixtures CFD/cTrader, UI de sólo lectura, suite
   offline, lint/formato/tipos y auditoría arquitectónica.
 
-La evidencia versionada y reproducible está en el [informe de ingeniería](reports/engineering/latest/engineering_consolidation.md),
+El alcance vigente de calidad está en [calidad global](docs/refactor_quality.md).
+La evidencia histórica de integración offline está en el [informe de ingeniería](reports/engineering/latest/engineering_consolidation.md),
 [engineering_results.json](reports/engineering/latest/engineering_results.json) y
 [engineering_tooling.json](reports/engineering/latest/engineering_tooling.json).
 La [matriz de fronteras A/B/C](docs/activation_boundaries.md) distingue lo que
@@ -81,9 +82,9 @@ OAuth y no usan cuentas.
 ```bash
 git clone https://github.com/victor982721-lab/MTF.git
 cd MTF
-python3 -m venv .venv
-.venv/bin/python -m pip install --upgrade pip setuptools
-.venv/bin/python -m pip install --no-build-isolation --no-deps --editable .
+python3 -m venv .venv-dev
+.venv-dev/bin/python -m pip install --requirement requirements-dev.lock
+./install-mtf-lab-wheel.sh --python .venv-dev/bin/python --venv .venv
 ```
 
 La instalación anterior es la instalación **base**. Si no se desea instalar el
@@ -94,7 +95,8 @@ checkout con `python3` (o con el intérprete indicado por `PYTHON`).
 
 Para instalar el artefacto PEP 517 fuera del checkout, prepara primero el
 entorno de tooling y usa el instalador local. El instalador construye un wheel
-con el backend fijado, no publica nada ni consulta un índice de paquetes:
+con el backend fijado en una copia temporal de las fuentes; no publica nada ni
+consulta un índice de paquetes. No modifica `build/` ni la metadata del checkout:
 
 ```bash
 .venv-dev/bin/python -m pip install --requirement requirements-dev.lock
@@ -110,7 +112,10 @@ SOURCE_DATE_EPOCH=0 .venv-dev/bin/python -m build --wheel --no-isolation --outdi
   --venv "$HOME/.venvs/mtf-lab"
 ```
 
-El script imprime el nombre y SHA-256 del wheel instalado. El estado de
+El script imprime nombre, SHA-256 y `WHEEL_PATH`. Los wheels generados se
+conservan en `dist/<sha256>/` (o `--wheel-dir`), sin sobreescribir artefactos
+homónimos diferentes. El smoke confirma que importa desde el venv destino,
+no desde el checkout. El estado de
 ejecución queda fuera de `site-packages`, en `MTF_LAB_STATE_DIR` o en la ruta
 XDG del usuario; las credenciales y OAuth no forman parte de esta instalación.
 
@@ -122,7 +127,6 @@ sin resolver versiones nuevas:
 
 ```bash
 .venv/bin/python -m pip install --requirement requirements-ctrader.lock
-.venv/bin/python -m pip install --no-build-isolation --no-deps --editable '.[ctrader]'
 .venv/bin/python -m pip check
 ```
 
@@ -133,13 +137,12 @@ store.
 
 ### Herramientas de desarrollo
 
-Mantén Ruff y mypy en `.venv-dev`, no en el entorno de runtime:
+Mantén Ruff, mypy, Pyright, Coverage.py y el frontend de build en `.venv-dev`,
+no en el entorno de runtime:
 
 ```bash
 python3 -m venv .venv-dev
-.venv-dev/bin/python -m pip install --upgrade pip setuptools
 .venv-dev/bin/python -m pip install --requirement requirements-dev.lock
-.venv-dev/bin/python -m pip install --no-build-isolation --no-deps --editable '.[dev]'
 ```
 
 `.venv/` y `.venv-dev/` no se versionan. `requirements-dev.lock` fija Ruff,
@@ -157,15 +160,16 @@ El alcance mantenido de lint y tipos está declarado en el propio checkout:
   --json runtime/verification/quality.json
 ```
 
-El gate ejecuta Ruff y formato sobre los módulos refactorizados, mypy estricto
-en el contrato tipado, Pyright según `pyrightconfig.json`, la auditoría de
-arquitectura y una cobertura de ramas mínima del 60 %. El informe completo de
-Ruff sobre el legado se conserva como diagnóstico advisory; no se relajan sus
-hallazgos para ocultarlos ni se confunden con la puerta mantenida.
+La puerta de calidad descubre todas las fuentes: Ruff/formato sobre
+`mtf_lab`, `tests` y `tools`; mypy estricto y Pyright sobre todo `mtf_lab` y
+`tools`. No hay una lista de módulos heredados exentos ni un resultado verde
+basado en `--exit-zero` o `--follow-imports=skip/silent`.
 
-La corrida de esta revisión observó 342 pruebas (3 omitidas), 74 % de cobertura
-de ramas y cero fallos en todas esas puertas. El detalle, los límites y la deuda
-advisory se conservan en [`docs/refactor_quality.md`](docs/refactor_quality.md).
+La suite usa el runner offline con HOME/XDG/TMP/estado aislados y red externa
+bloqueada. La cobertura informa líneas y ramas con sus denominadores; un
+porcentaje combinado no se presenta como cobertura exclusiva de ramas.
+El detalle y los resultados verificables están en
+[`docs/refactor_quality.md`](docs/refactor_quality.md).
 
 ## Arranque y comandos locales
 

@@ -94,7 +94,7 @@ class JsonlLogger:
                 self._stream = None
             self._closed = True
 
-    def __enter__(self) -> "JsonlLogger":
+    def __enter__(self) -> JsonlLogger:
         return self
 
     def __exit__(self, *_: Any) -> None:
@@ -156,7 +156,10 @@ class ProgressState:
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             # JSON round-trip gives callers an independent nested snapshot.
-            return json.loads(json.dumps(self._values, default=str))
+            decoded: object = json.loads(json.dumps(self._values, default=str))
+            if not isinstance(decoded, dict):
+                raise TypeError("progress snapshot must decode to an object")
+            return {str(key): value for key, value in decoded.items()}
 
     def as_line(self) -> str:
         snap = self.snapshot()
@@ -217,7 +220,7 @@ class OperationTelemetry:
         self.reporter.emit(force=True)
         self.logger.close()
 
-    def __enter__(self) -> "OperationTelemetry":
+    def __enter__(self) -> OperationTelemetry:
         return self
 
     def __exit__(self, *_: Any) -> None:

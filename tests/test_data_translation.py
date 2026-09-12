@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from mtf_lab.core.models import Candle as CoreCandle
-from mtf_lab.core.models import EventKind, MarketEvent as CoreEvent, OperationMode, PriceBase, parse_timeframe
-from mtf_lab.core.quality import DataQuality as CoreQuality, QualityFlag
+from mtf_lab.core.models import EventKind, OperationMode, PriceBase
+from mtf_lab.core.models import MarketEvent as CoreEvent
+from mtf_lab.core.quality import DataQuality as CoreQuality
+from mtf_lab.core.quality import QualityFlag
 from mtf_lab.data.models import Bar as DataBar
 from mtf_lab.data.models import Event as DataEvent
 from mtf_lab.data.translation import (
@@ -20,8 +22,6 @@ from mtf_lab.data.translation import (
     reconcile_native_candles,
 )
 
-
-UTC = timezone.utc
 T0 = datetime(2024, 1, 2, 12, 0, tzinfo=UTC)
 
 
@@ -222,7 +222,9 @@ class TranslationTests(unittest.TestCase):
             sequence=9,
             event_id="core-event-id",
             quality=quality,
-            metadata={"provenance": {"provider": "kraken", "mode": "LIVE", "instrument": "TEST/USD", "price_basis": "traded"}},
+            metadata={
+                "provenance": {"provider": "kraken", "mode": "LIVE", "instrument": "TEST/USD", "price_basis": "traded"}
+            },
         )
         data_event = core_event_to_data(event)
         restored_event = data_event_to_core(data_event)
@@ -243,7 +245,10 @@ class TranslationTests(unittest.TestCase):
             mode=OperationMode.LIVE,
             price_base=PriceBase.TRADED,
             candle_id="core-candle-id",
-            metadata={"revision": 6, "provenance": {"provider": "kraken", "mode": "LIVE", "instrument": "TEST/USD", "price_basis": "traded"}},
+            metadata={
+                "revision": 6,
+                "provenance": {"provider": "kraken", "mode": "LIVE", "instrument": "TEST/USD", "price_basis": "traded"},
+            },
         )
         data_bar = core_bar_to_data(candle)
         restored_bar = data_bar_to_core(data_bar)
@@ -288,9 +293,33 @@ class TranslationTests(unittest.TestCase):
 class ReconciliationTests(unittest.TestCase):
     def _events(self) -> list[DataEvent]:
         return [
-            DataEvent("TEST/USD", T0 + timedelta(seconds=5), 100, quantity=1, source="fixture", source_event_id="e1", available_at=T0 + timedelta(minutes=1)),
-            DataEvent("TEST/USD", T0 + timedelta(seconds=25), 102, quantity=2, source="fixture", source_event_id="e2", available_at=T0 + timedelta(minutes=1)),
-            DataEvent("TEST/USD", T0 + timedelta(seconds=45), 101, quantity=3, source="fixture", source_event_id="e3", available_at=T0 + timedelta(minutes=1)),
+            DataEvent(
+                "TEST/USD",
+                T0 + timedelta(seconds=5),
+                100,
+                quantity=1,
+                source="fixture",
+                source_event_id="e1",
+                available_at=T0 + timedelta(minutes=1),
+            ),
+            DataEvent(
+                "TEST/USD",
+                T0 + timedelta(seconds=25),
+                102,
+                quantity=2,
+                source="fixture",
+                source_event_id="e2",
+                available_at=T0 + timedelta(minutes=1),
+            ),
+            DataEvent(
+                "TEST/USD",
+                T0 + timedelta(seconds=45),
+                101,
+                quantity=3,
+                source="fixture",
+                source_event_id="e3",
+                available_at=T0 + timedelta(minutes=1),
+            ),
         ]
 
     def _native(self, *, high: float = 102) -> DataBar:
@@ -311,7 +340,9 @@ class ReconciliationTests(unittest.TestCase):
         )
 
     def test_equal_native_and_actual_events_match_without_invented_ticks(self) -> None:
-        result = reconcile_native_candles([self._native()], self._events(), "M1", instrument="TEST/USD", compare_volume=True)
+        result = reconcile_native_candles(
+            [self._native()], self._events(), "M1", instrument="TEST/USD", compare_volume=True
+        )
         self.assertEqual(result.matched_count, 1)
         self.assertEqual(result.mismatch_count, 0)
         self.assertFalse(result.blocked)
@@ -337,9 +368,7 @@ class ReconciliationTests(unittest.TestCase):
         self.assertEqual(result.invented_event_count, 0)
 
     def test_open_event_derived_bar_blocks_reconciliation(self) -> None:
-        events = [
-            DataEvent("TEST/USD", T0 + timedelta(seconds=5), 100, source="fixture", source_event_id="open-event")
-        ]
+        events = [DataEvent("TEST/USD", T0 + timedelta(seconds=5), 100, source="fixture", source_event_id="open-event")]
         result = reconcile_native_candles([self._native()], events, "M1", instrument="TEST/USD")
         self.assertTrue(result.blocked)
         self.assertTrue(any("remains open" in reason for reason in result.blocking_reasons))

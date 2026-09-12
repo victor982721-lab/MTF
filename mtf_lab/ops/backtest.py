@@ -9,7 +9,7 @@ import math
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 from .simulation import (
     DirectionalEvaluator,
@@ -23,13 +23,17 @@ from .simulation import (
 )
 
 
+class _ModelDumpRecord(Protocol):
+    def model_dump(self) -> Mapping[str, Any]: ...
+
+
 def _row(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     if hasattr(value, "model_dump"):
-        return dict(cast(Any, value).model_dump())
+        return dict(cast(_ModelDumpRecord, value).model_dump())
     if hasattr(value, "__dict__"):
         return {k: v for k, v in vars(value).items() if not k.startswith("_")}
     raise TypeError(f"expected record-like signal, got {type(value)!r}")
@@ -234,9 +238,8 @@ class BacktestRunner:
         data_complete: bool = True,
         as_of: datetime | None = None,
     ) -> SimulationResult:
-        evaluator = getattr(self.simulator, "evaluate_prepared", None)
-        if callable(evaluator) and points and isinstance(points[0], PricePoint):
-            return cast(Callable[..., SimulationResult], evaluator)(
+        if points and isinstance(points[0], PricePoint):
+            return self.simulator.evaluate_prepared(
                 signal,
                 points,
                 horizon_seconds=horizon,

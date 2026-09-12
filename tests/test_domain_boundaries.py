@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+import unittest
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 
 from mtf_lab.configuration import load_config
 from mtf_lab.core import (
@@ -23,8 +23,6 @@ from mtf_lab.core import (
 from mtf_lab.data.models import Bar, Event, _canonical_json
 from mtf_lab.data.translation import TranslationError, core_bar_to_data, data_bar_to_core, reconcile_native_candles
 
-
-UTC = timezone.utc
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
 

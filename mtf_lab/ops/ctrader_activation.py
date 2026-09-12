@@ -23,15 +23,12 @@ import tempfile
 from collections.abc import Mapping, Sequence, Set
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
-
 
 SUPPORTED_SCOPES = frozenset({"accounts", "trading"})
 _TOKEN_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
-_FORBIDDEN_CONFIG_KEYS = frozenset(
-    {"password", "passphrase", "client_secret", "access_token", "refresh_token"}
-)
+_FORBIDDEN_CONFIG_KEYS = frozenset({"password", "passphrase", "client_secret", "access_token", "refresh_token"})
 
 
 class ActivationError(RuntimeError):
@@ -46,12 +43,12 @@ class RealAccountForbidden(ActivationError):
     """MTF Lab never activates execution against a real account."""
 
 
-class ActivationMode(str, enum.Enum):
+class ActivationMode(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
     QUERY = "QUERY"
     DEMO = "DEMO"
 
 
-class ActivationState(str, enum.Enum):
+class ActivationState(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
     DISABLED = "DISABLED"
     APP_CREDENTIALS_REQUIRED = "APP_CREDENTIALS_REQUIRED"
     ACCOUNTS_SCOPE_REQUIRED = "ACCOUNTS_SCOPE_REQUIRED"
@@ -136,7 +133,7 @@ class OAuthAppConfig:
             object.__setattr__(self, name, value)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "OAuthAppConfig":
+    def from_mapping(cls, value: Mapping[str, Any]) -> OAuthAppConfig:
         forbidden = sorted(set(value) & _FORBIDDEN_CONFIG_KEYS)
         if forbidden:
             raise ActivationError(f"secretos directos prohibidos en configuración: {forbidden}")
@@ -196,7 +193,7 @@ class OAuthTokenPayload:
             object.__setattr__(self, "scopes", _scope_set(self.scopes))
 
     @classmethod
-    def from_response(cls, payload: Mapping[str, Any]) -> "OAuthTokenPayload":
+    def from_response(cls, payload: Mapping[str, Any]) -> OAuthTokenPayload:
         if not isinstance(payload, Mapping):
             raise ActivationError("respuesta OAuth no es un objeto")
         error = payload.get("errorCode") or payload.get("error")
@@ -250,7 +247,9 @@ def build_authorization_url(
     if not scopes:
         raise ActivationError("scope OAuth no puede estar vacío")
     if len(scopes) != 1:
-        raise ActivationError("solicite un solo scope OAuth por intento; accounts y trading se autorizan en fases separadas")
+        raise ActivationError(
+            "solicite un solo scope OAuth por intento; accounts y trading se autorizan en fases separadas"
+        )
     parsed = urlparse(app.authorization_url)
     query = (
         ("client_id", client_id),
@@ -288,7 +287,12 @@ def parse_callback_uri(
         registered.path,
         registered.params,
     )
-    if callback_base != registered_base or parsed.username is not None or parsed.password is not None or parsed.fragment:
+    if (
+        callback_base != registered_base
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
         raise ActivationError("callback OAuth no coincide exactamente con la URI registrada")
     try:
         pairs = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
@@ -333,6 +337,7 @@ def open_authorization_browser(
         raise ActivationError("authorization_url no es HTTPS")
     if opener is None:
         import webbrowser
+
         opener = webbrowser.open
     return bool(opener(str(authorization_url)))
 
@@ -352,24 +357,60 @@ def _safe_token_request(
         response = requester(app.token_url, dict(params), timeout)
     except Exception as exc:
         raise ActivationError("falló la solicitud OAuth; revise conectividad y estado de la aplicación") from exc
-    return OAuthTokenPayload.from_response(response)
+    return OAuthTokenPayload.from_response(cast(Mapping[str, Any], response))
 
 
-def exchange_authorization_code(app: OAuthAppConfig, *, client_id: str, client_secret: str, code: str, requester: Any = None, timeout: float = 10.0) -> OAuthTokenPayload:
+def exchange_authorization_code(
+    app: OAuthAppConfig, *, client_id: str, client_secret: str, code: str, requester: Any = None, timeout: float = 10.0
+) -> OAuthTokenPayload:
     """Exchange a one-minute authorization code; caller decides where to store tokens."""
     if not isinstance(client_secret, str) or not client_secret:
         raise ActivationError("client_secret debe llegar por el proveedor seguro, no por configuración")
     code = str(code).strip()
     if not code:
         raise ActivationError("authorization code vacío")
-    return _safe_token_request(app, {"grant_type": "authorization_code", "code": code, "redirect_uri": app.redirect_uri, "client_id": str(client_id), "client_secret": client_secret}, requester=requester, timeout=timeout)
+    return _safe_token_request(
+        app,
+        {
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": app.redirect_uri,
+            "client_id": str(client_id),
+            "client_secret": client_secret,
+        },
+        requester=requester,
+        timeout=timeout,
+    )
 
 
-def refresh_access_token(app: OAuthAppConfig, *, client_id: str, client_secret: str, refresh_token: str, requester: Any = None, timeout: float = 10.0) -> OAuthTokenPayload:
+def refresh_access_token(
+    app: OAuthAppConfig,
+    *,
+    client_id: str,
+    client_secret: str,
+    refresh_token: str,
+    requester: Any = None,
+    timeout: float = 10.0,
+) -> OAuthTokenPayload:
     """Rotate access/refresh atomically; never assume the old refresh token survives."""
-    if not isinstance(client_secret, str) or not client_secret or not isinstance(refresh_token, str) or not refresh_token:
+    if (
+        not isinstance(client_secret, str)
+        or not client_secret
+        or not isinstance(refresh_token, str)
+        or not refresh_token
+    ):
         raise ActivationError("credenciales OAuth de renovación incompletas")
-    return _safe_token_request(app, {"grant_type": "refresh_token", "refresh_token": refresh_token, "client_id": str(client_id), "client_secret": client_secret}, requester=requester, timeout=timeout)
+    return _safe_token_request(
+        app,
+        {
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": str(client_id),
+            "client_secret": client_secret,
+        },
+        requester=requester,
+        timeout=timeout,
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -400,9 +441,7 @@ class ActivationProfile:
         scopes = _scope_set(self.required_scopes)
         minimum = {"accounts"} if mode is ActivationMode.QUERY else {"accounts", "trading"}
         if scopes != minimum:
-            raise ActivationError(
-                f"required_scopes para {mode.value.lower()} debe ser exactamente {sorted(minimum)}"
-            )
+            raise ActivationError(f"required_scopes para {mode.value.lower()} debe ser exactamente {sorted(minimum)}")
         object.__setattr__(self, "required_scopes", scopes)
         account_id = str(self.account_id).strip()
         token_ref = str(self.token_ref).strip()
@@ -414,7 +453,7 @@ class ActivationProfile:
         object.__setattr__(self, "token_ref", token_ref)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "ActivationProfile":
+    def from_mapping(cls, value: Mapping[str, Any]) -> ActivationProfile:
         allowed = {
             "enabled",
             "operation_mode",
@@ -476,7 +515,9 @@ class BrokerAccount:
         if self.permissions is None:
             permissions = frozenset()
         elif isinstance(self.permissions, str):
-            permissions = frozenset(item.strip().lower() for item in self.permissions.replace(",", " ").split() if item.strip())
+            permissions = frozenset(
+                item.strip().lower() for item in self.permissions.replace(",", " ").split() if item.strip()
+            )
         elif isinstance(self.permissions, (set, frozenset, list, tuple)):
             permissions = frozenset(str(item).strip().lower() for item in self.permissions)
         else:
@@ -484,7 +525,7 @@ class BrokerAccount:
         object.__setattr__(self, "permissions", permissions)
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> "BrokerAccount":
+    def from_mapping(cls, value: Mapping[str, Any]) -> BrokerAccount:
         return cls(
             account_id=str(value.get("account_id", value.get("id", ""))),
             environment=str(value.get("environment", value.get("account_type", ""))),
@@ -589,7 +630,7 @@ class SecureTokenStore:
             raise UnsafeTokenStore("los tokens fixture sólo pueden usar un directorio temporal aislado")
 
     @classmethod
-    def for_fixture(cls, root: str | Path, *, project_root: str | Path) -> "SecureTokenStore":
+    def for_fixture(cls, root: str | Path, *, project_root: str | Path) -> SecureTokenStore:
         """Create a fixture-only store that can never target the real token path."""
 
         return cls(root, project_root=project_root, fixture=True)
@@ -718,7 +759,7 @@ class SecureTokenStore:
         )
 
 
-class OAuthAttemptPhase(str, enum.Enum):
+class OAuthAttemptPhase(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
     AWAITING_CALLBACK = "AWAITING_CALLBACK"
     CALLBACK_RECEIVED = "CALLBACK_RECEIVED"
     TOKEN_STORED = "TOKEN_STORED"
@@ -753,19 +794,13 @@ class OAuthAttempt:
         object.__setattr__(self, "expires_at", expires)
         phase = self.phase if isinstance(self.phase, OAuthAttemptPhase) else OAuthAttemptPhase(str(self.phase))
         object.__setattr__(self, "phase", phase)
-        callback_received = (
-            _utc(self.callback_received_at)
-            if self.callback_received_at is not None
-            else None
-        )
+        callback_received = _utc(self.callback_received_at) if self.callback_received_at is not None else None
         object.__setattr__(self, "callback_received_at", callback_received)
         if phase is OAuthAttemptPhase.AWAITING_CALLBACK and (
             self.authorization_code is not None or callback_received is not None
         ):
             raise ActivationError("un intento pendiente no puede contener callback")
-        if phase is OAuthAttemptPhase.CALLBACK_RECEIVED and (
-            not self.authorization_code or callback_received is None
-        ):
+        if phase is OAuthAttemptPhase.CALLBACK_RECEIVED and (not self.authorization_code or callback_received is None):
             raise ActivationError("CALLBACK_RECEIVED requiere código y momento observado")
         if phase is OAuthAttemptPhase.TOKEN_STORED:
             if not self.token_ref:
@@ -793,9 +828,7 @@ class OAuthAttempt:
             "state_fingerprint": hashlib.sha256(self.csrf_state.encode("utf-8")).hexdigest()[:16],
             "authorization_code": "REDACTED" if self.authorization_code else None,
             "callback_received_at": (
-                _iso(self.callback_received_at)
-                if self.callback_received_at is not None
-                else None
+                _iso(self.callback_received_at) if self.callback_received_at is not None else None
             ),
             "token_ref": self.token_ref,
             "resumable": self.phase is not OAuthAttemptPhase.TOKEN_STORED and not self.is_expired(instant),
@@ -822,15 +855,13 @@ class OAuthAttempt:
             "phase": self.phase.value,
             "authorization_code": self.authorization_code,
             "callback_received_at": (
-                _iso(self.callback_received_at)
-                if self.callback_received_at is not None
-                else None
+                _iso(self.callback_received_at) if self.callback_received_at is not None else None
             ),
             "token_ref": self.token_ref,
         }
 
     @classmethod
-    def _from_private_dict(cls, raw: Mapping[str, Any]) -> "OAuthAttempt":
+    def _from_private_dict(cls, raw: Mapping[str, Any]) -> OAuthAttempt:
         if raw.get("version") != 1:
             raise ActivationError("versión del intento OAuth inválida")
         try:
@@ -843,14 +874,10 @@ class OAuthAttempt:
                 expires_at=_utc(raw["expires_at"]),
                 phase=OAuthAttemptPhase(str(raw["phase"])),
                 authorization_code=(
-                    str(raw["authorization_code"])
-                    if raw.get("authorization_code") is not None
-                    else None
+                    str(raw["authorization_code"]) if raw.get("authorization_code") is not None else None
                 ),
                 callback_received_at=(
-                    _utc(raw["callback_received_at"])
-                    if raw.get("callback_received_at") is not None
-                    else None
+                    _utc(raw["callback_received_at"]) if raw.get("callback_received_at") is not None else None
                 ),
                 token_ref=(str(raw["token_ref"]) if raw.get("token_ref") is not None else None),
             )
@@ -873,7 +900,7 @@ class OAuthAttemptStore:
         self.is_fixture = self._guard.is_fixture
 
     @classmethod
-    def for_fixture(cls, root: str | Path, *, project_root: str | Path) -> "OAuthAttemptStore":
+    def for_fixture(cls, root: str | Path, *, project_root: str | Path) -> OAuthAttemptStore:
         return cls(root, project_root=project_root, fixture=True)
 
     def _path(self, attempt_id: str) -> Path:
@@ -970,8 +997,7 @@ class AccountDiscovery:
         if "accounts" not in scopes:
             raise ActivationError("descubrimiento de cuentas requiere scope accounts observado")
         normalized = tuple(
-            item if isinstance(item, BrokerAccount) else BrokerAccount.from_mapping(item)
-            for item in self.accounts
+            item if isinstance(item, BrokerAccount) else BrokerAccount.from_mapping(item) for item in self.accounts
         )
         if not normalized:
             raise ActivationError("el descubrimiento no contiene cuentas")
@@ -1010,8 +1036,7 @@ def record_account_discovery(
         observed_scopes=token.granted_scopes,
         observed_at=observed_at or datetime.now(UTC),
         accounts=tuple(
-            item if isinstance(item, BrokerAccount) else BrokerAccount.from_mapping(item)
-            for item in accounts
+            item if isinstance(item, BrokerAccount) else BrokerAccount.from_mapping(item) for item in accounts
         ),
         permission_scope=permission_scope,
     )
@@ -1029,6 +1054,183 @@ def select_discovered_demo_account(
     return select_demo_account(discovery.accounts, account_id, environment=environment)
 
 
+def _callback_handler(
+    assistant: Any,
+    attempt_id: str,
+    registered: Any,
+    outcome: dict[str, Any],
+) -> type[Any]:
+    """Build the request handler without exposing the callback query."""
+
+    import http.server
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            requested = urlparse(self.path)
+            callback_uri = urlunparse((registered.scheme, registered.netloc, requested.path, "", requested.query, ""))
+            try:
+                outcome["attempt"] = assistant.receive_callback(
+                    attempt_id,
+                    callback_uri,
+                    now=datetime.now(UTC),
+                )
+                body = b"Autorizacion recibida. Puede cerrar esta ventana."
+                self.send_response(200)
+            except Exception:
+                outcome["error"] = ActivationError("callback OAuth rechazado")
+                body = b"Callback OAuth rechazado. Puede cerrar esta ventana."
+                self.send_response(400)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    return CallbackHandler
+
+
+def _serve_callback(
+    assistant: Any,
+    attempt_id: str,
+    attempt: OAuthAttempt,
+    registered: Any,
+    outcome: dict[str, Any],
+    *,
+    open_browser: bool,
+    opener: Any,
+    timeout_seconds: float,
+) -> None:
+    """Serve exactly one local callback, closing the socket on every path."""
+
+    import http.server
+    import time
+
+    hostname = registered.hostname
+    port = registered.port
+    if hostname is None or port is None:
+        raise ActivationError("redirect_uri no contiene endpoint loopback completo")
+    handler = _callback_handler(assistant, attempt_id, registered, outcome)
+    server = http.server.HTTPServer((hostname, port), handler)
+    server.timeout = min(1.0, float(timeout_seconds))
+    deadline = time.monotonic() + float(timeout_seconds)
+    try:
+        if open_browser:
+            open_authorization_browser(
+                attempt.authorization_url,
+                allow_browser=True,
+                opener=opener,
+            )
+        while "attempt" not in outcome and "error" not in outcome and time.monotonic() < deadline:
+            server.handle_request()
+    finally:
+        server.server_close()
+
+
+def _callback_result(outcome: Mapping[str, Any]) -> OAuthAttempt:
+    attempt = outcome.get("attempt")
+    if isinstance(attempt, OAuthAttempt):
+        return attempt
+    error = outcome.get("error")
+    if isinstance(error, BaseException):
+        raise error
+    raise ActivationError("callback OAuth no recibido dentro del tiempo indicado")
+
+
+def _activation_preflight(
+    profile: ActivationProfile,
+    *,
+    token: TokenMetadata | None,
+    present_env_keys: Set[str],
+    app: OAuthAppConfig,
+    now: datetime | None,
+) -> ActivationStatus | None:
+    """Return a blocking status before account inventory is considered."""
+
+    if not profile.enabled:
+        return ActivationStatus(
+            ActivationState.DISABLED,
+            False,
+            profile.operation_mode,
+            (),
+            "Habilita el perfil explícitamente.",
+        )
+    missing_app = [name for name in (app.client_id_env, app.client_secret_env) if name not in present_env_keys]
+    if missing_app:
+        return ActivationStatus(
+            ActivationState.APP_CREDENTIALS_REQUIRED,
+            False,
+            profile.operation_mode,
+            (),
+            f"Define localmente las variables requeridas: {', '.join(missing_app)}; no las guardes en TOML.",
+        )
+    if token is None:
+        return ActivationStatus(
+            ActivationState.ACCOUNTS_SCOPE_REQUIRED,
+            False,
+            profile.operation_mode,
+            ("accounts",),
+            "Completa OAuth local solicitando primero scope=accounts y guarda sólo el token_ref.",
+        )
+    if not profile.token_ref or token.token_ref != profile.token_ref:
+        return ActivationStatus(
+            ActivationState.TOKEN_REFERENCE_REQUIRED,
+            False,
+            profile.operation_mode,
+            (),
+            "Configura un token_ref que coincida exactamente con el sobre externo seleccionado.",
+        )
+    instant = _utc(now or datetime.now(UTC))
+    if token.is_expired(instant):
+        return ActivationStatus(
+            ActivationState.TOKEN_EXPIRED,
+            False,
+            profile.operation_mode,
+            tuple(sorted(profile.required_scopes - token.granted_scopes)),
+            "Rota el token de forma atómica antes de consultar o ejecutar.",
+        )
+    if "accounts" not in token.granted_scopes:
+        return ActivationStatus(
+            ActivationState.ACCOUNTS_SCOPE_REQUIRED,
+            False,
+            profile.operation_mode,
+            ("accounts",),
+            "Reautoriza con scope=accounts; un token de trading no sustituye el descubrimiento de cuentas.",
+        )
+    return None
+
+
+def _normalize_accounts(
+    accounts: Sequence[BrokerAccount | Mapping[str, Any]],
+) -> tuple[BrokerAccount, ...]:
+    return tuple(item if isinstance(item, BrokerAccount) else BrokerAccount.from_mapping(item) for item in accounts)
+
+
+def _account_selection_status(
+    profile: ActivationProfile,
+    accounts: Sequence[BrokerAccount],
+) -> BrokerAccount | ActivationStatus:
+    try:
+        return select_demo_account(accounts, profile.account_id, environment=profile.environment)
+    except RealAccountForbidden:
+        return ActivationStatus(
+            ActivationState.REAL_ACCOUNT_FORBIDDEN,
+            False,
+            profile.operation_mode,
+            (),
+            "Elimina la selección real y elige una cuenta DEMO; MTF Lab no admite cuentas reales.",
+        )
+    except ActivationError:
+        return ActivationStatus(
+            ActivationState.ACCOUNT_SELECTION_INVALID,
+            False,
+            profile.operation_mode,
+            (),
+            "El account_id seleccionado no coincide exactamente con una cuenta descubierta; selecciona de nuevo.",
+        )
+
+
 class LoopbackOAuthAssistant:
     """Restart-safe orchestration around pure OAuth helpers and external stores."""
 
@@ -1042,9 +1244,7 @@ class LoopbackOAuthAssistant:
         code_ttl_seconds: int = 60,
     ) -> None:
         if attempts.is_fixture != tokens.is_fixture or bool(fixture_mode) != tokens.is_fixture:
-            raise UnsafeTokenStore(
-                "los stores de intentos/tokens y fixture_mode deben pertenecer al mismo aislamiento"
-            )
+            raise UnsafeTokenStore("los stores de intentos/tokens y fixture_mode deben pertenecer al mismo aislamiento")
         self.app = app
         self.attempts = attempts
         if isinstance(code_ttl_seconds, bool) or not 1 <= int(code_ttl_seconds) <= 300:
@@ -1135,10 +1335,6 @@ class LoopbackOAuthAssistant:
         authorization code), binds only to the registered loopback address,
         and returns a generic browser response.
         """
-
-        import http.server
-        import time
-
         if isinstance(timeout_seconds, bool) or not 1 <= float(timeout_seconds) <= 1800:
             raise ActivationError("timeout_seconds debe estar entre 1 y 1800")
         instant = _utc(now or datetime.now(UTC))
@@ -1150,56 +1346,18 @@ class LoopbackOAuthAssistant:
         registered = urlparse(self.app.redirect_uri)
         if not _is_loopback_redirect(self.app.redirect_uri):
             raise ActivationError("redirect_uri no es loopback")
-        assistant = self
         outcome: dict[str, Any] = {}
-
-        class CallbackHandler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self) -> None:
-                requested = urlparse(self.path)
-                callback_uri = urlunparse(
-                    (registered.scheme, registered.netloc, requested.path, "", requested.query, "")
-                )
-                try:
-                    outcome["attempt"] = assistant.receive_callback(
-                        attempt_id,
-                        callback_uri,
-                        now=datetime.now(UTC),
-                    )
-                    body = b"Autorizacion recibida. Puede cerrar esta ventana."
-                    self.send_response(200)
-                except Exception:
-                    outcome["error"] = ActivationError("callback OAuth rechazado")
-                    body = b"Callback OAuth rechazado. Puede cerrar esta ventana."
-                    self.send_response(400)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, format: str, *args: Any) -> None:
-                return
-
-        server = http.server.HTTPServer(
-            (registered.hostname, int(registered.port)), CallbackHandler
+        _serve_callback(
+            self,
+            attempt_id,
+            attempt,
+            registered,
+            outcome,
+            open_browser=open_browser,
+            opener=opener,
+            timeout_seconds=float(timeout_seconds),
         )
-        server.timeout = min(1.0, float(timeout_seconds))
-        deadline = time.monotonic() + float(timeout_seconds)
-        try:
-            if open_browser:
-                open_authorization_browser(
-                    attempt.authorization_url,
-                    allow_browser=True,
-                    opener=opener,
-                )
-            while "attempt" not in outcome and "error" not in outcome and time.monotonic() < deadline:
-                server.handle_request()
-        finally:
-            server.server_close()
-        if "attempt" in outcome:
-            return outcome["attempt"]
-        if "error" in outcome:
-            raise outcome["error"]
-        raise ActivationError("callback OAuth no recibido dentro del tiempo indicado")
+        return _callback_result(outcome)
 
     def receive_callback(
         self,
@@ -1246,9 +1404,8 @@ class LoopbackOAuthAssistant:
             raise ActivationError("el intento no está listo para intercambio")
         if attempt.is_expired(instant):
             raise ActivationError("el intento OAuth caducó; inicia un intento nuevo")
-        if (
-            attempt.callback_received_at is None
-            or instant >= attempt.callback_received_at + timedelta(seconds=self.code_ttl_seconds)
+        if attempt.callback_received_at is None or instant >= attempt.callback_received_at + timedelta(
+            seconds=self.code_ttl_seconds
         ):
             raise ActivationError("el código OAuth caducó; inicia un intento nuevo")
         scopes = _scope_set(observed_scopes) if observed_scopes is not None else None
@@ -1355,7 +1512,9 @@ def select_demo_account(
     matches = [
         item if isinstance(item, BrokerAccount) else BrokerAccount.from_mapping(item)
         for item in accounts
-        if str(item.account_id if isinstance(item, BrokerAccount) else item.get("account_id", item.get("id", ""))).strip()
+        if str(
+            item.account_id if isinstance(item, BrokerAccount) else item.get("account_id", item.get("id", ""))
+        ).strip()
         == str(account_id).strip()
     ]
     if len(matches) != 1:
@@ -1377,51 +1536,17 @@ def evaluate_activation(
 ) -> ActivationStatus:
     """Evaluate activation from supplied facts without performing any I/O."""
 
-    if not profile.enabled:
-        return ActivationStatus(ActivationState.DISABLED, False, profile.operation_mode, (), "Habilita el perfil explícitamente.")
-    missing_app = [name for name in (app.client_id_env, app.client_secret_env) if name not in present_env_keys]
-    if missing_app:
-        return ActivationStatus(
-            ActivationState.APP_CREDENTIALS_REQUIRED,
-            False,
-            profile.operation_mode,
-            (),
-            f"Define localmente las variables requeridas: {', '.join(missing_app)}; no las guardes en TOML.",
-        )
-    if token is None:
-        return ActivationStatus(
-            ActivationState.ACCOUNTS_SCOPE_REQUIRED,
-            False,
-            profile.operation_mode,
-            ("accounts",),
-            "Completa OAuth local solicitando primero scope=accounts y guarda sólo el token_ref.",
-        )
-    if not profile.token_ref or token.token_ref != profile.token_ref:
-        return ActivationStatus(
-            ActivationState.TOKEN_REFERENCE_REQUIRED,
-            False,
-            profile.operation_mode,
-            (),
-            "Configura un token_ref que coincida exactamente con el sobre externo seleccionado.",
-        )
-    instant = _utc(now or datetime.now(UTC))
-    if token.is_expired(instant):
-        return ActivationStatus(
-            ActivationState.TOKEN_EXPIRED,
-            False,
-            profile.operation_mode,
-            tuple(sorted(profile.required_scopes - token.granted_scopes)),
-            "Rota el token de forma atómica antes de consultar o ejecutar.",
-        )
-    if "accounts" not in token.granted_scopes:
-        return ActivationStatus(
-            ActivationState.ACCOUNTS_SCOPE_REQUIRED,
-            False,
-            profile.operation_mode,
-            ("accounts",),
-            "Reautoriza con scope=accounts; un token de trading no sustituye el descubrimiento de cuentas.",
-        )
-    normalized = tuple(item if isinstance(item, BrokerAccount) else BrokerAccount.from_mapping(item) for item in accounts)
+    preflight = _activation_preflight(
+        profile,
+        token=token,
+        present_env_keys=present_env_keys,
+        app=app,
+        now=now,
+    )
+    if preflight is not None:
+        return preflight
+    assert token is not None
+    normalized = _normalize_accounts(accounts)
     if not normalized:
         return ActivationStatus(
             ActivationState.ACCOUNT_DISCOVERY_REQUIRED,
@@ -1438,24 +1563,10 @@ def evaluate_activation(
             (),
             "Seleccione una cuenta DEMO explícitamente, cuyo environment haya sido observado en el servidor.",
         )
-    try:
-        selected = select_demo_account(normalized, profile.account_id, environment=profile.environment)
-    except RealAccountForbidden:
-        return ActivationStatus(
-            ActivationState.REAL_ACCOUNT_FORBIDDEN,
-            False,
-            profile.operation_mode,
-            (),
-            "Elimina la selección real y elige una cuenta DEMO; MTF Lab no admite cuentas reales.",
-        )
-    except ActivationError:
-        return ActivationStatus(
-            ActivationState.ACCOUNT_SELECTION_INVALID,
-            False,
-            profile.operation_mode,
-            (),
-            "El account_id seleccionado no coincide exactamente con una cuenta descubierta; selecciona de nuevo.",
-        )
+    selected_or_status = _account_selection_status(profile, normalized)
+    if isinstance(selected_or_status, ActivationStatus):
+        return selected_or_status
+    selected = selected_or_status
     if profile.operation_mode is ActivationMode.QUERY:
         return ActivationStatus(
             ActivationState.QUERY_READY,

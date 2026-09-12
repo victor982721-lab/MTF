@@ -6,10 +6,10 @@ la interfaz local compartan exactamente los mismos cálculos y reglas.
 
 from .aggregation import AggregationResult, CandleAggregator, aggregate_events
 from .indicators import (
+    IncrementalIndicatorEngine,
     IndicatorConfig,
     IndicatorPoint,
     IndicatorSeries,
-    IncrementalIndicatorEngine,
     compute_indicators,
     compute_indicators_incremental,
 )

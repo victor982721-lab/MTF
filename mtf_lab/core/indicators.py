@@ -17,14 +17,15 @@ como si fuera una observación continua.
 
 from __future__ import annotations
 
+import math
 from collections import deque
+from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-import math
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, cast, overload
 
 from .models import Candle, Timeframe, normalize_utc, parse_timeframe
-from .quality import DataQuality, QualityFlag, QualityIssue, validate_candle
+from .quality import DataQuality, QualityFlag, QualityIssue
 
 
 def _positive_int(value: Any, name: str) -> int:
@@ -50,7 +51,7 @@ class IndicatorConfig:
             raise ValueError("Esta implementación exige el suavizado Wilder (wilder=true)")
 
     @classmethod
-    def from_mapping(cls, mapping: Mapping[str, Any] | None) -> "IndicatorConfig":
+    def from_mapping(cls, mapping: Mapping[str, Any] | None) -> IndicatorConfig:
         if mapping is None:
             return cls()
         if not isinstance(mapping, Mapping):
@@ -92,19 +93,21 @@ class IndicatorPoint:
     index: int = 0
 
     @property
-    def timestamp(self):
+    def timestamp(self) -> Any:
         """Alias temporal usado por la estrategia y callers sencillos."""
 
         return self.end
 
     @property
-    def effective_available_at(self):
+    def effective_available_at(self) -> Any | None:
         return self.available_at if self.closed else None
 
     @property
     def ready(self) -> bool:
-        return self.closed and self.quality.valid and all(
-            value is not None for value in (self.close, self.ema_fast, self.ema_slow, self.rsi, self.atr)
+        return (
+            self.closed
+            and self.quality.valid
+            and all(value is not None for value in (self.close, self.ema_fast, self.ema_slow, self.rsi, self.atr))
         )
 
     @property
@@ -113,7 +116,7 @@ class IndicatorPoint:
 
     def value(self, name: str) -> float | None:
         aliases = {"ema20": "ema_fast", "ema50": "ema_slow", "rsi14": "rsi", "atr14": "atr"}
-        return getattr(self, aliases.get(name, name))
+        return cast(float | None, getattr(self, aliases.get(name, name)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,10 +163,16 @@ class IndicatorSeries:
     def __len__(self) -> int:
         return len(self.points)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[IndicatorPoint]:
         return iter(self.points)
 
-    def __getitem__(self, item):
+    @overload
+    def __getitem__(self, item: int) -> IndicatorPoint: ...
+
+    @overload
+    def __getitem__(self, item: slice) -> tuple[IndicatorPoint, ...]: ...
+
+    def __getitem__(self, item: int | slice) -> IndicatorPoint | tuple[IndicatorPoint, ...]:
         return self.points[item]
 
 
@@ -221,6 +230,7 @@ class _WilderRSIState:
             self.average_gain = sum(self.gains) / self.period
             self.average_loss = sum(self.losses) / self.period
         else:
+            assert self.average_gain is not None and self.average_loss is not None
             self.average_gain = (self.average_gain * (self.period - 1) + gain) / self.period
             self.average_loss = (self.average_loss * (self.period - 1) + loss) / self.period
         assert self.average_gain is not None and self.average_loss is not None
@@ -276,8 +286,17 @@ def _bar_fields(bar: Any) -> tuple[Any, Any, Any, Any, Any, Any, bool, DataQuali
     """Obtiene campos de Candle y acepta mappings de proveedores ya normalizados."""
     if isinstance(bar, Candle):
         return (
-            bar.start, bar.end, bar.open, bar.high, bar.low, bar.close,
-            bar.closed, bar.quality, bar.candle_id, bar.timeframe, bar.instrument,
+            bar.start,
+            bar.end,
+            bar.open,
+            bar.high,
+            bar.low,
+            bar.close,
+            bar.closed,
+            bar.quality,
+            bar.candle_id,
+            bar.normalized_timeframe,
+            bar.instrument,
         )
     if isinstance(bar, Mapping):
         row = bar
@@ -285,8 +304,10 @@ def _bar_fields(bar: Any) -> tuple[Any, Any, Any, Any, Any, Any, bool, DataQuali
         end = row.get("end", row.get("interval_end", row.get("end_ts")))
         required = {"open", "high", "low", "close"}
         missing = [key for key in required if key not in row]
-        if start is None: missing.append("start")
-        if end is None: missing.append("end")
+        if start is None:
+            missing.append("start")
+        if end is None:
+            missing.append("end")
         if missing:
             raise ValueError(f"Faltan campos de vela: {sorted(set(missing))}")
         timeframe = parse_timeframe(row.get("timeframe", row.get("resolution", "M1")))
@@ -295,12 +316,25 @@ def _bar_fields(bar: Any) -> tuple[Any, Any, Any, Any, Any, Any, bool, DataQuali
             # Un estado textual de proveedor se conserva como bloqueo cuando
             # no es valid/synthetic, evitando tratarlo como calidad buena.
             text = str(quality).lower()
-            quality = DataQuality.good() if text in {"valid", "synthetic", "validated_local", "public_provider_closed"} else DataQuality.from_flag(QualityFlag.INVALID, text)
+            quality = (
+                DataQuality.good()
+                if text in {"valid", "synthetic", "validated_local", "public_provider_closed"}
+                else DataQuality.from_flag(QualityFlag.INVALID, text)
+            )
         return (
-            start, end, float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]),
-            bool(row.get("closed", row.get("is_closed", True))), quality,
-            str(row.get("candle_id", row.get("data_id"))) if row.get("candle_id", row.get("data_id")) is not None else None,
-            timeframe, str(row.get("instrument", row.get("symbol", "unknown"))),
+            start,
+            end,
+            float(row["open"]),
+            float(row["high"]),
+            float(row["low"]),
+            float(row["close"]),
+            bool(row.get("closed", row.get("is_closed", True))),
+            quality,
+            str(row.get("candle_id", row.get("data_id")))
+            if row.get("candle_id", row.get("data_id")) is not None
+            else None,
+            timeframe,
+            str(row.get("instrument", row.get("symbol", "unknown"))),
         )
     # Dataclasses de proveedores (por ejemplo data.Bar) pueden adaptarse sin
     # importar el paquete de datos en el núcleo.
@@ -309,21 +343,41 @@ def _bar_fields(bar: Any) -> tuple[Any, Any, Any, Any, Any, Any, bool, DataQuali
         quality = getattr(bar, "quality", DataQuality.good())
         if not isinstance(quality, DataQuality):
             quality = DataQuality.good(synthetic=bool(getattr(bar, "synthetic", False)))
-        return (bar.interval_start, bar.interval_end, float(bar.open), float(bar.high), float(bar.low), float(bar.close), bool(getattr(bar, "closed", True)), quality, str(getattr(bar, "data_id", getattr(bar, "candle_id", ""))) or None, tf, str(getattr(bar, "instrument", "unknown")))
+        return (
+            bar.interval_start,
+            bar.interval_end,
+            float(bar.open),
+            float(bar.high),
+            float(bar.low),
+            float(bar.close),
+            bool(getattr(bar, "closed", True)),
+            quality,
+            str(getattr(bar, "data_id", getattr(bar, "candle_id", ""))) or None,
+            tf,
+            str(getattr(bar, "instrument", "unknown")),
+        )
     raise TypeError("compute_indicators requiere Candle o mapping de vela")
 
 
 class IncrementalIndicatorEngine:
     """Estado incremental de EMA/RSI/ATR para una sola serie temporal."""
 
-    def __init__(self, config: IndicatorConfig | Mapping[str, Any] | None = None, *, max_points: int | None = None, max_issues: int | None = None) -> None:
+    def __init__(
+        self,
+        config: IndicatorConfig | Mapping[str, Any] | None = None,
+        *,
+        max_points: int | None = None,
+        max_issues: int | None = None,
+    ) -> None:
         self.config = config if isinstance(config, IndicatorConfig) else IndicatorConfig.from_mapping(config)
         if max_points is not None and (isinstance(max_points, bool) or int(max_points) <= 0):
             raise ValueError("max_points debe ser entero positivo")
         if max_issues is not None and (isinstance(max_issues, bool) or int(max_issues) <= 0):
             raise ValueError("max_issues debe ser entero positivo")
         self.max_points = int(max_points) if max_points is not None else None
-        self.max_issues = int(max_issues) if max_issues is not None else (self.max_points if self.max_points is not None else None)
+        self.max_issues = (
+            int(max_issues) if max_issues is not None else (self.max_points if self.max_points is not None else None)
+        )
         self._ema_fast = _EMAState(self.config.ema_fast)
         self._ema_slow = _EMAState(self.config.ema_slow)
         self._rsi = _WilderRSIState(self.config.rsi_period)
@@ -332,8 +386,12 @@ class IncrementalIndicatorEngine:
         self._timeframe: Timeframe | None = None
         self._instrument: str = "unknown"
         self._index = 0
-        self._points = deque(maxlen=self.max_points) if self.max_points is not None else []
-        self._issues = deque(maxlen=self.max_issues) if self.max_issues is not None else []
+        self._points: deque[IndicatorPoint] | list[IndicatorPoint] = (
+            deque(maxlen=self.max_points) if self.max_points is not None else []
+        )
+        self._issues: deque[QualityIssue] | list[QualityIssue] = (
+            deque(maxlen=self.max_issues) if self.max_issues is not None else []
+        )
 
     @property
     def points(self) -> tuple[IndicatorPoint, ...]:
@@ -341,7 +399,13 @@ class IncrementalIndicatorEngine:
 
     @property
     def series(self) -> IndicatorSeries:
-        return IndicatorSeries(self._timeframe or Timeframe("M1", 60), self._instrument, self.config, tuple(self._points), tuple(self._issues))
+        return IndicatorSeries(
+            self._timeframe or Timeframe("M1", 60),
+            self._instrument,
+            self.config,
+            tuple(self._points),
+            tuple(self._issues),
+        )
 
     def reset(self) -> None:
         self._ema_fast.reset()
@@ -361,7 +425,9 @@ class IncrementalIndicatorEngine:
         quality: DataQuality,
         candle_id: str | None,
     ) -> IndicatorPoint:
-        return IndicatorPoint(start, end, available_at, close, None, None, None, None, closed, quality, candle_id, self._index)
+        return IndicatorPoint(
+            start, end, available_at, close, None, None, None, None, closed, quality, candle_id, self._index
+        )
 
     def update(self, bar: Candle | Mapping[str, Any]) -> IndicatorPoint:
         fields = _bar_fields(bar)
@@ -388,8 +454,23 @@ class IncrementalIndicatorEngine:
         # contamina el estado de indicadores de velas cerradas.
         if not closed or not quality.valid:
             if not quality.valid:
-                self._issues.append(QualityIssue("quality_blocked", ",".join(sorted(flag.value for flag in quality.flags)), record_id=candle_id, timestamp=end))
-            point = self._unknown_point(start=start, end=end, available_at=available_at, close=float(close) if close is not None else None, closed=closed, quality=quality, candle_id=candle_id)
+                self._issues.append(
+                    QualityIssue(
+                        "quality_blocked",
+                        ",".join(sorted(flag.value for flag in quality.flags)),
+                        record_id=candle_id,
+                        timestamp=end,
+                    )
+                )
+            point = self._unknown_point(
+                start=start,
+                end=end,
+                available_at=available_at,
+                close=float(close) if close is not None else None,
+                closed=closed,
+                quality=quality,
+                candle_id=candle_id,
+            )
             self._points.append(point)
             self._index += 1
             self.reset()
@@ -399,9 +480,19 @@ class IncrementalIndicatorEngine:
         # La continuidad se comprueba antes de alimentar el siguiente cálculo.
         if self._previous_end is not None and start != self._previous_end:
             quality = quality.with_flags(QualityFlag.GAP, reason=f"intervalo_no_contiguo:{self._previous_end}->{start}")
-            issue = QualityIssue("gap", "Intervalos no contiguos; se reinicia calentamiento", record_id=candle_id, timestamp=start)
+            issue = QualityIssue(
+                "gap", "Intervalos no contiguos; se reinicia calentamiento", record_id=candle_id, timestamp=start
+            )
             self._issues.append(issue)
-            point = self._unknown_point(start=start, end=end, available_at=available_at, close=float(close), closed=closed, quality=quality, candle_id=candle_id)
+            point = self._unknown_point(
+                start=start,
+                end=end,
+                available_at=available_at,
+                close=float(close),
+                closed=closed,
+                quality=quality,
+                candle_id=candle_id,
+            )
             self._points.append(point)
             self._index += 1
             self.reset()
@@ -415,7 +506,9 @@ class IncrementalIndicatorEngine:
         ema_slow = self._ema_slow.update(close_value)
         rsi = self._rsi.update(close_value)
         atr = self._atr.update(high_value, low_value, close_value)
-        point = IndicatorPoint(start, end, available_at, close_value, ema_fast, ema_slow, rsi, atr, closed, quality, candle_id, self._index)
+        point = IndicatorPoint(
+            start, end, available_at, close_value, ema_fast, ema_slow, rsi, atr, closed, quality, candle_id, self._index
+        )
         self._points.append(point)
         self._index += 1
         self._previous_end = end

@@ -7,15 +7,22 @@ must never be presented as observations of a real instrument.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 import random
-from typing import Iterable, Literal, Sequence
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal
 
-from .models import Bar, DataQuality, DataSet, Provenance, ValidationIssue, infer_quality, resolution_name, resolution_to_seconds
+from .models import (
+    Bar,
+    DataSet,
+    Provenance,
+    ValidationIssue,
+    infer_quality,
+    resolution_name,
+    resolution_to_seconds,
+)
 
-
-UTC = timezone.utc
 ScenarioName = Literal["trend", "pullback", "sideways", "volatility_change"]
 _SUPPORTED_SCENARIOS = {"trend", "pullback", "sideways", "volatility_change"}
 _SUPPORTED_ANOMALIES = {"gap", "duplicate", "out_of_order"}
@@ -112,7 +119,7 @@ class SyntheticGenerator:
         )
         return self.generate_dataset(config)
 
-    def generate_bars(self, *args, **kwargs) -> list[Bar]:
+    def generate_bars(self, *args: Any, **kwargs: Any) -> list[Bar]:
         """Convenience API returning only bars."""
 
         return list(self.generate(*args, **kwargs).bars)
@@ -124,7 +131,9 @@ class SyntheticGenerator:
         bars: list[Bar] = []
         close = float(config.base_price)
         for index in range(config.periods):
-            drift, volatility, mean_reversion = self._scenario_parameters(config.scenario, index, config.periods, close, config.base_price)
+            drift, volatility, mean_reversion = self._scenario_parameters(
+                config.scenario, index, config.periods, close, config.base_price
+            )
             open_price = close
             shock = rng.gauss(0.0, volatility)
             if mean_reversion:
@@ -215,7 +224,9 @@ class SyntheticGenerator:
         all_notes: list[str] = []
         for offset, scenario in enumerate(scenarios):
             scenario_seed = self.seed + offset * 1009
-            scenario_start = self.start + timedelta(seconds=offset * periods_each * resolution_to_seconds(self.resolution))
+            scenario_start = self.start + timedelta(
+                seconds=offset * periods_each * resolution_to_seconds(self.resolution)
+            )
             generator = SyntheticGenerator(
                 scenario_seed,
                 instrument=self.instrument,
@@ -229,7 +240,13 @@ class SyntheticGenerator:
             )
             data = generator.generate(periods_each, scenario=scenario, anomalies=anomalies)
             records.extend(data.bars)
-            all_notes.extend([f"{scenario}: {note}" for note in data.provenance.notes if note.startswith(("gap:", "duplicate:", "out_of_order:"))])
+            all_notes.extend(
+                [
+                    f"{scenario}: {note}"
+                    for note in data.provenance.notes
+                    if note.startswith(("gap:", "duplicate:", "out_of_order:"))
+                ]
+            )
         issues = tuple(ValidationIssue(code="SYNTHETIC_SCENARIO", message=note, severity="ERROR") for note in all_notes)
         times = [bar.interval_start for bar in records]
         quality = infer_quality(records, issues)
@@ -249,7 +266,9 @@ class SyntheticGenerator:
         return DataSet(tuple(records), provenance, quality, issues)
 
     @staticmethod
-    def _scenario_parameters(scenario: str, index: int, periods: int, close: float, base: float) -> tuple[float, float, float]:
+    def _scenario_parameters(
+        scenario: str, index: int, periods: int, close: float, base: float
+    ) -> tuple[float, float, float]:
         """Return drift, volatility and optional mean-reversion strength."""
 
         if scenario == "trend":
@@ -286,7 +305,9 @@ class SyntheticGenerator:
         if "out_of_order" in requested and len(result) >= 2:
             # If a duplicate was inserted at the default midpoint, skip it so
             # the anomaly really swaps two different intervals.
-            default_left = len(result) // 2 + (1 if "duplicate" in requested and config.out_of_order_positions is None else 0)
+            default_left = len(result) // 2 + (
+                1 if "duplicate" in requested and config.out_of_order_positions is None else 0
+            )
             if default_left >= len(result) - 1:
                 default_left = len(result) - 2
             pair = config.out_of_order_positions or (default_left, default_left + 1)

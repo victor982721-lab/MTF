@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
-from pathlib import Path
 import tempfile
 import unittest
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.request import urlopen
 
 from mtf_lab.data.capture import CaptureEnvelope, MessageClass
 from mtf_lab.ops.persistence import IdempotencyConflict, SQLiteStore
 from mtf_lab.ops.query import QueryService
 from mtf_lab.ops.ui import create_server
-
 
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -57,21 +56,19 @@ class ProductPersistenceTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_atomic_batch_rolls_back_all_writes_and_nested_helpers_use_savepoints(self) -> None:
-        with self.assertRaisesRegex(RuntimeError, "abort"):
-            with self.store.atomic_batch():
-                self.store.save_checkpoint(self.session_id, "runtime", state={"cursor": 1})
-                self.store.save_cfd_trade(self.session_id, self.analysis_id, cfd_trade())
-                raise RuntimeError("abort")
+        with self.assertRaisesRegex(RuntimeError, "abort"), self.store.atomic_batch():
+            self.store.save_checkpoint(self.session_id, "runtime", state={"cursor": 1})
+            self.store.save_cfd_trade(self.session_id, self.analysis_id, cfd_trade())
+            raise RuntimeError("abort")
         self.assertIsNone(self.store.get_checkpoint(self.session_id, "runtime"))
         self.assertEqual(self.store.list_cfd_trades(self.session_id, self.analysis_id), [])
 
         with self.store.atomic_batch():
             self.store.save_checkpoint(self.session_id, "runtime", state={"cursor": 2})
-            with self.assertRaisesRegex(ValueError, "stake"):
-                with self.store.transaction():
-                    self.store.save_cfd_trade(
-                        self.session_id, self.analysis_id, {**cfd_trade(), "trade_id": "inner", "stake": "1000"}
-                    )
+            with self.assertRaisesRegex(ValueError, "stake"), self.store.transaction():
+                self.store.save_cfd_trade(
+                    self.session_id, self.analysis_id, {**cfd_trade(), "trade_id": "inner", "stake": "1000"}
+                )
             self.store.save_cfd_trade(self.session_id, self.analysis_id, {**cfd_trade(), "trade_id": "outer"})
         self.assertIsNotNone(self.store.get_checkpoint(self.session_id, "runtime"))
         self.assertEqual(len(self.store.list_cfd_trades(self.session_id, self.analysis_id)), 1)
@@ -102,9 +99,7 @@ class ProductPersistenceTests(unittest.TestCase):
         self.assertTrue(row["close_observed"])
         self.assertNotIn("stake", row)
         with self.assertRaises(IdempotencyConflict):
-            self.store.save_cfd_trade(
-                self.session_id, self.analysis_id, {**closed, "net_pnl": "0.30001"}
-            )
+            self.store.save_cfd_trade(self.session_id, self.analysis_id, {**closed, "net_pnl": "0.30001"})
         with self.assertRaises(IdempotencyConflict):
             self.store.save_cfd_trade(self.session_id, self.analysis_id, {**pending, "state": "PENDING"})
 
@@ -131,32 +126,47 @@ class ProductPersistenceTests(unittest.TestCase):
 
     def test_capture_envelopes_are_idempotent_and_stream_by_causal_cursor(self) -> None:
         envelopes = [
-            CaptureEnvelope(T0, T0 + timedelta(seconds=2), T0 + timedelta(seconds=2), 2, 0, MessageClass.SPOT, {"n": 2}),
-            CaptureEnvelope(T0, T0 + timedelta(seconds=1), T0 + timedelta(seconds=1), 1, 0, MessageClass.SPOT, {"n": 1}),
-            CaptureEnvelope(T0, T0 + timedelta(seconds=1), T0 + timedelta(seconds=1), 3, 1, MessageClass.CONNECTION, {"n": 3}),
+            CaptureEnvelope(
+                T0, T0 + timedelta(seconds=2), T0 + timedelta(seconds=2), 2, 0, MessageClass.SPOT, {"n": 2}
+            ),
+            CaptureEnvelope(
+                T0, T0 + timedelta(seconds=1), T0 + timedelta(seconds=1), 1, 0, MessageClass.SPOT, {"n": 1}
+            ),
+            CaptureEnvelope(
+                T0, T0 + timedelta(seconds=1), T0 + timedelta(seconds=1), 3, 1, MessageClass.CONNECTION, {"n": 3}
+            ),
         ]
         for envelope in envelopes:
             self.assertTrue(self.store.save_capture_envelope(self.session_id, envelope))
             self.assertFalse(self.store.save_capture_envelope(self.session_id, envelope))
         ordered = list(self.store.iter_capture_envelopes(self.session_id))
-        self.assertEqual([(row["available_at"], row["ingest_sequence"]) for row in ordered], [
-            ("2026-01-01T00:00:01.000000Z", 1),
-            ("2026-01-01T00:00:01.000000Z", 3),
-            ("2026-01-01T00:00:02.000000Z", 2),
-        ])
-        after = list(self.store.iter_capture_envelopes(
-            self.session_id, after_cursor=(ordered[0]["available_at"], ordered[0]["ingest_sequence"])
-        ))
+        self.assertEqual(
+            [(row["available_at"], row["ingest_sequence"]) for row in ordered],
+            [
+                ("2026-01-01T00:00:01.000000Z", 1),
+                ("2026-01-01T00:00:01.000000Z", 3),
+                ("2026-01-01T00:00:02.000000Z", 2),
+            ],
+        )
+        after = list(
+            self.store.iter_capture_envelopes(
+                self.session_id, after_cursor=(ordered[0]["available_at"], ordered[0]["ingest_sequence"])
+            )
+        )
         self.assertEqual([row["ingest_sequence"] for row in after], [3, 2])
         with self.assertRaises(IdempotencyConflict):
             self.store.save_capture_envelope(
                 self.session_id,
-                CaptureEnvelope(T0, T0 + timedelta(seconds=2), T0 + timedelta(seconds=2), 2, 0, MessageClass.SPOT, {"n": 999}),
+                CaptureEnvelope(
+                    T0, T0 + timedelta(seconds=2), T0 + timedelta(seconds=2), 2, 0, MessageClass.SPOT, {"n": 999}
+                ),
             )
         with self.assertRaises(IdempotencyConflict):
             self.store.save_capture_envelope(
                 self.session_id,
-                CaptureEnvelope(T0, T0 + timedelta(seconds=3), T0 + timedelta(seconds=3), 2, 1, MessageClass.SPOT, {"n": 2}),
+                CaptureEnvelope(
+                    T0, T0 + timedelta(seconds=3), T0 + timedelta(seconds=3), 2, 1, MessageClass.SPOT, {"n": 2}
+                ),
             )
 
     def test_query_and_read_only_ui_keep_cfd_separate(self) -> None:
@@ -169,13 +179,18 @@ class ProductPersistenceTests(unittest.TestCase):
         self.assertEqual(query.query_simulations(self.session_id).total, 0)
         self.assertEqual(query.snapshot(self.session_id)["pending_cfd_trades"], 1)
 
-        server = create_server(Path(self.tmp.name) / "lab.sqlite3", host="127.0.0.1", port=0, session_id=self.session_id)
+        server = create_server(
+            Path(self.tmp.name) / "lab.sqlite3", host="127.0.0.1", port=0, session_id=self.session_id
+        )
         import threading
+
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
         thread.start()
         try:
             base = f"http://127.0.0.1:{server.server_port}"
-            with urlopen(base + f"/api/cfd-trades?session={self.session_id}&analysis_id={self.analysis_id}", timeout=3) as response:
+            with urlopen(
+                base + f"/api/cfd-trades?session={self.session_id}&analysis_id={self.analysis_id}", timeout=3
+            ) as response:
                 payload = json.loads(response.read().decode())
             self.assertEqual(payload["items"][0]["state"], "PENDING")
             with urlopen(base + f"/api/simulations?session={self.session_id}", timeout=3) as response:

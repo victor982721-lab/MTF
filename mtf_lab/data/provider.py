@@ -4,9 +4,12 @@ Los adaptadores sólo normalizan datos y procedencia; no implementan EMA,
 estrategia ni ejecución. Cualquier proveedor futuro puede cumplir este Protocol
 sin cambiar el detector.
 """
+
 from __future__ import annotations
-from collections.abc import Iterable, Iterator
-from typing import Protocol, runtime_checkable, Any
+
+from collections.abc import Iterator
+from typing import Any, Protocol, runtime_checkable
+
 
 @runtime_checkable
 class MarketDataProvider(Protocol):
@@ -24,5 +27,6 @@ class MarketDataProvider(Protocol):
 
 def provider_name(provider: Any) -> str:
     return str(getattr(provider, "name", getattr(provider, "provider", type(provider).__name__)))
+
 
 __all__ = ["MarketDataProvider", "provider_name"]

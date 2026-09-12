@@ -13,10 +13,11 @@ import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from typing import Any
 
 from ..configuration import EffectiveConfig
-from ..core import Candle, MarketEvent, OperationMode
+from ..core import Candle, MarketEvent, OperationMode, QualityFlag, Timeframe, parse_timeframe
 from ..core.reference import m1_reference_signals
 from ..ops.persistence import SQLiteStore, payload_hash
 from .consumers import SignalConsumer
@@ -32,7 +33,7 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(item) for item in value]
     if is_dataclass(value) and not isinstance(value, type):
         return {field.name: _jsonable(getattr(value, field.name)) for field in fields(value)}
-    if hasattr(value, "value"):
+    if isinstance(value, Enum):
         return value.value
     if isinstance(value, datetime):
         return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -84,6 +85,10 @@ def _mode(value: str | OperationMode) -> OperationMode:
     if text in {"SYNTHETIC", "SINTETICO", "SINTÉTICO", "OFFLINE"}:
         return OperationMode.SYNTHETIC
     return OperationMode.REPLAY
+
+
+def _timeframe_name(value: Timeframe | str | int) -> str:
+    return parse_timeframe(value).name
 
 
 @dataclass(slots=True)
@@ -294,6 +299,8 @@ class RuntimeCoordinator:
         self.external_blocked_reasons: list[str] = []
         self._external_block_details: dict[str, dict[str, Any]] = {}
         self._runtime_block_details: dict[str, dict[str, Any]] = {}
+        self._startup_event_time: datetime | None = None
+        self._startup_event_id: str | None = None
         self._block_history: list[dict[str, Any]] = []
         self.capture_state = "CAPTURING"
         self.freshness_state = (
@@ -356,7 +363,7 @@ class RuntimeCoordinator:
             snapshot = None
             processor_snapshot = None
             self.checkpoint_name = f"{checkpoint_name}:{self.analysis_id[:12]}"
-        if processor_snapshot:
+        if processor_snapshot and snapshot is not None:
             self.processor = IncrementalProcessor.from_checkpoint(
                 processor_snapshot,
                 signal_consumer=signal_consumer,
@@ -388,6 +395,7 @@ class RuntimeCoordinator:
                 self._block_history = [
                     dict(item) for item in operational.get("block_history", ()) if isinstance(item, Mapping)
                 ]
+                self._restore_startup_observation(operational)
                 self.last_received_at = _parse_datetime(operational.get("last_received_at"))
                 self.last_heartbeat_at = _parse_datetime(operational.get("last_heartbeat_at"))
                 self.last_processed_at = _parse_datetime(operational.get("last_processed_at"))
@@ -474,7 +482,8 @@ class RuntimeCoordinator:
         raw.setdefault("price_base", raw.get("base_price", self.config.price_base))
         raw.setdefault("quality", "UNKNOWN")
         raw.setdefault("resolution", self.config.timeframes[0].name)
-        assumptions = raw.get("assumptions") if isinstance(raw.get("assumptions"), Mapping) else {}
+        assumptions_value = raw.get("assumptions")
+        assumptions: Mapping[str, Any] = assumptions_value if isinstance(assumptions_value, Mapping) else {}
         raw["assumptions"] = {
             **dict(assumptions),
             "data_complete": bool(raw.get("capture_complete", False))
@@ -524,7 +533,7 @@ class RuntimeCoordinator:
 
     def _result_candle_point(self, candle: Candle) -> Any | None:
         try:
-            timeframe = candle.timeframe.name
+            timeframe = candle.timeframe_name
             absolute_index = self.processor._point_index_by_start.get(timeframe, {}).get(candle.start)
             index = (
                 (absolute_index - self.processor._point_base_index.get(timeframe, 0))
@@ -643,7 +652,48 @@ class RuntimeCoordinator:
         self.last_processed_at = _clock_value(self._clock)
         self._checkpoint_if_due()
 
-    def _runtime_block_from_result(self, result: ProcessResult) -> None:
+    def _restore_startup_observation(self, operational: Mapping[str, Any]) -> None:
+        self._startup_event_time = _parse_datetime(operational.get("startup_event_time"))
+        identity = operational.get("startup_event_id")
+        self._startup_event_id = identity if isinstance(identity, str) else None
+
+    def _remember_startup_observation(self, record: Any, result: ProcessResult) -> None:
+        if self.mode is OperationMode.LIVE or _looks_like_candle(record):
+            return
+        if self._startup_event_time is not None or self.processor.events_processed != 1:
+            return
+        if result.accepted and len(result.events) == 1:
+            event = result.events[0]
+            self._startup_event_time = event.event_time
+            self._startup_event_id = event.event_id
+
+    def _is_startup_partial(self, issue: RuntimeIssue, result: ProcessResult) -> bool:
+        """Recognize clipped first buckets, not an interruption of an existing stream.
+
+        The first accepted event is the evidence: later partials, other quality
+        flags, native input bars and LIVE are never classified this way.
+        Indicator warmup and every operational gate continue to apply.
+        """
+        first = self._startup_event_time
+        if self.mode is OperationMode.LIVE or first is None or self._startup_event_id is None:
+            return False
+        if issue.code == "partial_bucket":
+            return issue.timestamp == first and issue.record_id == self._startup_event_id
+        if issue.code != "quality_blocked":
+            return False
+        return any(
+            candle.candle_id == issue.record_id
+            and candle.closed
+            and candle.origin == "aggregated"
+            and candle.start < first < candle.end
+            and candle.metadata.get("partial") is True
+            and _parse_datetime(candle.metadata.get("coverage_start")) == first
+            and QualityFlag.PARTIAL in candle.quality.flags
+            and candle.quality.flags <= {QualityFlag.PARTIAL, QualityFlag.SYNTHETIC}
+            for candle in result.candles
+        )
+
+    def _runtime_block_from_result(self, result: ProcessResult, *, aggregated_input: bool = False) -> None:
         for issue in result.issues:
             if issue.code not in _BLOCKING_ISSUE_CODES:
                 continue
@@ -655,6 +705,16 @@ class RuntimeCoordinator:
                 "timestamp": _jsonable(issue.timestamp),
                 "active": True,
             }
+            if aggregated_input and self._is_startup_partial(issue, result):
+                self._block_history.append(
+                    {
+                        **detail,
+                        "active": False,
+                        "startup_partial": True,
+                        "first_event_time": _jsonable(self._startup_event_time),
+                    }
+                )
+                continue
             self._runtime_block_details[key] = detail
             self._block_history.append({**detail, "resolved": False})
             self.continuity_state = "BROKEN"
@@ -673,13 +733,14 @@ class RuntimeCoordinator:
         # The gate is checked before the transition. A blocked capture still
         # enters durable storage and the simulation book, but cannot emit new
         # strategy decisions/signals until an explicit resolution arrives.
-        allow_signals = (not bootstrap) and self.can_emit_signals
+        allow_signals = (not bootstrap) and self.can_emit_signals()
         result = (
             self.processor.process_bar(record, evaluate_strategy=allow_signals)
             if _looks_like_candle(record)
             else self.processor.process_event(record, evaluate_strategy=allow_signals)
         )
-        self._runtime_block_from_result(result)
+        self._remember_startup_observation(record, result)
+        self._runtime_block_from_result(result, aggregated_input=not _looks_like_candle(record))
         if result.accepted and self.continuity_state == "UNKNOWN":
             self.continuity_state = "CONTINUOUS"
         self._persist_result(record, result, allow_signals=allow_signals)
@@ -692,13 +753,13 @@ class RuntimeCoordinator:
     def advance(self, watermark: datetime, *, complete: bool = False) -> ProcessResult:
         # ``complete`` only changes simulation grace/watermark. It never
         # bypasses an active gate for new decisions.
-        allow_signals = self.can_emit_signals
+        allow_signals = self.can_emit_signals()
         if complete and self.processor.signal_consumer.consumer_type == "binary_simulation":
             watermark = watermark + timedelta(
                 seconds=max(self.config.simulation.horizons_seconds) + self.config.simulation.max_price_age_seconds
             )
         result = self.processor.finalize(watermark, evaluate_strategy=allow_signals, capture_complete=complete)
-        self._runtime_block_from_result(result)
+        self._runtime_block_from_result(result, aggregated_input=True)
         self._persist_result({}, result, allow_signals=allow_signals)
         self.last_processed_at = _clock_value(self._clock)
         self.checkpoint()
@@ -756,6 +817,8 @@ class RuntimeCoordinator:
                 "external_blocked_reasons": list(self.external_blocked_reasons),
                 "external_block_details": _jsonable(self._external_block_details),
                 "runtime_block_details": _jsonable(self._runtime_block_details),
+                "startup_event_time": _jsonable(self._startup_event_time),
+                "startup_event_id": self._startup_event_id,
                 "block_history": _jsonable(self._block_history[-256:]),
                 "last_received_at": _jsonable(self.last_received_at),
                 "last_heartbeat_at": _jsonable(self.last_heartbeat_at),
@@ -819,6 +882,7 @@ class RuntimeCoordinator:
             self._block_history = [
                 dict(item) for item in operational.get("block_history", ()) if isinstance(item, Mapping)
             ]
+            self._restore_startup_observation(operational)
             self.last_received_at = _parse_datetime(operational.get("last_received_at"))
             self.last_heartbeat_at = _parse_datetime(operational.get("last_heartbeat_at"))
             self.last_processed_at = _parse_datetime(operational.get("last_processed_at"))
@@ -951,7 +1015,7 @@ class RuntimeCoordinator:
 
     def reference_signals(self) -> tuple[list[dict[str, Any]], str]:
         """Persiste la referencia M1 sobre la misma captura, aunque MTF sea cero."""
-        name = self.config.strategy.trigger_timeframe.name
+        name = _timeframe_name(self.config.strategy.trigger_timeframe)
         engine = self.processor.indicator_engines.get(name)
         if engine is None:
             return [], self.analysis_id
@@ -1033,7 +1097,9 @@ class RuntimeCoordinator:
             blocked.append(f"freshness:{self.freshness_state.lower()}")
         if self.capture_state in {"STOPPED", "ERROR", "RECOVERING", "RECONCILING", "BLOCKED"}:
             blocked.append(f"capture:{self.capture_state.lower()}")
-        if self.continuity_state in {"BROKEN", "UNKNOWN", "UNVERIFIED", "BLOCKED"} and self.processor.events_processed:
+        if self.continuity_state in {"BROKEN", "UNVERIFIED", "BLOCKED"} or (
+            self.continuity_state == "UNKNOWN" and self.processor.events_processed
+        ):
             blocked.append(f"continuity:{self.continuity_state.lower()}")
         for key in self._runtime_block_details:
             blocked.append(key)
@@ -1042,9 +1108,9 @@ class RuntimeCoordinator:
     def _processor_blocked_reasons(self, processor_status: Mapping[str, Any]) -> list[str]:
         blocked: list[str] = []
         for tf in (
-            self.config.strategy.context_timeframe.name,
-            self.config.strategy.preparation_timeframe.name,
-            self.config.strategy.trigger_timeframe.name,
+            _timeframe_name(self.config.strategy.context_timeframe),
+            _timeframe_name(self.config.strategy.preparation_timeframe),
+            _timeframe_name(self.config.strategy.trigger_timeframe),
         ):
             if processor_status.get("warmup_pending", {}).get(tf, 0):
                 blocked.append(f"warmup:{tf}")

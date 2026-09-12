@@ -46,9 +46,11 @@ from mtf_lab.data import KrakenPublicAdapter
 
 adapter = KrakenPublicAdapter("BTC/USD")
 result = adapter.fetch_ohlc(interval=1, include_open=False)
-for closed_bar in result: ...
-open_bar = result.open_bar       # siempre separado
-for event in adapter.iter_trades(duration_seconds=30, max_events=10): ...
+for closed_bar in result:
+    ...
+open_bar = result.open_bar  # siempre separado
+for event in adapter.iter_trades(duration_seconds=30, max_events=10):
+    ...
 ```
 
 REST es `https://api.kraken.com/0/public/OHLC` con `assetVersion=1`; WebSocket

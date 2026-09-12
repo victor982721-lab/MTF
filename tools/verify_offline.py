@@ -33,56 +33,21 @@ from collections.abc import Iterable, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import unquote
 
-BASE_COMMIT = "46545533992918ca44804038814f1adc19107f8b"
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from tools.quality_scope import QualityScope, discover_quality_scope
+
+BASE_COMMIT = "ea288085690ccfc617e6bcd5ba44f20925633f8f"
 REPORT_DIRECTORY = Path("reports/engineering/latest")
 RESULTS_FILENAME = "engineering_results.json"
 TOOLING_FILENAME = "engineering_tooling.json"
 DEFAULT_TIMEOUT = 900.0
 DEFAULT_BENCHMARK_EVENTS = 7500
 
-# The strict type gate established by the engineering refactor.  Keeping this
-# list in the tool, rather than reading a generated report, makes a clean
-# clone self-contained and avoids a report-to-gate circular dependency.
-MYPY_TARGETS: tuple[str, ...] = (
-    "mtf_lab/core/canonical.py",
-    "mtf_lab/core/cfd_simulation.py",
-    "mtf_lab/core/cfd_quality.py",
-    "mtf_lab/core/numeric.py",
-    "mtf_lab/core/reference.py",
-    "mtf_lab/data/capture.py",
-    "mtf_lab/data/ctrader_accounts.py",
-    "mtf_lab/data/ctrader_config.py",
-    "mtf_lab/data/ctrader_errors.py",
-    "mtf_lab/data/ctrader_fixtures.py",
-    "mtf_lab/data/ctrader_market.py",
-    "mtf_lab/data/ctrader_protocol.py",
-    "mtf_lab/data/ctrader_session.py",
-    "mtf_lab/data/ctrader_transport.py",
-    "mtf_lab/ops/ctrader_capture.py",
-    "mtf_lab/ops/ctrader_paper_adapters.py",
-    "mtf_lab/ops/ctrader_pipeline.py",
-    "mtf_lab/ops/ctrader_demo_transport.py",
-    "mtf_lab/ops/ctrader_demo_composition.py",
-    "mtf_lab/runtime/consumers.py",
-)
-
-# Ruff/format covers the declared critical modules and the executable tooling
-# itself.  It deliberately does not claim that legacy production modules are
-# repository-wide clean; the architecture result records that debt separately.
-TOOLING_TARGETS: tuple[str, ...] = (
-    "tools/benchmark_paper.py",
-    "tools/engineering_audit.py",
-    "tools/offline_tests.py",
-    "tools/verify_offline.py",
-    "tests/test_engineering_delivery.py",
-    "tests/test_demo_composition.py",
-    "tests/test_packaging_delivery.py",
-    "tests/test_migration_delivery.py",
-)
-QUALITY_TARGETS: tuple[str, ...] = (*MYPY_TARGETS, *TOOLING_TARGETS)
 RUNTIME_DISTRIBUTIONS: tuple[str, ...] = (
     "mtf-lab",
     "ctrader-open-api",
@@ -263,6 +228,7 @@ def _command_environment(temp_root: Path, extras: Mapping[str, str] | None = Non
         "XDG_CACHE_HOME": temp_root / "cache",
         "XDG_DATA_HOME": temp_root / "data",
         "XDG_STATE_HOME": temp_root / "state",
+        "MTF_LAB_STATE_DIR": temp_root / "state",
         "TMPDIR": temp_root / "tmp",
         "MTF_LAB_DB": temp_root / "data" / "mtf_lab.sqlite3",
         "PYTHONPYCACHEPREFIX": temp_root / "pycache",
@@ -278,6 +244,7 @@ def _command_environment(temp_root: Path, extras: Mapping[str, str] | None = Non
             "MTF_LAB_OFFLINE": "1",
             "PIP_CONFIG_FILE": os.devnull,
             "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PYTHONNOUSERSITE": "1",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
     )
@@ -503,6 +470,39 @@ print(json.dumps({
     return result
 
 
+def _probe_metadata_value(probe: Mapping[str, Any], key: str, default: Any = None) -> Any:
+    metadata = probe.get("metadata")
+    return metadata.get(key, default) if isinstance(metadata, Mapping) else default
+
+
+def site_packages_path(
+    python: Path,
+    *,
+    root: Path,
+    environment: Mapping[str, str],
+    timeout: float,
+) -> dict[str, Any]:
+    """Resolve the selected interpreter's import root without ambient state."""
+
+    code = "import json, site; print(json.dumps(site.getsitepackages()))"
+    outcome = run_command([str(python), "-c", code], root=root, environment=environment, timeout=timeout)
+    parsed = _last_json(outcome.stdout)
+    candidates = parsed if isinstance(parsed, list) else []
+    selected = next(
+        (Path(item) for item in candidates if isinstance(item, str) and Path(item).is_dir()),
+        None,
+    )
+    result = outcome.to_dict(root=root)
+    result.update(
+        {
+            "available": selected is not None,
+            "path": str(selected) if selected is not None else None,
+            "candidates": [item for item in candidates if isinstance(item, str)],
+        }
+    )
+    return result
+
+
 def _node_version(node: Path | None, *, root: Path, environment: Mapping[str, str], timeout: float) -> dict[str, Any]:
     if node is None:
         return {"path_available": False, "version": None, "ok": False, "reason": "node-not-found"}
@@ -541,15 +541,21 @@ def _compact_counts(summary: Mapping[str, Any] | None) -> dict[str, Any]:
     failed = number("failed")
     expected = number("expected_failures")
     unexpected = number("unexpected_successes")
-    consistent = (
-        all(
-            item is not None
-            for item in (discovered, tests_run, executed, passed, failed, skipped, expected, unexpected)
+    values = (discovered, tests_run, executed, passed, failed, skipped, expected, unexpected)
+    if any(item is None for item in values):
+        consistent = False
+    else:
+        assert discovered is not None
+        assert tests_run is not None
+        assert executed is not None
+        assert passed is not None
+        assert failed is not None
+        assert skipped is not None
+        assert expected is not None
+        assert unexpected is not None
+        consistent = (
+            tests_run >= skipped and discovered >= tests_run and executed == passed + failed + expected + unexpected
         )
-        and tests_run >= skipped
-        and discovered >= tests_run
-        and executed == passed + failed + expected + unexpected
-    )
     return {
         "discovered": discovered,
         "tests_run": tests_run,
@@ -589,7 +595,20 @@ def _run_offline_suite(
     environment: Mapping[str, str],
     temporary_root: Path,
     timeout: float,
+    coverage_file: Path | None = None,
+    coverage_site: Path | None = None,
+    build_python: Path | None = None,
 ) -> dict[str, Any]:
+    coverage_requested = coverage_file is not None or coverage_site is not None
+    if (coverage_file is None) != (coverage_site is None):
+        return {
+            "ok": False,
+            "required_ui_javascript": True,
+            "node": {"ok": False, "reason": "coverage_file y coverage_site deben proporcionarse juntos"},
+            "counts": _compact_counts(None),
+            "reason": "cobertura mal configurada; no se ejecutó la suite",
+            "coverage": {"enabled": coverage_requested, "ok": False, "error": "coverage configuration mismatch"},
+        }
     node_receipt = _node_version(node, root=root, environment=environment, timeout=min(timeout, 30.0))
     if not node_receipt.get("ok"):
         return {
@@ -598,6 +617,13 @@ def _run_offline_suite(
             "node": node_receipt,
             "counts": _compact_counts(None),
             "reason": "Node real no disponible; MTF_UI_JS_DEV=1 es un gate obligatorio",
+            "guard_evidence": None,
+            "guard_error": "offline runner was not started",
+            "coverage": {
+                "enabled": coverage_requested,
+                "ok": False if coverage_requested else None,
+                "error": "suite no ejecutada porque falta Node",
+            },
         }
     result_path = temporary_root / "offline-results.json"
     command = [
@@ -612,6 +638,11 @@ def _run_offline_suite(
     ]
     child_environment = dict(environment)
     child_environment.update({"MTF_UI_JS_DEV": "1", "MTF_NODE_BIN": str(node)})
+    if build_python is not None:
+        child_environment["MTF_LAB_BUILD_PYTHON"] = str(build_python)
+    if coverage_file is not None:
+        assert coverage_site is not None
+        command.extend(["--coverage-file", str(coverage_file), "--coverage-site", str(coverage_site)])
     outcome = run_command(command, root=root, environment=child_environment, timeout=timeout + 30.0)
     payload: Any = None
     try:
@@ -639,6 +670,12 @@ def _run_offline_suite(
     }
     network_attempts = _count_nested_records(suite, "network_attempts")
     write_attempts = _count_nested_records(suite, "write_attempts")
+    guard_evidence = suite.get("guard_evidence") if isinstance(suite, Mapping) else None
+    guard_ok = bool(
+        isinstance(guard_evidence, Mapping)
+        and guard_evidence.get("runtime_log") is True
+        and guard_evidence.get("write_log") is True
+    )
     runner_success = bool(payload.get("success")) if isinstance(payload, Mapping) else False
     closure = {
         "discovered_positive": isinstance(counts["discovered"], int) and counts["discovered"] > 0,
@@ -657,6 +694,7 @@ def _run_offline_suite(
         and all(closure.values())
         and network_attempts == 0
         and write_attempts == 0
+        and guard_ok
     )
     return {
         "ok": ok,
@@ -673,7 +711,22 @@ def _run_offline_suite(
         "closure": closure,
         "network_attempts": network_attempts,
         "write_attempts": write_attempts,
+        "guard_evidence": sanitize_payload(
+            guard_evidence,
+            root=root,
+            temporary_roots=(temporary_root,),
+        ),
+        "guard_error": (
+            None
+            if guard_ok
+            else (suite.get("guard_error") if isinstance(suite, Mapping) else "offline guard evidence missing")
+        ),
         "runner_success": runner_success,
+        "coverage": sanitize_payload(
+            payload.get("coverage") if isinstance(payload, Mapping) else None,
+            root=root,
+            temporary_roots=(temporary_root,),
+        ),
         "diagnostic": ("offline suite failed; inspect runner_output" if not ok else None),
         "smoke": sanitize_payload(
             payload.get("smoke") if isinstance(payload, Mapping) else None,
@@ -796,68 +849,22 @@ def document_link_check(root: Path) -> dict[str, Any]:
     }
 
 
-def _run_advisory_quality(
-    command: Sequence[str],
+def _failed_quality_command(
+    command: Sequence[str | os.PathLike[str]],
+    reason: str,
     *,
     root: Path,
-    environment: Mapping[str, str],
-    timeout: float,
-    json_output: bool = False,
+    temporary_root: Path,
 ) -> dict[str, Any]:
-    """Record full-repository debt without turning it into the critical gate."""
-
-    try:
-        completed = subprocess.run(
-            list(command),
-            cwd=str(root),
-            env=dict(environment),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return {
-            "status": "advisory-timeout",
-            "command": [_portable_text(item, root=root) for item in command],
-            "completed": False,
-            "returncode": None,
-            "finding_count": None,
-            "codes": [],
-        }
-    except OSError as exc:
-        return {
-            "status": "advisory-unavailable",
-            "command": [_portable_text(item, root=root) for item in command],
-            "completed": False,
-            "returncode": None,
-            "finding_count": None,
-            "codes": [],
-            "error": type(exc).__name__,
-        }
-    findings: list[Any] = []
-    if json_output:
-        try:
-            parsed = json.loads(completed.stdout)
-        except json.JSONDecodeError:
-            parsed = []
-        findings = parsed if isinstance(parsed, list) else []
-    else:
-        findings = [line for line in completed.stdout.splitlines() if "reformat" in line.lower()]
-    codes = sorted({str(item.get("code")) for item in findings if isinstance(item, Mapping) and item.get("code")})
-    files = sorted(
-        {str(item.get("filename")) for item in findings if isinstance(item, Mapping) and item.get("filename")}
+    outcome = _CommandOutcome(
+        tuple(os.fspath(item) for item in command),
+        2,
+        "",
+        reason,
+        False,
+        0.0,
     )
-    return {
-        "status": "advisory",
-        "command": [_portable_text(item, root=root) for item in command],
-        "completed": True,
-        "returncode": completed.returncode,
-        "finding_count": len(findings),
-        "files_with_findings": len(files),
-        "codes": codes,
-    }
+    return outcome.to_dict(root=root, temporary_roots=(temporary_root,))
 
 
 def _run_quality_gates(
@@ -868,11 +875,26 @@ def _run_quality_gates(
     environment: Mapping[str, str],
     temporary_root: Path,
     timeout: float,
+    scope: QualityScope,
 ) -> dict[str, Any]:
+    """Run required quality checks over one complete, immutable scope."""
+
+    scope_receipt = scope.as_dict(root)
+    scope_ok = bool(scope_receipt["ok"])
+    scope_reason = json.dumps(
+        {
+            "missing_roots": scope_receipt["missing_roots"],
+            "empty_roots": scope_receipt["empty_roots"],
+            "missing_files": scope_receipt["missing_files"],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    reason = f"quality scope invalid: {scope_reason}"
     compile_environment = dict(environment)
     compile_environment["PYTHONPYCACHEPREFIX"] = str(temporary_root / "compile-cache")
     compile_outcome = run_command(
-        [str(runtime_python), "-m", "compileall", "-q", "mtf_lab", "tests", "tools"],
+        [str(runtime_python), "-m", "compileall", "-q", *scope.ruff_roots],
         root=root,
         environment=compile_environment,
         timeout=min(timeout, 180.0),
@@ -902,64 +924,44 @@ def _run_quality_gates(
         environment=environment,
         timeout=min(timeout, 60.0),
     )
-    targets = list(QUALITY_TARGETS)
-    ruff_outcome = run_command(
-        [str(dev_python), "-m", "ruff", "check", "--no-cache", "--output-format", "concise", *targets],
-        root=root,
-        environment=environment,
-        timeout=min(timeout, 180.0),
-    )
-    format_outcome = run_command(
-        [str(dev_python), "-m", "ruff", "format", "--check", "--no-cache", *targets],
-        root=root,
-        environment=environment,
-        timeout=min(timeout, 180.0),
-    )
-    full_ruff_advisory = _run_advisory_quality(
-        [
-            str(dev_python),
-            "-m",
-            "ruff",
-            "check",
-            "--no-cache",
-            "--exit-zero",
-            "--output-format",
-            "json",
-            "mtf_lab",
-            "tests",
-            "tools",
-        ],
-        root=root,
-        environment=environment,
-        timeout=min(timeout, 180.0),
-        json_output=True,
-    )
-    full_format_advisory = _run_advisory_quality(
-        [str(dev_python), "-m", "ruff", "format", "--check", "--no-cache", "mtf_lab", "tests", "tools"],
-        root=root,
-        environment=environment,
-        timeout=min(timeout, 180.0),
-    )
-    mypy_cache = temporary_root / "mypy-cache"
-    mypy_outcome = run_command(
-        [
-            str(dev_python),
-            "-m",
-            "mypy",
-            "--strict",
-            "--follow-imports=silent",
-            "--no-incremental",
-            "--python-executable",
-            str(runtime_python),
-            "--cache-dir",
-            str(mypy_cache),
-            "--show-error-codes",
-            *MYPY_TARGETS,
-        ],
-        root=root,
-        environment=environment,
-        timeout=min(timeout, 300.0),
-    )
+    if scope_ok:
+        ruff_outcome = run_command(
+            [str(dev_python), "-m", "ruff", "check", "--no-cache", "--output-format", "concise", *scope.ruff_roots],
+            root=root,
+            environment=environment,
+            timeout=min(timeout, 180.0),
+        )
+        format_outcome = run_command(
+            [str(dev_python), "-m", "ruff", "format", "--check", "--no-cache", *scope.ruff_roots],
+            root=root,
+            environment=environment,
+            timeout=min(timeout, 180.0),
+        )
+        mypy_cache = temporary_root / "mypy-cache"
+        mypy_outcome = run_command(
+            [
+                str(dev_python),
+                "-m",
+                "mypy",
+                "--strict",
+                "--explicit-package-bases",
+                "--no-incremental",
+                "--python-executable",
+                str(runtime_python),
+                "--cache-dir",
+                str(mypy_cache),
+                "--show-error-codes",
+                *scope.mypy_roots,
+            ],
+            root=root,
+            environment=environment,
+            timeout=min(timeout, 300.0),
+        )
+    else:
+        ruff_outcome = None
+        format_outcome = None
+        mypy_outcome = None
+
     architecture_json = temporary_root / "architecture.json"
     architecture_outcome = run_command(
         [str(runtime_python), "tools/engineering_audit.py", "--strict", "--json", str(architecture_json)],
@@ -977,27 +979,63 @@ def _run_quality_gates(
         and isinstance(architecture_summary, Mapping)
         and int(architecture_summary.get("strict_violations", 1)) == 0
     )
+    ruff_receipt = (
+        ruff_outcome.to_dict(root=root)
+        if ruff_outcome is not None
+        else _failed_quality_command(
+            ["ruff", "check", *scope.ruff_roots], reason, root=root, temporary_root=temporary_root
+        )
+    )
+    format_receipt = (
+        format_outcome.to_dict(root=root)
+        if format_outcome is not None
+        else _failed_quality_command(
+            ["ruff", "format", *scope.ruff_roots], reason, root=root, temporary_root=temporary_root
+        )
+    )
+    mypy_receipt = (
+        mypy_outcome.to_dict(root=root, temporary_roots=(temporary_root,))
+        if mypy_outcome is not None
+        else _failed_quality_command(
+            ["mypy", "--strict", "--explicit-package-bases", *scope.mypy_roots],
+            reason,
+            root=root,
+            temporary_root=temporary_root,
+        )
+    )
+    pyright_outcome = run_command(
+        [str(dev_python), "-m", "pyright", "--project", "pyrightconfig.json", "--pythonpath", str(runtime_python)],
+        root=root,
+        environment=environment,
+        timeout=min(timeout, 420.0),
+    )
     return {
+        "quality_scope": scope_receipt,
         "compilation": {"ok": compile_outcome.ok, "command": compile_outcome.to_dict(root=root)},
         "git_diff_check": diff_receipt,
         "pip_check": {"ok": pip_outcome.ok, "command": pip_outcome.to_dict(root=root)},
         "ruff": {
-            "ok": ruff_outcome.ok,
-            "targets": targets,
-            "command": ruff_outcome.to_dict(root=root),
+            "ok": bool(ruff_outcome is not None and ruff_outcome.ok and scope_ok),
+            "roots": list(scope.ruff_roots),
+            "files": list(scope.ruff_files),
+            "command": ruff_receipt,
         },
         "format": {
-            "ok": format_outcome.ok,
-            "targets": targets,
-            "command": format_outcome.to_dict(root=root),
+            "ok": bool(format_outcome is not None and format_outcome.ok and scope_ok),
+            "roots": list(scope.ruff_roots),
+            "files": list(scope.ruff_files),
+            "command": format_receipt,
         },
-        "ruff_full_repository_advisory": full_ruff_advisory,
-        "format_full_repository_advisory": full_format_advisory,
         "mypy": {
-            "ok": mypy_outcome.ok,
-            "targets": list(MYPY_TARGETS),
-            "files_checked": len(MYPY_TARGETS),
-            "command": mypy_outcome.to_dict(root=root, temporary_roots=(temporary_root,)),
+            "ok": bool(mypy_outcome is not None and mypy_outcome.ok and scope_ok),
+            "roots": list(scope.mypy_roots),
+            "files": list(scope.mypy_files),
+            "files_checked": len(scope.mypy_files),
+            "command": mypy_receipt,
+        },
+        "pyright": {
+            "ok": pyright_outcome.ok,
+            "command": pyright_outcome.to_dict(root=root, temporary_roots=(temporary_root,)),
         },
         "architecture": {
             "ok": architecture_ok,
@@ -1066,14 +1104,14 @@ def run(
         dev_path = root_path / dev_path
     configured_node = os.environ.get("MTF_NODE_BIN")
     discovered_node = shutil.which("node")
-    node_path = (
-        Path(node or configured_node or discovered_node) if (node or configured_node or discovered_node) else None
-    )
+    node_candidate = node or configured_node or discovered_node
+    node_path = Path(node_candidate) if node_candidate is not None else None
     if node_path is not None and not node_path.is_absolute():
         node_path = root_path / node_path
     with tempfile.TemporaryDirectory(prefix="mtf-delivery-") as name:
         temporary_root = Path(name)
         environment = _command_environment(temporary_root)
+        scope = discover_quality_scope(root_path)
         before = source_manifest(root_path)
         git = git_snapshot(root_path)
         runtime_exists = runtime_path.is_file() and os.access(runtime_path, os.X_OK)
@@ -1102,9 +1140,11 @@ def run(
                 environment=environment,
                 temporary_root=temporary_root,
                 timeout=timeout,
+                scope=scope,
             )
             if runtime_exists and dev_exists
             else {
+                "quality_scope": scope.as_dict(root_path),
                 "compilation": {
                     "ok": False,
                     "reason": "runtime-python-not-found" if not runtime_exists else "dev-python-not-found",
@@ -1114,6 +1154,7 @@ def run(
                 "ruff": {"ok": False, "reason": "dev-python-not-found"},
                 "format": {"ok": False, "reason": "dev-python-not-found"},
                 "mypy": {"ok": False, "reason": "dev-python-not-found"},
+                "pyright": {"ok": False, "reason": "dev-python-not-found"},
                 "architecture": {"ok": False, "reason": "runtime-python-not-found"},
             }
         )
@@ -1125,6 +1166,7 @@ def run(
                 environment=environment,
                 temporary_root=temporary_root,
                 timeout=timeout,
+                build_python=dev_path if dev_exists else None,
             )
             if runtime_exists
             else {"ok": False, "reason": "runtime-python-not-found"}
@@ -1198,22 +1240,12 @@ def run(
                     "probe": sanitize_payload(dev_environment_probe, root=root_path, temporary_roots=(temporary_root,)),
                 },
                 "python": {
-                    "runtime": (environment_probe.get("metadata") or {}).get("python_version")
-                    if isinstance(environment_probe.get("metadata"), Mapping)
-                    else None,
-                    "dev": (dev_environment_probe.get("metadata") or {}).get("python_version")
-                    if isinstance(dev_environment_probe.get("metadata"), Mapping)
-                    else None,
+                    "runtime": _probe_metadata_value(environment_probe, "python_version"),
+                    "dev": _probe_metadata_value(dev_environment_probe, "python_version"),
                 },
-                "sqlite": (environment_probe.get("metadata") or {}).get("sqlite")
-                if isinstance(environment_probe.get("metadata"), Mapping)
-                else None,
-                "distributions": (environment_probe.get("metadata") or {}).get("distributions")
-                if isinstance(environment_probe.get("metadata"), Mapping)
-                else {},
-                "dev_distributions": (dev_environment_probe.get("metadata") or {}).get("distributions")
-                if isinstance(dev_environment_probe.get("metadata"), Mapping)
-                else {},
+                "sqlite": _probe_metadata_value(environment_probe, "sqlite"),
+                "distributions": _probe_metadata_value(environment_probe, "distributions", {}),
+                "dev_distributions": _probe_metadata_value(dev_environment_probe, "distributions", {}),
                 "node": sanitize_payload(offline.get("node"), root=root_path, temporary_roots=(temporary_root,)),
             },
             "validation": validation,
@@ -1229,7 +1261,7 @@ def run(
             },
             "success": bool(validation_ok and runtime_exists and dev_exists),
         }
-        return sanitize_payload(bundle, root=root_path, temporary_roots=(temporary_root,))
+        return cast(dict[str, Any], sanitize_payload(bundle, root=root_path, temporary_roots=(temporary_root,)))
 
 
 def _identity_contract() -> dict[str, Any]:
@@ -1271,6 +1303,7 @@ def build_reports(bundle: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
         ],
     }
     validation = results.get("validation", {})
+    quality_scope = validation.get("quality_scope", {}) if isinstance(validation, Mapping) else {}
     tooling = {
         "schema_version": 2,
         "scope": {
@@ -1280,9 +1313,14 @@ def build_reports(bundle: Mapping[str, Any]) -> tuple[dict[str, Any], dict[str, 
             "source_fingerprint": "tracked and non-ignored working-tree files, excluding generated engineering receipts",
         },
         "configuration": {
-            "mypy_targets": list(MYPY_TARGETS),
-            "ruff_format_targets": list(QUALITY_TARGETS),
-            "ruff_command_scope": "critical refactor modules plus tools/*.py; not repository-wide legacy claim",
+            "quality_scope": quality_scope,
+            "mypy_roots": quality_scope.get("mypy_roots", []) if isinstance(quality_scope, Mapping) else [],
+            "ruff_format_roots": quality_scope.get("ruff_roots", []) if isinstance(quality_scope, Mapping) else [],
+            "mypy_files": quality_scope.get("mypy_files", []) if isinstance(quality_scope, Mapping) else [],
+            "ruff_format_files": quality_scope.get("ruff_files", []) if isinstance(quality_scope, Mapping) else [],
+            "scope_identity_sha256": (
+                quality_scope.get("identity_sha256") if isinstance(quality_scope, Mapping) else None
+            ),
             "report_directory": REPORT_DIRECTORY.as_posix(),
         },
         "interpreters": results.get("environment", {}),

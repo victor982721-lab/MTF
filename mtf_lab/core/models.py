@@ -495,7 +495,13 @@ class Candle:
 
     @property
     def timeframe_name(self) -> str:
-        return parse_timeframe(self.timeframe).name
+        return self.normalized_timeframe.name
+
+    @property
+    def normalized_timeframe(self) -> Timeframe:
+        """Temporalidad normalizada tras la validación del constructor."""
+
+        return parse_timeframe(self.timeframe)
 
     @property
     def effective_available_at(self) -> datetime | None:

@@ -13,7 +13,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Protocol, overload
 
 if TYPE_CHECKING:  # pragma: no cover - sólo soporte de type checkers
     from .models import Candle, MarketEvent
@@ -134,6 +134,31 @@ _BLOCKING_FLAGS = frozenset(
 )
 
 
+class _QualityFactory(Protocol):
+    def __call__(self, *, synthetic: bool = False, source: str | None = None) -> DataQuality: ...
+
+
+class _ValidityDescriptor:
+    """Expose a bool on instances and the legacy factory on the class."""
+
+    @overload
+    def __get__(self, instance: None, owner: type[DataQuality]) -> _QualityFactory: ...
+
+    @overload
+    def __get__(self, instance: DataQuality, owner: type[DataQuality] | None = None) -> bool: ...
+
+    def __get__(
+        self,
+        instance: DataQuality | None,
+        owner: type[DataQuality] | None = None,
+    ) -> _QualityFactory | bool:
+        if instance is None:
+            if owner is None:
+                raise AttributeError("DataQuality.valid requires an owner")
+            return owner.good
+        return not bool(instance.flags & _BLOCKING_FLAGS)
+
+
 @dataclass(frozen=True, slots=True)
 class DataQuality:
     """Banderas y razones de calidad de un evento o una vela."""
@@ -141,6 +166,7 @@ class DataQuality:
     flags: frozenset[QualityFlag] = field(default_factory=frozenset)
     reasons: tuple[str, ...] = ()
     source: str | None = None
+    valid: ClassVar[_ValidityDescriptor] = _ValidityDescriptor()
 
     def __post_init__(self) -> None:
         normalized: set[QualityFlag] = set()
@@ -165,13 +191,6 @@ class DataQuality:
             if not isinstance(self.source, str):
                 raise TypeError("quality source must be a string")
             object.__setattr__(self, "source", self.source)
-
-    @classmethod
-    def valid(cls, *, synthetic: bool = False, source: str | None = None) -> DataQuality:
-        return cls(
-            frozenset({QualityFlag.SYNTHETIC} if synthetic else set()),
-            source=source,
-        )
 
     @classmethod
     def good(cls, *, synthetic: bool = False, source: str | None = None) -> DataQuality:
@@ -276,7 +295,7 @@ class DataQuality:
             QualityFlag.SYNTHETIC,
         ):
             if candidate in self.flags:
-                return candidate.value
+                return str(candidate.value)
         return sorted(flag.value for flag in self.flags)[0]
 
     def has(self, flag: QualityFlag | str) -> bool:
@@ -308,22 +327,6 @@ class DataQuality:
             "reason_codes": [reason.value for reason in self.reason_codes],
             "source": self.source,
         }
-
-
-class _ValidityDescriptor:
-    """Compatibilidad: ``DataQuality.valid`` es bool en instancias y
-    ``DataQuality.valid()`` fabrica una calidad válida al acceder a la clase.
-    """
-
-    def __get__(self, instance: DataQuality | None, owner: type[DataQuality]):
-        if instance is None:
-            return owner.good
-        return not bool(instance.flags & _BLOCKING_FLAGS)
-
-
-# Se instala después de que la clase exista para conservar ambos usos sin que
-# un classmethod o un property oculten al otro.
-DataQuality.valid = _ValidityDescriptor()  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True, slots=True)

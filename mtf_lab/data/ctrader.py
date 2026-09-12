@@ -14,8 +14,10 @@ imports used by the existing CLI/pipeline and exposes the central Protobuf
 presence helpers for other adapters.
 """
 
+from .ctrader_config import CTraderConfig, normalize_symbol_name
 from .ctrader_errors import (
     AuthState,
+    ConnectionState,
     CTraderAuthError,
     CTraderConfigurationError,
     CTraderDataError,
@@ -25,25 +27,47 @@ from .ctrader_errors import (
     CTraderRequestCancelled,
     CTraderRequestTimeout,
     CTraderTransportError,
-    ConnectionState,
     DependencyState,
     RequestPhase,
 )
+from .ctrader_fixtures import synthetic_spot_event, synthetic_trendbar
+from .ctrader_market import (
+    CTraderFetchResult,
+    CTraderHistoryResult,
+    CTraderInstrumentSpec,
+    CTraderMarketCalendar,
+    CTraderNormalizationResult,
+    CTraderProvider,
+    CTraderSessionWindow,
+    CTraderSymbol,
+    QuoteLegQuality,
+    QuoteQuality,
+    QuoteQualityReason,
+    QuoteQualityState,
+    SymbolCatalog,
+    _as_sequence,  # noqa: F401 - retained as a compatibility module attribute
+    _mapping,  # noqa: F401 - retained as a compatibility module attribute
+    _timestamp_ms,  # noqa: F401 - retained as a compatibility module attribute
+    _unix_ms,  # noqa: F401 - retained as a compatibility module attribute
+    normalize_account_payload,
+    normalize_spot_event,
+    normalize_trendbar,
+)
 from .ctrader_protocol import (
-    CTraderCodec,
-    DependencyReport,
     MAX_FRAME_LENGTH,
     MESSAGE_PAYLOAD_TYPES,
     PAYLOAD,
     PAYLOAD_NAMES,
+    PROTOBUF_MODULE,
     SDK_MODULE,
     SESSION_CONTROL_PAYLOAD_TYPES,
     SESSION_CONTROL_TYPE_NAMES,
-    PROTOBUF_MODULE,
-    SdkProtobufCodec,
-    TREND_PERIODS,
     TREND_PERIOD_NAMES,
+    TREND_PERIODS,
     WIRE_CLASS_NAMES,
+    CTraderCodec,
+    DependencyReport,
+    SdkProtobufCodec,
     WireMessage,
     canonical_json,
     capture_envelope,
@@ -61,13 +85,6 @@ from .ctrader_protocol import (
     redact_value,
     stable_hash,
 )
-from .ctrader_config import CTraderConfig, normalize_symbol_name
-from .ctrader_transport import (
-    CTraderRateLimiter,
-    CTraderTransport,
-    DeterministicTransport,
-    TcpTlsTransport,
-)
 from .ctrader_session import (
     AuthenticatedSessionEvidence,
     CancellationToken,
@@ -80,31 +97,14 @@ from .ctrader_session import (
     Scheduler,
     SessionEvidence,
     WallClock,
-    replace_status,
+    replace_status,  # noqa: F401 - retained as a compatibility module attribute
 )
-from .ctrader_market import (
-    CTraderFetchResult,
-    CTraderHistoryResult,
-    CTraderInstrumentSpec,
-    CTraderMarketCalendar,
-    CTraderNormalizationResult,
-    CTraderProvider,
-    CTraderSessionWindow,
-    CTraderSymbol,
-    QuoteLegQuality,
-    QuoteQuality,
-    QuoteQualityReason,
-    QuoteQualityState,
-    SymbolCatalog,
-    normalize_account_payload,
-    normalize_spot_event,
-    normalize_trendbar,
-    _as_sequence,
-    _mapping,
-    _timestamp_ms,
-    _unix_ms,
+from .ctrader_transport import (
+    CTraderRateLimiter,
+    CTraderTransport,
+    DeterministicTransport,
+    TcpTlsTransport,
 )
-from .ctrader_fixtures import synthetic_spot_event, synthetic_trendbar
 
 # Compatibility aliases used by integrators that identify the adapter by
 # protocol, while retaining one implementation.

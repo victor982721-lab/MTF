@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -171,7 +171,7 @@ class StrategyResult:
     signals: tuple[Signal, ...]
     episodes: tuple[PreparationEpisode, ...] = ()
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[tuple[Evaluation, ...] | tuple[Signal, ...]]:
         # Permite ``evaluations, signals = strategy.evaluate(...)`` sin perder
         # los metadatos adicionales disponibles en el objeto.
         yield self.evaluations
@@ -529,7 +529,7 @@ def _point_available(point: IndicatorPoint) -> datetime | None:
     available = point.available_at or point.end
     if not isinstance(available, datetime):
         return None
-    if available.tzinfo is None or point.end.tzinfo is None:
+    if not isinstance(point.end, datetime) or available.tzinfo is None or point.end.tzinfo is None:
         return None
     # Una IndicatorPoint puede llegar de un integrador externo sin pasar por
     # Candle.__post_init__. Aun así, una vela cerrada nunca queda disponible

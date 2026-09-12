@@ -1,0 +1,134 @@
+{
+  "architecture": {
+    "cross_object_private_accesses": 106,
+    "cycles": 0,
+    "dependency_edges": 211,
+    "dynamic_imports": 7,
+    "external_import_modules": 55,
+    "forbidden_core_imports": 0,
+    "functions": 2236,
+    "high_complexity_functions": 117,
+    "import_time_side_effects": 0,
+    "max_complexity": 38,
+    "modules": 64,
+    "parse_errors": 0,
+    "private_accesses": 2077,
+    "private_writes": 363,
+    "strict_violations": 0,
+    "typing_only_forbidden_core_imports": 0
+  },
+  "baseline_commit": "ea288085690ccfc617e6bcd5ba44f20925633f8f",
+  "baseline_diagnostics": {
+    "mypy_strict": 202,
+    "ruff": 356,
+    "ruff_C901": 8
+  },
+  "coverage": {
+    "branch_percent": 60.947,
+    "covered_branches": 4003,
+    "covered_lines": 16767,
+    "error": null,
+    "line_percent": 79.239,
+    "num_branches": 6568,
+    "num_statements": 21160,
+    "ok": true,
+    "threshold_percent": 60.0
+  },
+  "final_diagnostics": {
+    "mypy_strict": 0,
+    "pyright_errors": 0,
+    "pyright_warnings": 0,
+    "ruff": 0,
+    "ruff_C901": 0
+  },
+  "input_identity": {
+    "additional_inputs": [
+      "pyproject.toml",
+      "pyrightconfig.json",
+      "requirements-dev.lock",
+      "requirements-ctrader.lock",
+      "install-mtf-lab-wheel.sh",
+      "mtf-lab",
+      "bin/mtf-lab",
+      "README.md"
+    ],
+    "algorithm": "SHA256 of canonical JSON (sorted keys, separators comma/colon), mapping repo-relative input path to SHA256 of bytes",
+    "excluded": "generated outputs, caches, documentation outside packaged README; no receipt self-hash",
+    "files": 137,
+    "input_roots_py": [
+      "mtf_lab",
+      "tests",
+      "tools"
+    ],
+    "input_toml_roots": [
+      "config",
+      "mtf_lab/resources/config"
+    ],
+    "sha256": "9058976befcc309284cfd6739ef44ac3125fd7f764589bd8f8de9dbb1de71ac6"
+  },
+  "isolation": {
+    "auth_executed": false,
+    "broker_orders": false,
+    "credentials_used": false,
+    "external_network_attempts": 0,
+    "guard_evidence": {
+      "runtime_log": true,
+      "write_log": true
+    },
+    "source_unchanged_during_tests": true
+  },
+  "prior_receipt_content_sha256": "0fcb7673497a53922382c093bca607406f6fa7eae9f42e90b2455fb88e514511",
+  "reproduce": ".venv-dev/bin/python tools/quality_gate.py --runtime-python .venv/bin/python --dev-python .venv-dev/bin/python --node /usr/bin/node --json runtime/verification/quality.json",
+  "schema_version": 1,
+  "scope": {
+    "mypy_strict": [
+      "mtf_lab",
+      "tools"
+    ],
+    "pyright": [
+      "mtf_lab",
+      "tools"
+    ],
+    "python_files_mypy": 72,
+    "python_files_ruff": 117,
+    "ruff": [
+      "mtf_lab",
+      "tests",
+      "tools"
+    ]
+  },
+  "static": {
+    "architecture": true,
+    "compilation": true,
+    "document_links": true,
+    "git_cached_diff_check": true,
+    "git_diff_check": true,
+    "mypy": true,
+    "pip_check": true,
+    "pyright": true,
+    "ruff": true,
+    "ruff_format": true,
+    "scope": true
+  },
+  "status": "PASSED_LOCAL_OFFLINE",
+  "unittest": {
+    "consistent": true,
+    "discovered": 395,
+    "executed": 395,
+    "expected_failures": 0,
+    "failed": 0,
+    "passed": 395,
+    "skipped": 0,
+    "tests_run": 395,
+    "unexpected_successes": 0
+  },
+  "verified_at_utc": "2026-09-12T16:28:19+00:00",
+  "versions": {
+    "build": "1.6.1",
+    "coverage": "7.16.0",
+    "mypy": "2.3.1",
+    "pyright": "1.1.414",
+    "ruff": "0.16.7",
+    "setuptools": "84.0.0"
+  }
+}

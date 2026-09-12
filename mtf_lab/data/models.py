@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import hashlib
 import math
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from types import MappingProxyType
-from typing import Any, Literal
+from typing import Any, Literal, overload
 
 from ..core.canonical import canonical_json
 
@@ -699,13 +699,19 @@ class DataSet:
             raise TypeError("issues must contain ValidationIssue values")
         object.__setattr__(self, "issues", tuple(self.issues))
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Event | Bar]:
         return iter(self.records)
 
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, item):
+    @overload
+    def __getitem__(self, item: int) -> Event | Bar: ...
+
+    @overload
+    def __getitem__(self, item: slice) -> tuple[Event | Bar, ...]: ...
+
+    def __getitem__(self, item: int | slice) -> Event | Bar | tuple[Event | Bar, ...]:
         return self.records[item]
 
     @property

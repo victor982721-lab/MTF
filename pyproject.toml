@@ -53,3 +53,6 @@ indent-style = "space"
 [tool.mypy]
 python_version = "3.11"
 warn_unused_configs = true
+strict = true
+explicit_package_bases = true
+files = ["mtf_lab", "tools"]

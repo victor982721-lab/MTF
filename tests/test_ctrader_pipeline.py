@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
+import unittest
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
+from typing import Any
 
-from mtf_lab.configuration import load_config
+from mtf_lab.configuration import EffectiveConfig, load_config
 from mtf_lab.core import IndicatorConfig
 from mtf_lab.data.ctrader import CTraderInstrumentSpec
-from mtf_lab.ops.cfd_simulation import CFDConfig, TradeState
-from mtf_lab.ops.persistence import SQLiteStore
-from mtf_lab.ops.query import QueryService
+from mtf_lab.ops.cfd_simulation import TradeState
 from mtf_lab.ops.ctrader_pipeline import (
     PAPER_PRODUCT,
     PAPER_SESSION_VERSION,
@@ -23,13 +23,13 @@ from mtf_lab.ops.ctrader_pipeline import (
     spot_event_to_cfd_quote,
     synthetic_ctrader_capture,
 )
+from mtf_lab.ops.persistence import SQLiteStore
+from mtf_lab.ops.query import QueryService
 
-
-UTC = UTC
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
 
-def pipeline_config():
+def pipeline_config() -> EffectiveConfig:
     base = load_config("config/fixture_cfd.toml")
     indicators = IndicatorConfig(ema_fast=2, ema_slow=3, rsi_period=2, atr_period=2)
     strategy = replace(
@@ -47,7 +47,7 @@ def pipeline_config():
     return replace(base, mode="REPLAY", price_base="mid", indicators=indicators, strategy=strategy, cfd=cfd)
 
 
-def receipt(index: int, raw: dict) -> datetime:
+def receipt(index: int, raw: Mapping[str, Any]) -> datetime:
     timestamp = datetime.fromtimestamp(float(raw["timestamp"]) / 1000.0, UTC)
     return timestamp + timedelta(seconds=1)
 
@@ -85,7 +85,12 @@ class CTraderPipelineTests(unittest.TestCase):
     def test_replay_retains_partial_bid_ask_state_without_interpolation(self) -> None:
         payloads = (
             {"symbolId": 99, "timestamp": int(BASE.timestamp() * 1000), "bid": 110000, "sequence": 1},
-            {"symbolId": 99, "timestamp": int((BASE + timedelta(seconds=2)).timestamp() * 1000), "ask": 110020, "sequence": 2},
+            {
+                "symbolId": 99,
+                "timestamp": int((BASE + timedelta(seconds=2)).timestamp() * 1000),
+                "ask": 110020,
+                "sequence": 2,
+            },
         )
         capture = normalize_ctrader_capture(
             payloads,
@@ -103,51 +108,61 @@ class CTraderPipelineTests(unittest.TestCase):
     def test_real_runtime_warmup_emits_authentic_signals_and_adapts_cfd(self) -> None:
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
         config = pipeline_config()
-        with TemporaryDirectory() as tmp:
-            with SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
-                result = CTraderPipeline(
-                    store,
-                    config,
-                    spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99),
-                ).run(capture, session_id="ctrader-pipeline", capture_complete=True)
-                self.assertGreaterEqual(len(result.signals), 1)
-                self.assertEqual(len(result.signals), len(result.cfd_signals))
-                self.assertTrue(all(signal.mode.value == "REPLAY" for signal in result.signals))
-                self.assertTrue(all(signal.metadata["source"] == "RuntimeCoordinator" for signal in result.cfd_signals))
-                self.assertTrue(all(trade.state is TradeState.CLOSED for trade in result.trades))
-                self.assertTrue(all(signal.signal_id == cfd.signal_id for signal, cfd in zip(result.signals, result.cfd_signals)))
-                self.assertEqual(result.analysis_basis, "mid")
-                self.assertEqual(result.snapshot["schema_version"], PAPER_SESSION_VERSION)
-                self.assertEqual(result.snapshot["product"], PAPER_PRODUCT)
-                self.assertEqual(result.snapshot["paper"]["product"], PAPER_PRODUCT)
-                self.assertEqual(result.snapshot["processor"]["warmup_pending"]["M1"], 0)
-                self.assertEqual(result.snapshot["processor"]["warmup_pending"]["M5"], 0)
-                self.assertEqual(result.snapshot["processor"]["warmup_pending"]["M15"], 0)
-                self.assertEqual(result.runtime_result.rejected_records, 0)
+        with TemporaryDirectory() as tmp, SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
+            result = CTraderPipeline(
+                store,
+                config,
+                spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99),
+            ).run(capture, session_id="ctrader-pipeline", capture_complete=True)
+            self.assertGreaterEqual(len(result.signals), 1)
+            self.assertEqual(len(result.signals), len(result.cfd_signals))
+            self.assertTrue(all(signal.mode.value == "REPLAY" for signal in result.signals))
+            self.assertTrue(
+                all(
+                    signal.metadata is not None and signal.metadata["source"] == "RuntimeCoordinator"
+                    for signal in result.cfd_signals
+                )
+            )
+            self.assertTrue(all(trade.state is TradeState.CLOSED for trade in result.trades))
+            self.assertTrue(
+                all(
+                    signal.signal_id == cfd.signal_id
+                    for signal, cfd in zip(result.signals, result.cfd_signals, strict=False)
+                )
+            )
+            self.assertEqual(result.analysis_basis, "mid")
+            self.assertEqual(result.snapshot["schema_version"], PAPER_SESSION_VERSION)
+            self.assertEqual(result.snapshot["product"], PAPER_PRODUCT)
+            self.assertEqual(result.snapshot["paper"]["product"], PAPER_PRODUCT)
+            self.assertEqual(result.snapshot["processor"]["warmup_pending"]["M1"], 0)
+            self.assertEqual(result.snapshot["processor"]["warmup_pending"]["M5"], 0)
+            self.assertEqual(result.snapshot["processor"]["warmup_pending"]["M15"], 0)
+            self.assertEqual(result.runtime_result.rejected_records, 0)
 
     def test_native_trendbars_can_be_the_runtime_analysis_stream(self) -> None:
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
         traded = replace(pipeline_config(), price_base="native")
-        with TemporaryDirectory() as tmp:
-            with SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
-                result = CTraderPipeline(
-                    store,
-                    traded,
-                    spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99),
-                ).run(capture, session_id="native-bars")
-                self.assertTrue(result.analysis_records)
-                self.assertTrue(all(record.__class__.__name__ == "Bar" for record in result.analysis_records))
-                self.assertGreaterEqual(len(result.signals), 1)
-                self.assertEqual(result.analysis_basis, "native")
-                self.assertEqual(store.list_simulations(result.session_id), [])
-                self.assertTrue(store.list_cfd_trades(result.session_id, result.paper_analysis_id))
+        with TemporaryDirectory() as tmp, SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
+            result = CTraderPipeline(
+                store,
+                traded,
+                spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99),
+            ).run(capture, session_id="native-bars")
+            self.assertTrue(result.analysis_records)
+            self.assertTrue(all(record.__class__.__name__ == "Bar" for record in result.analysis_records))
+            self.assertGreaterEqual(len(result.signals), 1)
+            self.assertEqual(result.analysis_basis, "native")
+            self.assertEqual(store.list_simulations(result.session_id), [])
+            self.assertTrue(store.list_cfd_trades(result.session_id, result.paper_analysis_id))
 
     def test_paper_product_and_snapshot_are_visible_to_sqlite_and_query(self) -> None:
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
         with TemporaryDirectory() as tmp:
             db = Path(tmp) / "pipeline.sqlite3"
             with SQLiteStore(db) as store:
-                result = CTraderPipeline(store, pipeline_config(), spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="paper-visible")
+                result = CTraderPipeline(
+                    store, pipeline_config(), spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)
+                ).run(capture, session_id="paper-visible")
                 paper_rows = store.list_cfd_trades(result.session_id, result.paper_analysis_id)
                 self.assertEqual(store.list_simulations(result.session_id), [])
                 self.assertEqual(len(paper_rows), len(result.trades))
@@ -157,7 +172,9 @@ class CTraderPipelineTests(unittest.TestCase):
                 self.assertTrue(all("executor" not in str(row["payload"]).lower() for row in paper_rows))
                 self.assertTrue(all(row["state"] == "CLOSED" for row in paper_rows))
                 self.assertEqual(store.schema_version, 4)
-                checkpoint = store.get_checkpoint(result.session_id, "pipeline", analysis_id=result.paper_analysis_id, allow_alternate=False)
+                checkpoint = store.get_checkpoint(
+                    result.session_id, "pipeline", analysis_id=result.paper_analysis_id, allow_alternate=False
+                )
                 self.assertIsNotNone(checkpoint)
                 assert checkpoint is not None
                 self.assertEqual(checkpoint["state"]["schema_version"], PAPER_SESSION_VERSION)
@@ -170,19 +187,28 @@ class CTraderPipelineTests(unittest.TestCase):
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
         config = pipeline_config()
         with TemporaryDirectory() as first_tmp, TemporaryDirectory() as second_tmp:
-            with SQLiteStore(Path(first_tmp) / "first.sqlite3") as first_store, SQLiteStore(Path(second_tmp) / "second.sqlite3") as second_store:
-                first = CTraderPipeline(first_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="first")
-                second = CTraderPipeline(second_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(
-                    list(reversed(capture.envelopes)), session_id="second", received_at=receipt
-                )
+            with (
+                SQLiteStore(Path(first_tmp) / "first.sqlite3") as first_store,
+                SQLiteStore(Path(second_tmp) / "second.sqlite3") as second_store,
+            ):
+                first = CTraderPipeline(
+                    first_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)
+                ).run(capture, session_id="first")
+                second = CTraderPipeline(
+                    second_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)
+                ).run(list(reversed(capture.envelopes)), session_id="second", received_at=receipt)
                 self.assertEqual(first.capture.capture_hash, second.capture.capture_hash)
-                self.assertEqual([item.signal_id for item in first.signals], [item.signal_id for item in second.signals])
+                self.assertEqual(
+                    [item.signal_id for item in first.signals], [item.signal_id for item in second.signals]
+                )
                 self.assertEqual([item.to_dict() for item in first.trades], [item.to_dict() for item in second.trades])
                 self.assertEqual(first.snapshot["paper"]["trades"], second.snapshot["paper"]["trades"])
                 self.assertEqual(first.snapshot_hash, second.snapshot_hash)
 
             with SQLiteStore(Path(first_tmp) / "first.sqlite3") as rerun_store:
-                rerun = CTraderPipeline(rerun_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="first")
+                rerun = CTraderPipeline(
+                    rerun_store, config, spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)
+                ).run(capture, session_id="first")
                 self.assertEqual([item.signal_id for item in rerun.signals], [item.signal_id for item in first.signals])
                 rows = rerun_store.list_cfd_trades("first", rerun.paper_analysis_id)
                 self.assertEqual(len(rows), len(first.trades))
@@ -191,20 +217,26 @@ class CTraderPipelineTests(unittest.TestCase):
         capture = synthetic_ctrader_capture(start=BASE, symbol_id=99, count=190)
         quote = spot_event_to_cfd_quote(capture.quote_events[1], capture_hash=capture.capture_hash)
         self.assertEqual(quote.quality, "SYNTHETIC")
+        assert quote.metadata is not None
         self.assertEqual(quote.metadata["capture_hash"], capture.capture_hash)
+        assert quote.bid is not None
+        assert quote.spread is not None
+        assert quote.ask is not None
         self.assertEqual(quote.bid + quote.spread, quote.ask)
         one_sided = spot_event_to_cfd_quote(replace(capture.quote_events[1], bid=None))
         self.assertIsNone(one_sided.bid)
-        with TemporaryDirectory() as tmp:
-            with SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
-                result = CTraderPipeline(store, pipeline_config(), spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)).run(capture, session_id="boundary")
-                self.assertGreaterEqual(len(result.signals), 1)
-                converted = signal_to_cfd_signal(result.signals[0], capture_hash=capture.capture_hash)
-                self.assertEqual(converted.signal_id, result.signals[0].signal_id)
-                self.assertEqual(converted.metadata["episode_id"], result.signals[0].episode_id)
-                # The fixture's first quote is a snapshot and must not be a CFD fill.
-                snapshot_quote = spot_event_to_cfd_quote(capture.quote_events[0], capture_hash=capture.capture_hash)
-                self.assertEqual(snapshot_quote.quality, "SNAPSHOT")
+        with TemporaryDirectory() as tmp, SQLiteStore(Path(tmp) / "pipeline.sqlite3") as store:
+            result = CTraderPipeline(
+                store, pipeline_config(), spec=CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)
+            ).run(capture, session_id="boundary")
+            self.assertGreaterEqual(len(result.signals), 1)
+            converted = signal_to_cfd_signal(result.signals[0], capture_hash=capture.capture_hash)
+            self.assertEqual(converted.signal_id, result.signals[0].signal_id)
+            assert converted.metadata is not None
+            self.assertEqual(converted.metadata["episode_id"], result.signals[0].episode_id)
+            # The fixture's first quote is a snapshot and must not be a CFD fill.
+            snapshot_quote = spot_event_to_cfd_quote(capture.quote_events[0], capture_hash=capture.capture_hash)
+            self.assertEqual(snapshot_quote.quality, "SNAPSHOT")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mappin
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, cast
+from typing import Any, Protocol, cast, overload
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -47,6 +47,10 @@ from .models import (
 )
 
 _SUPPORTED_INTERVALS = {1, 5, 15, 30, 60, 240, 1440, 10080, 21600}
+
+
+class _WebSocketConnector(Protocol):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
 
 
 async def _close_async_iterator(iterator: AsyncIterator[Any]) -> None:
@@ -94,7 +98,13 @@ class KrakenFetchResult:
     def __len__(self) -> int:
         return len(self.bars)
 
-    def __getitem__(self, item):
+    @overload
+    def __getitem__(self, item: int) -> Bar: ...
+
+    @overload
+    def __getitem__(self, item: slice) -> tuple[Bar, ...]: ...
+
+    def __getitem__(self, item: int | slice) -> Bar | tuple[Bar, ...]:
         return self.bars[item]
 
     @property
@@ -532,7 +542,10 @@ class KrakenPublicAdapter:
         request = Request(uri, headers={"Accept": "application/json", "User-Agent": self.user_agent})
         try:
             with urlopen(request, timeout=self.timeout_seconds) as response:
-                return response.read()
+                body = response.read()
+                if not isinstance(body, bytes):
+                    raise KrakenTransportError("Kraken REST response body is not bytes")
+                return body
         except HTTPError as exc:
             body = exc.read()
             raw_hash = hashlib.sha256(body).hexdigest()
@@ -722,12 +735,13 @@ class KrakenPublicAdapter:
             await _close_async_iterator(messages)
 
     @staticmethod
-    def _websocket_connect() -> Callable[..., Any]:
+    def _websocket_connect() -> _WebSocketConnector:
         try:
             import websockets  # type: ignore[import-not-found]
         except ImportError as exc:
             raise KrakenTransportError("WebSocket observation requires optional dependency 'websockets'") from exc
-        return websockets.connect
+        connector: _WebSocketConnector = websockets.connect
+        return connector
 
     async def _heartbeat(
         self,

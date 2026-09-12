@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -17,6 +20,7 @@ import mtf_lab.configuration as configuration
 from mtf_lab.configuration import default_state_dir, load_config, packaged_config_path
 from mtf_lab.ops import cli
 from mtf_lab.ops.application_services import default_config, default_watch_config
+from tools import wheel_installer
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_NAMES = {
@@ -144,18 +148,29 @@ class PackagingDeliveryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="mtf-wheel-install-") as directory:
             isolated = Path(directory)
             target = isolated / "venv"
-            env = dict(os.environ)
+            env = wheel_installer._environment(isolated)
             env.update(
                 {
                     "PYTHONPATH": "",
                     "HOME": str(isolated / "home"),
                     "XDG_STATE_HOME": str(isolated / "state"),
                     "MTF_LAB_STATE_DIR": str(isolated / "mtf-state"),
-                    "MTF_LAB_BUILD_PYTHON": str(ROOT / ".venv-dev" / "bin" / "python"),
+                    "MTF_LAB_BUILD_PYTHON": os.environ.get(
+                        "MTF_LAB_BUILD_PYTHON", str(ROOT / ".venv-dev" / "bin" / "python")
+                    ),
                 }
             )
+            source_paths = [ROOT / "pyproject.toml", ROOT / "README.md", *(ROOT / "mtf_lab").rglob("*.py")]
+            before = {path: path.read_bytes() for path in source_paths}
+            build_paths = [ROOT / "build", ROOT / "mtf_lab.egg-info"]
+            derivatives = {
+                path: path.stat().st_mtime_ns
+                for directory in build_paths
+                for path in directory.rglob("*")
+                if path.is_file()
+            }
             result = subprocess.run(
-                [str(installer), "--venv", str(target)],
+                [str(installer), "--venv", str(target), "--wheel-dir", str(isolated / "wheels")],
                 cwd=isolated,
                 env=env,
                 capture_output=True,
@@ -166,6 +181,27 @@ class PackagingDeliveryTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("INSTALLED_WHEEL=mtf_lab-0.1.0-py3-none-any.whl", result.stdout)
             self.assertRegex(result.stdout, r"WHEEL_SHA256=[0-9a-f]{64}")
+            receipt = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+            retained_wheel = Path(receipt["WHEEL_PATH"])
+            self.assertTrue(retained_wheel.is_file(), "wheel bytes must survive temporary build cleanup")
+            self.assertEqual(hashlib.sha256(retained_wheel.read_bytes()).hexdigest(), receipt["WHEEL_SHA256"])
+            self.assertEqual(retained_wheel.parent, isolated / "wheels" / receipt["WHEEL_SHA256"])
+            with zipfile.ZipFile(retained_wheel) as archive:
+                for config_name in CONFIG_NAMES:
+                    self.assertEqual(
+                        archive.read(f"mtf_lab/resources/config/{config_name}"),
+                        (ROOT / "config" / config_name).read_bytes(),
+                    )
+            self.assertEqual(before, {path: path.read_bytes() for path in source_paths})
+            self.assertEqual(
+                derivatives,
+                {
+                    path: path.stat().st_mtime_ns
+                    for directory in build_paths
+                    for path in directory.rglob("*")
+                    if path.is_file()
+                },
+            )
             launcher = target / "bin" / "mtf-lab"
             self.assertTrue(launcher.is_file())
             smoke = subprocess.run(
@@ -179,6 +215,159 @@ class PackagingDeliveryTests(unittest.TestCase):
             )
             self.assertEqual(smoke.returncode, 0, smoke.stderr)
             self.assertIn("usage: mtf-lab", smoke.stdout)
+            install_existing = subprocess.run(
+                [
+                    str(installer),
+                    "--venv",
+                    str(target),
+                    "--wheel",
+                    str(retained_wheel),
+                    "--wheel-dir",
+                    str(isolated / "second-wheels"),
+                ],
+                cwd=isolated,
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=90,
+            )
+            self.assertEqual(install_existing.returncode, 0, install_existing.stderr)
+            existing_receipt = dict(line.split("=", 1) for line in install_existing.stdout.splitlines() if "=" in line)
+            self.assertEqual(existing_receipt["WHEEL_SHA256"], receipt["WHEEL_SHA256"])
+            self.assertEqual(Path(existing_receipt["WHEEL_PATH"]).read_bytes(), retained_wheel.read_bytes())
+
+    def test_installer_stages_only_distribution_sources(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mtf-stage-contract-") as name:
+            base = Path(name)
+            root = base / "repo"
+            package = root / "mtf_lab"
+            package.mkdir(parents=True)
+            (root / "pyproject.toml").write_text('[project]\nname="mtf-lab"\n', encoding="utf-8")
+            (root / "README.md").write_text("Fixture project", encoding="utf-8")
+            (package / "__init__.py").write_text("__version__ = '0.1.0'\n", encoding="utf-8")
+            (package / "secret.json").write_text("fixture-only-not-a-secret", encoding="utf-8")
+            staged = base / "source"
+            wheel_installer._copy_source(root, staged)
+            self.assertEqual((package / "__init__.py").read_bytes(), (staged / "mtf_lab/__init__.py").read_bytes())
+            self.assertFalse((staged / "mtf_lab/secret.json").exists())
+            (package / "bad.py").symlink_to(package / "__init__.py")
+            with self.assertRaisesRegex(ValueError, "regular"):
+                wheel_installer._copy_source(root, base / "second-source")
+
+    def test_installer_environment_does_not_inherit_credentials_or_pythonpath(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.dict(
+                os.environ,
+                {"CTRADER_CLIENT_SECRET": "fixture-token", "PYTHONPATH": "untrusted", "PIP_INDEX_URL": "fixture"},
+            ),
+        ):
+            env = wheel_installer._environment(Path(directory))
+            self.assertNotIn("CTRADER_CLIENT_SECRET", env)
+            self.assertNotIn("PYTHONPATH", env)
+            self.assertNotIn("PIP_INDEX_URL", env)
+            self.assertEqual(env["PIP_NO_INDEX"], "1")
+            for name in ("HOME", "XDG_STATE_HOME", "XDG_DATA_HOME", "MTF_LAB_STATE_DIR", "TMPDIR"):
+                self.assertTrue(Path(env[name]).is_relative_to(directory))
+
+    def test_installer_retains_wheel_bytes_and_rejects_identity_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            source = base / "mtf_lab-0.1.0-py3-none-any.whl"
+            with zipfile.ZipFile(source, "w") as archive:
+                archive.writestr("mtf_lab-0.1.0.dist-info/METADATA", "Name: mtf-lab\nVersion: 0.1.0\n")
+            retained = wheel_installer._retain_wheel(source, base / "dist")
+            self.assertEqual(retained.read_bytes(), source.read_bytes())
+            self.assertEqual(retained, wheel_installer._retain_wheel(source, base / "dist"))
+            retained.write_bytes(b"existing foreign bytes")
+            with self.assertRaisesRegex(ValueError, "colisión"):
+                wheel_installer._retain_wheel(source, base / "dist")
+            self.assertEqual(retained.read_bytes(), b"existing foreign bytes")
+
+    def test_installer_rejects_non_virtual_existing_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            directory = Path(name)
+            marker = directory / "preserve.txt"
+            marker.write_bytes(b"original")
+            with self.assertRaisesRegex(ValueError, "no es un entorno virtual"):
+                wheel_installer._target_python(directory, Path(sys.executable), directory, {})
+            self.assertEqual(marker.read_bytes(), b"original")
+
+    def test_installer_rejects_symlink_directories_without_writing_outside(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            wheel = base / "mtf_lab-0.1.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("mtf_lab-0.1.0.dist-info/METADATA", "Name: mtf-lab\nVersion: 0.1.0\n")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "preserved").write_bytes(b"original")
+            root_alias = base / "alias"
+            root_alias.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(OSError):
+                wheel_installer._retain_wheel(wheel, root_alias)
+            store = base / "store"
+            store.mkdir()
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            (store / digest).symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(OSError):
+                wheel_installer._retain_wheel(wheel, store)
+            self.assertEqual(list(outside.iterdir()), [outside / "preserved"])
+            self.assertEqual((outside / "preserved").read_bytes(), b"original")
+
+    def test_installer_rejects_nested_source_directory_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            root = base / "repo"
+            package = root / "mtf_lab"
+            package.mkdir(parents=True)
+            (root / "pyproject.toml").write_text('[project]\nname="mtf-lab"\n', encoding="utf-8")
+            (root / "README.md").write_text("fixture", encoding="utf-8")
+            outside = base / "outside"
+            outside.mkdir()
+            (outside / "module.py").write_text("VALUE=1\n", encoding="utf-8")
+            (package / "nested").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "directorio symlink"):
+                wheel_installer._copy_source(root, base / "staged")
+
+    def test_installer_rejects_fifo_artifact_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as name:
+            base = Path(name)
+            wheel = base / "mtf_lab-0.1.0-py3-none-any.whl"
+            with zipfile.ZipFile(wheel, "w") as archive:
+                archive.writestr("mtf_lab-0.1.0.dist-info/METADATA", "Name: mtf-lab\nVersion: 0.1.0\n")
+            digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
+            bucket = base / "dist" / digest
+            bucket.mkdir(parents=True)
+            os.mkfifo(bucket / wheel.name)
+            with self.assertRaisesRegex(ValueError, "no es un archivo regular"):
+                wheel_installer._retain_wheel(wheel, base / "dist")
+
+    def test_installer_checks_resolved_smoke_state_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            temporary = base / "temporary"
+            temporary.mkdir()
+            outside = base / "outside"
+            outside.mkdir()
+            (temporary / "state").symlink_to(outside, target_is_directory=True)
+            venv = base / "venv"
+            python = venv / "bin/python"
+            observed = json.dumps(
+                {
+                    "module": str(venv / "site-packages/mtf_lab/__init__.py"),
+                    "version": "0.1.0",
+                    "state": str(temporary / "state"),
+                }
+            )
+            with (
+                mock.patch.object(wheel_installer, "_wheel_identity", return_value=("0.1.0", "0" * 64)),
+                mock.patch.object(wheel_installer, "_target_python", return_value=python),
+                mock.patch.object(wheel_installer, "_run", side_effect=["", observed]),
+                self.assertRaisesRegex(ValueError, "estado no aislado"),
+            ):
+                wheel_installer.install_wheel(base / "fixture.whl", venv, python, temporary, {})
 
 
 if __name__ == "__main__":

@@ -25,6 +25,14 @@ class Outcome(str, enum.Enum):  # noqa: UP042 - preserve the public str/Enum rep
     INDETERMINATE = "INDETERMINATE"
 
 
+class _ModelDumpRecord(Protocol):
+    def model_dump(self) -> Mapping[str, Any]: ...
+
+
+class _DictRecord(Protocol):
+    def to_dict(self) -> Mapping[str, Any]: ...
+
+
 # One canonical vocabulary is shared with runtime/state.  ``trade`` and
 # ``close`` are explicit compatibility aliases for ``traded``; no other value
 # is silently converted.
@@ -186,9 +194,9 @@ def _record(value: Any) -> dict[str, Any]:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
     if hasattr(value, "model_dump"):
-        return dict(cast(Any, value).model_dump())
+        return dict(cast(_ModelDumpRecord, value).model_dump())
     if hasattr(value, "to_dict"):
-        result = cast(Any, value).to_dict()
+        result = cast(_DictRecord, value).to_dict()
         if isinstance(result, Mapping):
             return dict(result)
     if hasattr(value, "__dict__"):
@@ -706,7 +714,7 @@ class DirectionalEvaluator:
         exclude_point_id: str | None = None,
         exclude_market_time: datetime | None = None,
         instrument: str | None = None,
-    ) -> tuple[Selection | None, str | None]:
+    ) -> tuple[Selection[PricePoint] | None, str | None]:
         return select_price_point(
             points,
             target,
@@ -1217,7 +1225,9 @@ class VirtualContract:
 
 class VirtualContractSimulator:
     def __init__(self, contract: VirtualContract | EvaluationSpec | None = None, spec: EvaluationSpec | None = None):
-        if isinstance(contract, EvaluationSpec) and spec is None:
+        if isinstance(contract, EvaluationSpec):
+            if spec is not None:
+                raise ValueError("contract and spec cannot both be EvaluationSpec")
             spec = contract
             contract = None
         if contract is None and spec is not None:
@@ -1229,7 +1239,7 @@ class VirtualContractSimulator:
                 costs=spec.costs,
                 tie_tolerance=spec.tie_tolerance,
             )
-        self.contract: VirtualContract = cast(VirtualContract, contract or VirtualContract())
+        self.contract = contract if contract is not None else VirtualContract()
         self.spec = spec or EvaluationSpec(
             stake=self.contract.stake,
             payout_net=self.contract.payout_net,

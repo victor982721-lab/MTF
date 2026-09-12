@@ -16,7 +16,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Protocol, SupportsFloat, cast
 
 _MODE_LABELS = {
     "SYNTHETIC": "SINTETICO",
@@ -34,13 +34,21 @@ _DIMENSION_NAMES: tuple[str, str, str, str, str, str] = (
 )
 
 
+class _ToDictRecord(Protocol):
+    def to_dict(self) -> Mapping[str, Any]: ...
+
+
+class _IsoformatRecord(Protocol):
+    def isoformat(self) -> str: ...
+
+
 def _json_default(value: Any) -> Any:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return dataclasses.asdict(value)
     if hasattr(value, "to_dict"):
-        return cast(Any, value).to_dict()
+        return cast(_ToDictRecord, value).to_dict()
     if hasattr(value, "isoformat"):
-        return cast(Any, value).isoformat()
+        return cast(_IsoformatRecord, value).isoformat()
     return str(value)
 
 
@@ -50,7 +58,7 @@ def _mapping(value: Any) -> dict[str, Any]:
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return dataclasses.asdict(value)
     if hasattr(value, "to_dict"):
-        return dict(cast(Any, value).to_dict())
+        return dict(cast(_ToDictRecord, value).to_dict())
     if hasattr(value, "__dict__"):
         return {key: val for key, val in vars(value).items() if not key.startswith("_")}
     return {}
@@ -62,6 +70,14 @@ def _as_mapping(value: Any) -> Mapping[str, Any]:
 
 def _prefer_mapping(value: Any, fallback: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else _as_mapping(fallback)
+
+
+def _float_value(value: object) -> float:
+    if isinstance(value, SupportsFloat):
+        return float(value)
+    if isinstance(value, (str, bytes, bytearray)):
+        return float(value)
+    raise TypeError(f"value is not numeric: {value!r}")
 
 
 def _json(value: Any) -> Any:
@@ -100,10 +116,10 @@ def _break_even(row: Mapping[str, Any]) -> float | None:
     stake = contract.get("stake", row.get("stake"))
     costs = contract.get("costs", 0)
     try:
-        payout = float(cast(Any, payout))
-        loss_amount = float(cast(Any, loss_amount))
-        stake = float(cast(Any, stake))
-        costs = float(cast(Any, costs))
+        payout = _float_value(payout)
+        loss_amount = _float_value(loss_amount)
+        stake = _float_value(stake)
+        costs = _float_value(costs)
     except (TypeError, ValueError):
         return None
     # Contract break-even with no ties: p*(stake*payout-costs) +

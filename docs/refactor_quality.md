@@ -1,23 +1,26 @@
-# Refactorización y calidad local
+# Calidad global de MTF Lab
 
-Revisión: 2026-09-12. Este documento describe únicamente la mejora verificable
-del checkout local; no activa cTrader, no inicia OAuth y no envía operaciones.
+Alcance autorizado el 2026-09-12: terminar la limpieza Ruff/mypy heredada y
+mejorar el código sin auth, OAuth, cuentas ni conexiones al bróker. La validación
+es local; los fixtures siguen siendo sintéticos y no acreditan rentabilidad,
+permisos externos ni fills reales.
 
-## Alcance
+## Alcance sin excepciones de legado
 
-Se separaron responsabilidades en configuración, dominio, adaptadores de datos,
-servicios de consulta/simulación y persistencia incremental. Las extracciones
-son helpers deterministas y conservan las fachadas públicas y los contratos de
-causalidad. El estado sintético sigue marcado como `SYNTHETIC`/`PAPER`; no es
-cotización, fill ni evidencia de rentabilidad.
+- **Ruff y formato:** todas las fuentes Python de `mtf_lab/`, `tests/` y `tools/`.
+- **Mypy:** `--strict --explicit-package-bases mtf_lab tools`, con imports normales.
+- **Pyright:** todo `mtf_lab/` y `tools/`, Python 3.11/Linux.
+- **Arquitectura:** auditoría AST de dependencias, ciclos, efectos de importación
+  y complejidad; `core` no depende de red, SQLite, CLI ni SDK.
+- **Pruebas:** suite unittest descubierta de nuevo, con HOME/XDG/TMP/estado
+  temporales y red externa bloqueada. Node es requerido para los tests de UI.
+- **Cobertura:** líneas y ramas se informan por separado; Coverage.py también
+  calcula una métrica combinada que no equivale al porcentaje de ramas.
 
-La auditoría de arquitectura continúa siendo una segunda comprobación: `core`
-no puede depender de sockets, OAuth, SQLite, CLI ni del SDK opcional, y no se
-permite introducir ciclos ni efectos de importación.
-
-## Puertas reproducibles
-
-`tools/quality_gate.py` es la entrada única para la validación de esta revisión:
+`tools/quality_scope.py` define los directorios y los descubre en cada corrida.
+Un archivo/directorio requerido ausente falla la puerta; no se filtra para
+reducir el alcance. Se conservaron fachadas públicas y representaciones de enums;
+no se cambiaron reglas financieras para satisfacer un analizador.
 
 ```bash
 .venv-dev/bin/python tools/quality_gate.py \
@@ -26,47 +29,72 @@ permite introducir ciclos ni efectos de importación.
   --json runtime/verification/quality.json
 ```
 
-La salida separa cada comando y su cola diagnóstica. Las herramientas son
-locales y no requieren red:
+Las comprobaciones estáticas también son ejecutables individualmente:
 
-- Ruff y `ruff format` sobre el alcance refactorizado y los tests de entrega.
-- mypy estricto sobre los módulos tipados establecidos.
-- Pyright según `pyrightconfig.json` (Python 3.11/Linux) sobre los módulos
-  refactorizados y el contrato tipado; excluye `build`, `dist`, caches y
-  reportes generados.
-- auditoría AST estricta de dependencias, ciclos y efectos de importación.
-- suite `unittest` con Coverage.py de ramas y umbral mínimo de 60 %.
+```bash
+.venv-dev/bin/ruff check mtf_lab tests tools
+.venv-dev/bin/ruff format --check mtf_lab tests tools
+.venv-dev/bin/python -m mypy --strict --explicit-package-bases mtf_lab tools
+.venv-dev/bin/python -m pyright --project pyrightconfig.json
+```
 
-El inventario repository-wide de Ruff y la complejidad heredada pueden contener
-deuda fuera de este alcance; se reportan como advisory y no se presentan como
-limpios por el hecho de que pase la puerta mantenida.
+## Cambios de comportamiento protegidos
 
-## Resultado observado
+- `DataQuality.valid()` continúa siendo fábrica de clase y `quality.valid` un
+  booleano de instancia, con un descriptor tipado y pruebas de ambos contratos.
+- Identidades, temporalidades normalizadas, aritmética Decimal, disponibilidad,
+  reconstrucción y gates de riesgo se conservan mediante narrowing/contratos
+  explícitos; no se usa `Any` como supresión general de errores.
+- Se modularizan admisión de eventos/velas, restauración y evaluaciones sin
+  alterar el orden causal ni eliminar evidencia de datos incompletos.
+- Los checkpoints conservan también `last_event_id` al restaurar. Las señales
+  `LIVE` se rechazan tanto como dataclass con serializer como mappings con enum
+  o texto con espacios; se corrigió ese fallo heredado del baseline sin activar
+  la ruta externa.
+- No se cambia la autenticación real: sólo se validan rutas locales/controladas.
 
-En el árbol de esta revisión, el gate terminó con **342 pruebas**, cero fallos,
-3 omitidas y **74 % de cobertura de ramas**. Ruff check/formato, mypy estricto,
-Pyright (su alcance declarado) y la auditoría arquitectónica terminaron en cero
-errores; la complejidad Ruff de los módulos refactorizados quedó en cero
-diagnósticos C901. La auditoría AST registró 0 ciclos, 0 violaciones estrictas y
-un máximo de complejidad 38 (frente a 76 en el baseline histórico).
+## Distribución aislada
 
-El chequeo advisory de todo el repositorio aún registra deuda heredada fuera del
-gate mantenido (356 hallazgos Ruff en 43 archivos, incluidos 8 C901 en
-`runtime/processor.py`, `runtime/state.py` y `ops/ctrader_activation.py`). No se
-oculta ni se atribuye esa deuda a la validación del refactor; es trabajo futuro
-separado si se desea ampliar el alcance.
+`install-mtf-lab-wheel.sh` delega al helper stdlib `tools/wheel_installer.py`.
+El build usa `build==1.6.1`, `setuptools==84.0.0` y por defecto
+`SOURCE_DATE_EPOCH=0`. Trabaja en una copia temporal de fuentes; no genera
+`build/` ni `*.egg-info` en el checkout activo. Pip usa `--no-index --no-deps`.
+Los wheels se conservan por SHA-256 en `dist/<sha256>/`, y el smoke comprueba el
+origen instalado con estado HOME/XDG separado. No instala una release personal
+ni publica en PyPI como efecto de esta limpieza.
+El almacén rechaza symlinks y archivos especiales (incluidos FIFO) sin seguirlos
+ni bloquearse; las colisiones conservan los bytes existentes. El staging rechaza
+directorios symlink para evitar omitir fuentes silenciosamente.
 
-## Wheel e instalación
+## Línea base
 
-`install-mtf-lab-wheel.sh` construye un wheel con `setuptools==84.0.0` mediante
-el frontend `build==1.6.1` (por defecto `SOURCE_DATE_EPOCH=0` para bytes
-repetibles), o instala un wheel entregado por el usuario. Después verifica el
-launcher `mtf-lab --help` e imprime el SHA-256. El artefacto no se publica a
-PyPI y el runtime no escribe junto al código instalado.
+Se partió de `ea288085690ccfc617e6bcd5ba44f20925633f8f`: 356 hallazgos Ruff,
+8 C901 y 202 diagnósticos mypy al ampliar el alcance real a paquete y tooling.
+La auditoría AST de ese SHA tenía 123 funciones por encima de 10, máximo 38,
+0 ciclos y 0 violaciones estrictas. Su métrica AST cuenta constructos distintos
+que Ruff C901 y no debe intercambiarse numéricamente con ella.
 
-## Pendientes fuera del código
+## Resultado verificado
 
-La autenticación, el login, el consentimiento OAuth, la selección DEMO y la
-verificación del servidor/bróker siguen siendo intervención explícita de Víctor.
-Una pasada local de tests, tipos o fixtures no acredita permisos, catálogo,
-fills, costes ni aceptación contractual.
+La puerta global pasó con **395/395 pruebas**, cero fallos y cero omitidas:
+**53 pruebas más** que el baseline. Ruff/formato, mypy estricto (72 fuentes) y
+Pyright completos terminaron en cero errores; desaparecieron los 8 C901.
+La revisión cubre 117 archivos Python con Ruff, además del formato de ejemplos.
+
+Coverage.py midió **16,767/21,160 líneas (79.239 %)** y
+**4,003/6,568 ramas (60.947 %)**. El umbral actual exige 60 % en cada métrica,
+no sólo en la combinación. La cobertura es del proceso de tests instrumentado;
+no se presenta como cobertura total de cada subprocess de CLI/instalación.
+
+La auditoría AST mantiene 0 ciclos/violaciones: sus funciones sobre 10 bajan
+123 → 117 y el máximo sigue en 38. Eso no contradice C901 limpio: son métricas
+con reglas distintas. Queda margen para aumentar cobertura de ramas, no deuda
+Ruff/mypy oculta.
+
+El [receipt compacto](../reports/quality/global-static-20260912.json) conserva
+ámbito, comandos, versiones, métricas e identidad de los inputs ejecutables.
+Los fuentes no cambiaron durante la suite; después sólo se agregó este cierre
+documental y el receipt. El estado de `data/` mantuvo tamaño, mtime e inode en
+la verificación integrada, sin abrir sus bases.
+
+La autenticación y la observación del servidor siguen reservadas para Víctor.

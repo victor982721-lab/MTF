@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import stat
 import tempfile
 import unittest
@@ -9,7 +8,6 @@ from pathlib import Path
 
 from mtf_lab.ops.ctrader_activation import (
     ActivationError,
-    ActivationMode,
     ActivationProfile,
     ActivationState,
     BrokerAccount,
@@ -22,7 +20,6 @@ from mtf_lab.ops.ctrader_activation import (
     select_demo_account,
 )
 from mtf_lab.ops.ctrader_commands import select_account_command, status_command
-
 
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
 
@@ -87,23 +84,57 @@ class ActivationTests(unittest.TestCase):
     def test_state_machine_query_then_demo_scopes(self) -> None:
         accounts = [BrokerAccount("demo-123456", "DEMO", "fixture")]
         env = {"CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET"}
-        missing = evaluate_activation(profile(), token=None, accounts=accounts, present_env_keys=env, app=app(), now=NOW)
+        missing = evaluate_activation(
+            profile(), token=None, accounts=accounts, present_env_keys=env, app=app(), now=NOW
+        )
         self.assertEqual(missing.state, ActivationState.ACCOUNTS_SCOPE_REQUIRED)
-        query = evaluate_activation(profile(), token=token("accounts"), accounts=accounts, present_env_keys=env, app=app(), now=NOW)
+        query = evaluate_activation(
+            profile(), token=token("accounts"), accounts=accounts, present_env_keys=env, app=app(), now=NOW
+        )
         self.assertEqual(query.state, ActivationState.QUERY_READY)
-        needs_trading = evaluate_activation(profile("demo"), token=token("accounts"), accounts=accounts, present_env_keys=env, app=app(), now=NOW)
+        needs_trading = evaluate_activation(
+            profile("demo"), token=token("accounts"), accounts=accounts, present_env_keys=env, app=app(), now=NOW
+        )
         self.assertEqual(needs_trading.state, ActivationState.TRADING_SCOPE_REQUIRED)
-        ready = evaluate_activation(profile("demo"), token=token("accounts", "trading"), accounts=accounts, present_env_keys=env, app=app(), now=NOW)
+        ready = evaluate_activation(
+            profile("demo"),
+            token=token("accounts", "trading"),
+            accounts=accounts,
+            present_env_keys=env,
+            app=app(),
+            now=NOW,
+        )
         self.assertEqual(ready.state, ActivationState.DEMO_READY)
         self.assertTrue(ready.ready)
 
     def test_expiry_and_explicit_demo_selection_fail_closed(self) -> None:
         env = {"CTRADER_CLIENT_ID", "CTRADER_CLIENT_SECRET"}
-        expired = evaluate_activation(profile(), token=token("accounts", expired=True), accounts=[BrokerAccount("demo-123456", "DEMO")], present_env_keys=env, app=app(), now=NOW)
+        expired = evaluate_activation(
+            profile(),
+            token=token("accounts", expired=True),
+            accounts=[BrokerAccount("demo-123456", "DEMO")],
+            present_env_keys=env,
+            app=app(),
+            now=NOW,
+        )
         self.assertEqual(expired.state, ActivationState.TOKEN_EXPIRED)
-        mismatch = evaluate_activation(profile(), token=TokenMetadata("other", frozenset({"accounts"}), NOW + timedelta(hours=1), NOW, 1), accounts=[BrokerAccount("demo-123456", "DEMO")], present_env_keys=env, app=app(), now=NOW)
+        mismatch = evaluate_activation(
+            profile(),
+            token=TokenMetadata("other", frozenset({"accounts"}), NOW + timedelta(hours=1), NOW, 1),
+            accounts=[BrokerAccount("demo-123456", "DEMO")],
+            present_env_keys=env,
+            app=app(),
+            now=NOW,
+        )
         self.assertEqual(mismatch.state, ActivationState.TOKEN_REFERENCE_REQUIRED)
-        invalid = evaluate_activation(profile(account_id="unknown"), token=token("accounts"), accounts=[BrokerAccount("demo-123456", "DEMO")], present_env_keys=env, app=app(), now=NOW)
+        invalid = evaluate_activation(
+            profile(account_id="unknown"),
+            token=token("accounts"),
+            accounts=[BrokerAccount("demo-123456", "DEMO")],
+            present_env_keys=env,
+            app=app(),
+            now=NOW,
+        )
         self.assertEqual(invalid.state, ActivationState.ACCOUNT_SELECTION_INVALID)
         with self.assertRaises(RealAccountForbidden):
             select_demo_account([BrokerAccount("real-1", "REAL")], "real-1", environment="DEMO")
@@ -182,6 +213,7 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(before, repr(raw))
         self.assertNotIn("access_token", repr(output))
         from mtf_lab.ops.ctrader_commands import account_discovery_command
+
         discovery = account_discovery_command(
             token("accounts"),
             [{"account_id": "demo-123456", "environment": "DEMO"}],
@@ -196,28 +228,53 @@ class ActivationTests(unittest.TestCase):
 class OAuthHelperTests(unittest.TestCase):
     def test_authorization_url_and_callback_are_loopback_and_scoped(self) -> None:
         from mtf_lab.ops.ctrader_activation import build_authorization_url, parse_callback_uri
+
         url = build_authorization_url(app(), client_id="client-public", scope="accounts", state="state-1")
         self.assertIn("scope=accounts", url)
         with self.assertRaises(ActivationError):
             build_authorization_url(app(), client_id="client-public", scope=["accounts", "trading"], state="state-1")
         self.assertIn("state=state-1", url)
-        self.assertEqual(parse_callback_uri("http://127.0.0.1:8767/oauth/callback?code=abc&state=state-1", expected_state="state-1", registered_uri=app().redirect_uri), "abc")
+        self.assertEqual(
+            parse_callback_uri(
+                "http://127.0.0.1:8767/oauth/callback?code=abc&state=state-1",
+                expected_state="state-1",
+                registered_uri=app().redirect_uri,
+            ),
+            "abc",
+        )
         with self.assertRaises(ActivationError):
-            parse_callback_uri("http://127.0.0.1:8767/oauth/callback?code=abc&state=wrong", expected_state="state-1", registered_uri=app().redirect_uri)
+            parse_callback_uri(
+                "http://127.0.0.1:8767/oauth/callback?code=abc&state=wrong",
+                expected_state="state-1",
+                registered_uri=app().redirect_uri,
+            )
 
     def test_token_exchange_redacts_secrets_and_rotation_payload(self) -> None:
         from mtf_lab.ops.ctrader_activation import exchange_authorization_code, refresh_access_token
+
         seen = []
+
         def requester(url, params, timeout):
             seen.append((url, dict(params), timeout))
-            return {"accessToken": "access-secret", "refreshToken": "refresh-secret", "expiresIn": 60, "tokenType": "bearer"}
-        payload = exchange_authorization_code(app(), client_id="client", client_secret="secret", code="code", requester=requester)
+            return {
+                "accessToken": "access-secret",
+                "refreshToken": "refresh-secret",
+                "expiresIn": 60,
+                "tokenType": "bearer",
+            }
+
+        payload = exchange_authorization_code(
+            app(), client_id="client", client_secret="secret", code="code", requester=requester
+        )
         self.assertNotIn("access-secret", repr(payload))
         self.assertEqual(payload.expires_in, 60)
-        refreshed = refresh_access_token(app(), client_id="client", client_secret="secret", refresh_token="old", requester=requester)
+        refreshed = refresh_access_token(
+            app(), client_id="client", client_secret="secret", refresh_token="old", requester=requester
+        )
         self.assertEqual(refreshed.refresh_token, "refresh-secret")
         self.assertEqual(seen[0][1]["grant_type"], "authorization_code")
         self.assertEqual(seen[1][1]["grant_type"], "refresh_token")
+
 
 class ResumableLoopbackTests(unittest.TestCase):
     def test_callback_parser_is_exact_and_browser_requires_explicit_gate(self) -> None:
@@ -323,10 +380,7 @@ class ResumableLoopbackTests(unittest.TestCase):
             self.assertEqual(revealed_handoff["authorization_url"], attempt.authorization_url)
             self.assertFalse(revealed_handoff["browser_opened"])
 
-            callback = (
-                "http://127.0.0.1:8767/oauth/callback"
-                f"?code=short-lived&state={attempt.csrf_state}"
-            )
+            callback = f"http://127.0.0.1:8767/oauth/callback?code=short-lived&state={attempt.csrf_state}"
             assistant.receive_callback(attempt.attempt_id, callback, now=NOW)
 
             # New object, same private stores: this proves restart/resume.
@@ -372,9 +426,7 @@ class ResumableLoopbackTests(unittest.TestCase):
                 resumed.resume(attempt.attempt_id, now=NOW)["phase"],
                 "TOKEN_STORED",
             )
-            self.assertIsNone(
-                attempt_store.load(attempt.attempt_id).authorization_code
-            )
+            self.assertIsNone(attempt_store.load(attempt.attempt_id).authorization_code)
             discovery = record_account_discovery(
                 metadata,
                 [
@@ -449,7 +501,6 @@ class ResumableLoopbackTests(unittest.TestCase):
                 requester=None,
             )
 
-
     def test_observed_scopes_are_not_inferred_from_request(self) -> None:
         from mtf_lab.ops.ctrader_activation import (
             LoopbackOAuthAssistant,
@@ -475,8 +526,7 @@ class ResumableLoopbackTests(unittest.TestCase):
             )
             assistant.receive_callback(
                 attempt.attempt_id,
-                "http://127.0.0.1:8767/oauth/callback"
-                f"?code=short-lived&state={attempt.csrf_state}",
+                f"http://127.0.0.1:8767/oauth/callback?code=short-lived&state={attempt.csrf_state}",
                 now=NOW,
             )
             calls: list[object] = []

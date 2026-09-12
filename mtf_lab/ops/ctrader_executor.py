@@ -28,7 +28,8 @@ from collections.abc import Callable, Iterable, Mapping, MutableMapping, Sequenc
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any, Protocol, runtime_checkable
+from types import NotImplementedType
+from typing import Any, Protocol, cast, runtime_checkable
 
 # ---------------------------------------------------------------------------
 # Errors and normalized records
@@ -82,7 +83,7 @@ class CorrelationError(ExecutionError):
     pass
 
 
-class SendPhase(str, enum.Enum):
+class SendPhase(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
     """Shared send lifecycle phase used by the executor and adapters."""
 
     NOT_SENT = "NOT_SENT"
@@ -142,20 +143,20 @@ class DecimalValue(Decimal):
     shim is local to this module and never changes the process-wide context.
     """
 
-    def __new__(cls, value: Any = "0"):
+    def __new__(cls, value: Any = "0") -> DecimalValue:
         if isinstance(value, float):
             value = repr(value)
         return super().__new__(cls, value)
 
     @staticmethod
-    def _operand(value: Any) -> Decimal:
+    def _operand(value: Any) -> Decimal | NotImplementedType:
         if isinstance(value, bool):
             raise TypeError("boolean is not a decimal value")
         if isinstance(value, Decimal):
             return value
         if isinstance(value, (int, float, str)):
             return DecimalValue(value)
-        return NotImplemented  # type: ignore[return-value]
+        return cast(Decimal | NotImplementedType, NotImplemented)
 
     @classmethod
     def _result(cls, value: Decimal) -> DecimalValue:
@@ -163,8 +164,8 @@ class DecimalValue(Decimal):
 
     def __add__(self, other: Any) -> DecimalValue:
         operand = self._operand(other)
-        if operand is NotImplemented:
-            return NotImplemented  # type: ignore[return-value]
+        if isinstance(operand, NotImplementedType):
+            return NotImplemented
         return self._result(_DECIMAL_CONTEXT.add(self, operand))
 
     def __radd__(self, other: Any) -> DecimalValue:
@@ -172,20 +173,20 @@ class DecimalValue(Decimal):
 
     def __sub__(self, other: Any) -> DecimalValue:
         operand = self._operand(other)
-        if operand is NotImplemented:
-            return NotImplemented  # type: ignore[return-value]
+        if isinstance(operand, NotImplementedType):
+            return NotImplemented
         return self._result(_DECIMAL_CONTEXT.subtract(self, operand))
 
     def __rsub__(self, other: Any) -> DecimalValue:
         operand = self._operand(other)
-        if operand is NotImplemented:
-            return NotImplemented  # type: ignore[return-value]
+        if isinstance(operand, NotImplementedType):
+            return NotImplemented
         return self._result(_DECIMAL_CONTEXT.subtract(operand, self))
 
     def __mul__(self, other: Any) -> DecimalValue:
         operand = self._operand(other)
-        if operand is NotImplemented:
-            return NotImplemented  # type: ignore[return-value]
+        if isinstance(operand, NotImplementedType):
+            return NotImplemented
         return self._result(_DECIMAL_CONTEXT.multiply(self, operand))
 
     def __rmul__(self, other: Any) -> DecimalValue:
@@ -193,14 +194,14 @@ class DecimalValue(Decimal):
 
     def __truediv__(self, other: Any) -> DecimalValue:
         operand = self._operand(other)
-        if operand is NotImplemented:
-            return NotImplemented  # type: ignore[return-value]
+        if isinstance(operand, NotImplementedType):
+            return NotImplemented
         return self._result(_DECIMAL_CONTEXT.divide(self, operand))
 
     def __rtruediv__(self, other: Any) -> DecimalValue:
         operand = self._operand(other)
-        if operand is NotImplemented:
-            return NotImplemented  # type: ignore[return-value]
+        if isinstance(operand, NotImplementedType):
+            return NotImplemented
         return self._result(_DECIMAL_CONTEXT.divide(operand, self))
 
     def __abs__(self) -> DecimalValue:
@@ -229,7 +230,7 @@ def _decimal_text(value: DecimalValue | Decimal | Any) -> str:
     return format(DecimalValue(value), "f")
 
 
-class OrderState(str, enum.Enum):
+class OrderState(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
     INTENT_RECORDED = "INTENT_RECORDED"
     SUBMITTED = "SUBMITTED"
     PARTIAL = "PARTIAL"
@@ -247,7 +248,7 @@ _TERMINAL_STATES = frozenset(
 )
 
 
-class Side(str, enum.Enum):
+class Side(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
     BUY = "BUY"
     SELL = "SELL"
 
@@ -261,7 +262,7 @@ class Side(str, enum.Enum):
         raise ValueError(f"direction/side not supported: {value!r}")
 
 
-class QuoteQuality(str, enum.Enum):
+class QuoteQuality(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
     VALID = "VALID"
     SYNTHETIC = "SYNTHETIC"
     UNKNOWN = "UNKNOWN"
@@ -926,7 +927,13 @@ class DemoTransport:
             self._counter += 1
             pid = f"foreign-position-{self._counter:06d}"
             self.positions_by_id[pid] = Position(
-                pid, account_id, symbol, side, quantity, entry_price, owner="other-owner"
+                pid,
+                account_id,
+                symbol,
+                side,
+                _decimal_value(quantity, "position quantity", positive=True),
+                _decimal_value(entry_price, "position entry_price", positive=True),
+                owner="other-owner",
             )
             return pid
 
@@ -1083,7 +1090,7 @@ def _prepare_executor_account(
     account_obj = account if isinstance(account, DemoAccount) else DemoAccount.from_mapping(account)
     if not observation.matches_account(account_obj):
         raise DemoAccountRequired("server observation does not match selected account")
-    observed_scopes = set(getattr(observation, "scopes", ()))
+    observed_scopes: set[str] = set(cast(Iterable[str], getattr(observation, "scopes", ())))
     if "scope_trade" in observed_scopes or "trade" in observed_scopes:
         observed_scopes.add("trading")
     return dataclasses.replace(account_obj, verified=True, scopes=frozenset(set(account_obj.scopes) | observed_scopes))
@@ -1254,7 +1261,8 @@ class CTraderDemoExecutor:
         symbol = str(data.get("instrument", data.get("symbol", quote.symbol))).upper()
         if not signal_id:
             raise ExecutionError("signal_id is required")
-        mode = str(data.get("mode", "")).upper()
+        raw_mode = data.get("mode", "")
+        mode = str(getattr(raw_mode, "value", raw_mode)).strip().upper()
         if mode in {"REAL", "LIVE", "PRODUCTION"}:
             raise RealAccountForbidden("REAL/LIVE signal cannot reach demo executor")
         side = Side.parse(data.get("side", data.get("direction")))
@@ -1345,7 +1353,7 @@ class CTraderDemoExecutor:
                 {"correlation_id": intent.intent_id, "before_transport": True},
             )
             try:
-                snapshot = self.transport.submit(intent, timeout_seconds=self.policy.timeout_seconds)
+                snapshot = self.transport.submit(intent, timeout_seconds=float(self.policy.timeout_seconds))
             except ExecutionLocalFailure as exc:
                 return self._result_from_failure(intent, exc, event_type="SUBMIT_LOCAL_ERROR")
             except ExecutionTransportFailure as exc:
@@ -1531,7 +1539,7 @@ class CTraderDemoExecutor:
             )
             try:
                 snapshot = self.transport.close_position(
-                    position, client_order_id=intent.intent_id, timeout_seconds=self.policy.timeout_seconds
+                    position, client_order_id=intent.intent_id, timeout_seconds=float(self.policy.timeout_seconds)
                 )
             except ExecutionLocalFailure as exc:
                 return self._result_from_failure(intent, exc, event_type="CLOSE_LOCAL_ERROR")
@@ -1643,14 +1651,13 @@ DemoExecutionConfig = ExecutionPolicy
 def _as_mapping(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
+    for method_name in ("to_dict", "as_dict", "model_dump"):
+        method = getattr(value, method_name, None)
+        if callable(method):
+            payload = cast(Mapping[str, Any], method())
+            return dict(payload)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return {field.name: getattr(value, field.name) for field in dataclasses.fields(value)}
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        return dict(value.to_dict())
-    if hasattr(value, "as_dict") and callable(value.as_dict):
-        return dict(value.as_dict())
-    if hasattr(value, "model_dump") and callable(value.model_dump):
-        return dict(value.model_dump())
     if hasattr(value, "__dict__"):
         return {key: val for key, val in vars(value).items() if not key.startswith("_")}
     raise TypeError(f"expected mapping/dataclass/object, got {type(value)!r}")

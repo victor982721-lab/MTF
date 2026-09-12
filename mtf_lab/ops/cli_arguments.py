@@ -4,6 +4,7 @@ This module intentionally imports only ``argparse`` and ``pathlib`` at module
 load.  Optional SDKs and application services are resolved when a command is
 actually dispatched.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -75,7 +76,12 @@ def _add_input_options(parser: argparse.ArgumentParser, *, optional: bool = Fals
     parser.add_argument("--price-base", choices=["trade", "traded", "close", "mid", "bid", "ask"])
     parser.add_argument("--mapping", help="timestamp=ts,open=o,high=h,low=l,close=c,volume=v")
     parser.add_argument("--timezone", help="zona para timestamps sin offset")
-    parser.add_argument("--timestamp-unit", choices=["iso8601", "s", "ms", "us", "ns"], default="iso8601", help="unidad explícita para timestamps numéricos")
+    parser.add_argument(
+        "--timestamp-unit",
+        choices=["iso8601", "s", "ms", "us", "ns"],
+        default="iso8601",
+        help="unidad explícita para timestamps numéricos",
+    )
     parser.add_argument("--interval-seconds", type=float)
     parser.add_argument("--allow-issues", action="store_true")
     parser.add_argument("--allow-out-of-order", action="store_true")
@@ -86,7 +92,9 @@ def _add_input_options(parser: argparse.ArgumentParser, *, optional: bool = Fals
 def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.ArgumentParser:
     """Build the complete parser, preserving command names and flags."""
     callbacks: Mapping[str, Handler] = handlers or _default_handlers()
-    parser = argparse.ArgumentParser(prog="mtf-lab", description="MTF Lab — investigación cuantitativa local, virtual y reproducible")
+    parser = argparse.ArgumentParser(
+        prog="mtf-lab", description="MTF Lab — investigación cuantitativa local, virtual y reproducible"
+    )
     subs = parser.add_subparsers(dest="command", required=True)
 
     p = subs.add_parser("doctor", help="revisa Python, configuración, SQLite y opcionalmente conectividad")
@@ -174,13 +182,21 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
 
     q = csubs.add_parser("doctor", help="diagnostica SDK opcional, OAuth y gates de cuenta")
     q.add_argument("--config", type=Path)
-    q.add_argument("--network", "--check-network", dest="network", action="store_true", help="prueba explícitamente DNS/TCP/TLS DEMO; no autentica cuentas")
+    q.add_argument(
+        "--network",
+        "--check-network",
+        dest="network",
+        action="store_true",
+        help="prueba explícitamente DNS/TCP/TLS DEMO; no autentica cuentas",
+    )
     q.add_argument("--timeout", type=float, default=5.0)
     q.set_defaults(func=callbacks["ctrader_doctor"])
 
     q = csubs.add_parser("auth-url", help="inicia OAuth loopback reanudable; no abre navegador salvo flag")
     q.add_argument("--config", type=Path, default=_packaged_config_path("ctrader_query.toml"))
-    q.add_argument("--scope", choices=["accounts", "trading"], help="un solo scope por intento; trading va después de accounts")
+    q.add_argument(
+        "--scope", choices=["accounts", "trading"], help="un solo scope por intento; trading va después de accounts"
+    )
     q.add_argument("--open-browser", action="store_true")
     q.set_defaults(func=callbacks["ctrader_auth_url"])
 
@@ -197,7 +213,9 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     q.add_argument("--account-id", required=True)
     q.set_defaults(func=callbacks["ctrader_select"])
 
-    q = csubs.add_parser("token-exchange", help="reanuda OAuth; entregue callback por archivo 0600/stdin, fixture usa store temporal")
+    q = csubs.add_parser(
+        "token-exchange", help="reanuda OAuth; entregue callback por archivo 0600/stdin, fixture usa store temporal"
+    )
     q.add_argument("--config", type=Path, default=_packaged_config_path("ctrader_query.toml"))
     q.add_argument("--attempt-id")
     q.add_argument("--callback-file", type=Path)
@@ -230,14 +248,27 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     p = subs.add_parser("cfd-paper", help="pipeline cTrader→RuntimeCoordinator→CFD PAPER local")
     p.add_argument("--config", type=Path, default=_packaged_config_path("ctrader_pipeline_fixture.toml"))
     p.add_argument("--input", type=Path, help="captura JSON/JSONL local de payloads cTrader; sin red")
-    p.add_argument("--count", type=int, default=190, help="barras del fixture sintético cuando no se proporciona --input")
+    p.add_argument(
+        "--count", type=int, default=190, help="barras del fixture sintético cuando no se proporciona --input"
+    )
     p.add_argument("--session")
     p.add_argument("--db", type=Path)
     p.add_argument("--max-candles", type=int, default=256)
     p.add_argument("--chunk-size", type=int, default=128, help="cantidad de sobres por commit incremental")
-    p.add_argument("--order", choices=["as_observed", "market_time_corrected"], default="as_observed", help="orden causal; market_time_corrected es sólo inspección")
-    p.add_argument("--incomplete", action="store_true", help="no declara liquidación final; las ventanas ya vencidas siguen siendo UNKNOWN")
-    p.add_argument("--include-payloads", action="store_true", help="incluye payloads completos sólo en el reporte explícito")
+    p.add_argument(
+        "--order",
+        choices=["as_observed", "market_time_corrected"],
+        default="as_observed",
+        help="orden causal; market_time_corrected es sólo inspección",
+    )
+    p.add_argument(
+        "--incomplete",
+        action="store_true",
+        help="no declara liquidación final; las ventanas ya vencidas siguen siendo UNKNOWN",
+    )
+    p.add_argument(
+        "--include-payloads", action="store_true", help="incluye payloads completos sólo en el reporte explícito"
+    )
     p.add_argument("--report", type=Path)
     p.set_defaults(func=callbacks["cfd_paper"])
     return parser

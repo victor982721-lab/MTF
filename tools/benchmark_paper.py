@@ -13,13 +13,14 @@ from collections.abc import Iterator
 from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 from unittest.mock import patch
 
 from mtf_lab.core.canonical import canonical_json
 from mtf_lab.data.capture import CaptureEnvelope, MessageClass
 from mtf_lab.data.ctrader import CTraderInstrumentSpec
 from mtf_lab.data.paper_fixture import synthetic_ctrader_payloads
-from mtf_lab.ops.ctrader_pipeline import CaptureCoverage, CTraderPipeline
+from mtf_lab.ops.ctrader_pipeline import CaptureCoverage, CTraderPaperSession, CTraderPipeline
 from mtf_lab.ops.persistence import SQLiteStore
 from tests.test_ctrader_pipeline import BASE, pipeline_config
 
@@ -37,7 +38,7 @@ def events(count: int) -> Iterator[CaptureEnvelope]:
         yield CaptureEnvelope(market, available, available, index, 0, MessageClass.SPOT, raw)
 
 
-def sample(session, events_processed: int, elapsed: float) -> dict:
+def sample(session: CTraderPaperSession, events_processed: int, elapsed: float) -> dict[str, Any]:
     state = session.snapshot()
     checkpoint_bytes = len(canonical_json(state).encode())
     processor = state["runtime"]["processor"]
@@ -66,7 +67,7 @@ def sample(session, events_processed: int, elapsed: float) -> dict:
     }
 
 
-def run(count: int) -> dict:
+def run(count: int) -> dict[str, Any]:
     with TemporaryDirectory(prefix="mtf-paper-benchmark-") as directory:
         root = Path(directory)
         env = {
@@ -91,7 +92,7 @@ def run(count: int) -> dict:
             )
             tracemalloc.start()
             iterator = iter(events(count))
-            samples = []
+            samples: list[dict[str, Any]] = []
             start = time.perf_counter()
             for offset in range(0, count, 250):
                 session.ingest_many(next(iterator) for _ in range(min(250, count - offset)))

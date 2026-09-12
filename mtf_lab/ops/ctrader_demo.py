@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..data.ctrader import (
     PAYLOAD,
@@ -28,6 +29,7 @@ from .ctrader_demo_transport import (
 )
 from .ctrader_executor import (
     CTraderDemoExecutor,
+    DecimalValue,
     DemoAccount,
     DemoTransport,
     ExecutionIntent,
@@ -82,16 +84,16 @@ def _official_demo_probe(start: datetime) -> dict[str, Any]:
     class LocalRequestClient:
         """Synchronous typed client used only to prove offline composition."""
 
-        def __init__(self, session: AuthenticatedSession):
+        def __init__(self, session: AuthenticatedSession) -> None:
             self.session = session
 
-        def authenticated_session_evidence(self):
+        def authenticated_session_evidence(self) -> AuthenticatedSession:
             return self.session
 
-        def validate_session_evidence(self, proof):
+        def validate_session_evidence(self, proof: Any) -> bool:
             return True
 
-        def request_message(self, message, *, client_msg_id, timeout_seconds):
+        def request_message(self, message: Any, *, client_msg_id: str, timeout_seconds: float) -> WireMessage:
             raise AssertionError("el probe de construcción no debe enviar mensajes")
 
     try:
@@ -112,7 +114,7 @@ def _official_demo_probe(start: datetime) -> dict[str, Any]:
             start,
             "fixture-generation",
         )
-        gateway = CTraderClientGateway(LocalRequestClient(session), clock=lambda: start)
+        gateway = CTraderClientGateway(cast(CTraderClient, LocalRequestClient(session)), clock=lambda: start)
         transport = CTraderDemoTransport(
             account,
             client=gateway,
@@ -126,8 +128,8 @@ def _official_demo_probe(start: datetime) -> dict[str, Any]:
             "fixture-official-signal",
             "EUR/USD",
             Side.BUY,
-            1.0,
-            1.1002,
+            DecimalValue("1.0"),
+            DecimalValue("1.1002"),
             start,
             "7",
         )
@@ -174,7 +176,7 @@ def run_ctrader_fixture(report_path: str | Path | None = None) -> dict[str, Any]
         snapshot=True,
     )
     signal, quotes = known_fixture_eurusd_long()
-    cfd = CFDSimulator(CFDConfig(instrument="EUR/USD", units="1000", horizons_seconds=("60",)))
+    cfd = CFDSimulator(CFDConfig(instrument="EUR/USD", units=Decimal("1000"), horizons_seconds=(Decimal("60"),)))
     cfd_result = cfd.replay([signal], quotes)
     account = DemoAccount(
         "fixture-demo", "DEMO", "demo://ctrader", frozenset({"trading"}), selected=True, verified=True
@@ -186,20 +188,27 @@ def run_ctrader_fixture(report_path: str | Path | None = None) -> dict[str, Any]
         account,
         transport=demo_transport,
         policy=ExecutionPolicy(
-            max_quantity=1,
-            fixed_quantity=1,
-            max_exposure=10_000,
+            max_quantity=DecimalValue("1"),
+            fixed_quantity=DecimalValue("1"),
+            max_exposure=DecimalValue("10000"),
             max_positions=1,
-            max_spread=0.01,
-            max_price_age_seconds=30,
-            timeout_seconds=1,
+            max_spread=DecimalValue("0.01"),
+            max_price_age_seconds=DecimalValue("30"),
+            timeout_seconds=DecimalValue("1"),
         ),
         clock=lambda: start,
     )
     executor.activate()
     execution = executor.submit_signal(
         {"signal_id": "fixture-demo-signal", "instrument": "EUR/USD", "direction": "UP", "mode": "DEMO"},
-        Quote("EUR/USD", 1.1000, 1.1002, start, available_at=start, source="fixture"),
+        Quote(
+            "EUR/USD",
+            DecimalValue("1.1000"),
+            DecimalValue("1.1002"),
+            start,
+            available_at=start,
+            source="fixture",
+        ),
     )
     provider_status = provider.status.to_dict()
     official_probe = _official_demo_probe(start)

@@ -5,11 +5,12 @@ are intentionally separate modules.  This facade keeps the historical
 ``mtf_lab.ops.cli`` import path stable for the console entry point and
 integrators while exposing only one implementation of each command.
 """
+
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
 import sys
+from collections.abc import Callable
 
 from .application_services import (
     PROJECT_ROOT,
@@ -43,7 +44,8 @@ from .application_services import (
     default_watch_config,
     effective_config,
 )
-from .cli_arguments import _add_input_options, build_parser as _build_parser
+from .cli_arguments import _add_input_options
+from .cli_arguments import build_parser as _build_parser
 from .cli_handlers import (
     cmd_backtest,
     cmd_cfd_paper,

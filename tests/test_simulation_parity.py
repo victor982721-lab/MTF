@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from mtf_lab.ops.simulation import (
     DirectionalEvaluator,
@@ -13,7 +13,6 @@ from mtf_lab.ops.simulation import (
     select_price_point,
 )
 from mtf_lab.runtime.state import PendingSimulation, PriceObservation, SimulationConfig
-
 
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -69,10 +68,32 @@ class SimulationParityTests(unittest.TestCase):
 
     def test_as_of_excludes_late_final_and_completeness_controls_pending(self) -> None:
         points = [
-            PricePoint(BASE + timedelta(seconds=2), 100, available_at=BASE + timedelta(seconds=2), source="f", base_price="close", quality="VALID", resolution="M1", instrument="TEST/USD", point_id="entry"),
-            PricePoint(BASE + timedelta(seconds=62), 101, available_at=BASE + timedelta(seconds=62), source="f", base_price="traded", quality="VALID", resolution="M1", instrument="TEST/USD", point_id="final"),
+            PricePoint(
+                BASE + timedelta(seconds=2),
+                100,
+                available_at=BASE + timedelta(seconds=2),
+                source="f",
+                base_price="close",
+                quality="VALID",
+                resolution="M1",
+                instrument="TEST/USD",
+                point_id="entry",
+            ),
+            PricePoint(
+                BASE + timedelta(seconds=62),
+                101,
+                available_at=BASE + timedelta(seconds=62),
+                source="f",
+                base_price="traded",
+                quality="VALID",
+                resolution="M1",
+                instrument="TEST/USD",
+                point_id="final",
+            ),
         ]
-        spec = EvaluationSpec(horizons_seconds=(60,), entry_latency_seconds=1, max_price_age_seconds=5, requested_base_price="close")
+        spec = EvaluationSpec(
+            horizons_seconds=(60,), entry_latency_seconds=1, max_price_age_seconds=5, requested_base_price="close"
+        )
         evaluator = DirectionalEvaluator(spec)
         signal = {"signal_id": "sig", "instrument": "TEST/USD", "direction": "UP", "detected_ts": BASE}
         pending = evaluator.evaluate(signal, points, capture_complete=False, as_of=BASE + timedelta(seconds=60))
@@ -85,11 +106,34 @@ class SimulationParityTests(unittest.TestCase):
         self.assertEqual(resolved.final_point_id, "final")
 
     def test_shared_selector_uses_availability_and_instrument(self) -> None:
-        late = PricePoint(BASE + timedelta(seconds=2), 100, available_at=BASE + timedelta(seconds=20), source="f", base_price="traded", quality="VALID", resolution="M1", instrument="TEST/USD", point_id="late")
-        selection, reason = select_price_point([late], BASE + timedelta(seconds=1), rule="first_observation_at_or_after", requested_base_price="trade", max_price_age_seconds=5)
+        late = PricePoint(
+            BASE + timedelta(seconds=2),
+            100,
+            available_at=BASE + timedelta(seconds=20),
+            source="f",
+            base_price="traded",
+            quality="VALID",
+            resolution="M1",
+            instrument="TEST/USD",
+            point_id="late",
+        )
+        selection, reason = select_price_point(
+            [late],
+            BASE + timedelta(seconds=1),
+            rule="first_observation_at_or_after",
+            requested_base_price="trade",
+            max_price_age_seconds=5,
+        )
         self.assertIsNone(selection)
         self.assertEqual(reason, "MAX_PRICE_AGE_EXCEEDED")
-        selection, reason = select_price_point([late], BASE + timedelta(seconds=1), rule="first_observation_at_or_after", requested_base_price="traded", max_price_age_seconds=30, instrument="OTHER/USD")
+        selection, reason = select_price_point(
+            [late],
+            BASE + timedelta(seconds=1),
+            rule="first_observation_at_or_after",
+            requested_base_price="traded",
+            max_price_age_seconds=30,
+            instrument="OTHER/USD",
+        )
         self.assertIsNone(selection)
         self.assertEqual(reason, "PRICE_NOT_AVAILABLE")
 

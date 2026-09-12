@@ -86,6 +86,13 @@ _BASES = {
 }
 _QUALITY_FLAGS = {flag.value: flag for flag in QualityFlag}
 _EVENT_KINDS = {kind.value: kind for kind in EventKind}
+_CORE_DATA_BASES: dict[PriceBase, DataPriceBasis] = {
+    PriceBase.TRADED: "traded",
+    PriceBase.BID: "bid",
+    PriceBase.ASK: "ask",
+    PriceBase.MID: "mid",
+    PriceBase.NATIVE: "native",
+}
 
 
 def _text(value: Any, *, name: str) -> str:
@@ -138,6 +145,10 @@ def _core_base(value: Any, *, name: str = "price_base") -> PriceBase:
         return _BASES[raw]
     except KeyError as exc:
         raise TranslationError(f"base de precio core desconocida: {value!r}", code="PRICE_BASE_UNKNOWN") from exc
+
+
+def _data_basis_from_core(value: PriceBase) -> DataPriceBasis:
+    return _CORE_DATA_BASES[value]
 
 
 def _strict_bool(value: Any, *, name: str) -> bool:
@@ -604,7 +615,7 @@ def core_event_to_data(event: CoreEvent) -> DataEvent:
         raise TranslationError(f"se esperaba core.MarketEvent, llegó {type(event).__name__}", code="TYPE_INVALID")
     core_event_id = _strict_id(event.event_id, name="event_id")
     basis_enum = _core_base(event.price_base)
-    basis = cast(DataPriceBasis, basis_enum.value)
+    basis = _data_basis_from_core(basis_enum)
     mode_enum = _core_mode(event.mode)
     event_kind = _event_kind(event.event_kind, context="event_kind core")
     metadata = dict(event.metadata)
@@ -748,7 +759,7 @@ def core_bar_to_data(bar: CoreCandle) -> DataBar:
     if not isinstance(bar, CoreCandle):
         raise TranslationError(f"se esperaba core.Candle, llegó {type(bar).__name__}", code="TYPE_INVALID")
     core_candle_id = _strict_id(bar.candle_id, name="candle_id")
-    basis = cast(DataPriceBasis, _core_base(bar.price_base).value)
+    basis = _data_basis_from_core(_core_base(bar.price_base))
     mode_enum = _core_mode(bar.mode)
     closed = _strict_bool(bar.closed, name="closed")
     metadata = dict(bar.metadata)
@@ -1020,7 +1031,7 @@ def _collect_core_events(events: Iterable[DataEvent | CoreEvent]) -> tuple[list[
             validation = validate_event(candidate)
             if not validation.accepted:
                 blocking.extend(f"event {candidate.event_id}: {issue.code}" for issue in validation.issues)
-            elif not cast(bool, candidate.quality.valid):
+            elif not candidate.quality.valid:
                 blocking.append(f"event {candidate.event_id}: quality_blocked")
             normalized.append(candidate)
         except TranslationError as exc:
@@ -1094,7 +1105,7 @@ def _build_event_bars(
             result[key] = event_bar
             if not event_bar.closed:
                 blocking.append(f"{key}: event-derived candle remains open")
-            if not cast(bool, event_bar.quality.valid):
+            if not event_bar.quality.valid:
                 blocking.append(f"{key}: event-derived candle quality blocked")
         except TranslationError as exc:
             blocking.append(f"{key}: {exc}")

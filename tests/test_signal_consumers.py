@@ -2,26 +2,34 @@
 
 from __future__ import annotations
 
+import os
+import unittest
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
-import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-import unittest
 from unittest.mock import patch
 
-from mtf_lab.core import DataQuality, EventKind, IndicatorConfig, IndicatorPoint, IndicatorSeries, MarketEvent, PriceBase, Signal
+from mtf_lab.core import (
+    DataQuality,
+    EventKind,
+    IndicatorConfig,
+    IndicatorPoint,
+    IndicatorSeries,
+    MarketEvent,
+    PriceBase,
+    Signal,
+)
+from mtf_lab.core.reference import m1_reference_signals
 from mtf_lab.data.models import Event
+from mtf_lab.ops.simulation import PricePoint, select_price_point
 from mtf_lab.runtime import IncrementalProcessor
 from mtf_lab.runtime.consumers import (
     BinarySimulationConsumer,
     CFDSignalConsumer,
     RecordingSignalConsumer,
 )
-from mtf_lab.core.reference import m1_reference_signals
-from mtf_lab.ops.simulation import PricePoint, select_price_point
 from mtf_lab.runtime.state import PriceObservation, SimulationConfig, event_dict, event_from_dict
-
 
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
@@ -97,12 +105,18 @@ class SignalConsumerCompositionTests(unittest.TestCase):
                 observation_id="point-contract",
             )
             selected_point, point_reason = select_price_point(
-                [price_point], target, rule="first_observation_at_or_after",
-                requested_base_price="traded", instrument="TEST/USD",
+                [price_point],
+                target,
+                rule="first_observation_at_or_after",
+                requested_base_price="traded",
+                instrument="TEST/USD",
             )
             selected_observation, observation_reason = select_price_point(
-                [runtime_observation], target, rule="first_observation_at_or_after",
-                requested_base_price="traded", instrument="TEST/USD",
+                [runtime_observation],
+                target,
+                rule="first_observation_at_or_after",
+                requested_base_price="traded",
+                instrument="TEST/USD",
             )
             self.assertIsNone(point_reason)
             self.assertIsNone(observation_reason)
@@ -192,19 +206,33 @@ class SignalConsumerCompositionTests(unittest.TestCase):
         with isolated_environment():
             consumers = (None, RecordingSignalConsumer(), CFDSignalConsumer())
             processors = [
-                IncrementalProcessor(instrument="TEST/USD", signal_consumer=consumer)
-                for consumer in consumers
+                IncrementalProcessor(instrument="TEST/USD", signal_consumer=consumer) for consumer in consumers
             ]
             records = [event(index * 60, 100.0 + index * 0.1, f"event-{index}") for index in range(20)]
             results = []
             for processor in processors:
                 results.append(processor.replay(records, sort=False))
-            status_keys = ("mode", "instrument", "price_base", "timeframes", "events_processed", "candles_processed", "candles", "signals", "evaluations", "warmup_pending")
+            status_keys = (
+                "mode",
+                "instrument",
+                "price_base",
+                "timeframes",
+                "events_processed",
+                "candles_processed",
+                "candles",
+                "signals",
+                "evaluations",
+                "warmup_pending",
+            )
             baseline_status = {key: processors[0].status[key] for key in status_keys}
             for processor in processors[1:]:
                 self.assertEqual({key: processor.status[key] for key in status_keys}, baseline_status)
-            self.assertEqual([item.signal_id for item in processors[0].signals], [item.signal_id for item in processors[1].signals])
-            self.assertEqual([item.signal_id for item in processors[0].signals], [item.signal_id for item in processors[2].signals])
+            self.assertEqual(
+                [item.signal_id for item in processors[0].signals], [item.signal_id for item in processors[1].signals]
+            )
+            self.assertEqual(
+                [item.signal_id for item in processors[0].signals], [item.signal_id for item in processors[2].signals]
+            )
             self.assertEqual([item.evaluations for item in results], [results[0].evaluations] * 3)
             self.assertEqual([item.signals for item in results], [results[0].signals] * 3)
 

@@ -5,9 +5,10 @@ from __future__ import annotations
 import dataclasses
 import math
 import random
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .backtest import BacktestRunner, VariantSpec
 from .logging_state import OperationTelemetry
@@ -34,18 +35,30 @@ class DemoDataset:
 def _aggregate(m1: list[dict[str, Any]], minutes: int) -> list[dict[str, Any]]:
     grouped: list[dict[str, Any]] = []
     for offset in range(0, len(m1), minutes):
-        block = m1[offset:offset + minutes]
+        block = m1[offset : offset + minutes]
         if len(block) < minutes:
             break
         start = block[0]["start_ts"]
         end = block[-1]["end_ts"]
-        grouped.append({
-            "candle_id": f"demo-{minutes}m-{start}", "instrument": block[0]["instrument"], "timeframe": f"M{minutes}",
-            "start_ts": start, "end_ts": end, "open": block[0]["open"], "high": max(x["high"] for x in block),
-            "low": min(x["low"] for x in block), "close": block[-1]["close"], "volume": sum(x["volume"] for x in block),
-            "closed": True, "source": "synthetic-demo", "price_base": "close", "quality": "SYNTHETIC_VALIDATED",
-            "provenance": {"synthetic": True, "aggregation": f"[start,end), {minutes} x M1", "input": "demo-m1"},
-        })
+        grouped.append(
+            {
+                "candle_id": f"demo-{minutes}m-{start}",
+                "instrument": block[0]["instrument"],
+                "timeframe": f"M{minutes}",
+                "start_ts": start,
+                "end_ts": end,
+                "open": block[0]["open"],
+                "high": max(x["high"] for x in block),
+                "low": min(x["low"] for x in block),
+                "close": block[-1]["close"],
+                "volume": sum(x["volume"] for x in block),
+                "closed": True,
+                "source": "synthetic-demo",
+                "price_base": "close",
+                "quality": "SYNTHETIC_VALIDATED",
+                "provenance": {"synthetic": True, "aggregation": f"[start,end), {minutes} x M1", "input": "demo-m1"},
+            }
+        )
     return grouped
 
 
@@ -82,14 +95,29 @@ def generate_demo(seed: int = 42, *, minutes: int = 720, instrument: str = "DEMO
         low = min(open_price, close_price) - spread
         begin = start + timedelta(minutes=i)
         end = begin + timedelta(minutes=1)
-        m1.append({
-            "candle_id": f"demo-m1-{i:06d}", "instrument": instrument, "timeframe": "M1", "start_ts": begin.isoformat().replace("+00:00", "Z"), "end_ts": end.isoformat().replace("+00:00", "Z"),
-            "open": round(open_price, 8), "high": round(high, 8), "low": round(low, 8), "close": round(close_price, 8), "volume": round(1 + rng.random(), 6),
-            "closed": True, "source": "synthetic-demo", "price_base": "close", "quality": "SYNTHETIC_VALIDATED", "source_ordinal": i,
-            "provenance": {"synthetic": True, "seed": seed, "scenario": "trend/pullback/lateral/volatility_change"},
-        })
+        m1.append(
+            {
+                "candle_id": f"demo-m1-{i:06d}",
+                "instrument": instrument,
+                "timeframe": "M1",
+                "start_ts": begin.isoformat().replace("+00:00", "Z"),
+                "end_ts": end.isoformat().replace("+00:00", "Z"),
+                "open": round(open_price, 8),
+                "high": round(high, 8),
+                "low": round(low, 8),
+                "close": round(close_price, 8),
+                "volume": round(1 + rng.random(), 6),
+                "closed": True,
+                "source": "synthetic-demo",
+                "price_base": "close",
+                "quality": "SYNTHETIC_VALIDATED",
+                "source_ordinal": i,
+                "provenance": {"synthetic": True, "seed": seed, "scenario": "trend/pullback/lateral/volatility_change"},
+            }
+        )
         price = close_price
-    m5 = _aggregate(m1, 5); m15 = _aggregate(m1, 15)
+    m5 = _aggregate(m1, 5)
+    m15 = _aggregate(m1, 15)
     points = m1
     # These are reproducible candidate signal records used only to exercise
     # persistence and virtual evaluation.  They are not a claim that the
@@ -98,14 +126,33 @@ def generate_demo(seed: int = 42, *, minutes: int = 720, instrument: str = "DEMO
     for ordinal, idx in enumerate(range(90, minutes - 10, 37)):
         direction = "UP" if ordinal % 2 == 0 else "DOWN"
         detection = points[idx]["end_ts"]
-        signals.append({
-            "signal_id": f"demo-signal-{ordinal:04d}", "episode_id": f"demo-episode-{idx // 37:04d}", "detected_ts": detection,
-            "available_ts": detection, "instrument": instrument, "direction": direction, "status": "VALID_DEMO",
-            "strategy": "trend_pullback_v1", "mode": "SYNTHETIC", "payload": {"synthetic": True, "candidate": True, "source_ordinal": idx},
-        })
+        signals.append(
+            {
+                "signal_id": f"demo-signal-{ordinal:04d}",
+                "episode_id": f"demo-episode-{idx // 37:04d}",
+                "detected_ts": detection,
+                "available_ts": detection,
+                "instrument": instrument,
+                "direction": direction,
+                "status": "VALID_DEMO",
+                "strategy": "trend_pullback_v1",
+                "mode": "SYNTHETIC",
+                "payload": {"synthetic": True, "candidate": True, "source_ordinal": idx},
+            }
+        )
     issues = [
-        {"row": minutes // 3, "code": "DUPLICATE_FIXTURE", "message": "fixture problemático disponible en metadata; no se usa para señales", "synthetic": True},
-        {"row": minutes // 2, "code": "OUT_OF_ORDER_FIXTURE", "message": "fixture problemático disponible en metadata; no se usa para señales", "synthetic": True},
+        {
+            "row": minutes // 3,
+            "code": "DUPLICATE_FIXTURE",
+            "message": "fixture problemático disponible en metadata; no se usa para señales",
+            "synthetic": True,
+        },
+        {
+            "row": minutes // 2,
+            "code": "OUT_OF_ORDER_FIXTURE",
+            "message": "fixture problemático disponible en metadata; no se usa para señales",
+            "synthetic": True,
+        },
     ]
     return DemoDataset(instrument, seed, m1, m5, m15, signals, issues)
 
@@ -161,3 +208,17 @@ def run_demo(
         "results": result.simulations or [],
         "report": result.report or {},
     }
+
+
+__all__ = [
+    "BacktestRunner",
+    "DemoDataset",
+    "EvaluationSpec",
+    "OperationTelemetry",
+    "ReportBuilder",
+    "SQLiteStore",
+    "VariantSpec",
+    "VirtualContractSimulator",
+    "generate_demo",
+    "run_demo",
+]

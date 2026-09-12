@@ -2,17 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import json
 import unittest
+from datetime import UTC, datetime, timedelta
 
-from mtf_lab.core import Candle, DataQuality, IndicatorPoint, Signal
-from mtf_lab.data.models import Bar as ProviderBar, Event as ProviderEvent
+from mtf_lab.core import Signal
+from mtf_lab.data.models import Bar as ProviderBar
+from mtf_lab.data.models import Event as ProviderEvent
 from mtf_lab.runtime import IncrementalProcessor, SimulationConfig
 from mtf_lab.runtime.state import quality_label_is_usable
 
-
-UTC = timezone.utc
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -102,8 +101,12 @@ class RuntimeIncrementalTests(unittest.TestCase):
         original.finalize(BASE + timedelta(minutes=20))
         resumed.finalize(BASE + timedelta(minutes=20))
         self.assertEqual(original.status["candles"], resumed.status["candles"])
-        self.assertEqual([bar.candle_id for bar in original.candles["M5"]], [bar.candle_id for bar in resumed.candles["M5"]])
-        self.assertEqual([signal.signal_id for signal in original.signals], [signal.signal_id for signal in resumed.signals])
+        self.assertEqual(
+            [bar.candle_id for bar in original.candles["M5"]], [bar.candle_id for bar in resumed.candles["M5"]]
+        )
+        self.assertEqual(
+            [signal.signal_id for signal in original.signals], [signal.signal_id for signal in resumed.signals]
+        )
         self.assertEqual(len(resumed._seen_event_ids), resumed.events_processed)
 
     def test_strategy_window_is_bounded_and_indicators_are_not_recomputed(self) -> None:
@@ -150,10 +153,28 @@ class RuntimeIncrementalTests(unittest.TestCase):
 
         bid_processor = IncrementalProcessor(instrument="TEST/USD", price_base="bid")
         bid_processor.process_event(
-            ProviderEvent("TEST/USD", BASE, price=99.0, bid=99.0, ask=100.0, price_basis="bid", source="quotes", source_event_id="bid-0")
+            ProviderEvent(
+                "TEST/USD",
+                BASE,
+                price=99.0,
+                bid=99.0,
+                ask=100.0,
+                price_basis="bid",
+                source="quotes",
+                source_event_id="bid-0",
+            )
         )
         result = bid_processor.process_event(
-            ProviderEvent("TEST/USD", BASE + timedelta(minutes=1), price=98.0, bid=98.0, ask=99.0, price_basis="bid", source="quotes", source_event_id="bid-1")
+            ProviderEvent(
+                "TEST/USD",
+                BASE + timedelta(minutes=1),
+                price=98.0,
+                bid=98.0,
+                ask=99.0,
+                price_basis="bid",
+                source="quotes",
+                source_event_id="bid-1",
+            )
         )
         self.assertTrue(result.accepted)
         self.assertEqual(bid_processor.candles["M1"][0].price_base.value, "bid")

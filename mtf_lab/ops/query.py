@@ -406,9 +406,12 @@ class QueryService:
             return None
         try:
             padded = cursor + "=" * (-len(cursor) % 4)
-            data = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
+            decoded = json.loads(base64.urlsafe_b64decode(padded.encode()).decode())
         except Exception as exc:
             raise ValueError("cursor inválido") from exc
+        if not isinstance(decoded, dict):
+            raise ValueError("cursor inválido")
+        data: dict[str, Any] = decoded
         if (
             data.get("v") != 1
             or data.get("table") != table

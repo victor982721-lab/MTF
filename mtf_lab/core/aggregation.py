@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from .models import Candle, MarketEvent, OperationMode, PriceBase, Timeframe, normalize_utc, parse_timeframe
 from .quality import QualityFlag, QualityIssue, QualityReport, merge_quality, validate_event
 
+_OrderKey = tuple[datetime, datetime, datetime, tuple[int, int | float | str], str]
+
 
 def interval_start(timestamp: datetime, timeframe: Timeframe | str) -> datetime:
     """Devuelve el inicio de ``[inicio, fin)`` anclado a Unix epoch UTC."""
@@ -100,8 +102,10 @@ class CandleAggregator:
         self._closed_through: datetime | None = None
         self._seen_event_ids: set[str] = set()
         self._seen_event_order: deque[str] = deque()
-        self._last_order_key: tuple | None = None
-        self._issues = deque(maxlen=self.max_issues) if self.max_issues is not None else []
+        self._last_order_key: _OrderKey | None = None
+        self._issues: deque[QualityIssue] | list[QualityIssue] = (
+            deque(maxlen=self.max_issues) if self.max_issues is not None else []
+        )
         self._last_event_time: datetime | None = None
 
     @property
@@ -112,7 +116,7 @@ class CandleAggregator:
     def last_event_time(self) -> datetime | None:
         return self._last_event_time
 
-    def _event_order_key(self, event: MarketEvent) -> tuple:
+    def _event_order_key(self, event: MarketEvent) -> _OrderKey:
         received = event.received_at or event.event_time
         available = event.available_at or received
         sequence = event.sequence
@@ -163,7 +167,8 @@ class CandleAggregator:
 
     def _record_event(self, event: MarketEvent) -> None:
         order_key = self._event_order_key(event)
-        event_id = event.event_id or ""
+        event_id = event.event_id
+        assert event_id is not None
         self._seen_event_ids.add(event_id)
         self._seen_event_order.append(event_id)
         if self.max_seen_event_ids is not None:
@@ -320,7 +325,7 @@ class CandleAggregator:
         )
 
 
-def _event_sort_key(event: MarketEvent) -> tuple:
+def _event_sort_key(event: MarketEvent) -> _OrderKey:
     received = event.received_at or event.event_time
     available = event.available_at or received
     sequence = event.sequence
@@ -376,7 +381,8 @@ def aggregate_events(
     seen: set[str] = set()
     duplicates = 0
     for event in valid_events:
-        event_id = event.event_id or ""
+        event_id = event.event_id
+        assert event_id is not None
         if event_id in seen:
             duplicates += 1
             issues.append(

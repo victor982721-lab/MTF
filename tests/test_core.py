@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from mtf_lab.core import (
     Candle,
-    ConditionState,
     DataQuality,
     IndicatorConfig,
     IndicatorPoint,
@@ -19,8 +18,6 @@ from mtf_lab.core import (
     compute_indicators,
 )
 
-
-UTC = timezone.utc
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -28,7 +25,9 @@ def make_candle(index: int, *, price: float | None = None, timeframe: str = "M1"
     seconds = {"M1": 60, "M5": 300, "M15": 900}[timeframe]
     start = BASE + timedelta(seconds=index * seconds)
     value = 100.0 + index if price is None else price
-    return Candle("TEST", timeframe, start, start + timedelta(seconds=seconds), value, value + 1, value - 1, value, 1, 1)
+    return Candle(
+        "TEST", timeframe, start, start + timedelta(seconds=seconds), value, value + 1, value - 1, value, 1, 1
+    )
 
 
 class CoreModelsAndAggregationTests(unittest.TestCase):
@@ -57,7 +56,7 @@ class IndicatorTests(unittest.TestCase):
         closes = [1, 2, 3, 2, 2]
         highs = [2, 3, 4, 3, 3]
         lows = [0, 1, 2, 1, 1]
-        for index, (close, high, low) in enumerate(zip(closes, highs, lows)):
+        for index, (close, high, low) in enumerate(zip(closes, highs, lows, strict=False)):
             start = BASE + timedelta(minutes=index)
             candles.append(Candle("T", "M1", start, start + timedelta(minutes=1), close, high, low, close, 1, 1))
         series = compute_indicators(candles, config)
@@ -78,7 +77,7 @@ class IndicatorTests(unittest.TestCase):
         engine = IncrementalIndicatorEngine(config)
         points = [engine.update(candle) for candle in candles]
         self.assertEqual(len(points), len(batch.points))
-        for expected, actual in zip(batch.points, points):
+        for expected, actual in zip(batch.points, points, strict=False):
             for field in ("ema_fast", "ema_slow", "rsi", "atr"):
                 self.assertEqual(getattr(expected, field), getattr(actual, field))
 
@@ -90,11 +89,33 @@ class IndicatorTests(unittest.TestCase):
         self.assertFalse(series[2].ready)
 
 
-def point(start_minute: int, *, close: float, ema_fast: float, ema_slow: float, rsi: float = 60, atr: float = 10, available: int | None = None) -> IndicatorPoint:
+def point(
+    start_minute: int,
+    *,
+    close: float,
+    ema_fast: float,
+    ema_slow: float,
+    rsi: float = 60,
+    atr: float = 10,
+    available: int | None = None,
+) -> IndicatorPoint:
     start = BASE + timedelta(minutes=start_minute)
     end = start + timedelta(minutes=1)
     available_dt = end if available is None else BASE + timedelta(minutes=available)
-    return IndicatorPoint(start, end, available_dt, close, ema_fast, ema_slow, rsi, atr, True, DataQuality.good(), f"p-{start_minute}", start_minute)
+    return IndicatorPoint(
+        start,
+        end,
+        available_dt,
+        close,
+        ema_fast,
+        ema_slow,
+        rsi,
+        atr,
+        True,
+        DataQuality.good(),
+        f"p-{start_minute}",
+        start_minute,
+    )
 
 
 class StrategyCausalityTests(unittest.TestCase):
@@ -134,7 +155,11 @@ class StrategyCausalityTests(unittest.TestCase):
             point(29, close=101, ema_fast=100, ema_slow=100, rsi=60, available=30),
         ]
         result = TrendPullbackStrategy(self.config).evaluate({"M15": context, "M5": preparation, "M1": trigger})
-        early = next(evaluation for evaluation in result.evaluations if evaluation.stage == "trigger" and evaluation.timestamp.minute == 7)
+        early = next(
+            evaluation
+            for evaluation in result.evaluations
+            if evaluation.stage == "trigger" and evaluation.timestamp.minute == 7
+        )
         self.assertEqual(early.decision.value, "blocked")
         self.assertIn("context_not_available", early.reasons)
         # El punto de 00:30 ya puede usar el cierre de M15 y la preparación.
@@ -147,7 +172,13 @@ class StrategyCausalityTests(unittest.TestCase):
             point(30, close=106, ema_fast=106, ema_slow=101, available=45),
         ]
         preparation = [
-            point(index * 5, close=(105 if index < 5 else 101 if index == 5 else 105), ema_fast=100, ema_slow=100, available=(index + 1) * 5)
+            point(
+                index * 5,
+                close=(105 if index < 5 else 101 if index == 5 else 105),
+                ema_fast=100,
+                ema_slow=100,
+                available=(index + 1) * 5,
+            )
             for index in range(8)
         ]
         # La preparación [25,30) se registra a 30 y TTL=2 M5, así que 00:40
@@ -163,20 +194,51 @@ class StrategyCausalityTests(unittest.TestCase):
         result = TrendPullbackStrategy(self.config).evaluate({"M15": context, "M5": preparation, "M1": trigger})
         self.assertLessEqual(len(result.signals), 2)
         # Al menos un bloqueo explícito por expiración o por episodio ya usado.
-        self.assertTrue(any("preparation_expired" in evaluation.reasons or "signal_duplicate" in evaluation.reasons for evaluation in result.evaluations if evaluation.stage == "trigger"))
+        self.assertTrue(
+            any(
+                "preparation_expired" in evaluation.reasons or "signal_duplicate" in evaluation.reasons
+                for evaluation in result.evaluations
+                if evaluation.stage == "trigger"
+            )
+        )
 
     def test_unknown_mandatory_condition_never_becomes_partial_signal(self) -> None:
-        context = [point(0, close=100, ema_fast=99, ema_slow=100, available=15), point(15, close=105, ema_fast=105, ema_slow=101, available=30)]
-        preparation = [point(index * 5, close=105 if index < 5 else 101, ema_fast=100, ema_slow=100, available=(index + 1) * 5) for index in range(6)]
+        context = [
+            point(0, close=100, ema_fast=99, ema_slow=100, available=15),
+            point(15, close=105, ema_fast=105, ema_slow=101, available=30),
+        ]
+        preparation = [
+            point(index * 5, close=105 if index < 5 else 101, ema_fast=100, ema_slow=100, available=(index + 1) * 5)
+            for index in range(6)
+        ]
         # El cierre/EMA anterior se marca desconocido: el cruce obligatorio no
         # puede ser compensado por RSI/contexto.
         trigger = [
             point(28, close=99, ema_fast=100, ema_slow=100, rsi=40, available=29),
-            IndicatorPoint(BASE + timedelta(minutes=29), BASE + timedelta(minutes=30), BASE + timedelta(minutes=30), 101, None, 100, 60, 10, True, DataQuality.good(), "unknown-trigger", 29),
+            IndicatorPoint(
+                BASE + timedelta(minutes=29),
+                BASE + timedelta(minutes=30),
+                BASE + timedelta(minutes=30),
+                101,
+                None,
+                100,
+                60,
+                10,
+                True,
+                DataQuality.good(),
+                "unknown-trigger",
+                29,
+            ),
         ]
         result = TrendPullbackStrategy(self.config).evaluate({"M15": context, "M5": preparation, "M1": trigger})
         self.assertEqual(result.signals, ())
-        self.assertTrue(any(e.decision.value == "blocked" and "trigger_indicator_not_ready" in e.reasons for e in result.evaluations if e.stage == "trigger"))
+        self.assertTrue(
+            any(
+                e.decision.value == "blocked" and "trigger_indicator_not_ready" in e.reasons
+                for e in result.evaluations
+                if e.stage == "trigger"
+            )
+        )
 
 
 if __name__ == "__main__":

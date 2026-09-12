@@ -12,6 +12,7 @@ from .consumers import (
     SignalConsumerResult,
     consumer_from_checkpoint,
 )
+from .integration import CoordinatorStatus, RuntimeCoordinator, capture_hash, runtime_simulation_config
 from .processor import (
     IncrementalProcessor,
     IncrementalRuntime,
@@ -27,7 +28,6 @@ from .state import (
     to_core_candle,
     to_core_event,
 )
-from .integration import CoordinatorStatus, RuntimeCoordinator, capture_hash, runtime_simulation_config
 
 __all__ = [
     "BinarySimulationConsumer",

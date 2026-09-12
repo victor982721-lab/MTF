@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from mtf_lab.data.ctrader import (
     CTraderConfig,
@@ -14,7 +14,6 @@ from mtf_lab.data.ctrader import (
     QuoteQualityState,
     normalize_spot_event,
 )
-
 
 UTC_BASE = datetime(2026, 1, 1, tzinfo=UTC)
 

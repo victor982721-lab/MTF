@@ -13,7 +13,6 @@ from unittest import mock
 from mtf_lab.ops import cli
 from mtf_lab.ops.ctrader_activation import SecureTokenStore
 
-
 ROOT = Path(__file__).parents[1]
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
 
@@ -56,7 +55,7 @@ class CTraderCLIActivationTests(unittest.TestCase):
             self.assertFalse(output["network_performed"])
             self.assertTrue(output["attempt"]["attempt_id"].startswith("oauth-"))
             self.assertIn("state=", output["authorization_url"])
-            persisted = token_dir / f'.oauth-attempt-{output["attempt"]["attempt_id"]}.json'
+            persisted = token_dir / f".oauth-attempt-{output['attempt']['attempt_id']}.json"
             self.assertTrue(persisted.exists())
             self.assertEqual(persisted.stat().st_mode & 0o777, 0o600)
 
@@ -74,12 +73,8 @@ class CTraderCLIActivationTests(unittest.TestCase):
             )
             real_path = real_token_dir / "ctrader-query-demo.json"
             before = real_path.read_bytes()
-            exchange_code, exchange = run_cli(
-                ["ctrader", "token-exchange", "--config", str(config), "--fixture"]
-            )
-            refresh_code, refresh = run_cli(
-                ["ctrader", "token-refresh", "--config", str(config), "--fixture"]
-            )
+            exchange_code, exchange = run_cli(["ctrader", "token-exchange", "--config", str(config), "--fixture"])
+            refresh_code, refresh = run_cli(["ctrader", "token-refresh", "--config", str(config), "--fixture"])
             self.assertEqual((exchange_code, refresh_code), (0, 0))
             for output in (exchange, refresh):
                 self.assertTrue(output["fixture"])
@@ -200,12 +195,11 @@ class CTraderCLIActivationTests(unittest.TestCase):
                 "CTRADER_CLIENT_ID": "public-fixture-client",
                 "CTRADER_CLIENT_SECRET": "runtime-secret",
             }
-            with mock.patch.dict(os.environ, env, clear=False), mock.patch(
-                "mtf_lab.data.ctrader.CTraderProvider", Provider
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("mtf_lab.data.ctrader.CTraderProvider", Provider),
             ):
-                code, output = run_cli(
-                    ["ctrader", "query", "--config", str(config), "--network"]
-                )
+                code, output = run_cli(["ctrader", "query", "--config", str(config), "--network"])
             self.assertEqual(code, 0)
             self.assertTrue(output["ok"])
             self.assertEqual(
@@ -217,7 +211,6 @@ class CTraderCLIActivationTests(unittest.TestCase):
                 ["connect", "application_auth", "account_discovery", "account_auth", "catalog", "history"],
             )
             self.assertNotIn("runtime-secret", json.dumps(output))
-
 
     def test_query_discovers_accounts_then_stops_for_explicit_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -267,17 +260,18 @@ class CTraderCLIActivationTests(unittest.TestCase):
                 def close(self):
                     calls.append("close")
 
-            with mock.patch.dict(
-                os.environ,
-                {
-                    "CTRADER_CLIENT_ID": "public-fixture-client",
-                    "CTRADER_CLIENT_SECRET": "runtime-secret",
-                },
-                clear=False,
-            ), mock.patch("mtf_lab.data.ctrader.CTraderProvider", Provider):
-                code, output = run_cli(
-                    ["ctrader", "query", "--config", str(config), "--network"]
-                )
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CTRADER_CLIENT_ID": "public-fixture-client",
+                        "CTRADER_CLIENT_SECRET": "runtime-secret",
+                    },
+                    clear=False,
+                ),
+                mock.patch("mtf_lab.data.ctrader.CTraderProvider", Provider),
+            ):
+                code, output = run_cli(["ctrader", "query", "--config", str(config), "--network"])
             self.assertEqual(code, 2)
             self.assertEqual(
                 output["sequence"],

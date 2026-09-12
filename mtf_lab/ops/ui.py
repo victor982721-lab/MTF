@@ -11,15 +11,15 @@ import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from socketserver import BaseServer
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from .persistence import SQLiteStore, canonical_json
 from .query import QueryService
 from .reporting import ReportBuilder
 
-
-INDEX_HTML = r'''<!doctype html>
+INDEX_HTML = r"""<!doctype html>
 <html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>MTF Lab</title><style>
 body{font-family:system-ui,sans-serif;max-width:1280px;margin:1rem auto;padding:0 1rem;color:#182230;background:#fafbfc}
@@ -76,7 +76,7 @@ document.getElementById('sims').innerHTML=table(rows(await get('/api/simulations
 let cfd=await get('/api/cfd-trades?'+qs({limit:1000}));document.getElementById('cfdTrades').innerHTML=table(rows(cfd), [['detected_at','Detectada'],['trade_id','Operación'],['signal_id','Señal'],['direction','Dirección'],['units','Unidades'],['state','Estado'],['economic_state','Estado económico'],['economic_status','Economía'],['close_observed','Cierre observado'],['entry_price','Entrada'],['close_price','Cierre'],['gross_pnl_quote','Bruto'],['net_pnl','Neto'],['reason','Razón'] ]);}
 async function loadMoreCandles(cursor){let p=await get('/api/candles?'+qs({limit:200,cursor}));let old=window._candleItems||[];window._candleItems=old.concat(rows(p));document.getElementById('candlePager').innerHTML=p.next_cursor?'<button id="moreCandles">Cargar más</button>':'<span class="muted">Fin de velas</span>';if(p.next_cursor)document.getElementById('moreCandles').onclick=()=>loadMoreCandles(p.next_cursor);}
 (async()=>{let a=await get('/api/sessions');let list=rows(a);let s=document.getElementById('session');s.innerHTML=list.map(x=>'<option value="'+esc(x.session_id)+'">'+esc(x.session_id.slice(0,12)+' · '+x.mode+' · '+x.instrument)+'</option>').join('');s.onchange=load;document.getElementById('apply').onclick=load;await load();setInterval(()=>load().catch(()=>{}),5000)})().catch(e=>document.body.insertAdjacentHTML('beforeend','<pre class="bad">'+esc(e)+'</pre>'));
-</script></body></html>'''
+</script></body></html>"""
 
 
 def _json_bytes(data: Any) -> bytes:
@@ -94,41 +94,80 @@ def _bool_param(value: str | None) -> bool | None:
 
 
 class _Handler(BaseHTTPRequestHandler):
-    server: "MTFHTTPServer"
+    server: BaseServer
 
-    def log_message(self, fmt: str, *args: Any) -> None:
+    @property
+    def _mtf_server(self) -> MTFHTTPServer:
+        if not isinstance(self.server, MTFHTTPServer):
+            raise RuntimeError("handler is attached to an unexpected server")
+        return self.server
+
+    def log_message(self, format: str, *args: Any) -> None:
         return
 
-    def _send(self, data: Any, *, status: int = HTTPStatus.OK, content_type: str = "application/json; charset=utf-8") -> None:
+    def _send(
+        self, data: Any, *, status: int = HTTPStatus.OK, content_type: str = "application/json; charset=utf-8"
+    ) -> None:
         body = data.encode("utf-8") if isinstance(data, str) else _json_bytes(data)
-        self.send_response(status); self.send_header("Content-Type", content_type); self.send_header("Content-Length", str(len(body))); self.send_header("Cache-Control", "no-store"); self.end_headers(); self.wfile.write(body)
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
 
     def _common(self, query: dict[str, list[str]]) -> dict[str, Any]:
-        def one(name: str, default: Any = None) -> Any: return query.get(name, [default])[0]
+        def one(name: str, default: Any = None) -> Any:
+            return query.get(name, [default])[0]
+
         try:
             requested_limit = int(one("limit", 100))
         except (TypeError, ValueError) as exc:
             raise ValueError("limit debe ser entero") from exc
-        return {"start_ts": one("start_ts", one("start")), "end_ts": one("end_ts", one("end")), "instrument": one("instrument"), "timeframe": one("timeframe"), "limit": max(1, min(1000, requested_limit)), "recent": _bool_param(one("recent", "0")) or False, "cursor": one("cursor"), "revisions": one("revisions", "latest"), "closed": _bool_param(one("closed"))}
+        return {
+            "start_ts": one("start_ts", one("start")),
+            "end_ts": one("end_ts", one("end")),
+            "instrument": one("instrument"),
+            "timeframe": one("timeframe"),
+            "limit": max(1, min(1000, requested_limit)),
+            "recent": _bool_param(one("recent", "0")) or False,
+            "cursor": one("cursor"),
+            "revisions": one("revisions", "latest"),
+            "closed": _bool_param(one("closed")),
+        }
 
     def _cfd_query(self, sid: str, query: dict[str, list[str]], common: dict[str, Any]) -> dict[str, Any]:
         analysis = query.get("analysis_id", query.get("analysis", [None]))[0]
-        return self.server.queries.query_cfd_trades(
-            sid, analysis_id=analysis, variant=query.get("variant", [None])[0],
-            partition=query.get("partition", [None])[0], instrument=query.get("instrument", [None])[0],
-            state=query.get("state", [None])[0], signal_id=query.get("signal_id", [None])[0],
-            start_ts=common["start_ts"], end_ts=common["end_ts"], recent=common["recent"],
-            limit=common["limit"], cursor=common["cursor"],
+        return self._mtf_server.queries.query_cfd_trades(
+            sid,
+            analysis_id=analysis,
+            variant=query.get("variant", [None])[0],
+            partition=query.get("partition", [None])[0],
+            instrument=query.get("instrument", [None])[0],
+            state=query.get("state", [None])[0],
+            signal_id=query.get("signal_id", [None])[0],
+            start_ts=common["start_ts"],
+            end_ts=common["end_ts"],
+            recent=common["recent"],
+            limit=common["limit"],
+            cursor=common["cursor"],
         ).to_dict()
 
     def _simulation_query(self, sid: str, query: dict[str, list[str]], common: dict[str, Any]) -> dict[str, Any]:
         horizon = float(query["horizon_seconds"][0]) if query.get("horizon_seconds") else None
-        return self.server.queries.query_simulations(
-            sid, analysis=query.get("analysis", [None])[0], variant=query.get("variant", [None])[0],
-            partition=query.get("partition", [None])[0], contract=query.get("contract", [None])[0],
-            horizon_seconds=horizon, instrument=query.get("instrument", [None])[0],
-            start_ts=common["start_ts"], end_ts=common["end_ts"], recent=common["recent"],
-            limit=common["limit"], cursor=common["cursor"],
+        return self._mtf_server.queries.query_simulations(
+            sid,
+            analysis=query.get("analysis", [None])[0],
+            variant=query.get("variant", [None])[0],
+            partition=query.get("partition", [None])[0],
+            contract=query.get("contract", [None])[0],
+            horizon_seconds=horizon,
+            instrument=query.get("instrument", [None])[0],
+            start_ts=common["start_ts"],
+            end_ts=common["end_ts"],
+            recent=common["recent"],
+            limit=common["limit"],
+            cursor=common["cursor"],
         ).to_dict()
 
     def _query_kind(self, sid: str, query: dict[str, list[str]], common: dict[str, Any]) -> Any:
@@ -138,49 +177,83 @@ class _Handler(BaseHTTPRequestHandler):
         if kind in {"cfd_trades", "cfd-trades"}:
             return self._cfd_query(sid, query, common)
         if kind in {"capture_envelopes", "capture-envelopes", "captures"}:
-            return self.server.queries.query_capture_envelopes(
-                sid, start_ts=common["start_ts"], end_ts=common["end_ts"],
-                limit=common["limit"], cursor=common["cursor"],
+            return self._mtf_server.queries.query_capture_envelopes(
+                sid,
+                start_ts=common["start_ts"],
+                end_ts=common["end_ts"],
+                limit=common["limit"],
+                cursor=common["cursor"],
             ).to_dict()
         dispatch = {
-            "events": self.server.queries.query_events,
-            "candles": self.server.queries.query_candles,
-            "signals": self.server.queries.query_signals,
-            "decisions": self.server.queries.query_decisions,
-            "discards": self.server.queries.query_discards,
+            "events": self._mtf_server.queries.query_events,
+            "candles": self._mtf_server.queries.query_candles,
+            "signals": self._mtf_server.queries.query_signals,
+            "decisions": self._mtf_server.queries.query_decisions,
+            "discards": self._mtf_server.queries.query_discards,
         }
         if kind not in dispatch:
-            raise ValueError("kind debe ser events/candles/signals/decisions/discards/simulations/cfd_trades/capture_envelopes")
+            raise ValueError(
+                "kind debe ser events/candles/signals/decisions/discards/simulations/cfd_trades/capture_envelopes"
+            )
         return dispatch[kind](sid, **common).to_dict()
 
     def _read_api(self, path: str, sid: str, query: dict[str, list[str]], common: dict[str, Any]) -> Any:
         if path == "/api/status":
-            data = self.server.queries.snapshot(sid)
-            data["mode_label"] = {"SYNTHETIC": "SINTETICO", "LIVE": "OBSERVACIÓN EN DIRECTO", "REPLAY": "REPLAY", "BACKTEST": "BACKTEST"}.get(str(data.get("mode", "")).upper(), data.get("mode", "UNKNOWN"))
+            data = self._mtf_server.queries.snapshot(sid)
+            data["mode_label"] = {
+                "SYNTHETIC": "SINTETICO",
+                "LIVE": "OBSERVACIÓN EN DIRECTO",
+                "REPLAY": "REPLAY",
+                "BACKTEST": "BACKTEST",
+            }.get(str(data.get("mode", "")).upper(), data.get("mode", "UNKNOWN"))
             return data
         simple = {
-            "/api/candles": lambda: self.server.queries.query_candles(sid, **common).to_dict(),
-            "/api/indicators": lambda: self.server.queries.query_indicators(sid, **common).to_dict(),
-            "/api/revisions": lambda: self.server.queries.query_revisions(sid, **common).to_dict(),
-            "/api/events": lambda: self.server.queries.query_events(sid, **common).to_dict(),
-            "/api/signals": lambda: self.server.queries.query_signals(sid, **common).to_dict(),
-            "/api/decisions": lambda: self.server.queries.query_decisions(sid, **common).to_dict(),
-            "/api/discards": lambda: self.server.queries.query_discards(sid, **common).to_dict(),
-            "/api/poll": lambda: self.server.queries.poll(sid, limit=common["limit"]),
-            "/api/report": lambda: ReportBuilder(self.server.store, sid).summary(),
+            "/api/candles": lambda: self._mtf_server.queries.query_candles(sid, **common).to_dict(),
+            "/api/indicators": lambda: self._mtf_server.queries.query_indicators(sid, **common).to_dict(),
+            "/api/revisions": lambda: self._mtf_server.queries.query_revisions(sid, **common).to_dict(),
+            "/api/events": lambda: self._mtf_server.queries.query_events(sid, **common).to_dict(),
+            "/api/signals": lambda: self._mtf_server.queries.query_signals(sid, **common).to_dict(),
+            "/api/decisions": lambda: self._mtf_server.queries.query_decisions(sid, **common).to_dict(),
+            "/api/discards": lambda: self._mtf_server.queries.query_discards(sid, **common).to_dict(),
+            "/api/poll": lambda: self._mtf_server.queries.poll(sid, limit=common["limit"]),
+            "/api/report": lambda: ReportBuilder(self._mtf_server.store, sid).summary(),
         }
         if path in simple:
             return simple[path]()
         if path == "/api/conditions":
-            return self.server.queries.query_conditions(sid, start_ts=common["start_ts"], end_ts=common["end_ts"], recent=common["recent"], limit=common["limit"], cursor=common["cursor"]).to_dict()
+            return self._mtf_server.queries.query_conditions(
+                sid,
+                start_ts=common["start_ts"],
+                end_ts=common["end_ts"],
+                recent=common["recent"],
+                limit=common["limit"],
+                cursor=common["cursor"],
+            ).to_dict()
         if path == "/api/gaps":
-            return {"items": self.server.queries.query_gaps(sid, timeframe=common["timeframe"], instrument=common["instrument"], start_ts=common["start_ts"], end_ts=common["end_ts"], revisions=common["revisions"], include_open=common["closed"] is not True), "limit": common["limit"]}
+            return {
+                "items": self._mtf_server.queries.query_gaps(
+                    sid,
+                    timeframe=common["timeframe"],
+                    instrument=common["instrument"],
+                    start_ts=common["start_ts"],
+                    end_ts=common["end_ts"],
+                    revisions=common["revisions"],
+                    include_open=common["closed"] is not True,
+                ),
+                "limit": common["limit"],
+            }
         if path == "/api/simulations":
             return self._simulation_query(sid, query, common)
         if path in {"/api/cfd-trades", "/api/cfd_trades"}:
             return self._cfd_query(sid, query, common)
         if path in {"/api/captures", "/api/capture-envelopes", "/api/capture_envelopes"}:
-            return self.server.queries.query_capture_envelopes(sid, start_ts=common["start_ts"], end_ts=common["end_ts"], limit=common["limit"], cursor=common["cursor"]).to_dict()
+            return self._mtf_server.queries.query_capture_envelopes(
+                sid,
+                start_ts=common["start_ts"],
+                end_ts=common["end_ts"],
+                limit=common["limit"],
+                cursor=common["cursor"],
+            ).to_dict()
         if path == "/api/query":
             return self._query_kind(sid, query, common)
         raise LookupError("not found")
@@ -190,7 +263,7 @@ class _Handler(BaseHTTPRequestHandler):
             session_limit = max(1, min(100, int(query.get("limit", [50])[0])))
         except (TypeError, ValueError):
             session_limit = 50
-        return self.server.store.sessions(limit=session_limit)
+        return self._mtf_server.store.sessions(limit=session_limit)
 
     def _handle_api(self, path: str, sid: str, query: dict[str, list[str]]) -> None:
         try:
@@ -219,12 +292,11 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/sessions":
             self._send(self._session_list(query))
             return
-        sid = query.get("session", [self.server.default_session])[0]
+        sid = query.get("session", [self._mtf_server.default_session])[0]
         if not sid:
             self._send({"error": "session query parameter is required"}, status=HTTPStatus.BAD_REQUEST)
             return
         self._handle_api(parsed.path, sid, query)
-
 
 
 class MTFHTTPServer(ThreadingHTTPServer):
@@ -232,23 +304,41 @@ class MTFHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, address: tuple[str, int], store: SQLiteStore, *, default_session: str | None = None):
-        super().__init__(address, _Handler); self.store = store; self.queries = QueryService(store); self.default_session = default_session
+        super().__init__(address, _Handler)
+        self.store = store
+        self.queries = QueryService(store)
+        self.default_session = default_session
 
 
-def create_server(db_path: str | Path, *, host: str = "127.0.0.1", port: int = 8765, session_id: str | None = None) -> MTFHTTPServer:
+def create_server(
+    db_path: str | Path, *, host: str = "127.0.0.1", port: int = 8765, session_id: str | None = None
+) -> MTFHTTPServer:
     store = SQLiteStore(db_path, read_only=True)
     if session_id is None:
-        sessions = store.sessions(limit=1); session_id = sessions[0]["session_id"] if sessions else None
+        sessions = store.sessions(limit=1)
+        session_id = sessions[0]["session_id"] if sessions else None
     return MTFHTTPServer((host, int(port)), store, default_session=session_id)
 
 
-def serve(db_path: str | Path, *, host: str = "127.0.0.1", port: int = 8765, session_id: str | None = None, duration: float | None = None) -> MTFHTTPServer:
+def serve(
+    db_path: str | Path,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    session_id: str | None = None,
+    duration: float | None = None,
+) -> MTFHTTPServer:
     """Serve local read-only UI; optional duration makes smoke tests finite."""
     server = create_server(db_path, host=host, port=port, session_id=session_id)
     if duration is not None:
-        timer = threading.Timer(max(0.0, float(duration)), server.shutdown); timer.daemon = True; timer.start()
-    try: server.serve_forever(poll_interval=0.2)
-    finally: server.server_close(); server.store.close()
+        timer = threading.Timer(max(0.0, float(duration)), server.shutdown)
+        timer.daemon = True
+        timer.start()
+    try:
+        server.serve_forever(poll_interval=0.2)
+    finally:
+        server.server_close()
+        server.store.close()
     return server
 
 

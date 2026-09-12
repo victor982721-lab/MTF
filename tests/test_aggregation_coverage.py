@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
 import unittest
+from datetime import UTC, datetime, timedelta
 
 from mtf_lab.core import CandleAggregator, MarketEvent, QualityFlag, aggregate_events
 
-
-UTC = timezone.utc
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 def event(seconds: int, *, received_seconds: int | None = None, available_seconds: int | None = None) -> MarketEvent:
     timestamp = BASE + timedelta(seconds=seconds)
     received = BASE + timedelta(seconds=received_seconds if received_seconds is not None else seconds)
-    available = BASE + timedelta(seconds=available_seconds if available_seconds is not None else (received_seconds if received_seconds is not None else seconds))
+    available = BASE + timedelta(
+        seconds=available_seconds
+        if available_seconds is not None
+        else (received_seconds if received_seconds is not None else seconds)
+    )
     return MarketEvent(
         instrument="TEST/USD",
         event_time=timestamp,
@@ -70,7 +72,9 @@ class AggregationCoverageTests(unittest.TestCase):
         self.assertIn("partial_bucket", {issue.code for issue in result.issues})
         final = aggregator.flush()
         self.assertEqual([candle.start for candle in final.candles], [BASE + timedelta(minutes=10)])
-        self.assertEqual(len([candle for candle in result.candles + final.candles if candle.start == BASE + timedelta(minutes=5)]), 0)
+        self.assertEqual(
+            len([candle for candle in result.candles + final.candles if candle.start == BASE + timedelta(minutes=5)]), 0
+        )
 
     def test_late_boundary_event_does_not_move_availability_back_to_interval_end(self) -> None:
         aggregator = CandleAggregator("M5", instrument="TEST/USD")

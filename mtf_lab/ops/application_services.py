@@ -5,6 +5,7 @@ Services in this module compose the existing domain/runtime/adapters once and
 return serialisable command results.  They deliberately do not import the
 optional cTrader SDK at module import time.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -14,11 +15,11 @@ import json
 import os
 import sys
 import urllib.request
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, cast
 
 from .. import __version__
 from ..configuration import (
@@ -29,12 +30,13 @@ from ..configuration import (
     normalize_simulation_mapping,
     packaged_config_path,
 )
-from ..core import assess_freshness, compute_indicators
+from ..core import assess_freshness, compute_indicators, parse_timeframe
 from ..core.canonical import canonical_json
-from ..pipeline import m1_reference_signals
+from ..core.reference import m1_reference_signals
 from ..runtime import RuntimeCoordinator, capture_hash
 from ..runtime.state import to_core_candle
 from .backtest import BacktestRunner, VariantSpec
+from .ctrader_capture import CTraderCapture
 from .demo import run_demo
 from .importer import ColumnMapping, LocalImporter
 from .logging_state import OperationTelemetry
@@ -55,11 +57,11 @@ class CommandResult:
     stderr: bool = False
 
     @classmethod
-    def json(cls, payload: Any, *, code: int = 0, stderr: bool = False) -> "CommandResult":
+    def json(cls, payload: Any, *, code: int = 0, stderr: bool = False) -> CommandResult:
         return cls(code=code, payload=payload, stderr=stderr)
 
     @classmethod
-    def plain(cls, text: str, *, code: int = 0, stderr: bool = False) -> "CommandResult":
+    def plain(cls, text: str, *, code: int = 0, stderr: bool = False) -> CommandResult:
         return cls(code=code, text=text, stderr=stderr)
 
     def rendered(self) -> str:
@@ -120,6 +122,14 @@ def _canonical_base(value: Any) -> str:
     return "traded" if text in {"trade", "traded", "close"} else text
 
 
+def _timeframe_name(value: Any) -> str:
+    return parse_timeframe(value).name
+
+
+def _int_or_default(value: Any, default: int) -> int:
+    return default if value is None else int(value)
+
+
 def _override_config(
     config: EffectiveConfig,
     *,
@@ -178,7 +188,7 @@ def _sim_spec(config: EffectiveConfig | Mapping[str, Any] | None = None) -> Eval
 
 def _importer_identity(args: argparse.Namespace, config: EffectiveConfig | None) -> tuple[str, str, str]:
     instrument = getattr(args, "instrument", None) or (config.instrument if config else "UNKNOWN")
-    timeframe = getattr(args, "timeframe", None) or (config.timeframes[0].name if config else "M1")
+    timeframe = getattr(args, "timeframe", None) or (_timeframe_name(config.timeframes[0]) if config else "M1")
     base = getattr(args, "price_base", None) or (config.price_base if config else "close")
     return str(instrument), str(timeframe), "trade" if _canonical_base(base) == "traded" else str(base)
 
@@ -300,10 +310,15 @@ def _stored_records(store: SQLiteStore, session_id: str) -> list[dict[str, Any]]
         records.append(data)
     for row in store.list_candles(session_id):
         data = _stored_payload(row)
-        provenance = data.get("provenance") if isinstance(data.get("provenance"), Mapping) else {}
+        raw_provenance = data.get("provenance")
+        provenance: Mapping[str, Any] = raw_provenance if isinstance(raw_provenance, Mapping) else {}
         origin = str(data.get("origin", provenance.get("origin", "native"))).lower()
         source = str(row.get("source", data.get("source", ""))).lower()
-        if origin in {"aggregated", "derived", "resampled_ohlc", "runtime_aggregate"} or "aggregated" in source or "resampled" in source:
+        if (
+            origin in {"aggregated", "derived", "resampled_ohlc", "runtime_aggregate"}
+            or "aggregated" in source
+            or "resampled" in source
+        ):
             continue
         data.update(
             {
@@ -431,17 +446,17 @@ def _persist_reference(
     store: SQLiteStore,
     session_id: str,
     config: EffectiveConfig,
-    candles: list[Mapping[str, Any]],
+    candles: Sequence[Mapping[str, Any]],
     *,
     dataset_hash: str,
     partition: str = "all",
     mode: str = "REPLAY",
     identity_extra: Mapping[str, Any] | None = None,
-) -> tuple[list[dict[str, Any]], str]:
+) -> tuple[list[Mapping[str, Any]], str]:
     core_rows = [
         _core_candle(row, mode=mode)
         for row in _latest_candles(candles)
-        if str(row.get("timeframe", "")).upper() == config.strategy.trigger_timeframe.name
+        if str(row.get("timeframe", "")).upper() == _timeframe_name(config.strategy.trigger_timeframe)
     ]
     analysis_metadata = {"strategy": "m1_trigger_reference", "coverage": len(core_rows)}
     analysis_id = _analysis_for(
@@ -457,12 +472,15 @@ def _persist_reference(
     if not core_rows:
         return [], analysis_id
     series = compute_indicators(core_rows, config.indicators)
-    refs = m1_reference_signals(
-        series,
-        rsi_threshold=config.strategy.rsi_threshold,
-        mode=mode,
-        identity_salt=config.config_hash,
-    )
+    refs: list[Mapping[str, Any]] = [
+        dict(signal)
+        for signal in m1_reference_signals(
+            series,
+            rsi_threshold=config.strategy.rsi_threshold,
+            mode=mode,
+            identity_salt=config.config_hash,
+        )
+    ]
     for ordinal, signal in enumerate(refs):
         store.save_signal(
             session_id,
@@ -498,10 +516,14 @@ class DoctorService:
     def _config_line(args: argparse.Namespace) -> tuple[list[str], EffectiveConfig | None, list[str]]:
         try:
             config = _config_for(args)
-            return [
-                f"configuración: OK hash={config.config_hash}",
-                json.dumps({"effective_config": config.to_dict()}, ensure_ascii=False, sort_keys=True, default=str),
-            ], config, []
+            return (
+                [
+                    f"configuración: OK hash={config.config_hash}",
+                    json.dumps({"effective_config": config.to_dict()}, ensure_ascii=False, sort_keys=True, default=str),
+                ],
+                config,
+                [],
+            )
         except Exception as exc:
             return [f"configuración: ERROR {type(exc).__name__}: {exc}"], None, [f"configuración: {exc}"]
 
@@ -519,11 +541,15 @@ class DoctorService:
         if not getattr(args, "connectivity", False):
             return "conectividad: omitida (use --connectivity explícitamente)", []
         try:
-            with urllib.request.urlopen("https://api.kraken.com/0/public/Time", timeout=float(args.timeout)) as response:
+            with urllib.request.urlopen(
+                "https://api.kraken.com/0/public/Time", timeout=float(args.timeout)
+            ) as response:
                 body = response.read(4096).decode("utf-8", "replace")
             return f"conectividad Kraken REST: OK ({response.status}) cuerpo={body[:160]}", []
         except Exception as exc:
-            return f"conectividad Kraken REST: ERROR {type(exc).__name__}: {exc}", ["conectividad opcional no disponible"]
+            return f"conectividad Kraken REST: ERROR {type(exc).__name__}: {exc}", [
+                "conectividad opcional no disponible"
+            ]
 
     def run(self, args: argparse.Namespace) -> CommandResult:
         lines = [
@@ -532,12 +558,16 @@ class DoctorService:
             f"sqlite: {__import__('sqlite3').sqlite_version}",
             f"proyecto: {PROJECT_ROOT}",
         ]
-        required = {"tomllib": "stdlib", "sqlite3": "stdlib", "mtf_lab.core": "núcleo", "mtf_lab.data": "datos", "mtf_lab.ops": "operaciones"}
+        required = {
+            "tomllib": "stdlib",
+            "sqlite3": "stdlib",
+            "mtf_lab.core": "núcleo",
+            "mtf_lab.data": "datos",
+            "mtf_lab.ops": "operaciones",
+        }
         optional = {"websockets": "Kraken WebSocket", "requests": "HTTP opcional", "rich": "salida enriquecida"}
         module_lines, errors = self._module_lines(required, optional)
         lines.extend(module_lines)
-        if sys.version_info < (3, 11):
-            errors.append("Python >= 3.11 requerido")
         config_lines, config, config_errors = self._config_line(args)
         lines.extend(config_lines)
         errors.extend(config_errors)
@@ -582,7 +612,7 @@ class DemoService:
             minutes=int(args.minutes),
             report_path=args.report,
             log_path=_log_for(args, db, config),
-            config=config,
+            config=config.to_dict(),
         )
         keys = ("session_id", "db_path", "report_path", "log_path", "dataset", "results")
         return CommandResult.json({"ok": True, **{key: result[key] for key in keys}})
@@ -634,7 +664,9 @@ class ReplayService:
         return CommandResult.json(payload)
 
     @staticmethod
-    def _persisted_input(args: argparse.Namespace, config: EffectiveConfig, db: Path) -> tuple[list[Any], dict[str, Any], str, EffectiveConfig, str | None, str]:
+    def _persisted_input(
+        args: argparse.Namespace, config: EffectiveConfig, db: Path
+    ) -> tuple[list[Any], dict[str, Any], str, EffectiveConfig, str | None, str]:
         imported = _build_importer(args, config).read(args.input, fmt=args.format)
         config = _override_config(config, instrument=imported.instrument, price_base=imported.price_base, mode="REPLAY")
         sid, result = _persist_import(
@@ -649,7 +681,9 @@ class ReplayService:
         return records, result, sid, config, None, "REPLAY"
 
     @staticmethod
-    def _session_input(args: argparse.Namespace, config: EffectiveConfig, db: Path) -> tuple[list[dict[str, Any]], dict[str, Any], str, EffectiveConfig, str | None, str]:
+    def _session_input(
+        args: argparse.Namespace, config: EffectiveConfig, db: Path
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], str, EffectiveConfig, str | None, str]:
         with SQLiteStore(db) as store:
             sessions = store.sessions(limit=100)
             if not sessions:
@@ -659,7 +693,8 @@ class ReplayService:
             if session is None:
                 raise ConfigError(f"Sesión no encontrada: {sid}")
             records = _stored_records(store, sid)
-            stored_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
+            raw_stored_config = session.get("config")
+            stored_config: Mapping[str, Any] = raw_stored_config if isinstance(raw_stored_config, Mapping) else {}
             hint = str(stored_config.get("capture_hash")) if stored_config.get("capture_hash") else None
             capture_base = next((record.get("price_base") for record in records if record.get("price_base")), None)
             replay_mode = str(session.get("mode", "REPLAY")).upper()
@@ -673,11 +708,12 @@ class ReplayService:
             return records, result, sid, config, hint, replay_mode
 
     @staticmethod
-    def _capture(args: argparse.Namespace, config: EffectiveConfig, db: Path) -> tuple[list[Any], dict[str, Any], str, EffectiveConfig, str | None, str]:
+    def _capture(
+        args: argparse.Namespace, config: EffectiveConfig, db: Path
+    ) -> tuple[list[Any], dict[str, Any], str, EffectiveConfig, str | None, str]:
         if getattr(args, "input", None):
             return ReplayService._persisted_input(args, config, db)
         return ReplayService._session_input(args, config, db)
-
 
 
 class BacktestService:
@@ -738,7 +774,9 @@ class BacktestService:
         return CommandResult.json(payload)
 
     @staticmethod
-    def _load(store: SQLiteStore, args: argparse.Namespace, config: EffectiveConfig) -> tuple[str, EffectiveConfig, list[dict[str, Any]], list[dict[str, Any]], str, str, Mapping[str, Any]]:
+    def _load(
+        store: SQLiteStore, args: argparse.Namespace, config: EffectiveConfig
+    ) -> tuple[str, EffectiveConfig, list[dict[str, Any]], list[dict[str, Any]], str, str, Mapping[str, Any]]:
         sessions = store.sessions(limit=100)
         sid = args.session or (sessions[0]["session_id"] if sessions else None)
         if not sid:
@@ -747,13 +785,20 @@ class BacktestService:
         config = _override_config(config, instrument=str(session.get("instrument") or config.instrument))
         candle_rows = _latest_candles(store.list_candles(sid, closed_only=False))
         records = _stored_records(store, sid)
-        session_config = session.get("config") if isinstance(session.get("config"), Mapping) else {}
-        dataset_hash = str(session_config.get("capture_hash")) if session_config.get("capture_hash") else _capture_hash(records or candle_rows)
+        raw_stored_config = session.get("config")
+        session_config: Mapping[str, Any] = raw_stored_config if isinstance(raw_stored_config, Mapping) else {}
+        dataset_hash = (
+            str(session_config.get("capture_hash"))
+            if session_config.get("capture_hash")
+            else _capture_hash(records or candle_rows)
+        )
         mode = str(session.get("mode", "REPLAY"))
         return sid, _override_config(config, mode=mode), candle_rows, records, dataset_hash, mode, session_config
 
     @staticmethod
-    def _lineaged_primary(stored: list[Mapping[str, Any]], config: EffectiveConfig, session_config: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    def _lineaged_primary(
+        stored: Sequence[Mapping[str, Any]], config: EffectiveConfig, session_config: Mapping[str, Any]
+    ) -> list[Mapping[str, Any]]:
         primary = [row for row in stored if _signal_variant(row) in {"", "trend_pullback_v1", "MULTITIMEFRAME"}]
         lineaged = [row for row in primary if row.get("analysis_config_hash")]
         if not lineaged:
@@ -789,7 +834,8 @@ class BacktestService:
             identity_extra={"boundary": args.boundary or ""},
         )
         runtime.replay(records, sort=True, bootstrap=False, complete=True)
-        return [signal.as_dict() for signal in runtime.processor.signals], runtime.analysis_id
+        signals: list[Mapping[str, Any]] = [dict(signal.as_dict()) for signal in runtime.processor.signals]
+        return signals, runtime.analysis_id
 
     @staticmethod
     def _primary_signals(
@@ -817,12 +863,13 @@ class BacktestService:
         )
         return primary, analysis_id
 
-
     @staticmethod
-    def _points(candle_rows: list[Mapping[str, Any]], args: argparse.Namespace, config: EffectiveConfig, mode: str) -> list[Any]:
+    def _points(
+        candle_rows: Sequence[Mapping[str, Any]], args: argparse.Namespace, config: EffectiveConfig, mode: str
+    ) -> list[Any]:
         from ..pipeline import points_from_candles
 
-        point_tf = str(args.timeframe or config.strategy.trigger_timeframe.name).upper()
+        point_tf = str(args.timeframe or _timeframe_name(config.strategy.trigger_timeframe)).upper()
         core_m1 = [
             _core_candle(row, mode=mode)
             for row in candle_rows
@@ -848,11 +895,18 @@ class BacktestService:
         baseline = runner.run(
             refs,
             points,
-            variants=[VariantSpec("m1_trigger_reference", "Referencia sólo M1", {"context": False, "preparation": False}, mode="M1_REFERENCE")],
+            variants=[
+                VariantSpec(
+                    "m1_trigger_reference",
+                    "Referencia sólo M1",
+                    {"context": False, "preparation": False},
+                    mode="M1_REFERENCE",
+                )
+            ],
             boundary=args.boundary,
             partition=args.partition,
             data_quality=mode,
-            resolution=str(args.timeframe or config.strategy.trigger_timeframe.name).upper(),
+            resolution=str(args.timeframe or _timeframe_name(config.strategy.trigger_timeframe)).upper(),
             analysis_id=reference_id,
             analysis_name="m1_trigger_reference",
             analysis_config_hash=config.config_hash,
@@ -861,11 +915,18 @@ class BacktestService:
         mtf = runner.run(
             primary,
             points,
-            variants=[VariantSpec("trend_pullback_v1", "Contexto M15 + preparación M5 + disparador M1", {"context": True, "preparation": True}, mode="MULTITIMEFRAME")],
+            variants=[
+                VariantSpec(
+                    "trend_pullback_v1",
+                    "Contexto M15 + preparación M5 + disparador M1",
+                    {"context": True, "preparation": True},
+                    mode="MULTITIMEFRAME",
+                )
+            ],
             boundary=args.boundary,
             partition=args.partition,
             data_quality=mode,
-            resolution=str(args.timeframe or config.strategy.trigger_timeframe.name).upper(),
+            resolution=str(args.timeframe or _timeframe_name(config.strategy.trigger_timeframe)).upper(),
             analysis_id=primary_analysis,
             analysis_name="trend_pullback_v1",
             analysis_config_hash=config.config_hash,
@@ -936,8 +997,12 @@ def _kraken_bar_row(bar: Any, provenance: Any) -> dict[str, Any]:
     }
 
 
-def _freshness_state(config: EffectiveConfig, coordinator: RuntimeCoordinator, last_received_at: datetime | None) -> tuple[str, list[str], Any]:
-    closed_ends = [candle.end for values in coordinator.processor.candles.values() for candle in values if candle.closed]
+def _freshness_state(
+    config: EffectiveConfig, coordinator: RuntimeCoordinator, last_received_at: datetime | None
+) -> tuple[str, list[str], Any]:
+    closed_ends = [
+        candle.end for values in coordinator.processor.candles.values() for candle in values if candle.closed
+    ]
     last_closed_end = max(closed_ends, default=None)
     assessment = assess_freshness(
         now=datetime.now(UTC),
@@ -1033,7 +1098,14 @@ class WatchService:
     @staticmethod
     def _adapter_kwargs(config: EffectiveConfig) -> dict[str, Any]:
         provider_cfg = dict(config.provider)
-        return {key: value for key, value in {"rest_endpoint": provider_cfg.get("rest_url"), "websocket_endpoint": provider_cfg.get("websocket_url")}.items() if value}
+        return {
+            key: value
+            for key, value in {
+                "rest_endpoint": provider_cfg.get("rest_url"),
+                "websocket_endpoint": provider_cfg.get("websocket_url"),
+            }.items()
+            if value
+        }
 
     @staticmethod
     def _call_adapter(factory: Any, instrument: str, kwargs: Mapping[str, Any]) -> Any:
@@ -1049,10 +1121,14 @@ class WatchService:
         factory = getattr(module, "KrakenAdapter", None) or getattr(module, "KrakenPublicAdapter", None)
         if factory is None:
             raise RuntimeError("el adaptador Kraken no expone KrakenAdapter/KrakenPublicAdapter")
-        return WatchService._call_adapter(factory, str(args.instrument or config.instrument), WatchService._adapter_kwargs(config))
+        return WatchService._call_adapter(
+            factory, str(args.instrument or config.instrument), WatchService._adapter_kwargs(config)
+        )
 
     @staticmethod
-    def _context(args: argparse.Namespace, config: EffectiveConfig, db: Path, adapter: Any, store: SQLiteStore) -> WatchContext:
+    def _context(
+        args: argparse.Namespace, config: EffectiveConfig, db: Path, adapter: Any, store: SQLiteStore
+    ) -> WatchContext:
         instrument = str(args.instrument or config.instrument)
         if args.session and not args.instrument:
             existing = store.get_session(args.session)
@@ -1067,15 +1143,25 @@ class WatchService:
             if str(session.get("mode", "")).upper() != "LIVE":
                 raise ConfigError("La sesión de reanudación no es LIVE; no se reutiliza.")
             if str(session.get("instrument", "")).upper() != instrument.upper():
-                raise ConfigError(f"Instrumento incompatible con la sesión: {session.get('instrument')} != {instrument}")
+                raise ConfigError(
+                    f"Instrumento incompatible con la sesión: {session.get('instrument')} != {instrument}"
+                )
         else:
             session_id = store.create_session(
                 mode="LIVE",
                 provider="kraken-public-rest+websocket-v2",
                 instrument=instrument,
                 code_version=__version__,
-                config={**config.to_dict(), "watch": {"checkpoint_every": args.checkpoint_every, "max_candles": args.max_candles}},
-                metadata={"public_only": True, "synthetic": False, "ws_endpoint": getattr(adapter, "websocket_endpoint", None), "rest_endpoint": getattr(adapter, "rest_endpoint", None)},
+                config={
+                    **config.to_dict(),
+                    "watch": {"checkpoint_every": args.checkpoint_every, "max_candles": args.max_candles},
+                },
+                metadata={
+                    "public_only": True,
+                    "synthetic": False,
+                    "ws_endpoint": getattr(adapter, "websocket_endpoint", None),
+                    "rest_endpoint": getattr(adapter, "rest_endpoint", None),
+                },
             )
         coordinator = RuntimeCoordinator(
             store,
@@ -1093,10 +1179,20 @@ class WatchService:
         )
         log_path = _log_for(args, db, config)
         telemetry = OperationTelemetry(log_path=log_path, mode="LIVE", session_id=session_id, instrument=instrument)
-        telemetry.state.update(connection="CONNECTING", data_quality="PUBLIC_PROVIDER", continuity="UNKNOWN", warmup_pending=coordinator.processor.status["warmup_pending"], reconciliation="PENDING")
+        telemetry.state.update(
+            connection="CONNECTING",
+            data_quality="PUBLIC_PROVIDER",
+            continuity="UNKNOWN",
+            warmup_pending=coordinator.processor.status["warmup_pending"],
+            reconciliation="PENDING",
+        )
         intervals = _watch_intervals(config)
-        telemetry.event("watch_started", provider="kraken-public-rest+websocket-v2", intervals=list(intervals), resume=args.resume)
-        return WatchContext(args, config, db, log_path, adapter, store, session_id, coordinator, telemetry, intervals, {}, [])
+        telemetry.event(
+            "watch_started", provider="kraken-public-rest+websocket-v2", intervals=list(intervals), resume=args.resume
+        )
+        return WatchContext(
+            args, config, db, log_path, adapter, store, session_id, coordinator, telemetry, intervals, {}, []
+        )
 
     def _fetch_bootstrap(self, ctx: WatchContext) -> dict[int, Any]:
         fetched_by_interval: dict[int, Any] = {}
@@ -1110,7 +1206,16 @@ class WatchService:
                 continue
             fetched_by_interval[interval] = fetched
             ctx.rest_counts[f"M{interval}"] = len(fetched.bars)
-            ctx.telemetry.state.merge_nested("coverage", {f"M{interval}": {"closed": len(fetched.bars), "open": int(fetched.open_bar is not None), "last": str(fetched.last_timestamp) if fetched.last_timestamp else None}})
+            ctx.telemetry.state.merge_nested(
+                "coverage",
+                {
+                    f"M{interval}": {
+                        "closed": len(fetched.bars),
+                        "open": int(fetched.open_bar is not None),
+                        "last": str(fetched.last_timestamp) if fetched.last_timestamp else None,
+                    }
+                },
+            )
         return fetched_by_interval
 
     def _feed_bootstrap(self, ctx: WatchContext, fetched_by_interval: Mapping[int, Any]) -> None:
@@ -1121,12 +1226,22 @@ class WatchService:
                 self._record_received(ctx, getattr(bar, "received_at", None) or getattr(bar, "available_at", None))
                 ctx.rest_records += 1
             if fetched.open_bar is not None:
-                _save_open_bar(ctx.store, ctx.session_id, _kraken_bar_row(fetched.open_bar, fetched.provenance), ordinal=interval * 1_000_000)
+                _save_open_bar(
+                    ctx.store,
+                    ctx.session_id,
+                    _kraken_bar_row(fetched.open_bar, fetched.provenance),
+                    ordinal=interval * 1_000_000,
+                )
 
     @staticmethod
     def _bootstrap_complete(ctx: WatchContext, warmup: Mapping[str, Any]) -> bool:
-        required = {ctx.config.strategy.context_timeframe.name, ctx.config.strategy.preparation_timeframe.name, ctx.config.strategy.trigger_timeframe.name}
-        return not ctx.rest_errors and all(warmup.get(tf.name, 1) == 0 for tf in ctx.config.timeframes if tf.name in required)
+        required = {
+            _timeframe_name(ctx.config.strategy.context_timeframe),
+            _timeframe_name(ctx.config.strategy.preparation_timeframe),
+            _timeframe_name(ctx.config.strategy.trigger_timeframe),
+        }
+        configured = (_timeframe_name(tf) for tf in ctx.config.timeframes)
+        return not ctx.rest_errors and all(warmup.get(tf, 1) == 0 for tf in configured if tf in required)
 
     def _bootstrap(self, ctx: WatchContext) -> None:
         self._feed_bootstrap(ctx, self._fetch_bootstrap(ctx))
@@ -1134,9 +1249,26 @@ class WatchService:
         bootstrap_ok = self._bootstrap_complete(ctx, warmup)
         label, blocked, freshness = _freshness_state(ctx.config, ctx.coordinator, ctx.last_received_at)
         reasons = () if bootstrap_ok else ("bootstrap_incomplete",)
-        ctx.coordinator.update_feed_state(connection="CONNECTED", reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED", freshness=label, continuity="CONTINUOUS" if bootstrap_ok else "UNVERIFIED", blocked_reasons=tuple(dict.fromkeys((*reasons, *blocked))))
-        ctx.telemetry.state.update(connection="CONNECTED", warmup_pending=warmup, reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED", continuity="CONTINUOUS" if bootstrap_ok else "UNKNOWN", data_quality=label, rest_records=ctx.rest_records, feed_age_seconds=freshness.feed_age_seconds, closed_candle_age_seconds=freshness.closed_candle_age_seconds)
-        ctx.telemetry.event("bootstrap_complete", rest_counts=ctx.rest_counts, rest_errors=ctx.rest_errors, warmup_pending=warmup)
+        ctx.coordinator.update_feed_state(
+            connection="CONNECTED",
+            reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED",
+            freshness=label,
+            continuity="CONTINUOUS" if bootstrap_ok else "UNVERIFIED",
+            blocked_reasons=tuple(dict.fromkeys((*reasons, *blocked))),
+        )
+        ctx.telemetry.state.update(
+            connection="CONNECTED",
+            warmup_pending=warmup,
+            reconciliation="BOOTSTRAP_VERIFIED" if bootstrap_ok else "BLOCKED",
+            continuity="CONTINUOUS" if bootstrap_ok else "UNKNOWN",
+            data_quality=label,
+            rest_records=ctx.rest_records,
+            feed_age_seconds=freshness.feed_age_seconds,
+            closed_candle_age_seconds=freshness.closed_candle_age_seconds,
+        )
+        ctx.telemetry.event(
+            "bootstrap_complete", rest_counts=ctx.rest_counts, rest_errors=ctx.rest_errors, warmup_pending=warmup
+        )
 
     @staticmethod
     def _record_received(ctx: WatchContext, received: datetime | None) -> None:
@@ -1166,7 +1298,11 @@ class WatchService:
             errors = self._recover_bars(ctx, since)
             ctx.last_recovery_count = reconnect_count
             reconciliation = "BLOCKED" if errors else "RECOVERED_BOUNDED"
-            ctx.coordinator.update_feed_state(reconciliation=reconciliation, continuity="RECOVERED_BOUNDED" if not errors else None, blocked_reasons=("reconciliation_failed",) if errors else ())
+            ctx.coordinator.update_feed_state(
+                reconciliation=reconciliation,
+                continuity="RECOVERED_BOUNDED" if not errors else None,
+                blocked_reasons=("reconciliation_failed",) if errors else (),
+            )
             ctx.telemetry.event("reconciliation_cycle", reconnect_count=reconnect_count, errors=errors, verified=False)
         finally:
             ctx.recovery_in_progress = False
@@ -1180,7 +1316,12 @@ class WatchService:
         reconciliation = ctx.coordinator.reconciliation_state
         if needs and reconciliation != "RECOVERED_BOUNDED":
             reconciliation = "NEEDS_RECONCILIATION"
-        ctx.coordinator.update_feed_state(connection=state, reconciliation=reconciliation, blocked_reasons=tuple(dict.fromkeys((*ctx.coordinator.external_blocked_reasons, *reasons))), heartbeat_at=getattr(status, "last_message_at", None))
+        ctx.coordinator.update_feed_state(
+            connection=state,
+            reconciliation=reconciliation,
+            blocked_reasons=tuple(dict.fromkeys((*ctx.coordinator.external_blocked_reasons, *reasons))),
+            heartbeat_at=getattr(status, "last_message_at", None),
+        )
 
     @staticmethod
     def _heartbeat_callback(ctx: WatchContext, now: datetime) -> None:
@@ -1197,7 +1338,11 @@ class WatchService:
                 heartbeat_callback=lambda now: self._heartbeat_callback(ctx, now),
             )
         except TypeError:
-            iterator = ctx.adapter.iter_trades(duration_seconds=ctx.args.duration, max_events=ctx.args.max_events, include_snapshot=not ctx.args.no_snapshot)
+            iterator = ctx.adapter.iter_trades(
+                duration_seconds=ctx.args.duration,
+                max_events=ctx.args.max_events,
+                include_snapshot=not ctx.args.no_snapshot,
+            )
         try:
             for event in iterator:
                 self._process_event(ctx, event)
@@ -1216,10 +1361,32 @@ class WatchService:
         self._record_received(ctx, getattr(event, "received_at", None) or getattr(event, "available_at", None))
         label, blocked, freshness = _freshness_state(ctx.config, ctx.coordinator, ctx.last_received_at)
         dynamic = ("feed_discontinuity",) if needs else ()
-        reconciliation = "NEEDS_RECONCILIATION" if needs and ctx.coordinator.reconciliation_state != "RECOVERED_BOUNDED" else ctx.coordinator.reconciliation_state
-        ctx.coordinator.update_feed_state(connection=state, reconciliation=reconciliation, freshness=label, blocked_reasons=tuple(dict.fromkeys((*dynamic, *blocked))))
+        reconciliation = (
+            "NEEDS_RECONCILIATION"
+            if needs and ctx.coordinator.reconciliation_state != "RECOVERED_BOUNDED"
+            else ctx.coordinator.reconciliation_state
+        )
+        ctx.coordinator.update_feed_state(
+            connection=state,
+            reconciliation=reconciliation,
+            freshness=label,
+            blocked_reasons=tuple(dict.fromkeys((*dynamic, *blocked))),
+        )
         proc = ctx.coordinator.processor.status
-        ctx.telemetry.state.update(connection=state, last_received_ts=getattr(event, "received_at", None), last_available_ts=getattr(event, "available_at", None), events_processed=proc["events_processed"], candles_processed=proc["candles_processed"], signals=proc["signals"], errors=proc["errors"], warmup_pending=proc["warmup_pending"], reconciliation=ctx.coordinator.reconciliation_state, data_quality=label, feed_age_seconds=freshness.feed_age_seconds, closed_candle_age_seconds=freshness.closed_candle_age_seconds)
+        ctx.telemetry.state.update(
+            connection=state,
+            last_received_ts=getattr(event, "received_at", None),
+            last_available_ts=getattr(event, "available_at", None),
+            events_processed=proc["events_processed"],
+            candles_processed=proc["candles_processed"],
+            signals=proc["signals"],
+            errors=proc["errors"],
+            warmup_pending=proc["warmup_pending"],
+            reconciliation=ctx.coordinator.reconciliation_state,
+            data_quality=label,
+            feed_age_seconds=freshness.feed_age_seconds,
+            closed_candle_age_seconds=freshness.closed_candle_age_seconds,
+        )
         ctx.telemetry.state.update(feed_delay_ms=None)
         ctx.telemetry.reporter.emit()
 
@@ -1230,10 +1397,25 @@ class WatchService:
         label, blocked, freshness = _freshness_state(ctx.config, ctx.coordinator, ctx.last_received_at)
         final_state = str(getattr(status, "state", "STOPPED")).upper()
         reasons = ("feed_disconnected", *blocked) if final_state in {"DISCONNECTED", "ERROR"} else tuple(blocked)
-        ctx.coordinator.update_feed_state(connection=final_state, freshness=label, blocked_reasons=tuple(dict.fromkeys(reasons)))
+        ctx.coordinator.update_feed_state(
+            connection=final_state, freshness=label, blocked_reasons=tuple(dict.fromkeys(reasons))
+        )
         final_status = ctx.coordinator.status()
-        ctx.telemetry.state.update(connection=final_state, warmup_pending=ctx.coordinator.processor.status["warmup_pending"], signals=len(ctx.coordinator.processor.signals), reconciliation=ctx.coordinator.reconciliation_state)
-        ctx.telemetry.event("watch_complete", events=ctx.count, rest_records=ctx.rest_records, rest_errors=ctx.rest_errors, analysis_enabled=final_status.analysis_enabled, blocked_reasons=final_status.analysis_blocked_reasons, pending_simulations=final_status.pending_simulations)
+        ctx.telemetry.state.update(
+            connection=final_state,
+            warmup_pending=ctx.coordinator.processor.status["warmup_pending"],
+            signals=len(ctx.coordinator.processor.signals),
+            reconciliation=ctx.coordinator.reconciliation_state,
+        )
+        ctx.telemetry.event(
+            "watch_complete",
+            events=ctx.count,
+            rest_records=ctx.rest_records,
+            rest_errors=ctx.rest_errors,
+            analysis_enabled=final_status.analysis_enabled,
+            blocked_reasons=final_status.analysis_blocked_reasons,
+            pending_simulations=final_status.pending_simulations,
+        )
         ctx.telemetry.close()
         ctx.coordinator.finish(status="COMPLETED")
 
@@ -1324,7 +1506,6 @@ class CfdPaperService:
             raise ConfigError(f"no se pudo leer captura cTrader: {path}") from exc
         return CfdPaperService._document_values(parsed)
 
-
     @staticmethod
     def _jsonl_envelopes(path: Path, iter_jsonl: Any) -> Iterator[Any]:
         found = False
@@ -1349,7 +1530,6 @@ class CfdPaperService:
             return CfdPaperService._jsonl_input(path)
         values = CfdPaperService._json_document(path)
         return (CfdPaperService._capture_record(item, index=index) for index, item in enumerate(values))
-
 
     @staticmethod
     def _legacy_jsonl(path: Path) -> Iterator[Any]:
@@ -1407,7 +1587,7 @@ class CfdPaperService:
         config = _config_for(args)
         config, analysis_basis = self._pipeline_config(config)
         capture_source = "local_file" if getattr(args, "input", None) else "synthetic_fixture"
-        symbol_id = config.ctrader.get("symbol_id") if config.ctrader.get("symbol_id") is not None else 99
+        symbol_id = _int_or_default(config.ctrader.get("symbol_id"), 99)
         spec = CTraderInstrumentSpec(
             symbol=config.instrument,
             symbol_id=int(symbol_id),
@@ -1419,25 +1599,27 @@ class CfdPaperService:
         db.parent.mkdir(parents=True, exist_ok=True)
         with SQLiteStore(db) as store:
             if getattr(args, "input", None):
-                capture_input: Iterable[Any] = self._capture_input(Path(args.input))
+                capture_input: CTraderCapture | Iterable[Any] = self._capture_input(Path(args.input))
             elif getattr(args, "session", None):
                 capture_source = "sqlite_capture_envelopes"
                 capture_input = self._durable_input(store, str(args.session))
             else:
                 capture_input = synthetic_ctrader_capture(
                     start=datetime(2026, 1, 1, tzinfo=UTC),
-                    symbol_id=int(config.ctrader.get("symbol_id", 99)) if config.ctrader.get("symbol_id") is not None else 99,
+                    symbol_id=symbol_id,
                     count=int(getattr(args, "count", 190)),
                     mode="REPLAY",
                 )
-            pipeline = CTraderPipeline(store, config, spec=spec, mode="REPLAY", max_candles=getattr(args, "max_candles", 256))
+            pipeline = CTraderPipeline(
+                store, config, spec=spec, mode="REPLAY", max_candles=getattr(args, "max_candles", 256)
+            )
             result = pipeline.run(
                 capture_input,
                 session_id=getattr(args, "session", None),
                 capture_complete=not bool(getattr(args, "incomplete", False)),
                 quote_basis=(analysis_basis if analysis_basis in {"bid", "ask", "mid"} else "mid"),
                 chunk_size=int(getattr(args, "chunk_size", 128)),
-                order=str(getattr(args, "order", "as_observed")),
+                order=cast(Literal["as_observed", "market_time_corrected"], str(getattr(args, "order", "as_observed"))),
             )
             capture_view = result.capture.to_dict()
             if getattr(args, "include_payloads", False):
