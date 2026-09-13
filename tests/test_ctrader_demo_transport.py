@@ -56,6 +56,30 @@ class FakeOfficialGateway:
         return self.handler(message, kwargs)
 
 
+def external_policy(**overrides):
+    values = {
+        "fixed_quantity": 1,
+        "max_quantity": 1,
+        "max_positions": 2,
+        "max_exposure": 1000,
+        "max_spread": 1,
+        "max_price_age_seconds": 5,
+        "max_daily_loss": 100,
+        "max_drawdown": 100,
+        "min_margin_level": 1,
+        "max_inflight_intents": 1,
+        "max_holding_seconds": 3600,
+        "require_protective_stops": True,
+        "relative_stop_loss": 10,
+        "relative_take_profit": 20,
+    }
+    values.update(overrides)
+    return ExecutionPolicy(**values)
+
+
+VOLUME_GRID = {"min_volume": 100, "max_volume": 100_000, "step_volume": 100}
+
+
 def _event(
     *,
     account=123,
@@ -110,7 +134,14 @@ class CTraderOfficialTransportTests(unittest.TestCase):
         )
         self.intent = ExecutionIntent("intent-1", "signal-1", "EUR/USD", Side.BUY, 1.0, 1.1010, self.now, "123")
         self.observation = ServerAccountObservation(
-            "123", "DEMO", "demo.ctraderapi.com:5035", frozenset({"trading"}), self.now, source="fixture-server"
+            "123",
+            "DEMO",
+            "demo.ctraderapi.com:5035",
+            frozenset({"trading"}),
+            self.now,
+            source="fixture-server",
+            session_id="fixture-session",
+            connection_generation="fixture-generation",
         )
 
     def test_official_order_close_reconcile_messages_are_built(self):
@@ -122,6 +153,7 @@ class CTraderOfficialTransportTests(unittest.TestCase):
             symbol_ids={"EUR/USD": 11},
             clock=lambda: self.now,
             server_observation=self.observation,
+            volume_grid=VOLUME_GRID,
         )
         new = transport.build_new_order(self.intent)
         self.assertEqual(type(new).__name__, "ProtoOANewOrderReq")
@@ -171,13 +203,14 @@ class CTraderOfficialTransportTests(unittest.TestCase):
         )
         executor = CTraderDemoExecutor(
             account,
-            policy=ExecutionPolicy(fixed_quantity=1, max_quantity=1),
+            policy=external_policy(),
             transport=CTraderDemoTransport(
                 account,
                 client=FakeOfficialGateway(lambda *_: None),
                 proto=ProtoFixture,
                 symbol_ids={"EUR/USD": 11},
                 server_observation=self.observation,
+                volume_grid=VOLUME_GRID,
             ),
             server_observation=self.observation,
             clock=lambda: self.now,
@@ -207,23 +240,27 @@ class CTraderOfficialTransportTests(unittest.TestCase):
             proto=proto,
             symbol_ids={"EUR/USD": 11},
             server_observation=observation,
+            volume_grid=VOLUME_GRID,
         )
         new = transport.build_new_order(self.intent)
         self.assertEqual((new.orderType, new.tradeSide, new.volume), (1, 1, 100))
         reconcile = transport.build_reconcile()
         self.assertEqual(reconcile.ctidTraderAccountId, 123)
-        self.assertFalse(hasattr(reconcile, "returnProtectionOrders"))
+        if hasattr(reconcile, "returnProtectionOrders"):
+            self.assertFalse(reconcile.returnProtectionOrders)
 
     def test_official_execution_event_maps_to_executor_fill_and_position(self):
         store = MemoryIntentStore()
+        order_submitted = False
 
         def handler(message, kwargs):
+            nonlocal order_submitted
             if type(message).__name__ == "ProtoOANewOrderReq":
+                order_submitted = True
                 return _event(client_order_id=message.clientOrderId)
             if type(message).__name__ == "ProtoOAReconcileReq":
-                return ProtoMessage(
-                    ctidTraderAccountId=123, position=[_event(client_order_id="intent-1").position], order=[]
-                )
+                position = _event(client_order_id="intent-1").position if order_submitted else None
+                return ProtoMessage(ctidTraderAccountId=123, position=[position] if position else [], order=[])
             raise AssertionError(type(message).__name__)
 
         gateway = FakeOfficialGateway(handler)
@@ -235,23 +272,25 @@ class CTraderOfficialTransportTests(unittest.TestCase):
             symbol_names={11: "EUR/USD"},
             clock=lambda: self.now,
             server_observation=self.observation,
+            volume_grid=VOLUME_GRID,
         )
         executor = CTraderDemoExecutor(
             self.account,
-            policy=ExecutionPolicy(
-                fixed_quantity=1,
-                max_quantity=1,
-                max_positions=2,
-                max_exposure=1000,
-                max_spread=1,
-                max_price_age_seconds=5,
-            ),
+            policy=external_policy(),
             transport=transport,
             intent_store=store,
             clock=lambda: self.now,
             server_observation=self.observation,
         )
         executor.activate()
+        executor.update_risk_metrics(
+            realized_daily_pnl=0,
+            unrealized_daily_pnl=0,
+            drawdown=0,
+            margin_level=100,
+            observed_at=self.now,
+            connection_generation="fixture-generation",
+        )
         result = executor.submit_signal(
             {"signal_id": "signal-1", "instrument": "EUR/USD", "direction": "UP", "mode": "DEMO"},
             Quote("EUR/USD", 1.1009, 1.1010, self.now, self.now),
@@ -285,6 +324,7 @@ class CTraderOfficialTransportTests(unittest.TestCase):
             symbol_ids={"EUR/USD": 11},
             clock=lambda: self.now,
             server_observation=self.observation,
+            volume_grid=VOLUME_GRID,
         )
         result = transport.submit(self.intent, timeout_seconds=1)
         self.assertEqual(result.status, OrderState.PARTIAL)
@@ -302,6 +342,8 @@ class CTraderOfficialTransportTests(unittest.TestCase):
             calls.append(type(message).__name__)
             if type(message).__name__ == "ProtoOANewOrderReq":
                 raise TimeoutError("no ack")
+            if type(message).__name__ == "ProtoOAReconcileReq":
+                return ProtoMessage(ctidTraderAccountId=123, position=[], order=[])
             return None
 
         gateway = FakeOfficialGateway(handler)
@@ -312,6 +354,7 @@ class CTraderOfficialTransportTests(unittest.TestCase):
             symbol_ids={"EUR/USD": 11},
             clock=lambda: self.now,
             server_observation=self.observation,
+            volume_grid=VOLUME_GRID,
         )
         with self.assertRaises(TimeoutError):
             transport.submit(self.intent, timeout_seconds=0.1)
@@ -320,6 +363,88 @@ class CTraderOfficialTransportTests(unittest.TestCase):
         # new-order message again as a side effect of get_order.
         self.assertIsNone(transport.get_order("intent-1"))
         self.assertEqual(calls, ["ProtoOANewOrderReq", "ProtoOAReconcileReq"])
+
+    def test_close_reconciliation_does_not_match_an_opening_order_by_position_only(self):
+        close_intent = ExecutionIntent(
+            "close-1",
+            "close:9",
+            "EUR/USD",
+            Side.SELL,
+            1,
+            None,
+            self.now,
+            "123",
+            kind="CLOSE",
+            position_id="9",
+        )
+        opening_order = ProtoMessage(
+            orderId=7,
+            positionId=9,
+            closingOrder=False,
+            executedVolume=100,
+            executionPrice=1.101,
+            orderStatus="ORDER_STATUS_FILLED",
+        )
+        closing_order = ProtoMessage(
+            orderId=8,
+            positionId=9,
+            closingOrder=True,
+            executedVolume=100,
+            executionPrice=1.101,
+            orderStatus="ORDER_STATUS_FILLED",
+            tradeData=ProtoMessage(volume=100),
+        )
+        current = {"order": opening_order}
+
+        def handler(message, kwargs):
+            if type(message).__name__ != "ProtoOAReconcileReq":
+                raise AssertionError(type(message).__name__)
+            return ProtoMessage(ctidTraderAccountId=123, order=[current["order"]], position=[])
+
+        transport = CTraderDemoTransport(
+            self.account,
+            client=FakeOfficialGateway(handler),
+            proto=ProtoFixture,
+            symbol_ids={"EUR/USD": 11},
+            clock=lambda: self.now,
+            server_observation=self.observation,
+            volume_grid=VOLUME_GRID,
+        )
+        transport.register_intent(close_intent)
+        transport._close_positions[close_intent.intent_id] = "9"
+        self.assertIsNone(transport.get_order(close_intent.intent_id))
+
+        current["order"] = closing_order
+        recovered = transport.get_order(close_intent.intent_id)
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(recovered.status, OrderState.CLOSED)
+        self.assertEqual(recovered.position_ids, ("9",))
+
+    def test_register_intent_rejects_payload_collision_without_overwriting_identity(self):
+        gateway = FakeOfficialGateway(lambda message, kwargs: ProtoMessage(ctidTraderAccountId=123))
+        transport = CTraderDemoTransport(
+            self.account,
+            client=gateway,
+            proto=ProtoFixture,
+            symbol_ids={"EUR/USD": 11},
+            clock=lambda: self.now,
+            server_observation=self.observation,
+        )
+        transport.register_intent(self.intent)
+        conflicting = ExecutionIntent(
+            self.intent.intent_id,
+            self.intent.signal_id,
+            self.intent.symbol,
+            self.intent.side,
+            2,
+            self.intent.requested_price,
+            self.intent.created_at,
+            self.intent.account_id,
+        )
+        with self.assertRaises(OfficialCorrelationError):
+            transport.register_intent(conflicting)
+        self.assertEqual(transport._requested_quantities[self.intent.intent_id], self.intent.quantity)
 
     def test_real_scope_endpoint_and_correlation_fail_closed(self):
         with self.assertRaises(RealAccountForbidden):
@@ -352,6 +477,7 @@ class CTraderOfficialTransportTests(unittest.TestCase):
             symbol_ids={"EUR/USD": 11},
             clock=lambda: self.now,
             server_observation=self.observation,
+            volume_grid=VOLUME_GRID,
         )
         with self.assertRaises(OfficialCorrelationError):
             transport.submit(self.intent, timeout_seconds=1)

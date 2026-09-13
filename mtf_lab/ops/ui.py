@@ -28,6 +28,7 @@ header{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}h1{margin:.2rem 0
 <p class="muted">Consulta local de velas, indicadores, señales, condiciones, descartes, revisiones, huecos y simulaciones. Sólo lectura; no envía órdenes.</p>
 <div class="controls"><label>Temporalidad<select id="timeframe"><option value="">Todas</option><option>M1</option><option>M5</option><option>M15</option></select></label><label>Desde UTC<input id="start" placeholder="2025-01-01T00:00:00Z"></label><label>Hasta UTC (exclusivo)<input id="end" placeholder="2025-01-02T00:00:00Z"></label><label>Velas<select id="revisions"><option value="latest">Última revisión</option><option value="all">Todas las revisiones</option></select></label><button id="apply">Actualizar</button></div>
 <section id="summary" class="grid section"></section>
+<section class="section" aria-labelledby="readiness-title"><h2 id="readiness-title">Capacidad efectiva del supervisor</h2><p class="muted">Salud HTTP no equivale a disponibilidad de análisis ni permiso de operar. La evidencia debe pertenecer a un proceso vivo y estar vigente.</p><div id="readiness" class="grid" aria-live="polite"></div></section>
 <section class="section" aria-labelledby="observability-title"><h2 id="observability-title">Observabilidad: procedencia, proceso y frescura</h2><div id="observability" class="grid"></div></section>
 <section class="section"><h2>Gráficos sincronizados (datos persistidos)</h2><p class="muted">Las líneas se dibujan con los valores EMA/RSI/ATR registrados; el navegador no recalcula la estrategia.</p><div id="indicatorCharts" class="grid"></div></section>
 <section class="section"><h2>Velas M1/M5/M15 e indicadores</h2><p class="muted">Se conserva la distinción entre vela cerrada/abierta y revisión; los indicadores provienen del registro persistido.</p><div id="candles" class="grid"></div><div id="candlePager" class="pager"></div></section>
@@ -35,7 +36,7 @@ header{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}h1{margin:.2rem 0
 <section class="section"><h2>Señales y condiciones</h2><div id="signals" class="scroll"></div><div id="conditions" class="scroll"></div></section>
 <section class="section"><h2>Descartes</h2><div id="discards" class="scroll"></div></section>
 <section class="section"><h2>Simulaciones virtuales segmentadas</h2><div id="sims" class="scroll"></div></section>
-<section class="section"><h2>Operaciones CFD PAPER (ciclo y economía separados)</h2><p class="muted">La columna Estado representa el ciclo de vida; Neto desconocido no se convierte en WIN/LOSS/TIE.</p><div id="cfdTrades" class="scroll"></div></section>
+<section class="section"><h2>Operaciones CFD PAPER (ciclo y economía separados)</h2><p class="muted">La columna Estado representa el ciclo de vida; Neto desconocido no se convierte en WIN/LOSS/TIE. En economía v2 el slippage ya está incluido en los fills; v1 conserva su cálculo histórico sin reinterpretación. Horizontes y variantes son escenarios alternativos, no posiciones reales que deban sumarse.</p><div id="cfdTrades" class="scroll"></div></section>
 <script>
 const esc=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const secretKey=/token|secret|password|authorization|api[_-]?key|refresh/i;
@@ -50,6 +51,11 @@ function refreshState(sid){return refreshBySession[sid]??(refreshBySession[sid]=
 function shortError(){return 'No se pudo actualizar la consulta local; se conserva el último estado bueno.'}
 function displayValue(value){if(value===null||value===undefined||value==='')return 'UNKNOWN';if(typeof value==='object')return JSON.stringify(value);return String(value)}
 function metric(label,value){return '<div class="card"><div class="metric-label">'+esc(label)+'</div><div class="metric-value">'+esc(displayValue(value))+'</div></div>'}
+function renderReadiness(value){
+  const state=value||{}, operational=state.operational||{};
+  document.getElementById('readiness').innerHTML=metric('Capacidad en el modo declarado',state.ready===true?'DISPONIBLE':'BLOQUEADA / NO VERIFICADA')+metric('Modo',state.mode||'UNKNOWN')+metric('Identidad viva',state.liveness||'UNVERIFIED')+metric('Motivos',(state.reasons||[]).join(', ')||'Ninguno observado')+Object.entries(operational).map(([key,item])=>metric(key,item)).join('');
+}
+async function loadReadiness(){try{renderReadiness(await get('/api/readiness'));}catch(error){renderReadiness({ready:false,reasons:['HTTP_READINESS_UNAVAILABLE']});}}
 function freshnessMaxAge(value){if(typeof value==='number')return Number.isFinite(value)&&value>=0?value:null;if(typeof value==='string'&&value.trim()!==''){const number=Number(value);return Number.isFinite(number)&&number>=0?number:null;}return null}
 function freshnessView(status){
   const raw=status&&status.freshness||{}, provenance=status&&status.provenance||{};
@@ -155,7 +161,7 @@ async function load(){
     document.getElementById('conditions').innerHTML='<h3>Condiciones</h3>'+table(rows(conditions), [['observed_ts','Observada'],['decision','Decisión'],['name','Condición'],['state','Estado'],['observed','Observado'],['expected','Esperado'],['reason','Razón'],['mandatory','Obligatoria']]);
     document.getElementById('discards').innerHTML=table(rows(discards), [['observed_ts','Observada'],['reason_code','Razón'],['required','Obligatoria'],['condition_status','Condición'],['payload','Detalle']]);
     document.getElementById('sims').innerHTML=table(rows(sims), [['detected_ts','Detectada'],['horizon_seconds','Horizonte s'],['direction','Dirección'],['outcome','Resultado'],['net_result','Neto virtual'],['quality','Calidad'],['dimensions','Análisis/variante/contrato']]);
-    document.getElementById('cfdTrades').innerHTML=table(rows(cfd), [['detected_at','Detectada'],['trade_id','Operación'],['signal_id','Señal'],['direction','Dirección'],['units','Unidades'],['state','Estado'],['economic_state','Estado económico'],['economic_status','Economía'],['close_observed','Cierre observado'],['entry_price','Entrada'],['close_price','Cierre'],['gross_pnl_quote','Bruto'],['net_pnl','Neto'],['reason','Razón'] ]);
+    document.getElementById('cfdTrades').innerHTML=table(rows(cfd), [['detected_at','Detectada'],['horizon_seconds','Horizonte s'],['variant','Variante'],['economics_version','Economía versionada'],['trade_id','Operación'],['signal_id','Señal'],['direction','Dirección'],['units','Unidades'],['state','Estado'],['economic_state','Estado económico'],['economic_status','Economía'],['close_observed','Cierre observado'],['entry_price','Entrada'],['close_price','Cierre'],['gross_pnl_quote','Bruto ejecutado'],['slippage_quote','Slippage (desglose v2)'],['costs_account','Costes registrados'],['net_pnl','Neto'],['reason','Razón'] ]);
     state.lastGoodAt=new Date().toISOString();
     state.error=null;
     state.partial=Boolean(pollError);
@@ -169,7 +175,7 @@ async function load(){
   }
 }
 async function loadMoreCandles(cursor){let p=await get('/api/candles?'+qs({limit:200,cursor}));let old=window._candleItems||[];window._candleItems=old.concat(rows(p));document.getElementById('candlePager').innerHTML=p.next_cursor?'<button id="moreCandles">Cargar más</button>':'<span class="muted">Fin de velas</span>';if(p.next_cursor)document.getElementById('moreCandles').onclick=()=>loadMoreCandles(p.next_cursor);}
-(async()=>{let a=await get('/api/sessions');let list=rows(a);let s=document.getElementById('session');s.innerHTML=list.map(x=>'<option value="'+esc(x.session_id)+'">'+esc(x.session_id.slice(0,12)+' · '+x.mode+' · '+x.instrument)+'</option>').join('');s.onchange=load;document.getElementById('apply').onclick=load;await load();setInterval(()=>load(),5000)})().catch(()=>document.body.insertAdjacentHTML('beforeend','<pre class="bad">No se pudo cargar la UI local.</pre>'));
+(async()=>{await loadReadiness();setInterval(()=>loadReadiness(),5000);let a=await get('/api/sessions');let list=rows(a);let s=document.getElementById('session');s.innerHTML=list.map(x=>'<option value="'+esc(x.session_id)+'">'+esc(x.session_id.slice(0,12)+' · '+x.mode+' · '+x.instrument)+'</option>').join('');s.onchange=load;document.getElementById('apply').onclick=load;await load();setInterval(()=>load(),5000)})().catch(()=>document.body.insertAdjacentHTML('beforeend','<pre class="bad">No se pudo cargar la UI local.</pre>'));
 </script></body></html>"""
 
 
@@ -383,6 +389,11 @@ class _Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/health":
             self._send({"ok": True, "service": "mtf-lab-ui", "read_only": True})
             return
+        if parsed.path == "/api/readiness":
+            from .readiness import read_supervisor_readiness
+
+            self._send(read_supervisor_readiness(self._mtf_server.supervisor_state))
+            return
         if parsed.path == "/api/sessions":
             self._send(self._session_list(query))
             return
@@ -396,6 +407,7 @@ class _Handler(BaseHTTPRequestHandler):
 class MTFHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    supervisor_state: str | Path | None = None
 
     def __init__(self, address: tuple[str, int], store: SQLiteStore, *, default_session: str | None = None):
         super().__init__(address, _Handler)
@@ -405,13 +417,20 @@ class MTFHTTPServer(ThreadingHTTPServer):
 
 
 def create_server(
-    db_path: str | Path, *, host: str = "127.0.0.1", port: int = 8765, session_id: str | None = None
+    db_path: str | Path,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    session_id: str | None = None,
+    supervisor_state: str | Path | None = None,
 ) -> MTFHTTPServer:
     store = SQLiteStore(db_path, read_only=True)
     if session_id is None:
         sessions = store.sessions(limit=1)
         session_id = sessions[0]["session_id"] if sessions else None
-    return MTFHTTPServer((host, int(port)), store, default_session=session_id)
+    server = MTFHTTPServer((host, int(port)), store, default_session=session_id)
+    server.supervisor_state = supervisor_state
+    return server
 
 
 def serve(
@@ -421,9 +440,10 @@ def serve(
     port: int = 8765,
     session_id: str | None = None,
     duration: float | None = None,
+    supervisor_state: str | Path | None = None,
 ) -> MTFHTTPServer:
     """Serve local read-only UI; optional duration makes smoke tests finite."""
-    server = create_server(db_path, host=host, port=port, session_id=session_id)
+    server = create_server(db_path, host=host, port=port, session_id=session_id, supervisor_state=supervisor_state)
     if duration is not None:
         timer = threading.Timer(max(0.0, float(duration)), server.shutdown)
         timer.daemon = True

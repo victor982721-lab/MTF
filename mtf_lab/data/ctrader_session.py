@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import queue
+import secrets
 import threading
 import time
 import uuid
@@ -246,6 +247,8 @@ class CTraderClient:
         self._generation = initial_generation
         self._last_heartbeat_monotonic = self._clock()
         self._recent_request_phases: deque[RequestPhase] = deque(maxlen=64)
+        self._retired_request_ids: deque[str] = deque(maxlen=512)
+        self._retired_request_id_set: set[str] = set()
         self._ingest_sequence = next_ingest_sequence
         self._account_discovery: dict[str, Any] | None = None
         self._session_evidence: AuthenticatedSessionEvidence | None = None
@@ -409,24 +412,24 @@ class CTraderClient:
             try:
                 self._maybe_heartbeat(generation=generation)
                 message = self.transport.receive(0.10)
+                if message is None:
+                    self._wait(stop, 0.005)
+                    continue
+                if generation != self._generation or stop.is_set():
+                    continue
+                if message.connection_generation is not None and message.connection_generation != generation:
+                    continue
+                message = self._stamp_message(message, generation)
+                now = message.received_at or self._wall_clock()
+                self._set_status(last_message_at=now)
+                if self._dispatch_inbound(message, generation, stop, now):
+                    continue
+                self._set_status(last_event_at=now)
+                self._publish_event(message, stop=stop)
             except Exception as exc:
                 if not stop.is_set():
                     self._on_reader_failure(generation, exc)
                 return
-            if message is None:
-                self._wait(stop, 0.005)
-                continue
-            if generation != self._generation or stop.is_set():
-                continue
-            if message.connection_generation is not None and message.connection_generation != generation:
-                continue
-            message = self._stamp_message(message, generation)
-            now = message.received_at or self._wall_clock()
-            self._set_status(last_message_at=now)
-            if self._dispatch_inbound(message, generation, stop, now):
-                continue
-            self._set_status(last_event_at=now)
-            self._publish_event(message, stop=stop)
 
     def _dispatch_inbound(
         self,
@@ -441,7 +444,7 @@ class CTraderClient:
             return self._handle_heartbeat_message(generation, stop)
         if message.client_msg_id and self._route_response(message, generation):
             return True
-        if message.client_msg_id and str(message.client_msg_id).startswith("ctrader-"):
+        if message.client_msg_id and self._is_retired_request(str(message.client_msg_id)):
             self._set_status(
                 needs_reconciliation=True,
                 discontinuity_reason="late_response",
@@ -449,6 +452,10 @@ class CTraderClient:
             )
             return True
         return False
+
+    def _is_retired_request(self, request_id: str) -> bool:
+        with self._state_lock:
+            return str(request_id) in self._retired_request_id_set
 
     def _invalidate_from_control(self, message: WireMessage, generation: int) -> bool:
         kind = _session_control_kind(message)
@@ -514,7 +521,7 @@ class CTraderClient:
                 self._set_status(
                     dependency=dependency,
                     connection=ConnectionState.FAILED,
-                    action="Instale/verifique el extra opcional ctrader-open-api/google-protobuf; no se instaló automáticamente",
+                    action="Verifique el runtime de protobuf generado y las dependencias mantenidas; no se instaló automáticamente",
                 )
                 raise CTraderDependencyError(report.message or "SDK/codec cTrader no operativo")
         with self._lifecycle_lock:
@@ -711,6 +718,11 @@ class CTraderClient:
         )
         pending = _PendingRequest(record, queue.Queue(maxsize=1))
         with self._state_lock:
+            if request_id in self._pending:
+                raise CTraderTransportError(
+                    f"client_msg_id ya está en vuelo: {request_id}",
+                    phase=RequestPhase.FAILED_BEFORE_SEND,
+                )
             self._requests[request_id] = record
             self._pending[request_id] = pending
         try:
@@ -842,8 +854,19 @@ class CTraderClient:
 
     def _unregister_request(self, request_id: str) -> None:
         with self._state_lock:
+            record = self._requests.get(request_id)
             self._pending.pop(request_id, None)
             self._requests.pop(request_id, None)
+            if (
+                record is not None
+                and record.phase is not RequestPhase.COMPLETED
+                and request_id not in self._retired_request_id_set
+            ):
+                if len(self._retired_request_ids) == self._retired_request_ids.maxlen:
+                    old = self._retired_request_ids.popleft()
+                    self._retired_request_id_set.discard(old)
+                self._retired_request_ids.append(request_id)
+                self._retired_request_id_set.add(request_id)
             pending_count = len(self._pending)
         self._set_status(pending_requests=pending_count)
 
@@ -945,6 +968,13 @@ class CTraderClient:
         # Ordinary discovery snapshots remain redacted by default.
         token_echo = read_field(response.payload, "accessToken", "access_token", default=None)
         if isinstance(token_echo, str):
+            if not token_echo or not secrets.compare_digest(token_echo, token):
+                self._account_discovery = None
+                self._set_status(
+                    auth=AuthState.INVALID,
+                    action="La respuesta de discovery no corresponde al access token presentado",
+                )
+                raise CTraderAuthError("account discovery token echo mismatch", action=self._status.action)
             self._account_discovery["accessToken"] = token_echo
         return self._copy_account_discovery()
 
@@ -1237,16 +1267,21 @@ class CTraderClient:
 
 
 def _permission_scopes(value: Any) -> set[str]:
-    if value is None:
+    """Map only the exact cTrader permission enum to effective scopes."""
+
+    named = getattr(value, "name", None)
+    if named is not None:
+        value = named
+    if isinstance(value, bool) or value is None:
         return set()
-    text = str(value).strip().lower()
-    tokens = {item for item in text.replace(",", " ").replace("_", " ").split() if item}
-    scopes = set(tokens)
-    if "trade" in tokens or "trading" in tokens:
-        scopes.add("trading")
-    if "account" in tokens or "accounts" in tokens or "view" in tokens:
-        scopes.add("accounts")
-    return scopes
+    if isinstance(value, int):
+        return {"accounts"} if value == 0 else ({"accounts", "trading"} if value == 1 else set())
+    text = str(value).strip().upper()
+    if text in {"0", "SCOPE_VIEW"}:
+        return {"accounts"}
+    if text in {"1", "SCOPE_TRADE"}:
+        return {"accounts", "trading"}
+    return set()
 
 
 def _session_control_kind(message: WireMessage) -> str | None:

@@ -1,0 +1,5 @@
+# Immutable upstream sources: preserve original bytes, including whitespace.
+# This changes diff whitespace diagnostics only; no clean/eol filters are set.
+schemas/ctrader/openapi-proto-messages/91/OpenApiCommonMessages.proto -whitespace
+schemas/ctrader/openapi-proto-messages/91/OpenApiCommonModelMessages.proto -whitespace
+schemas/ctrader/openapi-proto-messages/91/README.md -whitespace

@@ -434,8 +434,7 @@ class CTraderSessionRevocationTests(unittest.TestCase):
         return client, transport
 
     def test_matching_account_disconnect_invalidates_proof_and_gateway_sends_nothing(self):
-        from ctrader_open_api.messages import OpenApiMessages_pb2 as proto
-
+        from mtf_lab.data.protobuf_generated import OpenApiMessages_pb2 as proto
         from mtf_lab.ops.ctrader_demo_transport import CTraderClientGateway, OfficialGatewayConfigurationError
 
         client, transport = self._authenticated_client()
@@ -483,8 +482,7 @@ class CTraderSessionRevocationTests(unittest.TestCase):
             client.close()
 
     def test_matching_token_invalidation_invalidates_proof_and_gateway_sends_nothing(self):
-        from ctrader_open_api.messages import OpenApiMessages_pb2 as proto
-
+        from mtf_lab.data.protobuf_generated import OpenApiMessages_pb2 as proto
         from mtf_lab.ops.ctrader_demo_transport import CTraderClientGateway, OfficialGatewayConfigurationError
 
         client, transport = self._authenticated_client()

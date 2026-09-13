@@ -7,6 +7,8 @@ machine in the orchestration layer.
 
 from ..core.cfd_quality import QuoteAssessment, QuoteLeg, QuoteLegAssessment, QuoteQuality, QuoteReason, QuoteSide
 from ..core.cfd_simulation import (
+    CFD_ECONOMICS_LEGACY_VERSION,
+    CFD_ECONOMICS_VERSION,
     CFD_PRODUCT,
     CFD_SNAPSHOT_VERSION,
     CFDConfig,
@@ -31,6 +33,8 @@ from ..core.cfd_simulation import (
 )
 
 __all__ = [
+    "CFD_ECONOMICS_LEGACY_VERSION",
+    "CFD_ECONOMICS_VERSION",
     "CFDConfig",
     "CFDEconomicResult",
     "CFD_PRODUCT",

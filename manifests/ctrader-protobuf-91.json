@@ -1,0 +1,159 @@
+{
+  "generated": [
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiCommonMessages_pb2.py",
+      "sha256": "b683495c4c0632625a9cb59a7ce9ec3842d38544f89fceed081de3772f512220",
+      "size": 2338
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiCommonMessages_pb2.pyi",
+      "sha256": "f46eaf0b00b395ec4fde541354fa74eeb588ff19639d0ea9da829ebc4116bf71",
+      "size": 1763
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiCommonModelMessages_pb2.py",
+      "sha256": "c30c76c4a26459c13f7b708ecff0171766fb8b6a51cca1a9c2d8af910cb5182c",
+      "size": 2194
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiCommonModelMessages_pb2.pyi",
+      "sha256": "a44bfbcffda7862e1e1b285677c92ef45b46111dcca1aa17dd19a60d5bf26c9d",
+      "size": 1464
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiMessages_pb2.py",
+      "sha256": "fd48fba8d20b5f22fd619cbd3285991d45724697f6731cd61786bb0562f07eb2",
+      "size": 40430
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiMessages_pb2.pyi",
+      "sha256": "ced21f909bd699b20180b6534f7c5dc4c8b39dfa64c3db8c99e4460c116d3851",
+      "size": 69903
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiModelMessages_pb2.py",
+      "sha256": "72364d9a9f7d04c9d462d61fd20a8a7170db33588871c324b935ebdc77ea3d8b",
+      "size": 33243
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/OpenApiModelMessages_pb2.pyi",
+      "sha256": "8306decfa5716ff6fce19b84039a216a32d0549ce05cd53a869992bfd8a9913b",
+      "size": 63514
+    },
+    {
+      "path": "mtf_lab/data/protobuf_generated/__init__.py",
+      "sha256": "08ab416c8bc75691221492c1e514f2065ef7a0edcdc04096b7b891096f8ca93b",
+      "size": 344
+    }
+  ],
+  "generator": {
+    "generated_files": [
+      "OpenApiCommonMessages_pb2.py",
+      "OpenApiCommonModelMessages_pb2.py",
+      "OpenApiMessages_pb2.py",
+      "OpenApiModelMessages_pb2.py",
+      "OpenApiCommonMessages_pb2.pyi",
+      "OpenApiCommonModelMessages_pb2.pyi",
+      "OpenApiMessages_pb2.pyi",
+      "OpenApiModelMessages_pb2.pyi"
+    ],
+    "protoc_version": "36.1",
+    "python_runtime_version": "7.36.1",
+    "relative_import_rewrite": {
+      "OpenApiCommonMessages_pb2.py": "OpenApiCommonModelMessages_pb2",
+      "OpenApiCommonMessages_pb2.pyi": "OpenApiCommonModelMessages_pb2",
+      "OpenApiMessages_pb2.py": "OpenApiModelMessages_pb2",
+      "OpenApiMessages_pb2.pyi": "OpenApiModelMessages_pb2"
+    },
+    "stub_mapping_rewrite": "bare _Mapping annotations -> _Mapping[str, _Any]"
+  },
+  "licenses": [
+    {
+      "path": "licencias/spotware-openapi-proto-messages-MIT.txt",
+      "sha256": "d3fc4cfe3604a0d96b55f7808c530e428aa74f349364eaee195339dfa95d5213",
+      "spdx": "MIT"
+    },
+    {
+      "path": "licencias/protobuf-7.36.1-BSD-3-Clause.txt",
+      "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d",
+      "spdx": "BSD-3-Clause"
+    },
+    {
+      "path": "licencias/types-protobuf-7.35.1.20260906-Apache-2.0.txt",
+      "sha256": "295f8538c94ae5c3043301cf7cff1c852dab6a786a8ddee471e061b40d5ecabe",
+      "spdx": "Apache-2.0"
+    }
+  ],
+  "packaged_resources": [
+    {
+      "path": "mtf_lab/resources/licenses/spotware-openapi-proto-messages-MIT.txt",
+      "sha256": "d3fc4cfe3604a0d96b55f7808c530e428aa74f349364eaee195339dfa95d5213"
+    },
+    {
+      "path": "mtf_lab/resources/licenses/protobuf-7.36.1-BSD-3-Clause.txt",
+      "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d"
+    },
+    {
+      "path": "mtf_lab/resources/provenance/ctrader-protobuf-91.json",
+      "sha256": "fa377ba2c49d686660d8d8bd86faaf1a27ef224b2580c7832a66d57998197c49"
+    }
+  ],
+  "quality_scope": {
+    "mypy_policy": "generated .pyi stubs are consumed; generated implementation is not hand-maintained",
+    "pyright_policy": "generated .pyi stubs are consumed; runtime import warnings remain observable",
+    "ruff_exclusion": "mtf_lab/data/protobuf_generated",
+    "ruff_exclusion_reason": "protoc-owned generated code and stubs; regenerated and hash-verified here"
+  },
+  "runtime_artifacts": {
+    "protobuf_wheel": {
+      "filename": "protobuf-7.36.1-cp310-abi3-manylinux2014_x86_64.whl",
+      "sha256": "97198b77e369a0abd8e262b8f6c7266c55ddb796a3a12c76d7b8881188ed83aa",
+      "url": "https://files.pythonhosted.org/packages/22/df/c799fe7a05ef16ba853a59db01f3a2c5f7d0676469589ccc4874f76a2a88/protobuf-7.36.1-cp310-abi3-manylinux2014_x86_64.whl"
+    },
+    "protoc_asset": {
+      "filename": "protoc-36.1-linux-x86_64.zip",
+      "sha256": "c4bc672d9d49214dc8cafdceadf4df92182d6ca8e3ec65a56b2d7de5602669b4",
+      "url": "https://github.com/protocolbuffers/protobuf/releases/download/v36.1/protoc-36.1-linux-x86_64.zip"
+    },
+    "types_protobuf_wheel": {
+      "filename": "types_protobuf-7.35.1.20260906-py3-none-any.whl",
+      "sha256": "5155e48569e0dabff303fdf578db96cd31ea9a4a63b18018a4ceac6b0ae17462",
+      "url": "https://files.pythonhosted.org/packages/44/4e/f63e826c68f77ef875506d72f225918800346545ee99847bc28f3394f18d/types_protobuf-7.35.1.20260906-py3-none-any.whl"
+    }
+  },
+  "schema": {
+    "commit": "017413087c1c23c1866bbf07ff24d56574047253",
+    "files": [
+      {
+        "git_blob_sha1": "a21699b17c0101f4fc230710743449aab92e9685",
+        "path": "schemas/ctrader/openapi-proto-messages/91/OpenApiCommonMessages.proto",
+        "sha256": "9816cd24b340dcc4eb28548eb4dd16735995d2a61889337591e5c4d8021652a2",
+        "size": 1645,
+        "url": "https://raw.githubusercontent.com/spotware/openapi-proto-messages/91/OpenApiCommonMessages.proto"
+      },
+      {
+        "git_blob_sha1": "a420d2bea7a92c9e31a97c3a67d3553f97b1e21d",
+        "path": "schemas/ctrader/openapi-proto-messages/91/OpenApiCommonModelMessages.proto",
+        "sha256": "b95d7df670a7e890a53ec08f676198ace7bb0a074a4b07ff0b493c4be00a0dea",
+        "size": 1227,
+        "url": "https://raw.githubusercontent.com/spotware/openapi-proto-messages/91/OpenApiCommonModelMessages.proto"
+      },
+      {
+        "git_blob_sha1": "959bfb2e101485e266afdf48d69c38d73c947e2c",
+        "path": "schemas/ctrader/openapi-proto-messages/91/OpenApiMessages.proto",
+        "sha256": "a342d27a5298d9b58b6011843f267fe1e1e71af189bcfa5d1dc99abaf9c9d34f",
+        "size": 52832,
+        "url": "https://raw.githubusercontent.com/spotware/openapi-proto-messages/91/OpenApiMessages.proto"
+      },
+      {
+        "git_blob_sha1": "79db8354d04cb0c78d20410078737170a7212f58",
+        "path": "schemas/ctrader/openapi-proto-messages/91/OpenApiModelMessages.proto",
+        "sha256": "c2d34d07e663f9b43d6b5806ae2b706f460aa55afd847aa83343d3d9955201ee",
+        "size": 45811,
+        "url": "https://raw.githubusercontent.com/spotware/openapi-proto-messages/91/OpenApiModelMessages.proto"
+      }
+    ],
+    "repository": "https://github.com/spotware/openapi-proto-messages",
+    "tag": "91"
+  }
+}

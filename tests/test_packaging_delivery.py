@@ -40,7 +40,7 @@ class PackagingDeliveryTests(unittest.TestCase):
         self.assertEqual(metadata["requires-python"], ">=3.11")
         self.assertEqual(
             metadata["optional-dependencies"]["ctrader"],
-            ["ctrader-open-api==0.9.2", "service-identity==24.2.0"],
+            ["protobuf==7.36.1"],
         )
         self.assertEqual(
             metadata["optional-dependencies"]["dev"],
@@ -53,7 +53,14 @@ class PackagingDeliveryTests(unittest.TestCase):
             ],
         )
         self.assertEqual(metadata["readme"], "README.md")
-        self.assertEqual(project["tool"]["setuptools"]["package-data"]["mtf_lab"], ["resources/config/*.toml"])
+        self.assertEqual(
+            project["tool"]["setuptools"]["package-data"]["mtf_lab"],
+            ["resources/config/*.toml", "data/protobuf_generated/*.pyi"],
+        )
+        self.assertEqual(
+            project["tool"]["setuptools"]["package-data"]["mtf_lab.resources"],
+            ["licenses/*.txt", "provenance/*.json"],
+        )
 
     def test_all_source_configs_have_byte_equal_wheel_resources(self) -> None:
         source_root = ROOT / "config"
@@ -192,6 +199,14 @@ class PackagingDeliveryTests(unittest.TestCase):
                         archive.read(f"mtf_lab/resources/config/{config_name}"),
                         (ROOT / "config" / config_name).read_bytes(),
                     )
+                package_data = [
+                    *(ROOT / "mtf_lab/data/protobuf_generated").glob("*.pyi"),
+                    *(ROOT / "mtf_lab/resources/licenses").glob("*.txt"),
+                    *(ROOT / "mtf_lab/resources/provenance").glob("*.json"),
+                ]
+                for source in package_data:
+                    archive_name = source.relative_to(ROOT).as_posix()
+                    self.assertEqual(archive.read(archive_name), source.read_bytes(), msg=archive_name)
             self.assertEqual(before, {path: path.read_bytes() for path in source_paths})
             self.assertEqual(
                 derivatives,
@@ -243,17 +258,43 @@ class PackagingDeliveryTests(unittest.TestCase):
             root = base / "repo"
             package = root / "mtf_lab"
             package.mkdir(parents=True)
-            (root / "pyproject.toml").write_text('[project]\nname="mtf-lab"\n', encoding="utf-8")
+            (root / "pyproject.toml").write_text(
+                '[project]\nname="mtf-lab"\n[tool.setuptools.package-data]\nmtf_lab = ["resources/*.txt"]\n',
+                encoding="utf-8",
+            )
             (root / "README.md").write_text("Fixture project", encoding="utf-8")
             (package / "__init__.py").write_text("__version__ = '0.1.0'\n", encoding="utf-8")
+            (package / "resources").mkdir()
+            (package / "resources" / "declared.txt").write_text("declared", encoding="utf-8")
             (package / "secret.json").write_text("fixture-only-not-a-secret", encoding="utf-8")
             staged = base / "source"
             wheel_installer._copy_source(root, staged)
             self.assertEqual((package / "__init__.py").read_bytes(), (staged / "mtf_lab/__init__.py").read_bytes())
+            self.assertEqual(
+                (package / "resources/declared.txt").read_bytes(),
+                (staged / "mtf_lab/resources/declared.txt").read_bytes(),
+            )
             self.assertFalse((staged / "mtf_lab/secret.json").exists())
             (package / "bad.py").symlink_to(package / "__init__.py")
             with self.assertRaisesRegex(ValueError, "regular"):
                 wheel_installer._copy_source(root, base / "second-source")
+
+    def test_installer_rejects_declared_package_data_symlink(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="mtf-stage-data-symlink-") as name:
+            base = Path(name)
+            root = base / "repo"
+            package = root / "mtf_lab"
+            (package / "resources").mkdir(parents=True)
+            (root / "pyproject.toml").write_text(
+                '[project]\nname="mtf-lab"\n[tool.setuptools.package-data]\nmtf_lab = ["resources/*.txt"]\n',
+                encoding="utf-8",
+            )
+            (root / "README.md").write_text("fixture", encoding="utf-8")
+            outside = base / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            (package / "resources/linked.txt").symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "regular"):
+                wheel_installer._copy_source(root, base / "staged")
 
     def test_installer_environment_does_not_inherit_credentials_or_pythonpath(self) -> None:
         with (

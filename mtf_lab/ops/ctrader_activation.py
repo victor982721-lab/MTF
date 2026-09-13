@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import fcntl
 import hashlib
 import json
 import os
@@ -20,11 +21,14 @@ import re
 import secrets
 import stat
 import tempfile
-from collections.abc import Mapping, Sequence, Set
+from collections.abc import Iterator, Mapping, Sequence, Set
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+
+from .oauth_policy import approved_oauth_endpoint
 
 SUPPORTED_SCOPES = frozenset({"accounts", "trading"})
 _TOKEN_REF = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
@@ -37,6 +41,10 @@ class ActivationError(RuntimeError):
 
 class UnsafeTokenStore(ActivationError):
     """The selected token store is not external or is not private."""
+
+
+class ReauthorizationRequired(ActivationError):
+    """A prior one-use OAuth transaction has an unknown outcome."""
 
 
 class RealAccountForbidden(ActivationError):
@@ -91,18 +99,172 @@ def _oauth_scope_set(values: Sequence[str] | Set[str]) -> frozenset[str]:
     return frozenset({"accounts", "trading"}) if scopes == frozenset({"trading"}) else scopes
 
 
+_AUTHORIZATION_QUERY_KEYS = frozenset({"client_id", "redirect_uri", "scope", "product", "state"})
+_TRANSACTION_ID = re.compile(r"^oauth-txn-[0-9a-f]{32}$")
+_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _candidate_proof(
+    *,
+    kind: str,
+    token_ref: str,
+    current_generation: int,
+    attempt_id: str,
+    client_id: str,
+    token_url: str,
+    redirect_uri: str,
+    requested_scopes: Sequence[str] | Set[str],
+) -> str:
+    """Derive a non-secret transaction proof from the intended request."""
+
+    material = {
+        "attempt_id": str(attempt_id),
+        "client_id": str(client_id).strip(),
+        "current_generation": int(current_generation),
+        "kind": str(kind),
+        "redirect_uri": str(redirect_uri),
+        "requested_scopes": sorted(_scope_set(requested_scopes)),
+        "token_ref": str(token_ref).strip(),
+        "token_url": str(token_url),
+    }
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _parse_authorization_handoff(url: str) -> tuple[Any, dict[str, str]]:
+    """Validate an authorization URL and return its non-secret fields."""
+
+    parsed = urlparse(str(url).strip())
+    if not approved_oauth_endpoint(parsed._replace(query="").geturl(), token=False):
+        raise ActivationError("authorization_url no corresponde a un endpoint aprobado")
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ActivationError("authorization_url inválida")
+    values = _unique_query_values(
+        parsed.query,
+        allowed=_AUTHORIZATION_QUERY_KEYS,
+        invalid_message="query de authorization_url inválido",
+        unknown_message="authorization_url contiene parámetros no reconocidos",
+    )
+    required = {"client_id", "redirect_uri", "scope", "state"}
+    if not required.issubset(values) or any(not values[key].strip() for key in required):
+        raise ActivationError("authorization_url requiere client_id, redirect_uri, scope y state")
+    redirect_uri = values["redirect_uri"]
+    if not _is_loopback_redirect(redirect_uri):
+        raise ActivationError("authorization_url contiene un redirect_uri no loopback")
+    scopes = _scope_set(str(values["scope"]).replace(",", " ").split())
+    if len(scopes) != 1:
+        raise ActivationError("authorization_url requiere exactamente un scope")
+    if "product" in values and values["product"] != "web":
+        raise ActivationError("authorization_url contiene un product no soportado")
+    values["scope"] = next(iter(scopes))
+    return parsed, values
+
+
+def _unique_query_values(
+    query: str,
+    *,
+    allowed: Set[str],
+    invalid_message: str,
+    unknown_message: str,
+) -> dict[str, str]:
+    try:
+        pairs = parse_qsl(query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as exc:
+        raise ActivationError(invalid_message) from exc
+    values: dict[str, str] = {}
+    for key, value in pairs:
+        if key not in allowed:
+            raise ActivationError(unknown_message)
+        if key in values:
+            raise ActivationError(f"parámetro OAuth {key} duplicado")
+        values[key] = value
+    return values
+
+
+def _validate_transaction_marker(raw: Mapping[str, Any], token_ref: str) -> Mapping[str, Any]:
+    """Validate marker identity and keep the marker content non-secret."""
+
+    if raw.get("version") != 1:
+        raise UnsafeTokenStore("versión de marker OAuth inválida")
+    if str(raw.get("token_ref", "")) != str(token_ref):
+        raise UnsafeTokenStore("marker OAuth no corresponde al token_ref")
+    state = str(raw.get("state", ""))
+    if state not in {"IN_FLIGHT", "UNKNOWN", "REAUTH_PENDING"}:
+        raise UnsafeTokenStore("estado de marker OAuth inválido")
+    if not _TOKEN_REF.fullmatch(str(raw.get("attempt_id", ""))):
+        raise UnsafeTokenStore("attempt_id de marker OAuth inválido")
+    if not _TRANSACTION_ID.fullmatch(str(raw.get("transaction_id", ""))):
+        raise UnsafeTokenStore("transaction_id de marker OAuth inválido")
+    if not _FINGERPRINT.fullmatch(str(raw.get("candidate_proof", ""))):
+        raise UnsafeTokenStore("candidate_proof de marker OAuth inválido")
+    if str(raw.get("kind", "")) not in {"exchange", "refresh"}:
+        raise UnsafeTokenStore("tipo de marker OAuth inválido")
+    generation = raw.get("current_generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+        raise UnsafeTokenStore("current_generation de marker OAuth inválida")
+    _utc(raw.get("created_at", ""))
+    return raw
+
+
 def _is_loopback_redirect(uri: str) -> bool:
-    parsed = urlparse(uri)
+    try:
+        parsed = urlparse(uri)
+        port = parsed.port
+    except ValueError:
+        return False
     return (
         parsed.scheme == "http"
         and parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-        and parsed.port is not None
+        and port is not None
+        and 1 <= port <= 65535
         and bool(parsed.path)
         and parsed.username is None
         and parsed.password is None
         and not parsed.query
         and not parsed.fragment
     )
+
+
+def _attempt_client_fingerprint(
+    authorization_url: str,
+    csrf_state: str,
+    requested_scopes: frozenset[str],
+    configured_fingerprint: str,
+) -> str:
+    _, authorization = _parse_authorization_handoff(authorization_url)
+    if not secrets.compare_digest(authorization["state"], csrf_state):
+        raise ActivationError("state del authorization_url no coincide con el intento")
+    if _scope_set((authorization["scope"],)) != requested_scopes:
+        raise ActivationError("scope del authorization_url no coincide con el intento")
+    derived = hashlib.sha256(authorization["client_id"].encode("utf-8")).hexdigest()
+    if configured_fingerprint and configured_fingerprint != derived:
+        raise ActivationError("client_id del intento no coincide con authorization_url")
+    return derived
+
+
+def _validate_attempt_phase(
+    phase: OAuthAttemptPhase,
+    authorization_code: str | None,
+    callback_received_at: datetime | None,
+    token_ref: str | None,
+) -> None:
+    if phase is OAuthAttemptPhase.AWAITING_CALLBACK and (
+        authorization_code is not None or callback_received_at is not None
+    ):
+        raise ActivationError("un intento pendiente no puede contener callback")
+    if phase is OAuthAttemptPhase.CALLBACK_RECEIVED and (not authorization_code or callback_received_at is None):
+        raise ActivationError("CALLBACK_RECEIVED requiere código y momento observado")
+    if phase is OAuthAttemptPhase.TOKEN_STORED:
+        if not token_ref:
+            raise ActivationError("TOKEN_STORED requiere token_ref")
+        if authorization_code is not None:
+            raise ActivationError("TOKEN_STORED debe purgar authorization_code")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -125,6 +287,8 @@ class OAuthAppConfig:
             raise ActivationError("redirect_uri debe ser un callback HTTP de loopback con puerto y ruta")
         for name in ("authorization_url", "token_url"):
             value = str(getattr(self, name)).strip()
+            if not approved_oauth_endpoint(value, token=name == "token_url"):
+                raise ActivationError(f"{name} no es un endpoint cTrader aprobado")
             parsed = urlparse(value)
             if (
                 parsed.scheme != "https"
@@ -248,6 +412,10 @@ class OAuthTokenCandidate:
     store_generation: int
     server_endpoint: str = ""
     connection_generation: int = 0
+    transaction_id: str = ""
+    candidate_proof: str = ""
+    transaction_attempt_id: str = ""
+    _transaction: Any = dataclasses.field(default=None, repr=False, compare=False)
     token_fingerprint: str = dataclasses.field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -277,6 +445,22 @@ class OAuthTokenCandidate:
         if isinstance(self.connection_generation, bool) or int(self.connection_generation) < 0:
             raise ActivationError("connection_generation de candidate inválida")
         object.__setattr__(self, "connection_generation", int(self.connection_generation))
+        transaction_fields = (
+            str(self.transaction_id).strip(),
+            str(self.candidate_proof).strip(),
+            str(self.transaction_attempt_id).strip(),
+        )
+        if any(transaction_fields):
+            if (
+                not all(transaction_fields)
+                or not _TRANSACTION_ID.fullmatch(transaction_fields[0])
+                or not _FINGERPRINT.fullmatch(transaction_fields[1])
+                or not _TOKEN_REF.fullmatch(transaction_fields[2])
+            ):
+                raise ActivationError("transaction binding de candidate inválido")
+            object.__setattr__(self, "transaction_id", transaction_fields[0])
+            object.__setattr__(self, "candidate_proof", transaction_fields[1])
+            object.__setattr__(self, "transaction_attempt_id", transaction_fields[2])
         object.__setattr__(self, "token_fingerprint", hashlib.sha256(self.payload.access_token.encode()).hexdigest())
 
     @property
@@ -406,9 +590,11 @@ def open_authorization_browser(
 
     if allow_browser is not True:
         raise ActivationError("abrir navegador requiere allow_browser=True explícito")
-    parsed = urlparse(str(authorization_url))
-    if parsed.scheme != "https" or not parsed.hostname:
-        raise ActivationError("authorization_url no es HTTPS")
+    parsed = urlparse(str(authorization_url).strip())
+    if parsed.query:
+        _parse_authorization_handoff(authorization_url)
+    elif not approved_oauth_endpoint(parsed.geturl(), token=False):
+        raise ActivationError("authorization_url no corresponde a un endpoint aprobado")
     if opener is None:
         import webbrowser
 
@@ -683,16 +869,8 @@ def _validate_binding_fields(
         raise ActivationError("evidencia de token incompleta")
     if len(fields[0]) != 64 or any(char not in "0123456789abcdef" for char in fields[0].lower()):
         raise ActivationError("fingerprint de token inválido")
-    parsed = urlparse(fields[2])
-    if (
-        parsed.scheme != "https"
-        or not parsed.hostname
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise ActivationError("endpoint de evidencia no es HTTPS base")
+    if not approved_oauth_endpoint(fields[2], token=True):
+        raise ActivationError("endpoint de evidencia no está aprobado")
     if fields[3] < 1 or fields[5] < 1:
         raise ActivationError("generation de evidencia inválida")
     validate_demo_server_endpoint(fields[4])
@@ -1031,7 +1209,10 @@ class SecureTokenStore:
         project_root: str | Path,
         fixture: bool = False,
     ) -> None:
-        self.root = Path(root).expanduser().resolve(strict=False)
+        raw_root = Path(root).expanduser().absolute()
+        if any(item.is_symlink() for item in (raw_root, *raw_root.parents)):
+            raise UnsafeTokenStore("token_store_dir y sus padres no pueden ser symlinks")
+        self.root = raw_root.resolve(strict=False)
         self.project_root = Path(project_root).expanduser().resolve(strict=False)
         self.is_fixture = bool(fixture)
         if self.root == self.project_root or self.root.is_relative_to(self.project_root):
@@ -1046,13 +1227,27 @@ class SecureTokenStore:
 
         return cls(root, project_root=project_root, fixture=True)
 
-    def _prepare(self) -> None:
-        if self.root.exists() and self.root.is_symlink():
+    def _check_root(self, *, strict_mode: bool = False) -> None:
+        if any(item.is_symlink() for item in (self.root, *self.root.parents)):
             raise UnsafeTokenStore("token_store_dir no puede ser symlink")
+        if not self.root.exists():
+            return
+        info = self.root.stat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise UnsafeTokenStore("token_store_dir debe ser un directorio privado del usuario actual")
+        if strict_mode and stat.S_IMODE(info.st_mode) != 0o700:
+            raise UnsafeTokenStore("token_store_dir debe tener permisos exactos 0700")
+
+    def _prepare(self) -> None:
+        self._check_root()
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.root, 0o700)
         root_info = self.root.stat()
-        if stat.S_IMODE(root_info.st_mode) != 0o700 or root_info.st_uid != os.getuid():
+        if (
+            not stat.S_ISDIR(root_info.st_mode)
+            or stat.S_IMODE(root_info.st_mode) != 0o700
+            or root_info.st_uid != os.getuid()
+        ):
             raise UnsafeTokenStore("token_store_dir debe ser del usuario actual y tener permisos 0700")
 
     def _path(self, token_ref: str) -> Path:
@@ -1060,7 +1255,335 @@ class SecureTokenStore:
             raise ActivationError("token_ref inválido")
         return self.root / f"{token_ref}.json"
 
+    def _marker_path(self, token_ref: str) -> Path:
+        self._path(token_ref)
+        return self.root / f".oauth-transaction-{token_ref}.json"
+
+    def _open_rotation_fd(self, token_ref: str) -> int:
+        self._path(token_ref)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.root / f".{token_ref}.lock", flags, 0o600)
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o600
+            ):
+                raise UnsafeTokenStore("lock OAuth inseguro")
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    @staticmethod
+    def _unlock_fd(fd: int) -> None:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _read_private_json(self, target: Path, *, description: str) -> Mapping[str, Any]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(target, flags)
+        except OSError as exc:
+            raise UnsafeTokenStore(f"no se pudo abrir {description} de forma segura") from exc
+        try:
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid()
+            ):
+                raise UnsafeTokenStore(f"{description} debe ser un archivo privado regular 0600")
+            with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                fd = -1
+                raw = json.load(handle)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        if not isinstance(raw, Mapping):
+            raise ActivationError(f"{description} inválido")
+        return raw
+
+    def _read_transaction_marker(self, token_ref: str) -> Mapping[str, Any] | None:
+        self._check_root(strict_mode=True)
+        target = self._marker_path(token_ref)
+        if not os.path.lexists(target):
+            return None
+        if target.is_symlink():
+            raise UnsafeTokenStore("marker OAuth no puede ser symlink")
+        return _validate_transaction_marker(self._read_private_json(target, description="marker OAuth"), token_ref)
+
+    def transaction_state(self, token_ref: str) -> str | None:
+        """Return a blocking transaction state without exposing marker values."""
+
+        self._check_root(strict_mode=True)
+        marker = self._read_transaction_marker(token_ref)
+        return str(marker["state"]) if marker is not None else None
+
+    def _write_private_json(self, target: Path, payload: Mapping[str, Any], *, prefix: str) -> None:
+        temporary = self.root / f".{prefix}.{os.getpid()}.{secrets.token_hex(8)}.tmp"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(temporary, flags, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                fd = -1
+                json.dump(payload, handle, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+            os.chmod(target, 0o600)
+            directory_fd = os.open(self.root, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if temporary.exists():
+                temporary.unlink()
+
+    @staticmethod
+    def _marker_matches(marker: Mapping[str, Any], transaction: _OAuthTransaction) -> bool:
+        return (
+            str(marker.get("token_ref", "")) == transaction.token_ref
+            and str(marker.get("transaction_id", "")) == transaction.transaction_id
+            and str(marker.get("candidate_proof", "")) == transaction.candidate_proof
+            and str(marker.get("attempt_id", "")) == transaction.attempt_id
+            and int(marker.get("current_generation", -1)) == transaction.current_generation
+        )
+
+    def _assert_transaction_marker_locked(self, transaction: _OAuthTransaction) -> Mapping[str, Any]:
+        marker = self._read_transaction_marker(transaction.token_ref)
+        if marker is None or marker.get("state") != "IN_FLIGHT" or not self._marker_matches(marker, transaction):
+            raise ReauthorizationRequired("la transacción OAuth ya no coincide; requiere reautorización")
+        return marker
+
+    def _set_transaction_state_locked(self, transaction: _OAuthTransaction, state: str) -> None:
+        marker = self._assert_transaction_marker_locked(transaction)
+        if state not in {"IN_FLIGHT", "UNKNOWN"}:
+            raise ActivationError("estado de transacción OAuth inválido")
+        self._write_private_json(
+            self._marker_path(transaction.token_ref),
+            {**dict(marker), "state": state},
+            prefix=f"oauth-transaction-{transaction.token_ref}",
+        )
+
+    def _remove_transaction_marker_locked(
+        self,
+        token_ref: str,
+        *,
+        transaction_id: str,
+        candidate_proof: str,
+        attempt_id: str,
+    ) -> None:
+        marker = self._read_transaction_marker(token_ref)
+        if (
+            marker is None
+            or marker.get("state") != "IN_FLIGHT"
+            or (
+                str(marker.get("transaction_id", "")) != transaction_id
+                or str(marker.get("candidate_proof", "")) != candidate_proof
+                or str(marker.get("attempt_id", "")) != attempt_id
+            )
+        ):
+            raise ReauthorizationRequired("la transacción OAuth no coincide; requiere reautorización")
+        target = self._marker_path(token_ref)
+        target.unlink()
+        directory_fd = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def _current_generation_locked(self, token_ref: str) -> int:
+        target = self._path(token_ref)
+        if not os.path.lexists(target):
+            return 0
+        if target.is_symlink():
+            raise UnsafeTokenStore("el token no puede ser symlink")
+        return self._metadata_from_payload(self._load(token_ref)).generation
+
+    def current_generation(self, token_ref: str, *, allow_reauth_pending: bool = False) -> int:
+        """Read the generation used to bind a new transaction proof."""
+
+        self._check_root(strict_mode=True)
+        marker = self._read_transaction_marker(token_ref)
+        if marker is not None and not (allow_reauth_pending and marker.get("state") in {"UNKNOWN", "REAUTH_PENDING"}):
+            raise ReauthorizationRequired("la transacción OAuth no tiene resultado confirmado; requiere reautorización")
+        return self._current_generation_locked(token_ref)
+
+    def begin_transaction(
+        self,
+        token_ref: str,
+        *,
+        current_generation: int | None,
+        attempt_id: str,
+        candidate_proof: str,
+        kind: str,
+    ) -> _OAuthTransaction:
+        """Claim a one-use OAuth operation before sending its HTTP request."""
+
+        if kind not in {"exchange", "refresh"}:
+            raise ActivationError("tipo de transacción OAuth inválido")
+        if not _TOKEN_REF.fullmatch(str(token_ref)) or not _TOKEN_REF.fullmatch(str(attempt_id)):
+            raise ActivationError("identidad de transacción OAuth inválida")
+        if not _FINGERPRINT.fullmatch(str(candidate_proof)):
+            raise ActivationError("candidate_proof de transacción OAuth inválido")
+        if current_generation is not None and (
+            isinstance(current_generation, bool) or not isinstance(current_generation, int) or current_generation < 0
+        ):
+            raise ActivationError("current_generation de transacción OAuth inválida")
+        self._prepare()
+        fd = self._open_rotation_fd(token_ref)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ReauthorizationRequired("hay una transacción OAuth activa; espere su resultado") from exc
+            actual_generation = self._current_generation_locked(token_ref)
+            if current_generation is not None and actual_generation != current_generation:
+                raise ReauthorizationRequired("la generación OAuth cambió; requiere reautorización")
+            marker = self._read_transaction_marker(token_ref)
+            if marker is not None:
+                if not (
+                    marker.get("state") == "REAUTH_PENDING"
+                    and marker.get("kind") == kind == "exchange"
+                    and str(marker.get("attempt_id")) == str(attempt_id)
+                    and str(marker.get("candidate_proof")) == str(candidate_proof)
+                    and int(marker.get("current_generation", -1)) == actual_generation
+                ):
+                    raise ReauthorizationRequired("hay una transacción OAuth sin resultado; requiere reautorización")
+                transaction_id = str(marker["transaction_id"])
+                marker = {**dict(marker), "state": "IN_FLIGHT"}
+            else:
+                transaction_id = f"oauth-txn-{secrets.token_hex(16)}"
+                marker = {
+                    "version": 1,
+                    "token_ref": str(token_ref),
+                    "current_generation": actual_generation,
+                    "attempt_id": str(attempt_id),
+                    "candidate_proof": str(candidate_proof),
+                    "transaction_id": transaction_id,
+                    "kind": kind,
+                    "state": "IN_FLIGHT",
+                    "created_at": _iso(datetime.now(UTC)),
+                }
+            self._write_private_json(
+                self._marker_path(token_ref),
+                marker,
+                prefix=f"oauth-transaction-{token_ref}",
+            )
+            return _OAuthTransaction(
+                store=self,
+                token_ref=str(token_ref),
+                current_generation=actual_generation,
+                attempt_id=str(attempt_id),
+                candidate_proof=str(candidate_proof),
+                transaction_id=transaction_id,
+                fd=fd,
+                kind=kind,
+            )
+        except BaseException:
+            self._unlock_fd(fd)
+            raise
+
+    def prepare_reauthorization(self, token_ref: str, *, attempt_id: str, candidate_proof: str) -> None:
+        """Bind a stale outcome to a new explicit authorization attempt."""
+
+        if not _TOKEN_REF.fullmatch(str(attempt_id)):
+            raise ActivationError("attempt_id inválido")
+        if not _FINGERPRINT.fullmatch(str(candidate_proof)):
+            raise ActivationError("candidate_proof de reautorización inválido")
+        self._prepare()
+        fd = self._open_rotation_fd(token_ref)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ReauthorizationRequired("hay una transacción OAuth activa; espere su resultado") from exc
+            marker = self._read_transaction_marker(token_ref)
+            if marker is not None:
+                current_generation = self._current_generation_locked(token_ref)
+                pending = {
+                    **dict(marker),
+                    "state": "REAUTH_PENDING",
+                    "kind": "exchange",
+                    "current_generation": current_generation,
+                    "attempt_id": str(attempt_id),
+                    "candidate_proof": str(candidate_proof),
+                    "transaction_id": f"oauth-txn-{secrets.token_hex(16)}",
+                    "created_at": _iso(datetime.now(UTC)),
+                }
+                self._write_private_json(
+                    self._marker_path(token_ref),
+                    pending,
+                    prefix=f"oauth-transaction-{token_ref}",
+                )
+        finally:
+            self._unlock_fd(fd)
+
     def rotate(
+        self,
+        token_ref: str,
+        *,
+        access_token: str,
+        refresh_token: str | None,
+        granted_scopes: Sequence[str] | Set[str],
+        expires_at: datetime | str,
+        now: datetime | None = None,
+        fixture_payload: bool = False,
+        expected_generation: int | None = None,
+    ) -> TokenMetadata:
+        """Serialize rotations and optionally reject a stale verified token."""
+        if bool(fixture_payload) != self.is_fixture:
+            raise UnsafeTokenStore(
+                "fixture_payload y tipo de token store deben coincidir; nunca mezcle fixtures con tokens reales"
+            )
+        if not isinstance(access_token, str) or not access_token:
+            raise ActivationError("access_token no puede estar vacío")
+        if refresh_token is not None and (not isinstance(refresh_token, str) or not refresh_token):
+            raise ActivationError("refresh_token debe ser texto no vacío o None")
+        self._prepare()
+        with self._rotation_lock(token_ref):
+            target = self._path(token_ref)
+            if target.is_symlink():
+                raise UnsafeTokenStore("el token no puede ser symlink, incluso sin target")
+            if self._read_transaction_marker(token_ref) is not None:
+                raise ReauthorizationRequired("hay una transacción OAuth sin resultado; requiere reautorización")
+            previous = self._current_generation_locked(token_ref)
+            if expected_generation is not None and previous != expected_generation:
+                raise ActivationError("store_generation OAuth cambió; revalidación requerida")
+            return self._rotate_locked(
+                token_ref,
+                access_token=access_token,
+                refresh_token=refresh_token,
+                granted_scopes=granted_scopes,
+                expires_at=expires_at,
+                now=now,
+                fixture_payload=fixture_payload,
+            )
+
+    @contextmanager
+    def _rotation_lock(self, token_ref: str) -> Iterator[None]:
+        self._path(token_ref)  # Validate before constructing the stable lock path.
+        fd = self._open_rotation_fd(token_ref)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _rotate_locked(
         self,
         token_ref: str,
         *,
@@ -1073,17 +1596,11 @@ class SecureTokenStore:
     ) -> TokenMetadata:
         """Atomically replace one token envelope and return redacted metadata."""
 
-        if bool(fixture_payload) != self.is_fixture:
-            raise UnsafeTokenStore(
-                "fixture_payload y tipo de token store deben coincidir; nunca mezcle fixtures con tokens reales"
-            )
-        if not isinstance(access_token, str) or not access_token:
-            raise ActivationError("access_token no puede estar vacío")
-        if refresh_token is not None and (not isinstance(refresh_token, str) or not refresh_token):
-            raise ActivationError("refresh_token debe ser texto no vacío o None")
         self._prepare()
         target = self._path(token_ref)
-        previous = self.metadata(token_ref) if target.exists() else None
+        if target.is_symlink():
+            raise UnsafeTokenStore("el token no puede ser symlink")
+        previous = self._metadata_from_payload(self._load(token_ref)) if target.exists() else None
         rotated_at = _utc(now or datetime.now(UTC))
         metadata = TokenMetadata(
             token_ref=token_ref,
@@ -1122,6 +1639,7 @@ class SecureTokenStore:
         return metadata
 
     def read(self, token_ref: str) -> TokenLease:
+        self._reject_blocking_transaction(token_ref)
         raw = self._load(token_ref)
         metadata = self._metadata_from_payload(raw)
         access_token = raw.get("access_token")
@@ -1131,7 +1649,12 @@ class SecureTokenStore:
         return TokenLease(metadata, access_token, refresh_token)
 
     def metadata(self, token_ref: str) -> TokenMetadata:
+        self._reject_blocking_transaction(token_ref)
         return self._metadata_from_payload(self._load(token_ref))
+
+    def _reject_blocking_transaction(self, token_ref: str) -> None:
+        if self._read_transaction_marker(token_ref) is not None:
+            raise ReauthorizationRequired("la transacción OAuth no tiene resultado confirmado; requiere reautorización")
 
     def _load(self, token_ref: str) -> Mapping[str, Any]:
         target = self._path(token_ref)
@@ -1144,7 +1667,12 @@ class SecureTokenStore:
             raise UnsafeTokenStore(f"no se pudo abrir el token de forma segura: {exc}") from exc
         try:
             info = os.fstat(fd)
-            if stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid():
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid()
+            ):
                 raise UnsafeTokenStore("el archivo de token debe ser del usuario actual y tener permisos exactos 0600")
             with os.fdopen(fd, "r", encoding="utf-8") as handle:
                 fd = -1
@@ -1154,6 +1682,9 @@ class SecureTokenStore:
                 os.close(fd)
         if not isinstance(raw, Mapping):
             raise ActivationError("sobre de token inválido")
+        metadata = self._metadata_from_payload(raw)
+        if metadata.token_ref != str(token_ref):
+            raise UnsafeTokenStore("el archivo de token no corresponde al token_ref solicitado")
         return raw
 
     @staticmethod
@@ -1168,6 +1699,83 @@ class SecureTokenStore:
             rotated_at=_utc(meta["rotated_at"]),
             generation=int(meta["generation"]),
         )
+
+
+@dataclasses.dataclass(slots=True)
+class _OAuthTransaction:
+    """A held per-token lock plus a secret-free durable transaction marker."""
+
+    store: SecureTokenStore
+    token_ref: str
+    current_generation: int
+    attempt_id: str
+    candidate_proof: str
+    transaction_id: str
+    fd: int
+    kind: str
+    active: bool = True
+
+    def rotate(
+        self,
+        *,
+        access_token: str,
+        refresh_token: str | None,
+        granted_scopes: Sequence[str] | Set[str],
+        expires_at: datetime | str,
+        now: datetime | None = None,
+        fixture_payload: bool = False,
+    ) -> TokenMetadata:
+        self._assert_active()
+        self.store._assert_transaction_marker_locked(self)
+        actual_generation = self.store._current_generation_locked(self.token_ref)
+        if actual_generation != self.current_generation:
+            raise ReauthorizationRequired("la generación OAuth cambió durante la transacción")
+        return self.store._rotate_locked(
+            self.token_ref,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            granted_scopes=granted_scopes,
+            expires_at=expires_at,
+            now=now,
+            fixture_payload=fixture_payload,
+        )
+
+    def commit(self) -> None:
+        self._assert_active()
+        try:
+            self.store._remove_transaction_marker_locked(
+                self.token_ref,
+                transaction_id=self.transaction_id,
+                candidate_proof=self.candidate_proof,
+                attempt_id=self.attempt_id,
+            )
+        finally:
+            self._release()
+
+    def mark_unknown(self) -> None:
+        if not self.active:
+            return
+        try:
+            self.store._set_transaction_state_locked(self, "UNKNOWN")
+        finally:
+            self._release()
+
+    def _assert_active(self) -> None:
+        if not self.active:
+            raise ReauthorizationRequired("la transacción OAuth ya terminó; requiere reautorización")
+
+    def _release(self) -> None:
+        if self.active:
+            self.active = False
+            self.store._unlock_fd(self.fd)
+
+    def __del__(self) -> None:
+        if getattr(self, "active", False):
+            try:
+                self.mark_unknown()
+            except Exception:
+                with suppress(Exception):
+                    self._release()
 
 
 class OAuthAttemptPhase(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
@@ -1190,13 +1798,23 @@ class OAuthAttempt:
     authorization_code: str | None = dataclasses.field(default=None, repr=False)
     callback_received_at: datetime | None = None
     token_ref: str | None = None
+    client_id_fingerprint: str = dataclasses.field(default="", repr=False)
 
     def __post_init__(self) -> None:
         if not _TOKEN_REF.fullmatch(str(self.attempt_id)):
             raise ActivationError("attempt_id inválido")
         if not isinstance(self.csrf_state, str) or len(self.csrf_state) < 32:
             raise ActivationError("csrf_state insuficiente")
-        object.__setattr__(self, "requested_scopes", _scope_set(self.requested_scopes))
+        requested_scopes = _scope_set(self.requested_scopes)
+        object.__setattr__(self, "requested_scopes", requested_scopes)
+        client_id_fingerprint = str(self.client_id_fingerprint).strip().lower()
+        object.__setattr__(
+            self,
+            "client_id_fingerprint",
+            _attempt_client_fingerprint(
+                self.authorization_url, self.csrf_state, requested_scopes, client_id_fingerprint
+            ),
+        )
         created = _utc(self.created_at)
         expires = _utc(self.expires_at)
         if expires <= created:
@@ -1207,17 +1825,12 @@ class OAuthAttempt:
         object.__setattr__(self, "phase", phase)
         callback_received = _utc(self.callback_received_at) if self.callback_received_at is not None else None
         object.__setattr__(self, "callback_received_at", callback_received)
-        if phase is OAuthAttemptPhase.AWAITING_CALLBACK and (
-            self.authorization_code is not None or callback_received is not None
-        ):
-            raise ActivationError("un intento pendiente no puede contener callback")
-        if phase is OAuthAttemptPhase.CALLBACK_RECEIVED and (not self.authorization_code or callback_received is None):
-            raise ActivationError("CALLBACK_RECEIVED requiere código y momento observado")
-        if phase is OAuthAttemptPhase.TOKEN_STORED:
-            if not self.token_ref:
-                raise ActivationError("TOKEN_STORED requiere token_ref")
-            if self.authorization_code is not None:
-                raise ActivationError("TOKEN_STORED debe purgar authorization_code")
+        _validate_attempt_phase(phase, self.authorization_code, callback_received, self.token_ref)
+        if self.token_ref is not None:
+            token_ref = str(self.token_ref).strip()
+            if not _TOKEN_REF.fullmatch(token_ref):
+                raise ActivationError("token_ref del intento inválido")
+            object.__setattr__(self, "token_ref", token_ref)
 
     def __repr__(self) -> str:
         return f"OAuthAttempt(attempt_id={self.attempt_id!r}, phase={self.phase.value!r}, secrets='REDACTED')"
@@ -1226,6 +1839,36 @@ class OAuthAttempt:
 
     def is_expired(self, now: datetime) -> bool:
         return self.expires_at <= _utc(now)
+
+    def validate_binding(
+        self,
+        *,
+        app: OAuthAppConfig,
+        client_id: str,
+        token_ref: str,
+        profile_scopes: Sequence[str] | Set[str] | None = None,
+        require_token_ref: bool = True,
+    ) -> None:
+        """Bind a persisted attempt to its current application/profile."""
+
+        parsed, authorization = _parse_authorization_handoff(self.authorization_url)
+        if parsed._replace(query="", fragment="").geturl().rstrip("/") != app.authorization_url.rstrip("/"):
+            raise ReauthorizationRequired("endpoint de autorización del intento cambió; requiere reautorización")
+        if authorization["redirect_uri"] != app.redirect_uri:
+            raise ReauthorizationRequired("redirect_uri del intento cambió; requiere reautorización")
+        if _scope_set((authorization["scope"],)) != self.requested_scopes:
+            raise ReauthorizationRequired("scope del intento cambió; requiere reautorización")
+        if require_token_ref and (not self.token_ref or self.token_ref != str(token_ref).strip()):
+            raise ReauthorizationRequired("token_ref del intento cambió; requiere reautorización")
+        if self.token_ref is not None and self.token_ref != str(token_ref).strip():
+            raise ReauthorizationRequired("token_ref del intento cambió; requiere reautorización")
+        if not secrets.compare_digest(
+            self.client_id_fingerprint,
+            hashlib.sha256(str(client_id).strip().encode("utf-8")).hexdigest(),
+        ):
+            raise ReauthorizationRequired("client_id del intento cambió; requiere reautorización")
+        if profile_scopes is not None and _oauth_scope_set(self.requested_scopes) != _oauth_scope_set(profile_scopes):
+            raise ReauthorizationRequired("el intento no coincide con el perfil OAuth vigente")
 
     def to_public_dict(self, *, now: datetime | None = None) -> dict[str, Any]:
         instant = _utc(now or datetime.now(UTC))
@@ -1269,6 +1912,7 @@ class OAuthAttempt:
                 _iso(self.callback_received_at) if self.callback_received_at is not None else None
             ),
             "token_ref": self.token_ref,
+            "client_id_fingerprint": self.client_id_fingerprint,
         }
 
     @classmethod
@@ -1291,6 +1935,7 @@ class OAuthAttempt:
                     _utc(raw["callback_received_at"]) if raw.get("callback_received_at") is not None else None
                 ),
                 token_ref=(str(raw["token_ref"]) if raw.get("token_ref") is not None else None),
+                client_id_fingerprint=str(raw.get("client_id_fingerprint", "")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ActivationError("intento OAuth persistido inválido") from exc
@@ -1368,6 +2013,7 @@ class OAuthAttemptStore:
                 temporary.unlink()
 
     def load(self, attempt_id: str) -> OAuthAttempt:
+        self._guard._check_root(strict_mode=True)
         target = self._path(attempt_id)
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
@@ -1378,8 +2024,13 @@ class OAuthAttemptStore:
             raise ActivationError("intento OAuth no encontrado o inseguro") from exc
         try:
             info = os.fstat(fd)
-            if stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid():
-                raise UnsafeTokenStore("el intento OAuth debe ser del usuario actual y tener permisos exactos 0600")
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid()
+            ):
+                raise UnsafeTokenStore("el intento OAuth debe ser un archivo regular privado 0600")
             with os.fdopen(fd, "r", encoding="utf-8") as handle:
                 fd = -1
                 raw = json.load(handle)
@@ -1388,7 +2039,10 @@ class OAuthAttemptStore:
                 os.close(fd)
         if not isinstance(raw, Mapping):
             raise ActivationError("intento OAuth persistido inválido")
-        return OAuthAttempt._from_private_dict(raw)
+        attempt = OAuthAttempt._from_private_dict(raw)
+        if attempt.attempt_id != str(attempt_id):
+            raise UnsafeTokenStore("el intento OAuth no corresponde al nombre solicitado")
+        return attempt
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1516,6 +2170,7 @@ def _serve_callback(
     """Serve exactly one local callback, closing the socket on every path."""
 
     import http.server
+    import socket
     import time
 
     hostname = registered.hostname
@@ -1523,7 +2178,14 @@ def _serve_callback(
     if hostname is None or port is None:
         raise ActivationError("redirect_uri no contiene endpoint loopback completo")
     handler = _callback_handler(assistant, attempt_id, registered, outcome)
-    server = http.server.HTTPServer((hostname, port), handler)
+    if hostname == "::1":
+
+        class IPv6HTTPServer(http.server.HTTPServer):
+            address_family = socket.AF_INET6
+
+        server: http.server.HTTPServer = IPv6HTTPServer((hostname, port, 0, 0), handler)
+    else:
+        server = http.server.HTTPServer((hostname, port), handler)
     server.timeout = min(1.0, float(timeout_seconds))
     deadline = time.monotonic() + float(timeout_seconds)
     try:
@@ -1664,6 +2326,36 @@ class LoopbackOAuthAssistant:
         self.fixture_mode = bool(fixture_mode)
         self.code_ttl_seconds = int(code_ttl_seconds)
 
+    def _transaction_for_candidate(self, candidate: OAuthTokenCandidate) -> _OAuthTransaction | None:
+        transaction = getattr(candidate, "_transaction", None)
+        if not isinstance(transaction, _OAuthTransaction):
+            return None
+        if transaction.store is not self.tokens or not transaction.active:
+            raise ReauthorizationRequired("candidate OAuth sin transacción activa; requiere reautorización")
+        if (
+            candidate.transaction_id != transaction.transaction_id
+            or candidate.candidate_proof != transaction.candidate_proof
+            or candidate.transaction_attempt_id != transaction.attempt_id
+            or candidate.token_ref != transaction.token_ref
+        ):
+            raise ReauthorizationRequired("candidate OAuth no corresponde a su transacción")
+        return transaction
+
+    def abandon_candidate(self, candidate: OAuthTokenCandidate | None) -> None:
+        """Leave a durable UNKNOWN marker when external outcome is uncertain."""
+
+        if candidate is None:
+            return
+        transaction = self._transaction_for_candidate(candidate)
+        if transaction is not None:
+            transaction.mark_unknown()
+
+    def _candidate_transaction_or_fixture(self, candidate: OAuthTokenCandidate) -> _OAuthTransaction | None:
+        transaction = self._transaction_for_candidate(candidate)
+        if transaction is None and not self.fixture_mode:
+            raise ReauthorizationRequired("candidate OAuth no está ligado a una transacción; requiere reautorización")
+        return transaction
+
     def _next_generation(self, token_ref: str) -> int:
         if not _TOKEN_REF.fullmatch(str(token_ref).strip()):
             raise ActivationError("token_ref inválido")
@@ -1677,6 +2369,7 @@ class LoopbackOAuthAssistant:
         *,
         client_id: str,
         requested_scopes: Sequence[str] | Set[str],
+        token_ref: str | None = None,
         open_browser: bool = False,
         opener: Any = None,
         now: datetime | None = None,
@@ -1685,12 +2378,17 @@ class LoopbackOAuthAssistant:
         if isinstance(ttl_seconds, bool) or int(ttl_seconds) < 30:
             raise ActivationError("ttl_seconds debe ser entero >= 30")
         instant = _utc(now or datetime.now(UTC))
+        client_id_value = str(client_id).strip()
+        if not client_id_value:
+            raise ActivationError("client_id no puede estar vacío")
+        if token_ref is not None and not _TOKEN_REF.fullmatch(str(token_ref).strip()):
+            raise ActivationError("token_ref del intento inválido")
         attempt_id = f"oauth-{secrets.token_hex(12)}"
         csrf_state = secrets.token_urlsafe(32)
         scopes = _scope_set(requested_scopes)
         url = build_authorization_url(
             self.app,
-            client_id=client_id,
+            client_id=client_id_value,
             scope=sorted(scopes),
             state=csrf_state,
         )
@@ -1701,11 +2399,47 @@ class LoopbackOAuthAssistant:
             authorization_url=url,
             created_at=instant,
             expires_at=instant + timedelta(seconds=int(ttl_seconds)),
+            token_ref=str(token_ref).strip() if token_ref is not None else None,
+            client_id_fingerprint=hashlib.sha256(client_id_value.encode("utf-8")).hexdigest(),
         )
         self.attempts.save(attempt)
         if open_browser:
             open_authorization_browser(url, allow_browser=True, opener=opener)
         return attempt
+
+    def prepare_reauthorization(
+        self,
+        attempt: OAuthAttempt,
+        *,
+        client_id: str,
+        profile_scopes: Sequence[str] | Set[str],
+    ) -> None:
+        """Keep old-token use blocked while a new authorization is pending."""
+
+        if not attempt.token_ref:
+            raise ReauthorizationRequired("el intento no tiene token_ref; requiere reautorización")
+        attempt.validate_binding(
+            app=self.app,
+            client_id=client_id,
+            token_ref=attempt.token_ref,
+            profile_scopes=profile_scopes,
+        )
+        current_generation = self.tokens.current_generation(attempt.token_ref, allow_reauth_pending=True)
+        proof = _candidate_proof(
+            kind="exchange",
+            token_ref=attempt.token_ref,
+            current_generation=current_generation,
+            attempt_id=attempt.attempt_id,
+            client_id=client_id,
+            token_url=self.app.token_url,
+            redirect_uri=self.app.redirect_uri,
+            requested_scopes=attempt.requested_scopes,
+        )
+        self.tokens.prepare_reauthorization(
+            attempt.token_ref,
+            attempt_id=attempt.attempt_id,
+            candidate_proof=proof,
+        )
 
     def resume(self, attempt_id: str, *, now: datetime | None = None) -> dict[str, Any]:
         return self.attempts.load(attempt_id).to_public_dict(now=now)
@@ -1805,6 +2539,106 @@ class LoopbackOAuthAssistant:
         self.attempts.save(updated)
         return updated
 
+    def _exchange_transaction_inputs(
+        self,
+        attempt: OAuthAttempt,
+        *,
+        attempt_id: str,
+        token_ref: str,
+        client_id: str,
+        client_secret: str,
+        requester: Any,
+        profile_scopes: Sequence[str] | Set[str] | None,
+    ) -> tuple[str, int, str]:
+        token_ref_value = str(token_ref).strip()
+        if not _TOKEN_REF.fullmatch(token_ref_value):
+            raise ActivationError("token_ref inválido")
+        if attempt.token_ref is not None and attempt.token_ref != token_ref_value:
+            raise ReauthorizationRequired("token_ref del intento no coincide; requiere reautorización")
+        attempt.validate_binding(
+            app=self.app,
+            client_id=client_id,
+            token_ref=token_ref_value,
+            profile_scopes=profile_scopes,
+            require_token_ref=profile_scopes is not None,
+        )
+        if not isinstance(client_secret, str) or not client_secret:
+            raise ActivationError("client_secret debe llegar por el proveedor seguro, no por configuración")
+        if requester is None or not callable(requester):
+            raise ActivationError("intercambio OAuth requiere un transporte explícito")
+        current_generation = self.tokens.current_generation(
+            token_ref_value, allow_reauth_pending=profile_scopes is not None
+        )
+        proof = _candidate_proof(
+            kind="exchange",
+            token_ref=token_ref_value,
+            current_generation=current_generation,
+            attempt_id=attempt_id,
+            client_id=client_id,
+            token_url=self.app.token_url,
+            redirect_uri=self.app.redirect_uri,
+            requested_scopes=attempt.requested_scopes,
+        )
+        return token_ref_value, current_generation, proof
+
+    def _validated_payload_for_persistence(
+        self,
+        attempt: OAuthAttempt,
+        *,
+        token_ref: str,
+        candidate: OAuthTokenCandidate,
+        observed_scopes: Sequence[str] | Set[str],
+        transaction: _OAuthTransaction | None,
+    ) -> tuple[OAuthTokenPayload, frozenset[str]]:
+        if transaction is not None and (transaction.kind != "exchange" or transaction.attempt_id != attempt.attempt_id):
+            raise ReauthorizationRequired("candidate OAuth no corresponde al intento activo")
+        if candidate.token_ref != str(token_ref).strip() or candidate.token_url != self.app.token_url:
+            raise ActivationError("candidate OAuth no corresponde al destino de persistencia")
+        expected_generation = (
+            transaction.current_generation + 1 if transaction is not None else self._next_generation(token_ref)
+        )
+        if candidate.store_generation != expected_generation:
+            raise ActivationError("store_generation OAuth cambió antes de persistir")
+        payload = candidate.payload
+        scopes = _scope_set(observed_scopes)
+        if payload.scopes is not None and payload.scopes != scopes:
+            raise ActivationError("los scopes del token no coinciden con la evidencia observada")
+        if not attempt.requested_scopes.issubset(scopes):
+            raise ActivationError("los scopes observados no cubren los solicitados")
+        if payload.refresh_token is None:
+            raise ActivationError("el proveedor no devolvió refresh_token; no se persistió el intercambio")
+        return payload, scopes
+
+    def _rotate_candidate_payload(
+        self,
+        token_ref: str,
+        *,
+        candidate: OAuthTokenCandidate,
+        payload: OAuthTokenPayload,
+        scopes: frozenset[str],
+        now: datetime,
+        transaction: _OAuthTransaction | None,
+    ) -> TokenMetadata:
+        if transaction is not None:
+            return transaction.rotate(
+                access_token=payload.access_token,
+                refresh_token=payload.refresh_token,
+                granted_scopes=scopes,
+                expires_at=now + timedelta(seconds=payload.expires_in),
+                now=now,
+                fixture_payload=self.fixture_mode,
+            )
+        return self.tokens.rotate(
+            token_ref,
+            access_token=payload.access_token,
+            refresh_token=payload.refresh_token,
+            granted_scopes=scopes,
+            expires_at=now + timedelta(seconds=payload.expires_in),
+            now=now,
+            fixture_payload=self.fixture_mode,
+            expected_generation=candidate.store_generation - 1,
+        )
+
     def exchange_unpersisted(
         self,
         attempt_id: str,
@@ -1814,6 +2648,7 @@ class LoopbackOAuthAssistant:
         client_id: str,
         client_secret: str,
         requester: Any,
+        profile_scopes: Sequence[str] | Set[str] | None = None,
         now: datetime | None = None,
         timeout: float = 10.0,
     ) -> OAuthTokenCandidate:
@@ -1834,21 +2669,45 @@ class LoopbackOAuthAssistant:
             seconds=self.code_ttl_seconds
         ):
             raise ActivationError("el código OAuth caducó; inicia un intento nuevo")
-        payload = exchange_authorization_code(
-            self.app,
+        token_ref_value, current_generation, proof = self._exchange_transaction_inputs(
+            attempt,
+            attempt_id=attempt_id,
+            token_ref=token_ref,
             client_id=client_id,
             client_secret=client_secret,
-            code=str(attempt.authorization_code),
             requester=requester,
-            timeout=timeout,
+            profile_scopes=profile_scopes,
         )
-        return OAuthTokenCandidate(
-            payload=payload,
-            token_ref=token_ref,
-            token_url=self.app.token_url,
-            store_generation=self._next_generation(token_ref),
-            server_endpoint=server_endpoint,
+        transaction = self.tokens.begin_transaction(
+            token_ref_value,
+            current_generation=current_generation,
+            attempt_id=attempt_id,
+            candidate_proof=proof,
+            kind="exchange",
         )
+        try:
+            payload = exchange_authorization_code(
+                self.app,
+                client_id=client_id,
+                client_secret=client_secret,
+                code=str(attempt.authorization_code),
+                requester=requester,
+                timeout=timeout,
+            )
+            return OAuthTokenCandidate(
+                payload=payload,
+                token_ref=token_ref_value,
+                token_url=self.app.token_url,
+                store_generation=transaction.current_generation + 1,
+                server_endpoint=server_endpoint,
+                transaction_id=transaction.transaction_id,
+                candidate_proof=transaction.candidate_proof,
+                transaction_attempt_id=transaction.attempt_id,
+                _transaction=transaction,
+            )
+        except BaseException:
+            transaction.mark_unknown()
+            raise
 
     def _persist_payload(
         self,
@@ -1861,39 +2720,41 @@ class LoopbackOAuthAssistant:
     ) -> TokenMetadata:
         """Persist a payload after a caller supplied observed scopes."""
 
-        attempt = self.attempts.load(attempt_id)
-        if attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
-            raise ActivationError("el intento no está listo para persistencia")
-        if candidate.token_ref != str(token_ref).strip() or candidate.token_url != self.app.token_url:
-            raise ActivationError("candidate OAuth no corresponde al destino de persistencia")
-        if candidate.store_generation != self._next_generation(token_ref):
-            raise ActivationError("store_generation OAuth cambió antes de persistir")
-        payload = candidate.payload
-        scopes = _scope_set(observed_scopes)
-        if payload.scopes is not None and payload.scopes != scopes:
-            raise ActivationError("los scopes del token no coinciden con la evidencia observada")
-        if not attempt.requested_scopes.issubset(scopes):
-            raise ActivationError("los scopes observados no cubren los solicitados")
-        if payload.refresh_token is None:
-            raise ActivationError("el proveedor no devolvió refresh_token; no se persistió el intercambio")
-        metadata = self.tokens.rotate(
-            token_ref,
-            access_token=payload.access_token,
-            refresh_token=payload.refresh_token,
-            granted_scopes=scopes,
-            expires_at=now + timedelta(seconds=payload.expires_in),
-            now=now,
-            fixture_payload=self.fixture_mode,
-        )
-        self.attempts.save(
-            dataclasses.replace(
+        transaction = self._candidate_transaction_or_fixture(candidate)
+        try:
+            attempt = self.attempts.load(attempt_id)
+            if attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
+                raise ActivationError("el intento no está listo para persistencia")
+            payload, scopes = self._validated_payload_for_persistence(
                 attempt,
-                phase=OAuthAttemptPhase.TOKEN_STORED,
-                authorization_code=None,
                 token_ref=token_ref,
+                candidate=candidate,
+                observed_scopes=observed_scopes,
+                transaction=transaction,
             )
-        )
-        return metadata
+            metadata = self._rotate_candidate_payload(
+                token_ref,
+                candidate=candidate,
+                payload=payload,
+                scopes=scopes,
+                now=now,
+                transaction=transaction,
+            )
+            self.attempts.save(
+                dataclasses.replace(
+                    attempt,
+                    phase=OAuthAttemptPhase.TOKEN_STORED,
+                    authorization_code=None,
+                    token_ref=token_ref,
+                )
+            )
+            if transaction is not None:
+                transaction.commit()
+            return metadata
+        except BaseException:
+            if transaction is not None and transaction.active:
+                transaction.mark_unknown()
+            raise
 
     def persist_verified_token(
         self,
@@ -1907,30 +2768,36 @@ class LoopbackOAuthAssistant:
     ) -> TokenMetadata:
         """Persist a token only after exact server DEMO/scope verification."""
 
-        instant = _utc(now or datetime.now(UTC))
-        attempt = self.attempts.load(attempt_id)
-        if attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
-            raise ActivationError("el intento no está listo para persistencia")
-        # The authorization code was already exchanged by exchange_unpersisted;
-        # do not reapply its one-minute lifetime to the in-memory access token.
-        if not isinstance(verification, (VerifiedDemoAuthorization, VerifiedAccountAuthorization)):
-            raise ActivationError("se requiere evidencia de cuentas DEMO del servidor")
-        _require_candidate_binding(
-            candidate,
-            verification,
-            token_ref=token_ref,
-            token_url=self.app.token_url,
-            server_endpoint=server_endpoint,
-        )
-        if not attempt.requested_scopes.issubset(verification.granted_scopes):
-            raise ActivationError("la evidencia de permiso no cubre los scopes solicitados")
-        return self._persist_payload(
-            attempt_id,
-            token_ref=token_ref,
-            candidate=candidate,
-            observed_scopes=verification.granted_scopes,
-            now=instant,
-        )
+        transaction = self._transaction_for_candidate(candidate)
+        try:
+            instant = _utc(now or datetime.now(UTC))
+            attempt = self.attempts.load(attempt_id)
+            if attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
+                raise ActivationError("el intento no está listo para persistencia")
+            # The authorization code was already exchanged by exchange_unpersisted;
+            # do not reapply its one-minute lifetime to the in-memory access token.
+            if not isinstance(verification, (VerifiedDemoAuthorization, VerifiedAccountAuthorization)):
+                raise ActivationError("se requiere evidencia de cuentas DEMO del servidor")
+            _require_candidate_binding(
+                candidate,
+                verification,
+                token_ref=token_ref,
+                token_url=self.app.token_url,
+                server_endpoint=server_endpoint,
+            )
+            if not attempt.requested_scopes.issubset(verification.granted_scopes):
+                raise ActivationError("la evidencia de permiso no cubre los scopes solicitados")
+            return self._persist_payload(
+                attempt_id,
+                token_ref=token_ref,
+                candidate=candidate,
+                observed_scopes=verification.granted_scopes,
+                now=instant,
+            )
+        except BaseException:
+            if transaction is not None and transaction.active:
+                transaction.mark_unknown()
+            raise
 
     def refresh_unpersisted(
         self,
@@ -1944,24 +2811,59 @@ class LoopbackOAuthAssistant:
     ) -> OAuthTokenCandidate:
         """Rotate access credentials in memory without writing an unverified token."""
 
-        lease = self.tokens.read(token_ref)
+        token_ref_value = str(token_ref).strip()
+        if not _TOKEN_REF.fullmatch(token_ref_value):
+            raise ActivationError("token_ref inválido")
+        if not str(client_id).strip():
+            raise ActivationError("client_id no puede estar vacío")
+        if not isinstance(client_secret, str) or not client_secret:
+            raise ActivationError("client_secret debe llegar por el proveedor seguro, no por configuración")
+        if requester is None or not callable(requester):
+            raise ActivationError("renovación OAuth requiere un transporte explícito")
+        lease = self.tokens.read(token_ref_value)
         if not lease.refresh_token:
             raise ActivationError("el sobre activo no contiene refresh_token")
-        payload = refresh_access_token(
-            self.app,
+        transaction_attempt_id = f"refresh-{secrets.token_hex(12)}"
+        proof = _candidate_proof(
+            kind="refresh",
+            token_ref=token_ref_value,
+            current_generation=lease.metadata.generation,
+            attempt_id=transaction_attempt_id,
             client_id=client_id,
-            client_secret=client_secret,
-            refresh_token=lease.refresh_token,
-            requester=requester,
-            timeout=timeout,
-        )
-        return OAuthTokenCandidate(
-            payload=payload,
-            token_ref=token_ref,
             token_url=self.app.token_url,
-            store_generation=lease.metadata.generation + 1,
-            server_endpoint=server_endpoint,
+            redirect_uri=self.app.redirect_uri,
+            requested_scopes=lease.metadata.granted_scopes,
         )
+        transaction = self.tokens.begin_transaction(
+            token_ref_value,
+            current_generation=lease.metadata.generation,
+            attempt_id=transaction_attempt_id,
+            candidate_proof=proof,
+            kind="refresh",
+        )
+        try:
+            payload = refresh_access_token(
+                self.app,
+                client_id=client_id,
+                client_secret=client_secret,
+                refresh_token=lease.refresh_token,
+                requester=requester,
+                timeout=timeout,
+            )
+            return OAuthTokenCandidate(
+                payload=payload,
+                token_ref=token_ref_value,
+                token_url=self.app.token_url,
+                store_generation=transaction.current_generation + 1,
+                server_endpoint=server_endpoint,
+                transaction_id=transaction.transaction_id,
+                candidate_proof=transaction.candidate_proof,
+                transaction_attempt_id=transaction.attempt_id,
+                _transaction=transaction,
+            )
+        except BaseException:
+            transaction.mark_unknown()
+            raise
 
     def _rotate_payload(
         self,
@@ -1971,25 +2873,51 @@ class LoopbackOAuthAssistant:
         observed_scopes: Sequence[str] | Set[str],
         now: datetime,
     ) -> TokenMetadata:
-        if candidate.token_ref != str(token_ref).strip() or candidate.token_url != self.app.token_url:
-            raise ActivationError("candidate OAuth no corresponde al destino de rotación")
-        if candidate.store_generation != self._next_generation(token_ref):
-            raise ActivationError("store_generation OAuth cambió antes de rotar")
-        payload = candidate.payload
-        scopes = _scope_set(observed_scopes)
-        if payload.scopes is not None and payload.scopes != scopes:
-            raise ActivationError("los scopes del token no coinciden con la evidencia observada")
-        if payload.refresh_token is None:
-            raise ActivationError("refresh sin token de rotación; se conserva intacto el sobre previo")
-        return self.tokens.rotate(
-            token_ref,
-            access_token=payload.access_token,
-            refresh_token=payload.refresh_token,
-            granted_scopes=scopes,
-            expires_at=now + timedelta(seconds=payload.expires_in),
-            now=now,
-            fixture_payload=self.fixture_mode,
-        )
+        transaction = self._candidate_transaction_or_fixture(candidate)
+        try:
+            token_ref_value = str(token_ref).strip()
+            if transaction is not None and transaction.kind != "refresh":
+                raise ReauthorizationRequired("candidate OAuth no corresponde a renovación")
+            if candidate.token_ref != token_ref_value or candidate.token_url != self.app.token_url:
+                raise ActivationError("candidate OAuth no corresponde al destino de rotación")
+            expected_generation = (
+                transaction.current_generation + 1
+                if transaction is not None
+                else self._next_generation(token_ref_value)
+            )
+            if candidate.store_generation != expected_generation:
+                raise ActivationError("store_generation OAuth cambió antes de rotar")
+            payload = candidate.payload
+            scopes = _scope_set(observed_scopes)
+            if payload.scopes is not None and payload.scopes != scopes:
+                raise ActivationError("los scopes del token no coinciden con la evidencia observada")
+            if payload.refresh_token is None:
+                raise ActivationError("refresh sin token de rotación; se conserva intacto el sobre previo")
+            if transaction is not None:
+                metadata = transaction.rotate(
+                    access_token=payload.access_token,
+                    refresh_token=payload.refresh_token,
+                    granted_scopes=scopes,
+                    expires_at=now + timedelta(seconds=payload.expires_in),
+                    now=now,
+                    fixture_payload=self.fixture_mode,
+                )
+                transaction.commit()
+                return metadata
+            return self.tokens.rotate(
+                token_ref_value,
+                access_token=payload.access_token,
+                refresh_token=payload.refresh_token,
+                granted_scopes=scopes,
+                expires_at=now + timedelta(seconds=payload.expires_in),
+                now=now,
+                fixture_payload=self.fixture_mode,
+                expected_generation=candidate.store_generation - 1,
+            )
+        except BaseException:
+            if transaction is not None and transaction.active:
+                transaction.mark_unknown()
+            raise
 
     def persist_verified_refresh(
         self,
@@ -2002,22 +2930,28 @@ class LoopbackOAuthAssistant:
     ) -> TokenMetadata:
         """Persist a refreshed token only after a fresh server DEMO probe."""
 
-        if not isinstance(verification, (VerifiedDemoAuthorization, VerifiedAccountAuthorization)):
-            raise ActivationError("se requiere evidencia de cuentas DEMO del servidor")
-        _require_candidate_binding(
-            candidate,
-            verification,
-            token_ref=token_ref,
-            token_url=self.app.token_url,
-            server_endpoint=server_endpoint,
-        )
-        instant = _utc(now or datetime.now(UTC))
-        return self._rotate_payload(
-            token_ref,
-            candidate=candidate,
-            observed_scopes=verification.granted_scopes,
-            now=instant,
-        )
+        transaction = self._transaction_for_candidate(candidate)
+        try:
+            if not isinstance(verification, (VerifiedDemoAuthorization, VerifiedAccountAuthorization)):
+                raise ActivationError("se requiere evidencia de cuentas DEMO del servidor")
+            _require_candidate_binding(
+                candidate,
+                verification,
+                token_ref=token_ref,
+                token_url=self.app.token_url,
+                server_endpoint=server_endpoint,
+            )
+            instant = _utc(now or datetime.now(UTC))
+            return self._rotate_payload(
+                token_ref,
+                candidate=candidate,
+                observed_scopes=verification.granted_scopes,
+                now=instant,
+            )
+        except BaseException:
+            if transaction is not None and transaction.active:
+                transaction.mark_unknown()
+            raise
 
     def exchange(
         self,
@@ -2076,34 +3010,26 @@ class LoopbackOAuthAssistant:
         if not self.fixture_mode:
             raise ActivationError("refresh legado sólo está permitido en stores fixture aislados")
         instant = _utc(now or datetime.now(UTC))
-        lease = self.tokens.read(token_ref)
-        if not lease.refresh_token:
-            raise ActivationError("el sobre activo no contiene refresh_token")
         scopes = _scope_set(observed_scopes)
         if not scopes:
             raise ActivationError("refresh requiere scopes observados")
-        payload = refresh_access_token(
-            self.app,
+        candidate = self.refresh_unpersisted(
+            token_ref,
             client_id=client_id,
             client_secret=client_secret,
-            refresh_token=lease.refresh_token,
             requester=requester,
             timeout=timeout,
         )
+        payload = candidate.payload
         if payload.scopes is not None:
             if not payload.scopes.issubset(scopes):
                 raise ActivationError("los scopes declarados por refresh no coinciden con los observados")
             scopes = payload.scopes
-        if payload.refresh_token is None:
-            raise ActivationError("refresh sin token de rotación; se conserva intacto el sobre previo")
-        return self.tokens.rotate(
+        return self._rotate_payload(
             token_ref,
-            access_token=payload.access_token,
-            refresh_token=payload.refresh_token,
-            granted_scopes=scopes,
-            expires_at=instant + timedelta(seconds=payload.expires_in),
+            candidate=candidate,
+            observed_scopes=scopes,
             now=instant,
-            fixture_payload=self.fixture_mode,
         )
 
 
@@ -2235,6 +3161,7 @@ __all__ = [
     "BrokerAccount",
     "OAuthAppConfig",
     "OAuthTokenCandidate",
+    "ReauthorizationRequired",
     "VerifiedDemoAuthorization",
     "VerifiedAccountAuthorization",
     "RealAccountForbidden",

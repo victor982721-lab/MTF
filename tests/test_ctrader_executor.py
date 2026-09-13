@@ -314,6 +314,44 @@ class CTraderExecutorTests(unittest.TestCase):
         with self.assertRaises(ForeignPosition):
             executor.close_position(pid)
 
+    def test_close_unknown_is_reconciled_without_a_second_close_submission(self) -> None:
+        executor = self.make_executor()
+        executor.activate()
+        opened = executor.submit_signal(self.signal("close-late"), self.quote())
+        position_id = executor.positions()[0].position_id
+        executor.transport.queue_behavior("timeout")
+
+        first = executor.close_position(position_id)
+        self.assertEqual(first.state, OrderState.UNKNOWN)
+        close_intents = [intent_id for intent_id in executor.transport.orders if intent_id != opened.intent.intent_id]
+        self.assertEqual(len(close_intents), 1)
+
+        second = executor.close_position(position_id)
+        self.assertEqual(second.intent.intent_id, first.intent.intent_id)
+        self.assertEqual(second.state, OrderState.UNKNOWN)
+        close_intents = [intent_id for intent_id in executor.transport.orders if intent_id != opened.intent.intent_id]
+        self.assertEqual(len(close_intents), 1)
+
+    def test_close_partial_reconciliation_preserves_residual_and_does_not_resend(self) -> None:
+        executor = self.make_executor()
+        executor.activate()
+        executor.submit_signal(self.signal("close-partial"), self.quote())
+        position_id = executor.positions()[0].position_id
+        executor.transport.queue_behavior("partial")
+
+        first = executor.close_position(position_id)
+        self.assertEqual(first.state, OrderState.CLOSE_PARTIAL)
+        self.assertIsNone(first.intent.requested_price)
+        self.assertEqual(executor.positions()[0].quantity, 0.5)
+        close_intents = [intent_id for intent_id, item in executor._intents.items() if item.kind == "CLOSE"]
+        self.assertEqual(len(close_intents), 1)
+
+        second = executor.close_position(position_id)
+        self.assertEqual(second.intent.intent_id, first.intent.intent_id)
+        self.assertEqual(second.state, OrderState.CLOSE_PARTIAL)
+        close_intents = [intent_id for intent_id, item in executor._intents.items() if item.kind == "CLOSE"]
+        self.assertEqual(len(close_intents), 1)
+
     def test_jsonl_intent_store_flushes_intent_and_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "intent.jsonl"

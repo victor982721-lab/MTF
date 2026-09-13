@@ -41,8 +41,8 @@ def app_config() -> OAuthAppConfig:
         client_id_env="CTRADER_CLIENT_ID",
         client_secret_env="CTRADER_CLIENT_SECRET",
         redirect_uri="http://127.0.0.1:8765/callback",
-        authorization_url="https://id.example.test/oauth/authorize",
-        token_url="https://id.example.test/oauth/token",
+        authorization_url="https://id.ctrader.com/authorize",
+        token_url="https://openapi.ctrader.com/apps/token",
     )
 
 

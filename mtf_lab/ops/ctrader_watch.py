@@ -114,6 +114,8 @@ class CTraderWatchContext:
     stop_event: StopSignal | None = None
     clock: Callable[[], datetime] | None = None
     monotonic: Callable[[], float] | None = None
+    close_provider: bool = True
+    on_initialized: Callable[[str, str], None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -717,6 +719,8 @@ class CTraderWatchRunner:
                 reconciliation=reconciliation,
                 freshness="UNKNOWN" if self.mode == "LIVE" else "NOT_APPLICABLE",
             )
+        if self.context.on_initialized is not None:
+            self.context.on_initialized(self.coordinator.session_id, self.coordinator.analysis_id)
 
     def _check_provider_ready(self) -> None:
         status = getattr(self.context.provider, "status", None)
@@ -1101,10 +1105,7 @@ class CTraderWatchRunner:
             if clean_stop:
                 self.coordinator.capture_state = "PAUSED"
             attempt(self._checkpoint)
-        close_error = _close_provider(self.context.provider)
-        if first_error is None:
-            first_error = close_error
-        if self._coordinator is not None:
+        if self._coordinator is not None and self.context.close_provider:
             needs_reconciliation = self._previous_watch is not None or self._generation_recovery_pending
             attempt(
                 lambda: self.coordinator.update_feed_state(
@@ -1117,6 +1118,10 @@ class CTraderWatchRunner:
                 )
             )
             attempt(self._checkpoint)
+        if self.context.close_provider:
+            close_error = _close_provider(self.context.provider)
+            if first_error is None:
+                first_error = close_error
         return first_error
 
     def run(self) -> CTraderWatchResult:
@@ -1175,7 +1180,7 @@ def run_ctrader_watch(
     try:
         runner = CTraderWatchRunner(context, options)
     except BaseException as exc:
-        close_error = _close_provider(context.provider)
+        close_error = _close_provider(context.provider) if context.close_provider else None
         if close_error is not None:
             raise CTraderWatchError("falló la construcción y también el cierre del provider") from exc
         raise

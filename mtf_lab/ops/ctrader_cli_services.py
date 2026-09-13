@@ -37,6 +37,7 @@ _SAFE_ERROR_CODES = frozenset(
     {
         "ActivationError",
         "UnsafeTokenStore",
+        "ReauthorizationRequired",
         "RealAccountForbidden",
         "OAuthHTTPError",
         "CTraderError",
@@ -441,6 +442,7 @@ class CTraderCliService:
     def doctor(self, args: argparse.Namespace) -> CommandResult:
         from ..data.ctrader import dependency_report
         from .ctrader_commands import status_command
+        from .runtime_safety import sqlite_wal_readiness
 
         config = _config_for(args)
         report = dependency_report()
@@ -449,6 +451,10 @@ class CTraderCliService:
             "diagnostic_ok": True,
             "provider": "ctrader_open_api",
             "dependency": report.to_dict(),
+            "codec_usable": report.codec_operational,
+            "sqlite": sqlite_wal_readiness(),
+            "external_operation_ready": False,
+            "external_operation_reasons": ["SERVER_ACCOUNT_AND_RUNTIME_NOT_OBSERVED"],
             "config_path": config.path,
             "network_performed": False,
             "browser_opened": False,
@@ -576,7 +582,32 @@ class CTraderCliService:
         tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
         attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
         assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
-        attempt = assistant.begin(client_id=client_id, requested_scopes=[requested_scope], open_browser=False)
+        try:
+            attempt = assistant.begin(
+                client_id=client_id,
+                requested_scopes=[requested_scope],
+                token_ref=profile.token_ref,
+                open_browser=False,
+            )
+            # Starting a new authorization is the explicit human recovery path
+            # for an old transaction whose one-use outcome is unknown.  An
+            # active transaction still holds the lock and cannot be cleared.
+            assistant.prepare_reauthorization(
+                attempt,
+                client_id=client_id,
+                profile_scopes=profile.required_scopes,
+            )
+        except Exception as exc:
+            return _json_error(
+                {
+                    "ok": False,
+                    "state": _safe_error_code(exc),
+                    "network_performed": False,
+                    "browser_opened": False,
+                    "next_action": "No se abrió el navegador; complete una reautorización cuando el store esté libre.",
+                    "error": _safe_error_code(exc),
+                }
+            )
         handoff = assistant.resume_authorization(
             attempt.attempt_id, reveal_url=True, open_browser=bool(getattr(args, "open_browser", False))
         )
@@ -668,7 +699,11 @@ class CTraderCliService:
             attempts = OAuthAttemptStore.for_fixture(root / "attempts", project_root=PROJECT_ROOT)
             assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens, fixture_mode=True)
             scopes = ("trading",) if "trading" in profile.required_scopes else ("accounts",)
-            attempt = assistant.begin(client_id="fixture-client", requested_scopes=scopes)
+            attempt = assistant.begin(
+                client_id="fixture-client",
+                requested_scopes=scopes,
+                token_ref=profile.token_ref,
+            )
             assistant.receive_callback(
                 attempt.attempt_id, f"{app.redirect_uri}?code=fixture-code&state={attempt.csrf_state}"
             )
@@ -823,15 +858,32 @@ class CTraderCliService:
             )
         network_performed = False
         raw_payload = None
+        assistant = None
         try:
             tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
             attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
             assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
             provider_config = _ctrader_config(config)
             server_endpoint = f"{provider_config.host}:{provider_config.port}"
+            if tokens.transaction_state(profile.token_ref) is not None:
+                return _json_error(
+                    {
+                        "ok": False,
+                        "state": "ReauthorizationRequired",
+                        "network_performed": False,
+                        "next_action": "El resultado de una operación OAuth previa es desconocido; reautorice explícitamente.",
+                    }
+                )
             pending = attempts.load(args.attempt_id)
             if pending.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
                 assistant.receive_callback(args.attempt_id, _read_callback_input(args))
+                pending = attempts.load(args.attempt_id)
+            pending.validate_binding(
+                app=app,
+                client_id=client_id,
+                token_ref=profile.token_ref,
+                profile_scopes=profile.required_scopes,
+            )
             network_performed = True
             raw_payload = assistant.exchange_unpersisted(
                 args.attempt_id,
@@ -840,6 +892,7 @@ class CTraderCliService:
                 client_id=client_id,
                 client_secret=client_secret,
                 requester=_oauth_http_request,
+                profile_scopes=profile.required_scopes,
             )
             candidate, verification, observed = CTraderCliService._verify_unpersisted_demo(
                 config,
@@ -863,6 +916,9 @@ class CTraderCliService:
                 server_endpoint=server_endpoint,
             )
         except Exception as exc:
+            if assistant is not None:
+                with suppress(Exception):
+                    assistant.abandon_candidate(raw_payload)
             return _json_error(
                 {
                     "ok": False,
@@ -965,8 +1021,29 @@ class CTraderCliService:
             )
         network_performed = False
         raw_payload = None
+        assistant = None
         try:
             tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
+            if tokens.transaction_state(profile.token_ref) is not None:
+                return _json_error(
+                    {
+                        "ok": False,
+                        "state": "ReauthorizationRequired",
+                        "network_performed": False,
+                        "next_action": "El resultado de una rotación previa es desconocido; reautorice explícitamente.",
+                    }
+                )
+            current_metadata = tokens.metadata(profile.token_ref)
+            expected_scopes = frozenset(profile.required_scopes)
+            if current_metadata.granted_scopes != expected_scopes:
+                return _json_error(
+                    {
+                        "ok": False,
+                        "state": "SCOPE_NOT_ALLOWED",
+                        "network_performed": False,
+                        "next_action": "El token no coincide exactamente con el alcance del perfil; reautorice.",
+                    }
+                )
             attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
             assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
             provider_config = _ctrader_config(config)
@@ -1000,6 +1077,9 @@ class CTraderCliService:
                 server_endpoint=server_endpoint,
             )
         except Exception as exc:
+            if assistant is not None:
+                with suppress(Exception):
+                    assistant.abandon_candidate(raw_payload)
             return _json_error(
                 {
                     "ok": False,
@@ -1176,7 +1256,12 @@ class CTraderCliService:
             }
         )
 
-    def _prepare_query(self, args: argparse.Namespace) -> QueryContext | CommandResult:
+    def _prepare_query(
+        self,
+        args: argparse.Namespace,
+        *,
+        execution: bool = False,
+    ) -> QueryContext | CommandResult:
         from .ctrader_activation import ActivationProfile, OAuthAppConfig, SecureTokenStore
         from .ctrader_commands import status_command
 
@@ -1192,11 +1277,13 @@ class CTraderCliService:
         activation_payload = _activation_payload_with_selection(config)
         profile = ActivationProfile.from_mapping(dict(activation_payload["ctrader"]))
         app = OAuthAppConfig.from_mapping(dict(config.ctrader_oauth))
+        required_mode = "DEMO" if execution else "QUERY"
+        required_scopes = {"accounts", "trading"} if execution else {"accounts"}
         if (
-            profile.operation_mode.value != "QUERY"
+            profile.operation_mode.value != required_mode
             or metadata is None
             or metadata.is_expired(datetime.now(UTC))
-            or "accounts" not in metadata.granted_scopes
+            or not required_scopes.issubset(metadata.granted_scopes)
         ):
             return _json_error(
                 {
@@ -1204,7 +1291,11 @@ class CTraderCliService:
                     "state": status_before["status"]["state"],
                     "network_performed": False,
                     "activation": status_before,
-                    "next_action": "Complete un token accounts vigente antes de conectar.",
+                    "next_action": (
+                        "Complete un token accounts+trading vigente y un perfil DEMO habilitado antes de conectar."
+                        if execution
+                        else "Complete un token accounts vigente antes de conectar."
+                    ),
                 }
             )
         client_id = os.environ.get(app.client_id_env, "")

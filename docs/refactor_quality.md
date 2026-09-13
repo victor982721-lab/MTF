@@ -7,7 +7,10 @@ permisos externos ni fills reales.
 
 ## Alcance sin excepciones de legado
 
-- **Ruff y formato:** todas las fuentes Python de `mtf_lab/`, `tests/` y `tools/`.
+- **Ruff y formato:** fuentes Python de `mtf_lab/`, `tests/` y `tools/`.
+  La ampliación H1 de 2026-09-13 excluye sólo `data/protobuf_generated/` del
+  estilo: son bytes de protoc, identificados por manifiesto y comprobados con
+  `tools/generate_ctrader_protobuf.py --check`, no una excepción de código manual.
 - **Mypy:** `--strict --explicit-package-bases mtf_lab tools`, con imports normales.
 - **Pyright:** todo `mtf_lab/` y `tools/`, Python 3.11/Linux.
 - **Arquitectura:** auditoría AST de dependencias, ciclos, efectos de importación
@@ -35,8 +38,14 @@ Las comprobaciones estáticas también son ejecutables individualmente:
 .venv-dev/bin/ruff check mtf_lab tests tools
 .venv-dev/bin/ruff format --check mtf_lab tests tools
 .venv-dev/bin/python -m mypy --strict --explicit-package-bases mtf_lab tools
-.venv-dev/bin/python -m pyright --project pyrightconfig.json
+.venv-dev/bin/python -m pyright --project pyrightconfig.json \
+  --pythonpath runtime/implementation/runtime-venv/bin/python
 ```
+
+El `--pythonpath` debe seleccionar el runtime candidato realmente validado;
+la configuración no fuerza el antiguo `.venv`. Para la evolución H0–H6 se usa
+el mismo intérprete candidato en `quality_gate.py --runtime-python`. El ejemplo
+anterior con `.venv` documenta la entrega histórica, no su aptitud externa actual.
 
 ## Cambios de comportamiento protegidos
 

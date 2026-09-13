@@ -56,6 +56,7 @@ from .cli_handlers import (
     cmd_ctrader_fixture,
     cmd_ctrader_query,
     cmd_ctrader_select,
+    cmd_ctrader_supervise,
     cmd_ctrader_token_exchange,
     cmd_ctrader_token_refresh,
     cmd_ctrader_watch,
@@ -64,6 +65,7 @@ from .cli_handlers import (
     cmd_import,
     cmd_replay,
     cmd_report,
+    cmd_research,
     cmd_ui,
     cmd_watch,
 )
@@ -107,6 +109,8 @@ def _handler_map() -> dict[str, Callable[[argparse.Namespace], int]]:
         "ctrader_demo": cmd_ctrader_demo,
         "ctrader_fixture": cmd_ctrader_fixture,
         "cfd_paper": cmd_cfd_paper,
+        "research": cmd_research,
+        "ctrader_supervise": cmd_ctrader_supervise,
     }
 
 
@@ -190,6 +194,8 @@ __all__ = [
     "cmd_ctrader_demo",
     "cmd_ctrader_fixture",
     "cmd_cfd_paper",
+    "cmd_research",
+    "cmd_ctrader_supervise",
     "_add_input_options",
     "build_parser",
     "main",

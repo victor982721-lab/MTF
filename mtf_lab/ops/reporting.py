@@ -129,6 +129,31 @@ def _break_even(row: Mapping[str, Any]) -> float | None:
     return (stake * loss_amount + costs) / denominator if denominator > 0 else None
 
 
+def _settlement_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    value = row.get("final_available_ts") or row.get("expiry_ts") or row.get("detected_ts") or ""
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00")) if value else None
+        stamp = parsed.astimezone(UTC).isoformat() if parsed is not None and parsed.tzinfo is not None else ""
+    except (ValueError, OverflowError):
+        stamp = ""
+    return stamp, str(row.get("simulation_id", row.get("simulation_row_id", "")))
+
+
+def _gross_value(row: Mapping[str, Any]) -> float | None:
+    net = _net(row.get("net_result"))
+    if net is None:
+        return None
+    assumptions = row.get("assumptions", row.get("assumptions_json"))
+    if isinstance(assumptions, str):
+        try:
+            assumptions = json.loads(assumptions)
+        except (TypeError, ValueError):
+            return None
+    raw_cost = assumptions.get("costs", 0.0) if isinstance(assumptions, Mapping) else row.get("costs", 0.0)
+    cost = _net(raw_cost)
+    return net + cost if cost is not None else None
+
+
 def _aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     outcomes = Counter(_outcome(row.get("outcome", "UNKNOWN")) for row in rows)
     nets = [_net(row.get("net_result")) for row in rows]
@@ -136,9 +161,8 @@ def _aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     equity = 0.0
     peak = 0.0
     max_drawdown = 0.0
-    for row in sorted(
-        rows, key=lambda item: (str(item.get("detected_ts", "")), int(item.get("simulation_row_id", 0) or 0))
-    ):
+    chronology_known = all(_settlement_key(row)[0] for row in rows if _net(row.get("net_result")) is not None)
+    for row in sorted(rows, key=_settlement_key):
         net = _net(row.get("net_result"))
         if net is None:
             continue
@@ -157,9 +181,13 @@ def _aggregate(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "indeterminate_count": outcomes.get("INDETERMINATE", 0) + outcomes.get("PENDING", 0),
         "pending_count": outcomes.get("PENDING", 0),
         "net_result": sum(value for value in nets if value is not None),
-        "gross_wins": sum(value for value in nets if value is not None and value > 0),
-        "gross_losses": sum(value for value in nets if value is not None and value < 0),
-        "max_drawdown": max_drawdown if any(value is not None for value in nets) else None,
+        "gross_wins": sum(value for row in rows if (value := _gross_value(row)) is not None and value > 0),
+        "gross_losses": sum(value for row in rows if (value := _gross_value(row)) is not None and value < 0),
+        "net_wins": sum(value for value in nets if value is not None and value > 0),
+        "net_losses": sum(value for value in nets if value is not None and value < 0),
+        "equity_order": "settlement_available" if chronology_known else "NOT_ASSESSED_MISSING_SETTLEMENT",
+        "metrics_version": 2,
+        "max_drawdown": max_drawdown if chronology_known and any(value is not None for value in nets) else None,
         "win_rate_on_resolved": outcomes.get("WIN", 0) / resolved if resolved else None,
         "break_even_probability": (sum(be_values) / len(be_values)) if be_values else None,
     }

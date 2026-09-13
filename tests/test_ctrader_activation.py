@@ -80,6 +80,19 @@ class ActivationTests(unittest.TestCase):
                 "https://example.invalid/auth",
                 "https://example.invalid/token",
             )
+        for redirect_uri in (
+            "http://127.0.0.1:0/callback",
+            "http://127.0.0.1:not-a-port/callback",
+            "http://127.0.0.1:65536/callback",
+        ):
+            with self.subTest(redirect_uri=redirect_uri), self.assertRaises(ActivationError):
+                OAuthAppConfig(
+                    "CTRADER_CLIENT_ID",
+                    "CTRADER_CLIENT_SECRET",
+                    redirect_uri,
+                    "https://id.ctrader.com/authorize",
+                    "https://openapi.ctrader.com/apps/token",
+                )
 
     def test_state_machine_query_then_demo_scopes(self) -> None:
         accounts = [BrokerAccount("demo-123456", "DEMO", "fixture")]
@@ -197,8 +210,8 @@ class ActivationTests(unittest.TestCase):
                 "client_id_env": "CTRADER_CLIENT_ID",
                 "client_secret_env": "CTRADER_CLIENT_SECRET",
                 "redirect_uri": "http://localhost:8767/callback",
-                "authorization_url": "https://example.invalid/auth",
-                "token_url": "https://example.invalid/token",
+                "authorization_url": "https://id.ctrader.com/authorize",
+                "token_url": "https://openapi.ctrader.com/apps/token",
             },
         }
         before = repr(raw)

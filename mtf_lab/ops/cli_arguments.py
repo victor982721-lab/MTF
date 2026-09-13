@@ -32,6 +32,7 @@ def _default_handlers() -> dict[str, Handler]:
         cmd_ctrader_fixture,
         cmd_ctrader_query,
         cmd_ctrader_select,
+        cmd_ctrader_supervise,
         cmd_ctrader_token_exchange,
         cmd_ctrader_token_refresh,
         cmd_ctrader_watch,
@@ -40,6 +41,7 @@ def _default_handlers() -> dict[str, Handler]:
         cmd_import,
         cmd_replay,
         cmd_report,
+        cmd_research,
         cmd_ui,
         cmd_watch,
     )
@@ -64,6 +66,8 @@ def _default_handlers() -> dict[str, Handler]:
         "ctrader_demo": cmd_ctrader_demo,
         "ctrader_fixture": cmd_ctrader_fixture,
         "cfd_paper": cmd_cfd_paper,
+        "research": cmd_research,
+        "ctrader_supervise": cmd_ctrader_supervise,
     }
 
 
@@ -143,6 +147,36 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     p.add_argument("--boundary", help="timestamp UTC de frontera cronológica")
     p.set_defaults(func=callbacks["backtest"])
 
+    p = subs.add_parser("research", help="investigación CFD explícita; no reutiliza payout binario")
+    research = p.add_subparsers(dest="research_action", required=True)
+    q = research.add_parser("run", help="registra todos los intentos y evalúa un replay local causal")
+    source = q.add_mutually_exclusive_group(required=True)
+    source.add_argument("--fixture", action="store_true", help="datos sintéticos; sin evidencia de mercado")
+    source.add_argument("--input", type=Path, help="captura local autorizada JSON/JSONL")
+    q.add_argument("--manifest", type=Path, required=True, help="manifiesto nuevo; no sobrescribe intentos")
+    q.add_argument("--config", type=Path)
+    q.add_argument("--fixture-count", type=int, default=190)
+    q.add_argument("--variants", nargs="+", help="estrategias explícitas; nombres no soportados se rechazan")
+    q.add_argument("--horizons-seconds", nargs="+", help="horizontes alternativos; nunca se suman entre sí")
+    q.add_argument("--seed", type=int, default=42)
+    q.add_argument("--bootstrap-iterations", type=int, default=250)
+    q.add_argument("--bootstrap-block-days", type=int, default=5)
+    q.add_argument(
+        "--execution-model",
+        choices=["full_fill", "ioc_partial", "rejected"],
+        default="full_fill",
+        help="hipótesis local de ejecución, no profundidad/fills observados del bróker",
+    )
+    q.add_argument("--fill-fraction", help="fracción Decimal entre 0 y 1 exclusiva de ioc_partial")
+    q.add_argument("--order", choices=["as_observed", "event_time"], default="as_observed")
+    q.set_defaults(func=callbacks["research"])
+    q = research.add_parser("compare", help="compara manifiestos íntegros sin sumar productos/horizontes")
+    q.add_argument("manifests", type=Path, nargs="+")
+    q.set_defaults(func=callbacks["research"])
+    q = research.add_parser("validate", help="verifica integridad, particiones, economía y límites de evidencia")
+    q.add_argument("manifest", type=Path)
+    q.set_defaults(func=callbacks["research"])
+
     p = subs.add_parser("report", help="genera o imprime informe de una sesión")
     p.add_argument("--session")
     p.add_argument("--latest", action="store_true", help="selecciona la sesión más reciente")
@@ -171,6 +205,9 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     p.set_defaults(resume=True, func=callbacks["watch"])
 
     p = subs.add_parser("ui", help="sirve interfaz local de sólo lectura")
+    p.add_argument(
+        "--supervisor-state", type=Path, help="snapshot privado del supervisor; readiness requiere identidad viva"
+    )
     p.add_argument("--db", type=Path)
     p.add_argument("--config", type=Path)
     p.add_argument("--session")
@@ -266,6 +303,36 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     q.add_argument("--checkpoint-every", type=int, default=100)
     q.add_argument("--report", type=Path)
     q.set_defaults(func=callbacks["ctrader_watch"])
+
+    q = csubs.add_parser("supervise", help="supervisor Linux local; sin trading por defecto")
+    q.add_argument("--mode", choices=["observe", "shadow", "demo"], default="observe")
+    q.add_argument(
+        "--continuous", action="store_true", help="sin límite de tiempo/eventos; no elimina gates ni watchdog"
+    )
+    source = q.add_mutually_exclusive_group(required=True)
+    source.add_argument(
+        "--fixture", action="store_true", help="fuente sintética aislada; nunca satisface permiso externo"
+    )
+    source.add_argument("--network", action="store_true", help="fuente DEMO con autorización existente y verificada")
+    q.add_argument("--activate", action="store_true", help="requiere modo DEMO y gates de operación aprobados")
+    q.add_argument("--config", type=Path, default=_packaged_config_path("ctrader_query.toml"))
+    q.add_argument("--state-dir", type=Path, required=True, help="estado privado fuera del checkout")
+    q.add_argument("--db", type=Path, required=True)
+    q.add_argument("--account-key", default="fixture", help="identidad local para el bloqueo de escritor")
+    q.add_argument("--duration", type=float, default=30.0)
+    q.add_argument("--max-events", type=int, default=100)
+    q.add_argument("--idle-timeout", type=float, default=5.0)
+    q.add_argument("--poll-timeout", type=float, default=0.25)
+    q.add_argument("--checkpoint-every", type=int, default=100)
+    q.add_argument("--max-candles", type=int, default=5000)
+    q.add_argument("--max-reconnect-attempts", type=int, default=3)
+    q.add_argument("--reconnect-backoff-seconds", type=float, default=0.25)
+    q.add_argument("--stale-after-seconds", type=float, default=90.0)
+    q.add_argument("--no-resume", dest="resume", action="store_false")
+    q.add_argument("--watchdog", action="store_true", help="notificación local systemd de progreso útil")
+    q.add_argument("--dbus-alerts", action="store_true", help="notificaciones locales de escritorio")
+    q.add_argument("--report", type=Path)
+    q.set_defaults(func=callbacks["ctrader_supervise"], resume=True)
 
     q = csubs.add_parser("demo", help="ejecutor DEMO local: requiere --activate explícito y nunca usa servidor")
     q.add_argument("--activate", action="store_true")

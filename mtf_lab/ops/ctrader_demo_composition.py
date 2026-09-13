@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
+import os
 import queue
 from collections import deque
 from collections.abc import Callable, Iterable, Mapping
@@ -265,7 +266,7 @@ class OfflineDemoServer:
         # in ``calls`` or exported by the composition report.
         response = self.proto.ProtoOAGetAccountListByAccessTokenRes(
             permissionScope=1,
-            accessToken="fixture-token",
+            accessToken="offline-fixture-value",
         )
         response.ctidTraderAccount.add(ctidTraderAccountId=self.account_id, isLive=False)
         return self._response(request, 2150, response)
@@ -935,6 +936,10 @@ class CTraderDemoApplication:
             symbol_names={symbol_id: provider.spec.symbol},
             clock=lambda: self._current_time[0],
             server_observation=observation,
+            # The offline server fixture has no full-symbol catalog payload;
+            # keep its protocol volume grid explicit rather than inventing a
+            # broker default in the external transport.
+            volume_grid={"min_volume": 100, "max_volume": 100_000, "step_volume": 100},
         )
         executor = CTraderDemoExecutor(
             account,
@@ -943,6 +948,7 @@ class CTraderDemoApplication:
             intent_store=self.intent_store,
             clock=lambda: self._current_time[0],
             server_observation=observation,
+            fixture_mode=self.source_mode == "SYNTHETIC_FIXTURE",
         )
         if self.activate:
             executor.activate()
@@ -964,7 +970,14 @@ class CTraderDemoApplication:
         observed_events: list[Any] = []
 
         def quote_resolver(signal: Signal) -> Quote:
-            return _quote_for_observed_signal(observed_events, signal)
+            observation = getattr(executor, "server_observation", None)
+            return _quote_for_observed_signal(
+                observed_events,
+                signal,
+                session_id=getattr(observation, "session_id", None),
+                connection_generation=getattr(observation, "connection_generation", None),
+                synthetic=self.source_mode == "SYNTHETIC_FIXTURE",
+            )
 
         self._recovered_intents = ()
         self._startup_reconciled_results = ()
@@ -1003,6 +1016,8 @@ class CTraderDemoApplication:
         )
         resume_checkpoint = self._require_resume_checkpoint(coordinator) if resume else None
         if resume:
+            if self.activate and not reconcile_at_start:
+                raise OfflineCompositionError("activated resume requires reconciliation before new entries")
             raw_path = getattr(self.intent_store, "path", None)
             if not isinstance(raw_path, (str, Path)):
                 raise OfflineCompositionError("resume requires a durable JSONL intent journal")
@@ -1074,6 +1089,8 @@ class CTraderDemoApplication:
         rows = 0
         previous_generation: int | None = None
         for index, source in enumerate(payloads):
+            if isinstance(source, CaptureEnvelope) and source.message_class is MessageClass.CONNECTION:
+                raise OfflineCompositionError("connection control envelope requires reconciliation before ingest")
             if isinstance(source, CaptureEnvelope) and source.message_class not in {
                 MessageClass.SPOT,
                 MessageClass.REVISION,
@@ -1088,7 +1105,12 @@ class CTraderDemoApplication:
                 snapshot,
                 sequence,
                 generation,
-            ) = _source_payload(source, index, self.clock)
+            ) = _source_payload(
+                source,
+                index,
+                self.clock,
+                allow_synthetic_receipt=self.source_mode == "SYNTHETIC_FIXTURE",
+            )
             if previous_generation is not None and generation != previous_generation:
                 raise OfflineCompositionError(
                     "connection generation changed during DEMO ingest; explicit reconciliation is required"
@@ -1182,7 +1204,12 @@ class CTraderDemoOfflineComposition:
         if intent_store is not None:
             self.intent_store = intent_store
         else:
-            target = Path(intent_journal_path) if intent_journal_path is not None else Path("data/demo_intents.jsonl")
+            target = (
+                Path(intent_journal_path)
+                if intent_journal_path is not None
+                else Path(os.environ.get("MTF_LAB_STATE_DIR", "~/.local/state/mtf-lab")).expanduser()
+                / "ctrader-demo-intents.jsonl"
+            )
             self.intent_store = JsonlIntentStore(target)
         self.application: CTraderDemoApplication | None = None
         self.server: OfflineDemoServer | None = None
@@ -1197,7 +1224,7 @@ class CTraderDemoOfflineComposition:
 
     def _run_fixture(self) -> DemoCompositionResult:
         proto = _load_official_proto()
-        model = importlib.import_module("ctrader_open_api.messages.OpenApiModelMessages_pb2")
+        model = importlib.import_module("mtf_lab.data.protobuf_generated.OpenApiModelMessages_pb2")
         server = OfflineDemoServer(proto, model, fixture=self.fixture, account_id=self.account_id)
         codec = SdkProtobufCodec()
         wire_transport = LoopbackProtobufTransport(codec, server.handle)
@@ -1351,6 +1378,7 @@ def recover_execution_intents(
         result = _result_from_journal_update(intent, updates.get(intent_id))
         executor.restore_intent(intent, result=result)
         recovered.append(intent)
+    executor.complete_recovery()
     return tuple(recovered)
 
 
@@ -1483,7 +1511,14 @@ def _result_from_journal_update(
     return result
 
 
-def _quote_for_observed_signal(observed_events: Iterable[Any], signal: Signal) -> Quote:
+def _quote_for_observed_signal(
+    observed_events: Iterable[Any],
+    signal: Signal,
+    *,
+    session_id: str | None = None,
+    connection_generation: str | int | None = None,
+    synthetic: bool = False,
+) -> Quote:
     candidates: list[Any] = []
     for event in observed_events:
         if event.event_time > signal.trigger_end:
@@ -1504,6 +1539,11 @@ def _quote_for_observed_signal(observed_events: Iterable[Any], signal: Signal) -
         quality=str(quality),
         source=selected.source,
         base_price="bid_ask",
+        source_identity=selected.quote_id or selected.metadata.get("source_event_id"),
+        session_id=session_id,
+        connection_generation=connection_generation or selected.connection_generation,
+        data_mode="SYNTHETIC" if synthetic else "LIVE",
+        synthetic=synthetic,
     )
 
 
@@ -1511,30 +1551,60 @@ def _source_payload(
     source: Any,
     index: int,
     clock: Callable[[], datetime],
+    *,
+    allow_synthetic_receipt: bool = True,
 ) -> tuple[Any, datetime | None, datetime | None, bool, int | str, int]:
     if isinstance(source, CaptureEnvelope):
-        return (
-            source.payload,
-            source.received_at,
-            source.available_at,
-            bool(source.payload.get("snapshot", source.payload.get("isSnapshot", False))),
-            source.ingest_sequence,
-            source.connection_generation,
-        )
+        return _capture_source_payload(source)
     if isinstance(source, WireMessage):
-        payload = source.payload
-        wire_received = source.received_at or _utc(clock(), "clock")
-        wire_available = source.available_at or wire_received
-        sequence = source.ingest_sequence if source.ingest_sequence is not None else index
-        generation = source.connection_generation if source.connection_generation is not None else 0
-        return (
-            payload,
-            wire_received,
-            wire_available,
-            bool(read_field(payload, "snapshot", "isSnapshot", default=False)),
-            sequence,
-            generation,
-        )
+        return _wire_source_payload(source, index, clock, allow_synthetic_receipt=allow_synthetic_receipt)
+    return _mapping_source_payload(source, index, clock, allow_synthetic_receipt=allow_synthetic_receipt)
+
+
+def _capture_source_payload(
+    source: CaptureEnvelope,
+) -> tuple[Any, datetime | None, datetime | None, bool, int | str, int]:
+    return (
+        source.payload,
+        source.received_at,
+        source.available_at,
+        bool(source.payload.get("snapshot", source.payload.get("isSnapshot", False))),
+        source.ingest_sequence,
+        source.connection_generation,
+    )
+
+
+def _wire_source_payload(
+    source: WireMessage,
+    index: int,
+    clock: Callable[[], datetime],
+    *,
+    allow_synthetic_receipt: bool,
+) -> tuple[Any, datetime | None, datetime | None, bool, int | str, int]:
+    payload = source.payload
+    if not allow_synthetic_receipt and (source.received_at is None or source.available_at is None):
+        raise OfflineCompositionError("external source requires observed WireMessage receipt metadata")
+    wire_received = source.received_at or _utc(clock(), "clock")
+    wire_available = source.available_at or wire_received
+    sequence = source.ingest_sequence if source.ingest_sequence is not None else index
+    generation = source.connection_generation if source.connection_generation is not None else 0
+    return (
+        payload,
+        wire_received,
+        wire_available,
+        bool(read_field(payload, "snapshot", "isSnapshot", default=False)),
+        sequence,
+        generation,
+    )
+
+
+def _mapping_source_payload(
+    source: Any,
+    index: int,
+    clock: Callable[[], datetime],
+    *,
+    allow_synthetic_receipt: bool,
+) -> tuple[Any, datetime | None, datetime | None, bool, int | str, int]:
     payload = source if isinstance(source, Mapping) else message_to_mapping(source)
     if not isinstance(payload, Mapping):
         raise OfflineCompositionError(f"source row {index} is not a mapping/protobuf message")
@@ -1543,6 +1613,8 @@ def _source_payload(
     received_raw = read_field(payload, "received_at", "receivedAt", default=None)
     received: datetime | None = _parse_provider_time(received_raw) if received_raw is not None else None
     if received is None:
+        if not allow_synthetic_receipt:
+            raise OfflineCompositionError("external source requires observed received_at metadata")
         received = event_time + timedelta(seconds=1) if event_time is not None else _utc(clock(), "clock")
     available_raw = read_field(payload, "available_at", "availableAt", default=None)
     available: datetime | None = _parse_provider_time(available_raw) if available_raw is not None else received
@@ -1560,6 +1632,8 @@ def _source_payload(
         raise OfflineCompositionError("source connection generation must be an integer") from exc
     if generation < 0:
         raise OfflineCompositionError("source connection generation must be nonnegative")
+    if not allow_synthetic_receipt and generation <= 0:
+        raise OfflineCompositionError("external source requires a positive connection generation")
     return (
         payload,
         received,
@@ -1946,7 +2020,7 @@ def synthetic_demo_market_fixture(
 
 def _load_official_proto() -> Any:
     try:
-        return importlib.import_module("ctrader_open_api.messages.OpenApiMessages_pb2")
+        return importlib.import_module("mtf_lab.data.protobuf_generated.OpenApiMessages_pb2")
     except Exception as exc:  # pragma: no cover - optional dependency
         raise OfflineCompositionError("official cTrader generated protobuf module is unavailable") from exc
 

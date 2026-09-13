@@ -1,7 +1,7 @@
 # Estado de integración cTrader / Forex-CFD
 
-Revisión local: 2026-09-11. Esta entrega consolida y publica la implementación
-offline; no activa cuentas, no realiza OAuth y no envía operaciones. El [informe
+La consolidación histórica del 2026-09-11 publicó la implementación
+offline anterior; no activó cuentas, no realizó OAuth y no envió operaciones. El [informe
 de ingeniería](../reports/engineering/latest/engineering_consolidation.md), sus
 [resultados](../reports/engineering/latest/engineering_results.json) y el
 [manifest de tooling](../reports/engineering/latest/engineering_tooling.json)
@@ -9,6 +9,19 @@ son la evidencia reproducible del gate final. La [matriz A/B/C de fronteras](act
 producir un servidor autenticado.
 
 ## Estado actual
+
+### Evolución H0–H6 local — 2026-09-13
+
+La [matriz de implementación y aceptación](demo_reliability_plan.md) describe
+los cambios posteriores: economía CFD v2, investigación causal, codec generado,
+gestión de riesgo y supervisor deshabilitado. Los receipts históricos de abajo
+no validan estos bytes nuevos. No se publicó ni instaló una release operativa
+como parte de esta evolución y no se volvió a consultar el portal.
+
+El codec candidato usa Protobuf 7.36.1 y schemas Spotware 91, sin SDK antiguo.
+La presencia del SDK anterior en `.venv` no prueba utilidad: Protobuf 3.20.1
+queda rechazado. La reparación SQLite WAL-reset, la resistencia real de 72
+horas y las 30 sesiones DEMO son gates separados de la implementación local.
 
 ### Preparación externa DEMO — 2026-09-12
 

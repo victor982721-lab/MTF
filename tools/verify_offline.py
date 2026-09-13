@@ -50,12 +50,7 @@ DEFAULT_BENCHMARK_EVENTS = 7500
 
 RUNTIME_DISTRIBUTIONS: tuple[str, ...] = (
     "mtf-lab",
-    "ctrader-open-api",
     "protobuf",
-    "Twisted",
-    "service-identity",
-    "requests",
-    "pyOpenSSL",
     "pip",
 )
 DEV_DISTRIBUTIONS: tuple[str, ...] = ("ruff", "mypy", "pip")
@@ -744,12 +739,12 @@ def _run_sdk_codec_probe(
     code = """
 import importlib.metadata as metadata
 import json
-from ctrader_open_api.messages import OpenApiMessages_pb2 as messages
+from mtf_lab.data.protobuf_generated import OpenApiMessages_pb2 as messages
 from mtf_lab.data.ctrader_protocol import SdkProtobufCodec, WireMessage, dependency_report
 
 report = dependency_report()
 if not report.available:
-    raise RuntimeError("SDK/codec unavailable")
+    raise RuntimeError("Generated codec unavailable")
 codec = SdkProtobufCodec()
 heartbeat = codec.decode(codec.encode(WireMessage("PROTO_HEARTBEAT_EVENT")))
 order = messages.ProtoOANewOrderReq(
@@ -760,7 +755,8 @@ assert heartbeat.payload_type_id == 51
 assert decoded.payload_type_id == 2106
 assert decoded.client_msg_id == "offline-codec"
 print(json.dumps({
-    "sdk_version": metadata.version("ctrader-open-api"),
+    "codec_backend": report.codec_backend,
+    "schema_revision": report.schema_revision,
     "protobuf_version": metadata.version("protobuf"),
     "codec_operational": report.codec_operational,
     "heartbeat_payload_type": heartbeat.payload_type_id,

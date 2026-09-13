@@ -13,10 +13,13 @@ server-observed permission evidence to be persisted.
 from __future__ import annotations
 
 import json
+import math
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from .oauth_policy import approved_oauth_endpoint
 
 
 class OAuthHTTPError(RuntimeError):
@@ -28,6 +31,8 @@ _MAX_RESPONSE_BYTES = 128 * 1024
 
 
 def _validate_endpoint(url: str) -> urllib.parse.SplitResult:
+    if not approved_oauth_endpoint(url, token=True):
+        raise OAuthHTTPError("endpoint OAuth no aprobado")
     parsed = urllib.parse.urlsplit(str(url).strip())
     if (
         parsed.scheme != "https"
@@ -51,6 +56,8 @@ def _validate_params(grant_type: str, params: Mapping[str, str]) -> dict[str, st
         "authorization_code": {"grant_type", "code", "redirect_uri", "client_id", "client_secret"},
         "refresh_token": {"grant_type", "refresh_token", "client_id", "client_secret"},
     }[grant]
+    if set(values) - required:
+        raise OAuthHTTPError("parámetros OAuth no soportados")
     if any(not values.get(key, "") for key in required):
         raise OAuthHTTPError("parámetros OAuth incompletos")
     return values
@@ -78,8 +85,13 @@ def build_token_request(
         request_url,
         data=None,
         method=method,
-        headers={"Accept": "application/json", "Content-Type": "application/json"},
+        headers={"Accept": "application/json", "Content-Type": "application/json", "Cache-Control": "no-store"},
     )
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any, newurl: str) -> None:
+        raise OAuthHTTPError("redirección OAuth no permitida")
 
 
 def request_token(
@@ -95,16 +107,20 @@ def request_token(
     library opener; no response body, URL or credential is echoed on failure.
     """
 
-    if isinstance(timeout, bool) or float(timeout) <= 0:
+    try:
+        timeout_value = float(timeout)
+    except (TypeError, ValueError):
+        raise OAuthHTTPError("timeout OAuth inválido") from None
+    if isinstance(timeout, bool) or not math.isfinite(timeout_value) or timeout_value <= 0:
         raise OAuthHTTPError("timeout OAuth inválido")
     request = build_token_request(url, params)
-    open_request = opener or urllib.request.urlopen
+    open_request = opener or urllib.request.build_opener(_NoRedirect()).open
     try:
-        with open_request(request, timeout=float(timeout)) as response:
-            body = response.read(_MAX_RESPONSE_BYTES)
+        with open_request(request, timeout=timeout_value) as response:
+            body = response.read(_MAX_RESPONSE_BYTES + 1)
     except Exception:
         raise OAuthHTTPError("solicitud OAuth falló; revise conectividad y autorización") from None
-    if not isinstance(body, bytes):
+    if not isinstance(body, bytes) or len(body) > _MAX_RESPONSE_BYTES:
         raise OAuthHTTPError("respuesta OAuth inválida")
     try:
         payload = json.loads(body.decode("utf-8"))

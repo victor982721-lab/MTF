@@ -67,23 +67,79 @@ def _python_executable(value: str) -> Path:
     return Path(executable).absolute()
 
 
+def _validate_source_path(root: Path, source: Path) -> None:
+    if source.is_symlink() or not source.is_file():
+        raise ValueError(f"fuente no regular: {source.relative_to(root)}")
+    if any(parent.is_symlink() for parent in source.parents if parent != root and root in parent.parents):
+        raise ValueError("el árbol de fuentes contiene un directorio symlink")
+
+
+def _package_data_root(root: Path, package: Path, package_name: object) -> Path:
+    if not isinstance(package_name, str):
+        raise ValueError("nombre de paquete-data inválido")
+    segments = package_name.split(".")
+    if not segments or any(not segment.isidentifier() for segment in segments):
+        raise ValueError(f"nombre de paquete-data inválido: {package_name}")
+    package_root = root.joinpath(*segments)
+    if package_root.is_symlink() or not package_root.is_dir() or not package_root.is_relative_to(package):
+        raise ValueError(f"paquete-data no regular: {package_name}")
+    return package_root
+
+
+def _package_data_matches(root: Path, package_root: Path, package_name: str, patterns: object) -> list[Path]:
+    if not isinstance(patterns, list) or not all(isinstance(pattern, str) for pattern in patterns):
+        raise ValueError(f"patrones package-data inválidos: {package_name}")
+    sources: list[Path] = []
+    for pattern in patterns:
+        relative_pattern = Path(pattern)
+        if not pattern or relative_pattern.is_absolute() or ".." in relative_pattern.parts:
+            raise ValueError(f"patrón package-data fuera del paquete: {pattern}")
+        for source in sorted(package_root.glob(pattern)):
+            _validate_source_path(root, source)
+            sources.append(source)
+    return sources
+
+
+def _declared_package_data(root: Path, package: Path, metadata: Mapping[str, object]) -> list[Path]:
+    tool = metadata.get("tool")
+    setuptools = tool.get("setuptools") if isinstance(tool, Mapping) else None
+    package_data = setuptools.get("package-data") if isinstance(setuptools, Mapping) else None
+    if package_data is None:
+        return []
+    if not isinstance(package_data, Mapping):
+        raise ValueError("package-data inválido")
+    sources: list[Path] = []
+    for package_name, patterns in package_data.items():
+        package_root = _package_data_root(root, package, package_name)
+        sources.extend(_package_data_matches(root, package_root, str(package_name), patterns))
+    return sources
+
+
 def _copy_source(root: Path, destination: Path) -> None:
-    """Copy distribution sources, never caches, stores or generated build/."""
-    destination.mkdir()
-    sources = [root / "pyproject.toml", root / "README.md"]
+    """Copy only Python sources and package-data declared by pyproject.toml."""
     package = root / "mtf_lab"
     if package.is_symlink() or not package.is_dir():
         raise ValueError("el paquete fuente no es un directorio regular")
+    sources = [root / "pyproject.toml", root / "README.md"]
+    for source in sources:
+        _validate_source_path(root, source)
+    metadata = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     for directory, subdirectories, filenames in os.walk(package, followlinks=False):
         parent = Path(directory)
         if any((parent / name).is_symlink() for name in subdirectories):
             raise ValueError("el árbol de fuentes contiene un directorio symlink")
         sources.extend(parent / name for name in filenames if Path(name).suffix in {".py", ".toml"})
+    sources.extend(_declared_package_data(root, package, metadata))
+    unique_sources: dict[Path, Path] = {}
     for source in sources:
-        if source.is_symlink() or not source.is_file():
-            raise ValueError(f"fuente no regular: {source.relative_to(root)}")
-        if any(parent.is_symlink() for parent in source.parents if parent != root and root in parent.parents):
-            raise ValueError("el árbol de fuentes contiene un directorio symlink")
+        _validate_source_path(root, source)
+        relative = source.relative_to(root)
+        previous = unique_sources.setdefault(relative, source)
+        if previous != source:
+            raise ValueError(f"colisión de fuente: {relative}")
+
+    destination.mkdir()
+    for source in unique_sources.values():
         target = destination / source.relative_to(root)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(source.read_bytes())

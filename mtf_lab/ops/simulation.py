@@ -153,13 +153,16 @@ def quality_label_is_usable(value: Any) -> bool:
     """Strict shared quality gate for price observations."""
 
     if isinstance(value, Mapping):
+        details = str((value.get("flags", ()), value.get("reasons", ()), value.get("reason", ""))).upper()
+        if any(token in details for token in QUALITY_BLOCKED_TOKENS):
+            return False
         value = value.get("status", value.get("quality", "UNKNOWN"))
     elif hasattr(value, "status") and not isinstance(value, (str, bytes)):
         value = value.status
     label = str(value or "").strip().upper().replace("-", "_").replace(" ", "_")
     if not label or any(token in label for token in QUALITY_BLOCKED_TOKENS):
         return False
-    return label in QUALITY_ALLOWED_LABELS or label.startswith("VALID_") or label.startswith("SYNTHETIC_VALID")
+    return label in QUALITY_ALLOWED_LABELS
 
 
 def parse_bool(value: Any, *, default: bool | None = None, name: str = "boolean") -> bool:
@@ -816,12 +819,15 @@ class DirectionalEvaluator:
         signal_id = str(signal_id_value) if signal_id_value is not None else None
         direction = self._direction(signal_row)
         sim_id = str(simulation_id or f"{signal_id or 'signal'}:{horizon:g}:{simulation_type}")
-        entry_target = detected + timedelta(seconds=self.spec.entry_latency_seconds)
+        available_value = signal_row.get("available_at", signal_row.get("available_ts"))
+        available = parse_ts(available_value) if available_value is not None else detected
+        entry_target = max(detected, available) + timedelta(seconds=self.spec.entry_latency_seconds)
         assumptions: dict[str, Any] = {
             **self.spec.to_dict(),
             "selection_rule_entry": self.spec.entry_rule,
             "selection_rule_exit": self.spec.exit_rule,
             "target_entry_ts": iso_ts(entry_target),
+            "signal_available_ts": iso_ts(available),
             "data_complete": complete,
             "capture_complete": complete,
             "as_of": iso_ts(as_of_dt),

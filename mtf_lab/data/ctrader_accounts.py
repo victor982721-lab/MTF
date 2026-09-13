@@ -77,9 +77,20 @@ def _normalize_account_record(item: Any) -> dict[str, Any]:
 def _account_environment(is_live: Any) -> str:
     if is_live is None:
         return "UNKNOWN"
+    if isinstance(is_live, bool):
+        return "LIVE" if is_live else "DEMO"
     if isinstance(is_live, str):
-        return "LIVE" if is_live.strip().lower() in {"1", "true", "yes", "live"} else "DEMO"
-    return "LIVE" if bool(is_live) else "DEMO"
+        value = is_live.strip().lower()
+        if value in {"1", "true", "yes", "live"}:
+            return "LIVE"
+        if value in {"0", "false", "no", "demo"}:
+            return "DEMO"
+        return "UNKNOWN"
+    if isinstance(is_live, int) and is_live in {0, 1}:
+        return "LIVE" if is_live else "DEMO"
+    # A malformed server/mapping value must not be promoted to DEMO.  The
+    # selector and execution gates intentionally reject UNKNOWN.
+    return "UNKNOWN"
 
 
 def _as_sequence(value: Any) -> tuple[Any, ...]:

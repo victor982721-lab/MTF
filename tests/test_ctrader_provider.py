@@ -459,7 +459,7 @@ class CTraderProviderTests(unittest.TestCase):
                             {"ctidTraderAccountId": 7, "isLive": False, "traderLogin": 1234},
                             {"ctidTraderAccountId": 8},
                         ],
-                        "accessToken": "SERVER_ECHO_TOKEN",
+                        "accessToken": "TOKEN_VALUE",
                     },
                     request.client_msg_id,
                 )
@@ -488,10 +488,10 @@ class CTraderProviderTests(unittest.TestCase):
         self.assertEqual(discovery["permissionScope"], "SCOPE_VIEW")
         self.assertNotIn("accessToken", discovery)
         proof = provider.discover_accounts(include_token=True)
-        self.assertEqual(proof["accessToken"], "SERVER_ECHO_TOKEN")
+        self.assertEqual(proof["accessToken"], "TOKEN_VALUE")
         proof["accessToken"] = "caller-change"
-        self.assertEqual(provider.discover_accounts(include_token=True)["accessToken"], "SERVER_ECHO_TOKEN")
-        self.assertNotIn("SERVER_ECHO_TOKEN", str(provider.discover_accounts()))
+        self.assertEqual(provider.discover_accounts(include_token=True)["accessToken"], "TOKEN_VALUE")
+        self.assertNotIn("TOKEN_VALUE", str(provider.discover_accounts()))
         self.assertEqual(discovery["records"][0]["account_id"], 7)
         self.assertEqual(discovery["records"][0]["environment"], "DEMO")
         self.assertEqual(discovery["records"][0]["trader_login"], 1234)
@@ -532,7 +532,7 @@ class CTraderProviderTests(unittest.TestCase):
         report = dependency_report()
         if not report.codec_operational:
             self.skipTest("SDK cTrader opcional no instalado")
-        from ctrader_open_api.messages import OpenApiMessages_pb2 as pb
+        from mtf_lab.data.protobuf_generated import OpenApiMessages_pb2 as pb
 
         account_payload = pb.ProtoOAGetAccountListByAccessTokenRes()
         account_payload.accessToken = "secret-access-token"
@@ -754,8 +754,8 @@ class PumpTransportTests(unittest.TestCase):
                 except queue.Empty:
                     return None
 
-        if dependency_report().sdk_state.value != "AVAILABLE":
-            self.skipTest("SDK cTrader opcional no instalado en este intérprete")
+        if not dependency_report().codec_operational:
+            self.skipTest("codec Protobuf generado no disponible en este intérprete")
         transport = FakeTcp()
         client = CTraderClient(CTraderConfig(symbol_id=99), transport=transport)
         client.connect()

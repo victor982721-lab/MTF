@@ -53,6 +53,7 @@ class QuoteReason(StrEnum):
     DISCONNECTED = "DISCONNECTED"
     SESSION_MISMATCH = "SESSION_MISMATCH"
     FUTURE_SOURCE_TIMESTAMP = "FUTURE_SOURCE_TIMESTAMP"
+    FUTURE_AVAILABILITY = "FUTURE_AVAILABILITY"
     SPREAD_UNAVAILABLE = "SPREAD_UNAVAILABLE"
 
 
@@ -114,6 +115,10 @@ def quality_from(value: Any) -> QuoteQuality:
     if isinstance(value, QuoteQuality):
         return value
     if isinstance(value, Mapping):
+        # A scalar VALID state cannot override a blocking structured reason or
+        # flag.  The helper is defined below but resolved at call time.
+        if quality_reasons_from(value):
+            return QuoteQuality.UNKNOWN
         if "status" in value:
             value = value["status"]
         elif "state" in value:
@@ -131,6 +136,65 @@ def quality_from(value: Any) -> QuoteQuality:
         return QuoteQuality(raw)
     except ValueError:
         return QuoteQuality.UNKNOWN
+
+
+_QUALITY_REASON_ALIASES = {
+    "INVALID": QuoteReason.INVALID_QUALITY,
+    "UNKNOWN": QuoteReason.INVALID_QUALITY,
+    "VALID": None,
+    "VALIDATED": None,
+    "OK": None,
+    "GOOD": None,
+    "CLOSED_VALID": None,
+    "SYNTHETIC": None,
+    "SYNTHETIC_VALID": None,
+    "SYNTHETIC_VALIDATED": None,
+    "DATA_QUALITY_VALIDATED": None,
+    "PUBLIC_PROVIDER_CLOSED": None,
+}
+
+
+def quality_reasons_from(value: Any) -> tuple[QuoteReason, ...]:
+    """Extract structured quality flags/reasons without upgrading quality.
+
+    ``quality_from`` intentionally returns the scalar state for compatibility.
+    A structured provider value may nevertheless carry a blocking reason while
+    its state says ``VALID``; this helper preserves that evidence for the leg
+    assessment instead of silently discarding it.
+    """
+
+    if value is None:
+        return ()
+    raw_values: list[Any] = []
+    if isinstance(value, Mapping):
+        for key in ("reasons", "flags"):
+            raw = value.get(key, ())
+            if isinstance(raw, (str, QuoteReason)):
+                raw_values.append(raw)
+            else:
+                try:
+                    raw_values.extend(tuple(raw or ()))
+                except TypeError:
+                    raw_values.append(raw)
+    elif isinstance(value, (str, QuoteReason)):
+        raw_values.append(value)
+    else:
+        try:
+            raw_values.extend(tuple(value))
+        except TypeError:
+            raw_values.append(value)
+    result: list[QuoteReason] = []
+    allowed = {reason.value for reason in QuoteReason}
+    for raw in raw_values:
+        normalized = (
+            raw.value if isinstance(raw, QuoteReason) else str(raw).strip().upper().replace("-", "_").replace(" ", "_")
+        )
+        mapped = _QUALITY_REASON_ALIASES.get(
+            normalized, QuoteReason(normalized) if normalized in allowed else QuoteReason.INVALID_QUALITY
+        )
+        if mapped is not None and mapped not in result:
+            result.append(mapped)
+    return tuple(result)
 
 
 @dataclass(frozen=True, slots=True)
@@ -187,6 +251,7 @@ class QuoteAssessment:
     bid: QuoteLegAssessment | None = None
     ask: QuoteLegAssessment | None = None
     checked_at: datetime | None = None
+    common_usable: bool = True
 
     @property
     def status(self) -> QuoteQuality:
@@ -213,6 +278,7 @@ class QuoteAssessment:
             "bid": self.bid.to_dict() if self.bid else None,
             "ask": self.ask.to_dict() if self.ask else None,
             "checked_at": _iso(self.checked_at),
+            "common_usable": self.common_usable,
         }
 
 
@@ -231,6 +297,7 @@ class QuoteLeg:
     sequence: int | str | None = None
     session_generation: int | str | None = None
     present: bool | None = None
+    quality_reasons: tuple[QuoteReason | str, ...] = ()
 
     def __post_init__(self) -> None:
         side = _leg_side(self.side)
@@ -240,6 +307,9 @@ class QuoteLeg:
         available_at = _optional_utc(self.available_at, f"{side.value}.available_at")
         _validate_leg_times(side, source_timestamp, received_at, available_at, self.timestamp_known)
         present = _present_value(self.present, price, side)
+        quality_reasons = tuple(
+            dict.fromkeys((*quality_reasons_from(self.quality), *quality_reasons_from(self.quality_reasons)))
+        )
         object.__setattr__(self, "side", side)
         object.__setattr__(self, "price", price)
         object.__setattr__(self, "source_timestamp", source_timestamp)
@@ -248,6 +318,7 @@ class QuoteLeg:
         object.__setattr__(self, "quality", quality_from(self.quality))
         object.__setattr__(self, "source", str(self.source or "fixture"))
         object.__setattr__(self, "present", present)
+        object.__setattr__(self, "quality_reasons", quality_reasons)
 
     def assess(
         self,
@@ -269,6 +340,7 @@ class QuoteLeg:
             snapshot=snapshot,
             out_of_order=out_of_order,
         )
+        reasons.extend(quality_reasons_from(self.quality_reasons))
         age, time_reasons, time_quality = _leg_time_assessment(self, checked, max_age_seconds)
         reasons.extend(time_reasons)
         quality = time_quality or quality
@@ -308,6 +380,12 @@ def _validate_leg_times(
         raise ValueError(f"{side.value}.timestamp_known debe ser booleano")
     if timestamp_known and source_timestamp is None:
         raise ValueError(f"{side.value}.source_timestamp requerido cuando timestamp_known=True")
+    if source_timestamp is not None and received_at is not None and received_at < source_timestamp:
+        raise ValueError(f"{side.value}.received_at no puede preceder source_timestamp")
+    if received_at is not None and available_at is not None and available_at < received_at:
+        raise ValueError(f"{side.value}.available_at no puede preceder received_at")
+    if source_timestamp is not None and available_at is not None and available_at < source_timestamp:
+        raise ValueError(f"{side.value}.available_at no puede preceder source_timestamp")
 
 
 def _present_value(value: bool | None, price: Decimal | None, side: QuoteSide) -> bool:
@@ -392,6 +470,10 @@ def _leg_time_assessment(
         return None, [QuoteReason.MISSING_SOURCE_TIMESTAMP], None
     if leg.source_timestamp > checked:
         return None, [QuoteReason.FUTURE_SOURCE_TIMESTAMP], None
+    if leg.received_at is not None and leg.received_at > checked:
+        return None, [QuoteReason.FUTURE_AVAILABILITY], None
+    if leg.available_at is not None and leg.available_at > checked:
+        return None, [QuoteReason.FUTURE_AVAILABILITY], None
     age = _seconds(checked - leg.source_timestamp)
     if max_age_seconds is not None and age > _decimal(max_age_seconds, name="max_age_seconds"):
         return age, [QuoteReason.STALE], QuoteQuality.STALE
@@ -441,7 +523,15 @@ def assess_pair(
     if crossed:
         reasons.append(QuoteReason.CROSSED)
     unique = tuple(dict.fromkeys(reasons))
-    return QuoteAssessment(QuoteSide.MID, not unique, unique, bid_assessment, ask_assessment, _utc(at, name="at"))
+    return QuoteAssessment(
+        QuoteSide.MID,
+        not unique,
+        unique,
+        bid_assessment,
+        ask_assessment,
+        _utc(at, name="at"),
+        common_usable=common in _USABLE_QUALITY,
+    )
 
 
 __all__ = [
@@ -453,4 +543,5 @@ __all__ = [
     "QuoteSide",
     "assess_pair",
     "quality_from",
+    "quality_reasons_from",
 ]

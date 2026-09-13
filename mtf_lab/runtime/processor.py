@@ -16,7 +16,7 @@ from collections import deque
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 from ..core import (
     Candle,
@@ -1827,65 +1827,12 @@ def _indicator_point_from_dict(value: Mapping[str, Any]) -> IndicatorPoint:
 
 
 def _engine_state(engine: Any) -> dict[str, Any]:
-    def series_state(state: Any) -> dict[str, Any]:
-        return {"values": list(state.values), "current": state.current, "period": state.period}
-
-    return {
-        "previous_end": iso(engine._previous_end)
-        if isinstance(engine._previous_end, datetime)
-        else engine._previous_end,
-        "timeframe": engine._timeframe.name if engine._timeframe is not None else None,
-        "instrument": engine._instrument,
-        "index": engine._index,
-        "ema_fast": series_state(engine._ema_fast),
-        "ema_slow": series_state(engine._ema_slow),
-        "rsi": {
-            "previous_close": engine._rsi.previous_close,
-            "gains": list(engine._rsi.gains),
-            "losses": list(engine._rsi.losses),
-            "average_gain": engine._rsi.average_gain,
-            "average_loss": engine._rsi.average_loss,
-            "period": engine._rsi.period,
-        },
-        "atr": {
-            "previous_close": engine._atr.previous_close,
-            "true_ranges": list(engine._atr.true_ranges),
-            "current": engine._atr.current,
-            "period": engine._atr.period,
-        },
-    }
+    snapshot = engine.snapshot()
+    return cast(dict[str, Any], snapshot.to_dict())
 
 
 def _restore_engine_state(engine: Any, value: Mapping[str, Any]) -> None:
-    from collections import deque as _deque
-
-    previous_end = value.get("previous_end")
-    engine._previous_end = utc(previous_end) if previous_end else None
-    raw_tf = value.get("timeframe")
-    engine._timeframe = parse_timeframe(raw_tf) if raw_tf else engine._timeframe
-    engine._instrument = str(value.get("instrument", engine._instrument))
-    engine._index = int(value.get("index", engine._index))
-    for name in ("ema_fast", "ema_slow"):
-        raw = value.get(name)
-        if not isinstance(raw, Mapping):
-            continue
-        state = getattr(engine, f"_{name}")
-        state.values = _deque((float(item) for item in raw.get("values", ())), maxlen=state.period)
-        state.current = float(raw["current"]) if raw.get("current") is not None else None
-    raw = value.get("rsi")
-    if isinstance(raw, Mapping):
-        engine._rsi.previous_close = float(raw["previous_close"]) if raw.get("previous_close") is not None else None
-        engine._rsi.gains = _deque((float(item) for item in raw.get("gains", ())), maxlen=engine._rsi.period)
-        engine._rsi.losses = _deque((float(item) for item in raw.get("losses", ())), maxlen=engine._rsi.period)
-        engine._rsi.average_gain = float(raw["average_gain"]) if raw.get("average_gain") is not None else None
-        engine._rsi.average_loss = float(raw["average_loss"]) if raw.get("average_loss") is not None else None
-    raw = value.get("atr")
-    if isinstance(raw, Mapping):
-        engine._atr.previous_close = float(raw["previous_close"]) if raw.get("previous_close") is not None else None
-        engine._atr.true_ranges = _deque(
-            (float(item) for item in raw.get("true_ranges", ())), maxlen=engine._atr.period
-        )
-        engine._atr.current = float(raw["current"]) if raw.get("current") is not None else None
+    engine.restore(value, allow_legacy=True)
 
 
 def point_available(point: IndicatorPoint) -> datetime | None:

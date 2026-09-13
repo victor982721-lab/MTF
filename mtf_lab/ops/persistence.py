@@ -30,6 +30,7 @@ from typing import Any, Protocol, cast
 
 from ..core.canonical import canonical_json as _strict_canonical_json
 from ..core.canonical import fingerprint as _strict_fingerprint
+from ..core.cfd_simulation import CFD_ECONOMICS_LEGACY_VERSION, CFD_ECONOMICS_VERSION
 
 # Version 4 is an additive persistence migration.  The original binary
 # projections remain v3-compatible: existing rows are not rewritten and the
@@ -49,9 +50,12 @@ _CFD_DECIMAL_FIELDS = (
     "horizon_seconds",
     "pip_size",
     "entry_price",
+    "entry_reference_price",
     "close_price",
+    "close_reference_price",
     "pips",
     "gross_pnl_quote",
+    "reference_gross_pnl_quote",
     "costs_quote",
     "commission_quote",
     "slippage_quote",
@@ -116,6 +120,21 @@ _CFD_SEMANTIC_FIELDS = (
     "economic_reason",
     "quality",
     "reason",
+    "economics_version",
+    "entry_reference_price",
+    "close_reference_price",
+    "reference_gross_pnl_quote",
+)
+_CFD_LEGACY_SEMANTIC_FIELDS = tuple(
+    field
+    for field in _CFD_SEMANTIC_FIELDS
+    if field not in {"economics_version", "entry_reference_price", "close_reference_price", "reference_gross_pnl_quote"}
+)
+_CFD_ADDITIVE_FIELDS = (
+    "economics_version",
+    "entry_reference_price",
+    "close_reference_price",
+    "reference_gross_pnl_quote",
 )
 _CFD_STATIC_FIELDS = (
     "product",
@@ -139,6 +158,7 @@ _CFD_STATIC_FIELDS = (
     "partition",
     "analysis_config_hash",
     "contract_hash",
+    "economics_version",
 )
 _CFD_ROW_COLUMNS = (
     "session_id",
@@ -374,6 +394,10 @@ def _cfd_extract_economic(record: dict[str, Any]) -> None:
         "costs_account",
         "net_pnl",
         "economic_reason",
+        "economics_version",
+        "entry_reference_price",
+        "close_reference_price",
+        "reference_gross_pnl_quote",
     )
     for field in fields:
         if field not in record and field in economic:
@@ -456,6 +480,7 @@ def _cfd_normalize_metadata(record: dict[str, Any]) -> None:
     record["economic_reason"] = (
         str(record["economic_reason"]) if record.get("economic_reason") is not None else record["reason"]
     )
+    record["economics_version"] = _cfd_economics_version(record.get("economics_version"))
     lineage = record.get("lineage")
     if lineage is None:
         record["lineage"] = {}
@@ -465,6 +490,26 @@ def _cfd_normalize_metadata(record: dict[str, Any]) -> None:
         raise ValueError("lineage CFD debe ser un mapping")
     for field in _CFD_SEMANTIC_FIELDS:
         record.setdefault(field, None)
+
+
+def _cfd_economics_version(value: Any) -> str:
+    """Resolve a stored economics contract; absent pre-H1 means legacy v1."""
+
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return CFD_ECONOMICS_LEGACY_VERSION
+    raw = str(value).strip().lower().replace("_", "-")
+    aliases = {
+        "1": CFD_ECONOMICS_LEGACY_VERSION,
+        "v1": CFD_ECONOMICS_LEGACY_VERSION,
+        CFD_ECONOMICS_LEGACY_VERSION: CFD_ECONOMICS_LEGACY_VERSION,
+        "2": CFD_ECONOMICS_VERSION,
+        "v2": CFD_ECONOMICS_VERSION,
+        CFD_ECONOMICS_VERSION: CFD_ECONOMICS_VERSION,
+    }
+    try:
+        return aliases[raw]
+    except KeyError as exc:
+        raise ValueError(f"economics_version CFD no soportada: {value!r}") from exc
 
 
 def _normalise_cfd_trade(trade: Any) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -486,6 +531,20 @@ def _normalise_cfd_trade(trade: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     canonical_json(record)
     canonical_json(semantic)
     return record, semantic
+
+
+def _cfd_semantic_hash(record: Mapping[str, Any], fields: Iterable[str]) -> str:
+    return payload_hash({field: record.get(field) for field in fields})
+
+
+def project_cfd_additive_fields(result: dict[str, Any], payload: Mapping[str, Any] | None) -> None:
+    """Expose H1 fields without mutating the stored legacy payload."""
+
+    payload = payload or {}
+    raw_version = payload.get("economics_version", result.get("economics_version"))
+    result["economics_version"] = _cfd_economics_version(raw_version)
+    for field in _CFD_ADDITIVE_FIELDS[1:]:
+        result[field] = payload.get(field, result.get(field))
 
 
 def _capture_mapping(envelope: Any, *, sequence: int | None = None) -> dict[str, Any]:
@@ -751,7 +810,21 @@ def _cfd_existing_action(
     previous_state = str(existing[0]).upper()
     existing_record = _json_load(existing[2], {}) or {}
     if isinstance(existing_record, Mapping):
-        changed_static = [field for field in _CFD_STATIC_FIELDS if existing_record.get(field) != record.get(field)]
+        existing_version = _cfd_economics_version(existing_record.get("economics_version"))
+        if (
+            existing_version == CFD_ECONOMICS_LEGACY_VERSION
+            and record.get("economics_version") == CFD_ECONOMICS_LEGACY_VERSION
+            and _cfd_semantic_hash(existing_record, _CFD_LEGACY_SEMANTIC_FIELDS)
+            == _cfd_semantic_hash(record, _CFD_LEGACY_SEMANTIC_FIELDS)
+        ):
+            # A pre-H1 row has no new fields and must remain byte-for-byte
+            # untouched on an idempotent legacy replay.
+            return False
+        changed_static = [
+            field
+            for field in _CFD_STATIC_FIELDS
+            if (existing_version if field == "economics_version" else existing_record.get(field)) != record.get(field)
+        ]
         if changed_static:
             raise IdempotencyConflict(
                 f"conflicto semántico CFD en {changed_static}: identidad={(session_id, analysis_id, record['trade_id'])!r}"
@@ -2229,10 +2302,12 @@ class SQLiteStore:
         result["terminal"] = bool(int(result.get("terminal", 0)))
         result["close_observed"] = bool(int(result.get("close_observed", 0)))
         result["lineage"] = _json_load(result.pop("lineage_json", None), {}) or {}
+        payload = _json_load(result.pop("payload_json", None), {}) or {}
         if include_payload:
-            result["payload"] = _json_load(result.pop("payload_json", None), {}) or {}
+            result["payload"] = payload
         else:
             result.pop("payload_json", None)
+        project_cfd_additive_fields(result, payload if isinstance(payload, Mapping) else None)
         result["lifecycle_state"] = result.get("state")
         economic_state = str(
             result.get("economic_state")
@@ -2251,8 +2326,13 @@ class SQLiteStore:
         }.get(economic_state, "UNKNOWN")
         result["economic_result"] = {
             "state": economic_state,
+            "economics_version": result.get("economics_version"),
             "gross_pnl_quote": result.get("gross_pnl_quote"),
             "costs_quote": result.get("costs_quote"),
+            "slippage_quote": result.get("slippage_quote"),
+            "entry_reference_price": result.get("entry_reference_price"),
+            "close_reference_price": result.get("close_reference_price"),
+            "reference_gross_pnl_quote": result.get("reference_gross_pnl_quote"),
             "gross_pnl_account": result.get("gross_pnl_account"),
             "costs_account": result.get("costs_account"),
             "net_pnl": result.get("net_pnl"),

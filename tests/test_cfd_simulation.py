@@ -92,10 +92,15 @@ class CFDSimulationTests(unittest.TestCase):
         )
         self.assertEqual(trade.entry_price, Decimal("1.10030"))
         self.assertEqual(trade.close_price, Decimal("1.10040"))
+        self.assertEqual(trade.economics_version, "cfd-economics-v2")
+        self.assertEqual(trade.entry_reference_price, Decimal("1.10020"))
+        self.assertEqual(trade.close_reference_price, Decimal("1.10050"))
+        self.assertEqual(trade.reference_gross_pnl_quote, Decimal("0.30000"))
         self.assertEqual(trade.gross_pnl_quote, Decimal("0.10000"))
+        self.assertEqual(trade.pips, Decimal("1.0"))
         self.assertEqual(trade.commission_quote, Decimal("0.05"))
-        self.assertEqual(trade.slippage_quote, Decimal("0.2000"))
-        self.assertEqual(trade.net_pnl, Decimal("-0.15000"))
+        self.assertEqual(trade.slippage_quote, Decimal("0.20000"))
+        self.assertEqual(trade.net_pnl, Decimal("0.05000"))
 
     def test_horizon_is_from_effective_fill_after_decision_and_entry_latency(self) -> None:
         signal = CFDSignal("latency", "EUR/USD", "LONG", T0, available_at=T0 + timedelta(seconds=2))

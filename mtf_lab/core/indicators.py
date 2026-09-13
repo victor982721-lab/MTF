@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, cast, overload
 
+from .canonical import fingerprint
 from .models import Candle, Timeframe, normalize_utc, parse_timeframe
 from .quality import DataQuality, QualityFlag, QualityIssue
 
@@ -174,6 +175,343 @@ class IndicatorSeries:
 
     def __getitem__(self, item: int | slice) -> IndicatorPoint | tuple[IndicatorPoint, ...]:
         return self.points[item]
+
+
+def _snapshot_period(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{name} debe ser entero positivo")
+    return value
+
+
+def _snapshot_float(value: Any, name: str, *, allow_none: bool = True) -> float | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise TypeError(f"{name} debe ser numérico")
+    if isinstance(value, bool):
+        raise TypeError(f"{name} debe ser numérico")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{name} debe ser numérico") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{name} debe ser finito")
+    return result
+
+
+def _snapshot_values(values: Any, name: str, period: int) -> tuple[float, ...]:
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{name} debe ser una secuencia numérica")
+    try:
+        result = tuple(_snapshot_float(item, f"{name}[]", allow_none=False) for item in values)
+    except TypeError as exc:
+        raise TypeError(f"{name} debe ser una secuencia numérica") from exc
+    if len(result) > period:
+        raise ValueError(f"{name} excede el periodo {period}")
+    return cast(tuple[float, ...], result)
+
+
+def _snapshot_timestamp(value: Any, name: str) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return normalize_utc(value, name)
+    if not isinstance(value, str):
+        raise TypeError(f"{name} debe ser datetime o timestamp ISO")
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return normalize_utc(datetime.fromisoformat(text), name)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} debe ser timestamp ISO con zona horaria") from exc
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorEngineConfigIdentity:
+    """Identidad reproducible de la configuración de un engine incremental.
+
+    El estado de EMA/RSI/ATR no puede restaurarse en un engine con periodos o
+    límites de almacenamiento distintos.  Esta identidad forma parte del
+    snapshot público para que el consumidor no tenga que inspeccionar los
+    atributos internos del engine para validar una restauración.
+    """
+
+    ema_fast: int
+    ema_slow: int
+    rsi_period: int
+    atr_period: int
+    wilder: bool
+    max_points: int | None
+    max_issues: int | None
+
+    def __post_init__(self) -> None:
+        for name in ("ema_fast", "ema_slow", "rsi_period", "atr_period"):
+            object.__setattr__(self, name, _snapshot_period(getattr(self, name), name))
+        if not isinstance(self.wilder, bool):
+            raise TypeError("wilder debe ser booleano")
+        for name in ("max_points", "max_issues"):
+            value = getattr(self, name)
+            if value is not None:
+                object.__setattr__(self, name, _snapshot_period(value, name))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ema_fast": self.ema_fast,
+            "ema_slow": self.ema_slow,
+            "rsi_period": self.rsi_period,
+            "atr_period": self.atr_period,
+            "wilder": self.wilder,
+            "max_points": self.max_points,
+            "max_issues": self.max_issues,
+        }
+
+    @property
+    def fingerprint(self) -> str:
+        return fingerprint(self.to_dict())
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> IndicatorEngineConfigIdentity:
+        if not isinstance(value, Mapping):
+            raise TypeError("config_identity debe ser un mapping")
+        allowed = {"ema_fast", "ema_slow", "rsi_period", "atr_period", "wilder", "max_points", "max_issues"}
+        unknown = set(value) - allowed
+        if unknown:
+            raise ValueError(f"Claves desconocidas en config_identity: {sorted(unknown)}")
+        required = allowed - {"max_points", "max_issues"}
+        missing = required - set(value)
+        if missing:
+            raise ValueError(f"Faltan campos en config_identity: {sorted(missing)}")
+        return cls(
+            ema_fast=value["ema_fast"],
+            ema_slow=value["ema_slow"],
+            rsi_period=value["rsi_period"],
+            atr_period=value["atr_period"],
+            wilder=value["wilder"],
+            max_points=value.get("max_points"),
+            max_issues=value.get("max_issues"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class EMAStateSnapshot:
+    """Estado serializable de una EMA, sin exponer el objeto mutable interno."""
+
+    period: int
+    values: tuple[float, ...]
+    current: float | None
+
+    def __post_init__(self) -> None:
+        period = _snapshot_period(self.period, "period")
+        object.__setattr__(self, "period", period)
+        object.__setattr__(self, "values", _snapshot_values(self.values, "values", period))
+        object.__setattr__(self, "current", _snapshot_float(self.current, "current"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"values": list(self.values), "current": self.current, "period": self.period}
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any], name: str = "ema") -> EMAStateSnapshot:
+        if not isinstance(value, Mapping):
+            raise TypeError(f"{name} debe ser un mapping")
+        required = {"values", "current", "period"}
+        missing = required - set(value)
+        if missing:
+            raise ValueError(f"Faltan campos en {name}: {sorted(missing)}")
+        return cls(value["period"], tuple(value["values"]), value["current"])
+
+
+@dataclass(frozen=True, slots=True)
+class RSIStateSnapshot:
+    """Estado serializable del suavizado Wilder del RSI."""
+
+    period: int
+    previous_close: float | None
+    gains: tuple[float, ...]
+    losses: tuple[float, ...]
+    average_gain: float | None
+    average_loss: float | None
+
+    def __post_init__(self) -> None:
+        period = _snapshot_period(self.period, "period")
+        object.__setattr__(self, "period", period)
+        object.__setattr__(self, "previous_close", _snapshot_float(self.previous_close, "previous_close"))
+        object.__setattr__(self, "gains", _snapshot_values(self.gains, "gains", period))
+        object.__setattr__(self, "losses", _snapshot_values(self.losses, "losses", period))
+        object.__setattr__(self, "average_gain", _snapshot_float(self.average_gain, "average_gain"))
+        object.__setattr__(self, "average_loss", _snapshot_float(self.average_loss, "average_loss"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "previous_close": self.previous_close,
+            "gains": list(self.gains),
+            "losses": list(self.losses),
+            "average_gain": self.average_gain,
+            "average_loss": self.average_loss,
+            "period": self.period,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> RSIStateSnapshot:
+        if not isinstance(value, Mapping):
+            raise TypeError("rsi debe ser un mapping")
+        required = {"previous_close", "gains", "losses", "average_gain", "average_loss", "period"}
+        missing = required - set(value)
+        if missing:
+            raise ValueError(f"Faltan campos en rsi: {sorted(missing)}")
+        return cls(
+            value["period"],
+            value["previous_close"],
+            tuple(value["gains"]),
+            tuple(value["losses"]),
+            value["average_gain"],
+            value["average_loss"],
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ATRStateSnapshot:
+    """Estado serializable del suavizado Wilder del ATR."""
+
+    period: int
+    previous_close: float | None
+    true_ranges: tuple[float, ...]
+    current: float | None
+
+    def __post_init__(self) -> None:
+        period = _snapshot_period(self.period, "period")
+        object.__setattr__(self, "period", period)
+        object.__setattr__(self, "previous_close", _snapshot_float(self.previous_close, "previous_close"))
+        object.__setattr__(self, "true_ranges", _snapshot_values(self.true_ranges, "true_ranges", period))
+        object.__setattr__(self, "current", _snapshot_float(self.current, "current"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "previous_close": self.previous_close,
+            "true_ranges": list(self.true_ranges),
+            "current": self.current,
+            "period": self.period,
+        }
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> ATRStateSnapshot:
+        if not isinstance(value, Mapping):
+            raise TypeError("atr debe ser un mapping")
+        required = {"previous_close", "true_ranges", "current", "period"}
+        missing = required - set(value)
+        if missing:
+            raise ValueError(f"Faltan campos en atr: {sorted(missing)}")
+        return cls(value["period"], value["previous_close"], tuple(value["true_ranges"]), value["current"])
+
+
+@dataclass(frozen=True, slots=True)
+class IndicatorEngineSnapshot:
+    """Checkpoint tipado del estado incremental EMA/RSI/ATR.
+
+    ``to_dict`` conserva la forma histórica de los bloques ``ema_fast``,
+    ``ema_slow``, ``rsi`` y ``atr`` para que los checkpoints del runtime
+    sigan siendo JSON compatibles. La identidad nueva impide restaurar un
+    estado con una configuración diferente.
+    """
+
+    schema_version: int
+    config_identity: IndicatorEngineConfigIdentity
+    previous_end: datetime | None
+    timeframe: Timeframe | None
+    instrument: str
+    index: int
+    ema_fast: EMAStateSnapshot
+    ema_slow: EMAStateSnapshot
+    rsi: RSIStateSnapshot
+    atr: ATRStateSnapshot
+
+    VERSION = 1
+
+    def __post_init__(self) -> None:
+        if isinstance(self.schema_version, bool) or self.schema_version != self.VERSION:
+            raise ValueError(f"schema_version de engine no soportada: {self.schema_version!r}")
+        if not isinstance(self.config_identity, IndicatorEngineConfigIdentity):
+            raise TypeError("config_identity debe ser IndicatorEngineConfigIdentity")
+        object.__setattr__(self, "previous_end", _snapshot_timestamp(self.previous_end, "previous_end"))
+        if self.timeframe is not None and not isinstance(self.timeframe, Timeframe):
+            object.__setattr__(self, "timeframe", parse_timeframe(self.timeframe))
+        instrument = str(self.instrument).strip()
+        if not instrument:
+            raise ValueError("instrument no puede estar vacío")
+        object.__setattr__(self, "instrument", instrument)
+        if isinstance(self.index, bool) or not isinstance(self.index, int) or self.index < 0:
+            raise ValueError("index debe ser entero no negativo")
+        if not isinstance(self.ema_fast, EMAStateSnapshot):
+            raise TypeError("ema_fast debe ser EMAStateSnapshot")
+        if not isinstance(self.ema_slow, EMAStateSnapshot):
+            raise TypeError("ema_slow debe ser EMAStateSnapshot")
+        if not isinstance(self.rsi, RSIStateSnapshot):
+            raise TypeError("rsi debe ser RSIStateSnapshot")
+        if not isinstance(self.atr, ATRStateSnapshot):
+            raise TypeError("atr debe ser ATRStateSnapshot")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "config_identity": self.config_identity.to_dict(),
+            "config_hash": self.config_identity.fingerprint,
+            "previous_end": self.previous_end.isoformat().replace("+00:00", "Z")
+            if self.previous_end is not None
+            else None,
+            "timeframe": self.timeframe.name if self.timeframe is not None else None,
+            "instrument": self.instrument,
+            "index": self.index,
+            "ema_fast": self.ema_fast.to_dict(),
+            "ema_slow": self.ema_slow.to_dict(),
+            "rsi": self.rsi.to_dict(),
+            "atr": self.atr.to_dict(),
+        }
+
+    @classmethod
+    def from_mapping(
+        cls,
+        value: Mapping[str, Any],
+        *,
+        default_identity: IndicatorEngineConfigIdentity | None = None,
+        allow_legacy: bool = False,
+    ) -> IndicatorEngineSnapshot:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("snapshot de engine debe ser un mapping")
+        has_identity = "config_identity" in value
+        raw_identity = value.get("config_identity")
+        if has_identity:
+            if not isinstance(raw_identity, Mapping):
+                raise TypeError("config_identity debe ser un mapping")
+            identity = IndicatorEngineConfigIdentity.from_mapping(raw_identity)
+        elif allow_legacy and default_identity is not None:
+            identity = default_identity
+        else:
+            raise ValueError("snapshot de engine sin config_identity; sólo se acepta como checkpoint histórico")
+        version = value.get("schema_version")
+        if version is None:
+            if not allow_legacy:
+                raise ValueError("snapshot de engine sin schema_version")
+            version = cls.VERSION
+        if "config_hash" in value and has_identity and str(value["config_hash"]) != identity.fingerprint:
+            raise ValueError("config_hash de snapshot de engine no coincide con config_identity")
+        required = {"previous_end", "timeframe", "instrument", "index", "ema_fast", "ema_slow", "rsi", "atr"}
+        missing = required - set(value)
+        if missing:
+            raise ValueError(f"Faltan campos en snapshot de engine: {sorted(missing)}")
+        return cls(
+            schema_version=int(version),
+            config_identity=identity,
+            previous_end=_snapshot_timestamp(value["previous_end"], "previous_end"),
+            timeframe=parse_timeframe(value["timeframe"]) if value["timeframe"] else None,
+            instrument=str(value["instrument"]),
+            index=int(value["index"]),
+            ema_fast=EMAStateSnapshot.from_mapping(value["ema_fast"], "ema_fast"),
+            ema_slow=EMAStateSnapshot.from_mapping(value["ema_slow"], "ema_slow"),
+            rsi=RSIStateSnapshot.from_mapping(value["rsi"]),
+            atr=ATRStateSnapshot.from_mapping(value["atr"]),
+        )
 
 
 class _EMAState:
@@ -394,6 +732,26 @@ class IncrementalIndicatorEngine:
         )
 
     @property
+    def config_identity(self) -> IndicatorEngineConfigIdentity:
+        """Identidad tipada de la configuración efectiva del engine."""
+
+        return IndicatorEngineConfigIdentity(
+            ema_fast=self.config.ema_fast,
+            ema_slow=self.config.ema_slow,
+            rsi_period=self.config.rsi_period,
+            atr_period=self.config.atr_period,
+            wilder=self.config.wilder,
+            max_points=self.max_points,
+            max_issues=self.max_issues,
+        )
+
+    @property
+    def config_hash(self) -> str:
+        """Huella estable de :attr:`config_identity` para registros."""
+
+        return self.config_identity.fingerprint
+
+    @property
     def points(self) -> tuple[IndicatorPoint, ...]:
         return tuple(self._points)
 
@@ -413,6 +771,108 @@ class IncrementalIndicatorEngine:
         self._rsi.reset()
         self._atr.reset()
         self._previous_end = None
+
+    def snapshot(self) -> IndicatorEngineSnapshot:
+        """Captura el estado mutable mediante una API pública y tipada."""
+
+        return IndicatorEngineSnapshot(
+            schema_version=IndicatorEngineSnapshot.VERSION,
+            config_identity=self.config_identity,
+            previous_end=(
+                normalize_utc(self._previous_end, "previous_end") if isinstance(self._previous_end, datetime) else None
+            ),
+            timeframe=self._timeframe,
+            instrument=self._instrument,
+            index=self._index,
+            ema_fast=EMAStateSnapshot(
+                self._ema_fast.period,
+                tuple(self._ema_fast.values),
+                self._ema_fast.current,
+            ),
+            ema_slow=EMAStateSnapshot(
+                self._ema_slow.period,
+                tuple(self._ema_slow.values),
+                self._ema_slow.current,
+            ),
+            rsi=RSIStateSnapshot(
+                self._rsi.period,
+                self._rsi.previous_close,
+                tuple(self._rsi.gains),
+                tuple(self._rsi.losses),
+                self._rsi.average_gain,
+                self._rsi.average_loss,
+            ),
+            atr=ATRStateSnapshot(
+                self._atr.period,
+                self._atr.previous_close,
+                tuple(self._atr.true_ranges),
+                self._atr.current,
+            ),
+        )
+
+    def snapshot_json(self) -> str:
+        """Codifica el snapshot tipado sin depender de pickle."""
+
+        import json
+
+        return json.dumps(self.snapshot().to_dict(), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+    def restore(
+        self,
+        snapshot: IndicatorEngineSnapshot | Mapping[str, Any],
+        *,
+        allow_legacy: bool = False,
+    ) -> None:
+        """Restaura un snapshot después de validar identidad y contenido.
+
+        ``allow_legacy`` sólo existe para lectores del checkpoint v1 del
+        runtime, cuyo bloque histórico no llevaba identidad propia. Los
+        snapshots nuevos siempre exigen ``config_identity``.
+        """
+
+        typed = (
+            snapshot
+            if isinstance(snapshot, IndicatorEngineSnapshot)
+            else IndicatorEngineSnapshot.from_mapping(
+                snapshot,
+                default_identity=self.config_identity,
+                allow_legacy=allow_legacy,
+            )
+        )
+        expected = self.config_identity
+        if typed.config_identity != expected:
+            raise ValueError("config_identity del snapshot de engine no coincide con la configuración efectiva")
+        if typed.ema_fast.period != self._ema_fast.period or typed.ema_slow.period != self._ema_slow.period:
+            raise ValueError("periodos EMA del snapshot no coinciden")
+        if typed.rsi.period != self._rsi.period or typed.atr.period != self._atr.period:
+            raise ValueError("periodos RSI/ATR del snapshot no coinciden")
+
+        # Todas las conversiones y validaciones ocurren antes de tocar el
+        # objeto vivo; un snapshot corrupto no deja una restauración parcial.
+        from collections import deque as _deque
+
+        ema_fast_values = _deque(typed.ema_fast.values, maxlen=self._ema_fast.period)
+        ema_slow_values = _deque(typed.ema_slow.values, maxlen=self._ema_slow.period)
+        rsi_gains = _deque(typed.rsi.gains, maxlen=self._rsi.period)
+        rsi_losses = _deque(typed.rsi.losses, maxlen=self._rsi.period)
+        atr_ranges = _deque(typed.atr.true_ranges, maxlen=self._atr.period)
+
+        self._previous_end = typed.previous_end
+        self._timeframe = typed.timeframe
+        self._instrument = typed.instrument
+        self._index = typed.index
+        self._ema_fast.values = ema_fast_values
+        self._ema_fast.current = typed.ema_fast.current
+        self._ema_slow.values = ema_slow_values
+        self._ema_slow.current = typed.ema_slow.current
+        self._rsi.previous_close = typed.rsi.previous_close
+        self._rsi.gains = rsi_gains
+        self._rsi.losses = rsi_losses
+        self._rsi.average_gain = typed.rsi.average_gain
+        self._rsi.average_loss = typed.rsi.average_loss
+        self._atr.previous_close = typed.atr.previous_close
+        self._atr.true_ranges = atr_ranges
+        self._atr.current = typed.atr.current
 
     def _unknown_point(
         self,
@@ -537,9 +997,14 @@ def compute_indicators_incremental(
 
 
 __all__ = [
+    "ATRStateSnapshot",
+    "EMAStateSnapshot",
     "IncrementalIndicatorEngine",
     "IndicatorConfig",
+    "IndicatorEngineConfigIdentity",
+    "IndicatorEngineSnapshot",
     "IndicatorPoint",
+    "RSIStateSnapshot",
     "IndicatorSeries",
     "compute_indicators",
     "compute_indicators_incremental",

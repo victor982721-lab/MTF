@@ -1,0 +1,251 @@
+{
+  "schema_version": 1,
+  "observed_at": "2026-09-13T06:37:23.138776+00:00",
+  "scope": "Local candidate/development components, not operational environment or remote advisory audit",
+  "metadata_hash_semantics": "Hashes identify installed metadata bytes; they are not original wheel hashes and do not prove security or licensing completeness.",
+  "environments": {
+    "candidate_runtime": {
+      "python": "3.14.4",
+      "python_binary_sha256": "52e0a13e60a981d8c4b6478be2ba5176f69da07948a056bf49cf6f077e30cb41",
+      "sqlite_linked_version": "3.46.1",
+      "distributions": [
+        {
+          "name": "mtf-lab",
+          "version": "0.1.0",
+          "license_declared_in_metadata": null,
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "5c237be41f3a5b4d2b5b1ca219b5d6e42153d29c19e4a60107bbc0c127c6ca0f",
+            "RECORD": "b8c2b844385e903ef09aa0323deadc95e0be9c26617558200be6c6e6de3291d7",
+            "WHEEL": "61532836a2b3111b7ec23519c09df7c41180c27165fb872a6d8913b566b88ad1"
+          }
+        },
+        {
+          "name": "pip",
+          "version": "25.1.1",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [
+            "License :: OSI Approved :: MIT License"
+          ],
+          "installed_metadata_sha256": {
+            "METADATA": "405c63d6d2e993c8465ab8102d1849614a70a3fd45a81af8dce4f4b2b2197265",
+            "RECORD": "1d1d6a74a69cabd385ab28aae1e13d4806deb5ca60fdc943a132228be0eebec1",
+            "WHEEL": "95353a07a7887d8a224094d935cf9fc9a47a0692fa7a14f3537c466319f69fc9"
+          }
+        },
+        {
+          "name": "protobuf",
+          "version": "7.36.1",
+          "license_declared_in_metadata": "3-Clause BSD License",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "947ed3f132e70411555388d7fcd36712fdd60c8db6345001fb23bb56a2c6cab7",
+            "RECORD": "27c63ce394a4cc60dab3e155f1d98d1598a501eb2f9cf047728cc3b133ffe77d",
+            "WHEEL": "f7c768f330f75ba86dc31a1ff23d084a0ba20d8c82335b92cbbd32a6be0f125b"
+          }
+        },
+        {
+          "name": "types-protobuf",
+          "version": "7.35.1.20260906",
+          "license_declared_in_metadata": "Apache-2.0",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "d6b703bab3eedbc4e56bae2b1d77ad447d89df2308316e750da906322aed66db",
+            "RECORD": "31c47154bb7ab8611f6ace2e1d834a2fa22a676d11a0988eb0d130e91f26af2a",
+            "WHEEL": "61532836a2b3111b7ec23519c09df7c41180c27165fb872a6d8913b566b88ad1"
+          }
+        }
+      ]
+    },
+    "development": {
+      "python": "3.14.4",
+      "python_binary_sha256": "52e0a13e60a981d8c4b6478be2ba5176f69da07948a056bf49cf6f077e30cb41",
+      "sqlite_linked_version": "3.46.1",
+      "distributions": [
+        {
+          "name": "ast_serialize",
+          "version": "0.11.1",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "5a5aa0a51146727511810f68c5d7716741fdebf5ff54695b912d215698444d15",
+            "RECORD": "1d2f6a6306d07f67540cfe8ef4fa348d0ba473edba0f930b8f01062932b1e67a",
+            "WHEEL": "5d2d6ed787029819739feeb120bd326d8ef46f56e9370c5508d5a423755ddc6c"
+          }
+        },
+        {
+          "name": "build",
+          "version": "1.6.1",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "f3623590844a25dcf308a71a988c73e293b7ef779a1f43acb83ad1be218d61a0",
+            "RECORD": "703dd5d8df15efa8a44c65b563ccd801d2a710bc64bdfccdbfb1428515486fda",
+            "WHEEL": "ff23073da055face9f40cc14a28f3735275308cddcf315d6157461a9a7cdfbb6"
+          }
+        },
+        {
+          "name": "coverage",
+          "version": "7.16.0",
+          "license_declared_in_metadata": "Apache-2.0",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "7a33955c0b8885df0efa30fb4436f71c3c924689a67ccf4a9157b8071c25056e",
+            "RECORD": "7d6cdc1763e05a69f0945c0037783bc682bb65a9fa915d1d8cd1b1f26539b1f1",
+            "WHEEL": "398c38f0a30856fda9fd5f4784b29e08460c3aa4af47dc81e50bb955bf828a11"
+          }
+        },
+        {
+          "name": "librt",
+          "version": "0.15.0",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "58262fb3434943045ce7149ad5e4f2b8bf365f50a407c524b419d4286921830c",
+            "RECORD": "98f4d5a24795d0a49cfa849f81717ae99a91cda2e01249428a6307a55e65d3e8",
+            "WHEEL": "645d90bdb2a80d21ce133b91a2c9d511c4256fa98ae68342866315b976c24279"
+          }
+        },
+        {
+          "name": "mypy",
+          "version": "2.3.1",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "71f0d6bf44b899dd9517659bf27ccacfa5928b9651c4d0382e89dcd88bb360f5",
+            "RECORD": "3720ced37056abb4261f49ae7b4268ce696c8110e5c08cc3a04483b08f0d8058",
+            "WHEEL": "c42b07c0ecbe6b05fa7a6e6d6218cde26e2b79c95c03c844a637af1f68220d4a"
+          }
+        },
+        {
+          "name": "mypy_extensions",
+          "version": "1.1.0",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "2c4a44936d885f30433181ca40bbf62457351f1f6b0871b11f8789564f87477f",
+            "RECORD": "4b9472400c0c26704bf6d2aa2cb4375c0f1b3361e2e223fd001b57489840111c",
+            "WHEEL": "1b68144734c4b66791f27add5d425f3620775585718a03d0f9b110ba3a4d88db"
+          }
+        },
+        {
+          "name": "nodeenv",
+          "version": "1.10.0",
+          "license_declared_in_metadata": "BSD",
+          "license_classifiers": [
+            "License :: OSI Approved :: BSD License"
+          ],
+          "installed_metadata_sha256": {
+            "METADATA": "a8424896a12fd1be10526834176fc754cd296c900f40da655fb2e03c1b7eb921",
+            "RECORD": "ec83c6829e2942ddebfb3827f899531cd8dab52c1f34a0601f0ef07660087a5c",
+            "WHEEL": "24d5a1d459b551dc08415d3be609429f8315b8246cd2ca2d248abe27aadbc425"
+          }
+        },
+        {
+          "name": "packaging",
+          "version": "26.3",
+          "license_declared_in_metadata": "Apache-2.0 OR BSD-2-Clause",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "70fdb89fc4d4a9a043bf7372b8972bcc883fddff34ab55e9cf80d73875384763",
+            "RECORD": "fb96d1369585ab87d62ad98728c89d2e67274ad060f012c85e358ba17ca92577",
+            "WHEEL": "1b68144734c4b66791f27add5d425f3620775585718a03d0f9b110ba3a4d88db"
+          }
+        },
+        {
+          "name": "pathspec",
+          "version": "1.1.1",
+          "license_declared_in_metadata": null,
+          "license_classifiers": [
+            "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)"
+          ],
+          "installed_metadata_sha256": {
+            "METADATA": "68de3f158b6592f086e78754c962092f32a761944ab66a660c0d62ad79c4b69b",
+            "RECORD": "ca4088ae4ed65092ad08ee16bafdfa0edf30ddabd235c7aaa5d45778f606eb46",
+            "WHEEL": "1b68144734c4b66791f27add5d425f3620775585718a03d0f9b110ba3a4d88db"
+          }
+        },
+        {
+          "name": "pip",
+          "version": "25.1.1",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [
+            "License :: OSI Approved :: MIT License"
+          ],
+          "installed_metadata_sha256": {
+            "METADATA": "405c63d6d2e993c8465ab8102d1849614a70a3fd45a81af8dce4f4b2b2197265",
+            "RECORD": "00c9638265505c02158be73c8f6bc7c1d4db861a3f047499cc4e50cc43651f76",
+            "WHEEL": "95353a07a7887d8a224094d935cf9fc9a47a0692fa7a14f3537c466319f69fc9"
+          }
+        },
+        {
+          "name": "pyproject_hooks",
+          "version": "1.2.0",
+          "license_declared_in_metadata": null,
+          "license_classifiers": [
+            "License :: OSI Approved :: MIT License"
+          ],
+          "installed_metadata_sha256": {
+            "METADATA": "3bfd818e5a898e2c01d849e2342920136d822b59454b599ad55c0d293428654c",
+            "RECORD": "7adba468c7c3a5218d0bcbbd68dcc1ccba00d15ae22c6a4acfdf2f76ccb54cd5",
+            "WHEEL": "1196c6921ec87b83e865f450f08d19b8ff5592537f4ef719e83484e546abe33e"
+          }
+        },
+        {
+          "name": "pyright",
+          "version": "1.1.414",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "1129a9f5bb3dceb582ca8d1971c4ad0f7ae83f5b9d05f2a744b62540e64e9732",
+            "RECORD": "f415d0552da494a6e5efe923162971f2f418d79edfc291fc34edb453e08c0729",
+            "WHEEL": "4a63b1614ee9ccd281a804af409ec38d7dd719417dda5ac684c6f747afe28aa2"
+          }
+        },
+        {
+          "name": "ruff",
+          "version": "0.16.7",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "b18408dd45aaff3868b2e104741fe3b6fb51d8740c103062c42401f12d1eaa96",
+            "RECORD": "2be2e9669589684286e9db26b10448460fe3ed2cfce8600c799a9d29e32563a8",
+            "WHEEL": "400542c7e27564b24de3c9637c25e14f6d48204741c416dea555e21f12bb1048"
+          }
+        },
+        {
+          "name": "setuptools",
+          "version": "84.0.0",
+          "license_declared_in_metadata": "MIT",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "bdd67d4d16cf0bf3b893e7d18cd3d2d774adb82f37ed985bc7770c607226b35b",
+            "RECORD": "3bfab660a24704f84228e4bb1ce1f0e3fa9ff80e5c806352a626b2f460ead836",
+            "WHEEL": "ff309ddcdd65ebd02bc724dbf2bcc4a0ff53a5b61792a44548d383e4ebb19d3b"
+          }
+        },
+        {
+          "name": "typing_extensions",
+          "version": "4.16.0",
+          "license_declared_in_metadata": "PSF-2.0",
+          "license_classifiers": [],
+          "installed_metadata_sha256": {
+            "METADATA": "b05084ca1d50879865178d9fff9fabeab61bdfb1f361bfbde95421ffc8f9be46",
+            "RECORD": "d9c7c4c2b4b297c98f532b40a1f736672ca210e7bc59beefc2736c6849cbf59c",
+            "WHEEL": "1b68144734c4b66791f27add5d425f3620775585718a03d0f9b110ba3a4d88db"
+          }
+        }
+      ]
+    }
+  },
+  "node": {
+    "version": "v22.22.1",
+    "binary_sha256": "d0efb6fcb9d023ba4e2b160ec2384dc28fe4f17732141ef47f676828fa960505",
+    "license_record": "system package metadata; not redistributed by MTF"
+  },
+  "original_artifact_hashes": "ctrader-protobuf-91.json",
+  "sqlite_effective_review": "sqlite-wal-review-20260913.json",
+  "host_or_operational_environment_modified": false,
+  "network_used_for_inventory": false,
+  "project_identity_note": "MTF source validation runs from the frozen checkout. Installed mtf-lab metadata may identify an earlier isolated QA build, not the delivered wheel; final source and wheel identities belong to the final quality receipt."
+}

@@ -27,6 +27,7 @@ from .cfd_quality import (
     QuoteSide,
     assess_pair,
     quality_from,
+    quality_reasons_from,
 )
 from .numeric import (
     DECIMAL_POLICY_VERSION,
@@ -40,6 +41,11 @@ D0 = Decimal("0")
 D1 = Decimal("1")
 CFD_SNAPSHOT_VERSION = 3
 CFD_PRODUCT = "FOREX_CFD_LOCAL_PAPER"
+CFD_ECONOMICS_LEGACY_VERSION = "cfd-economics-v1"
+CFD_ECONOMICS_VERSION = "cfd-economics-v2"
+ECONOMICS_VERSION = CFD_ECONOMICS_VERSION
+LEGACY_ECONOMICS_VERSION = CFD_ECONOMICS_LEGACY_VERSION
+_SUPPORTED_ECONOMICS_VERSIONS = frozenset({CFD_ECONOMICS_LEGACY_VERSION, CFD_ECONOMICS_VERSION})
 _ALLOWED_FILL_POLICIES = {"first_quote_at_or_after"}
 _SIGNAL_USABLE_QUALITY = frozenset(
     {
@@ -100,6 +106,26 @@ def decimal(value: Any, *, name: str, minimum: Decimal | None = None, positive: 
     if minimum is not None and result < minimum:
         raise CFDSimulationError(f"{name} debe ser >= {minimum}")
     return result
+
+
+def _normalise_economics_version(value: Any, *, default: str = CFD_ECONOMICS_VERSION) -> str:
+    """Normalize the additive economics contract without upgrading legacy data."""
+
+    if value is None:
+        value = default
+    raw = str(value).strip().lower().replace("_", "-")
+    aliases = {
+        "1": CFD_ECONOMICS_LEGACY_VERSION,
+        "v1": CFD_ECONOMICS_LEGACY_VERSION,
+        "cfd-economics-v1": CFD_ECONOMICS_LEGACY_VERSION,
+        "2": CFD_ECONOMICS_VERSION,
+        "v2": CFD_ECONOMICS_VERSION,
+        "cfd-economics-v2": CFD_ECONOMICS_VERSION,
+    }
+    try:
+        return aliases[raw]
+    except KeyError as exc:
+        raise CFDSimulationError(f"economics_version no soportada: {value!r}") from exc
 
 
 def _utc(value: Any, *, name: str) -> datetime:
@@ -238,6 +264,8 @@ class CFDQuote:
     connection_generation: int | str | None = None
     is_snapshot: bool | None = None
     disconnected: bool = False
+    bid_quality_reasons: Sequence[QuoteReason | str] | None = None
+    ask_quality_reasons: Sequence[QuoteReason | str] | None = None
 
     def __post_init__(self) -> None:
         metadata = dict(self.metadata or {})
@@ -329,6 +357,7 @@ class CFDQuote:
                 self.source,
                 self.sequence,
                 self.session_generation,
+                quality_reasons=tuple(self.bid_quality_reasons or ()),
             )
         return QuoteLeg(
             selected,
@@ -341,6 +370,7 @@ class CFDQuote:
             self.source,
             self.sequence,
             self.session_generation,
+            quality_reasons=tuple(self.ask_quality_reasons or ()),
         )
 
     def assessment_for(
@@ -408,6 +438,14 @@ class CFDQuote:
             "ask_available_at": _iso(self.ask_available_at),
             "bid_quality": self.bid_quality,
             "ask_quality": self.ask_quality,
+            "bid_quality_reasons": [
+                reason.value if isinstance(reason, QuoteReason) else reason
+                for reason in (self.bid_quality_reasons or ())
+            ],
+            "ask_quality_reasons": [
+                reason.value if isinstance(reason, QuoteReason) else reason
+                for reason in (self.ask_quality_reasons or ())
+            ],
             "bid_timestamp_known": self.bid_timestamp_known,
             "ask_timestamp_known": self.ask_timestamp_known,
             "updated_sides": list(self.updated_sides or ()),
@@ -447,6 +485,8 @@ class CFDQuote:
             ask_available_at=value.get("ask_available_at"),
             bid_quality=value.get("bid_quality", value.get("bid_quality_status")),
             ask_quality=value.get("ask_quality", value.get("ask_quality_status")),
+            bid_quality_reasons=value.get("bid_quality_reasons"),
+            ask_quality_reasons=value.get("ask_quality_reasons"),
             bid_timestamp_known=value.get("bid_timestamp_known"),
             ask_timestamp_known=value.get("ask_timestamp_known"),
             updated_sides=value.get("updated_sides", value.get("changed_sides", value.get("updated_side"))),
@@ -459,7 +499,7 @@ class CFDQuote:
 
 def _quote_basic(quote: CFDQuote, metadata: Mapping[str, Any]) -> dict[str, Any]:
     instrument = _id(quote.instrument, name="instrument").upper()
-    market, available = _quote_times(quote)
+    market, available = _quote_times(quote, metadata)
     bid, ask = _quote_prices(quote)
     raw_quality, quality, reasons = _quote_quality(quote, metadata)
     _validate_cross(bid, ask, quality, reasons)
@@ -482,9 +522,24 @@ def _quote_basic(quote: CFDQuote, metadata: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
-def _quote_times(quote: CFDQuote) -> tuple[datetime, datetime]:
+def _quote_times(quote: CFDQuote, metadata: Mapping[str, Any] | None = None) -> tuple[datetime, datetime]:
     market = _utc(quote.market_time, name="market_time")
     available = _utc(quote.available_at, name="available_at") if quote.available_at is not None else market
+    metadata = metadata or {}
+    # A side may arrive later than the envelope timestamp.  Promote the
+    # effective quote availability before the quote is exposed to the book so
+    # a fill cannot observe that side early.  Source timestamps are market
+    # evidence, not availability evidence, and are checked separately.
+    for side in ("bid", "ask"):
+        for kind in ("received_at", "available_at"):
+            explicit = getattr(quote, f"{side}_{kind}")
+            value = explicit if explicit is not None else metadata.get(f"{side}_{kind}")
+            if value is None:
+                continue
+            side_time = _utc(value, name=f"{side}_{kind}")
+            if side_time < market:
+                raise CFDSimulationError(f"{side}_{kind} no puede preceder market_time")
+            available = max(available, side_time)
     if available < market:
         raise CFDSimulationError("available_at no puede preceder market_time")
     return market, available
@@ -531,7 +586,7 @@ def _quote_quality(
     quality = quality_from(raw_quality)
     raw_reasons = quote.quote_reasons
     if raw_reasons is None and isinstance(raw_quality, Mapping):
-        raw_reasons = raw_quality.get("reasons")
+        raw_reasons = tuple(reason.value for reason in quality_reasons_from(raw_quality))
     return raw_quality, quality, _quote_reasons(raw_reasons, metadata)
 
 
@@ -574,8 +629,14 @@ def _quote_is_strict(quote: CFDQuote, metadata: Mapping[str, Any]) -> bool:
             quote.ask_timestamp_known,
             quote.bid_source_timestamp,
             quote.ask_source_timestamp,
+            quote.bid_received_at,
+            quote.ask_received_at,
+            quote.bid_available_at,
+            quote.ask_available_at,
             quote.bid_quality,
             quote.ask_quality,
+            quote.bid_quality_reasons,
+            quote.ask_quality_reasons,
         )
     )
 
@@ -607,15 +668,19 @@ def _quote_legs(
         explicit_missing=quote.ask_source_timestamp_missing,
         global_missing=quote.source_timestamp_missing,
     )
-    bid_received = _side_datetime("bid_received_at", quote.bid_received_at, metadata, available)
-    ask_received = _side_datetime("ask_received_at", quote.ask_received_at, metadata, available)
+    bid_fallback = _side_availability_fallback("bid", quote, metadata, available)
+    ask_fallback = _side_availability_fallback("ask", quote, metadata, available)
+    bid_received = _side_datetime("bid_received_at", quote.bid_received_at, metadata, bid_fallback)
+    ask_received = _side_datetime("ask_received_at", quote.ask_received_at, metadata, ask_fallback)
     bid_available = _side_datetime("bid_available_at", quote.bid_available_at, metadata, available)
     ask_available = _side_datetime("ask_available_at", quote.ask_available_at, metadata, available)
     quality = quality_from(
         quote.quote_quality if quote.quote_quality is not None else metadata.get("quote_quality", quote.quality)
     )
-    bid_quality = _side_quality("bid", quote.bid_quality, metadata, quality)
-    ask_quality = _side_quality("ask", quote.ask_quality, metadata, quality)
+    bid_quality, bid_quality_reasons = _side_quality_evidence("bid", quote.bid_quality, metadata, quality)
+    ask_quality, ask_quality_reasons = _side_quality_evidence("ask", quote.ask_quality, metadata, quality)
+    bid_quality_reasons = tuple(dict.fromkeys((*bid_quality_reasons, *quality_reasons_from(quote.bid_quality_reasons))))
+    ask_quality_reasons = tuple(dict.fromkeys((*ask_quality_reasons, *quality_reasons_from(quote.ask_quality_reasons))))
     return {
         "bid_source_timestamp": bid_ts,
         "ask_source_timestamp": ask_ts,
@@ -627,6 +692,8 @@ def _quote_legs(
         "ask_available_at": ask_available,
         "bid_quality": bid_quality,
         "ask_quality": ask_quality,
+        "bid_quality_reasons": bid_quality_reasons,
+        "ask_quality_reasons": ask_quality_reasons,
     }
 
 
@@ -675,7 +742,7 @@ def _quote_pair_assessment(
     connected: bool,
     out_of_order: bool,
 ) -> QuoteAssessment:
-    return assess_pair(
+    pair = assess_pair(
         quote.leg(QuoteSide.BID),
         quote.leg(QuoteSide.ASK),
         at=checked,
@@ -689,6 +756,18 @@ def _quote_pair_assessment(
         or QuoteReason.OUT_OF_ORDER.value in (quote.quote_reasons or ()),
         crossed=_flag(quote.metadata or {}, "crossed") or QuoteReason.CROSSED.value in (quote.quote_reasons or ()),
     )
+    future_sources = tuple(
+        QuoteReason.FUTURE_SOURCE_TIMESTAMP
+        for side in (QuoteSide.BID, QuoteSide.ASK)
+        if (source := getattr(quote, f"{side.value}_source_timestamp")) is not None and source > quote.market_time
+    )
+    if future_sources:
+        pair = replace(
+            pair,
+            usable=False,
+            reasons=tuple(dict.fromkeys((*pair.reasons, *future_sources))),
+        )
+    return pair
 
 
 def _apply_forced_reasons(pair: QuoteAssessment, forced: Sequence[QuoteReason]) -> QuoteAssessment:
@@ -705,7 +784,7 @@ def _select_side_assessment(
     leg = pair.bid if selected is QuoteSide.BID else pair.ask
     assert leg is not None
     reasons = tuple(dict.fromkeys((*leg.reasons, *forced)))
-    usable = leg.usable and not forced and QuoteReason.CROSSED not in pair.reasons
+    usable = leg.usable and pair.common_usable and not forced and QuoteReason.CROSSED not in pair.reasons
     return QuoteAssessment(
         selected,
         usable,
@@ -713,6 +792,7 @@ def _select_side_assessment(
         leg if selected is QuoteSide.BID else None,
         leg if selected is QuoteSide.ASK else None,
         pair.checked_at,
+        pair.common_usable,
     )
 
 
@@ -737,8 +817,12 @@ def _has_side_contract(metadata: Mapping[str, Any]) -> bool:
         "ask_timestamp_known",
         "bid_quality",
         "ask_quality",
+        "bid_quality_reasons",
+        "ask_quality_reasons",
         "bid_received_at",
         "ask_received_at",
+        "bid_available_at",
+        "ask_available_at",
     }
     return bool(keys.intersection(metadata))
 
@@ -828,6 +912,10 @@ def _quote_reasons(raw: Any, metadata: Mapping[str, Any]) -> tuple[str, ...]:
         normalized = str(value).strip().upper().replace("-", "_").replace(" ", "_")
         if normalized in allowed:
             result.append(normalized)
+        else:
+            # Unknown diagnostic text cannot be treated as harmless metadata at
+            # the fill boundary.
+            result.append(QuoteReason.INVALID_QUALITY.value)
     return tuple(dict.fromkeys(result))
 
 
@@ -981,6 +1069,14 @@ def _side_datetime(name: str, explicit: datetime | None, metadata: Mapping[str, 
     return _utc(value, name=name) if value is not None else fallback
 
 
+def _side_availability_fallback(
+    side: str, quote: CFDQuote, metadata: Mapping[str, Any], fallback: datetime
+) -> datetime:
+    explicit = getattr(quote, f"{side}_available_at")
+    value = explicit if explicit is not None else metadata.get(f"{side}_available_at")
+    return _utc(value, name=f"{side}_available_at") if value is not None else fallback
+
+
 def _side_quality(side: str, explicit: Any, metadata: Mapping[str, Any], fallback: QuoteQuality) -> QuoteQuality:
     value = (
         explicit
@@ -988,6 +1084,17 @@ def _side_quality(side: str, explicit: Any, metadata: Mapping[str, Any], fallbac
         else metadata.get(f"{side}_quality", metadata.get(f"{side}_quality_status", fallback))
     )
     return quality_from(value)
+
+
+def _side_quality_evidence(
+    side: str, explicit: Any, metadata: Mapping[str, Any], fallback: QuoteQuality
+) -> tuple[QuoteQuality, tuple[QuoteReason, ...]]:
+    value = (
+        explicit
+        if explicit is not None
+        else metadata.get(f"{side}_quality", metadata.get(f"{side}_quality_status", fallback))
+    )
+    return quality_from(value), quality_reasons_from(value)
 
 
 def _updated_sides(raw: Any, metadata: Mapping[str, Any], has_bid: bool, has_ask: bool) -> tuple[str, ...]:
@@ -1123,6 +1230,7 @@ class CFDConfig:
     quote_id_retention: int = 4096
     commission_known: bool = True
     max_active_trades: int = 4096
+    economics_version: str = CFD_ECONOMICS_VERSION
 
     def __post_init__(self) -> None:
         values = _normalise_config_values(self)
@@ -1196,6 +1304,7 @@ class CFDConfig:
             "event_retention": self.event_retention,
             "quote_id_retention": self.quote_id_retention,
             "max_active_trades": self.max_active_trades,
+            "economics_version": self.economics_version,
         }
 
 
@@ -1207,6 +1316,7 @@ def _normalise_config_values(config: CFDConfig) -> dict[str, Any]:
         "horizons_seconds": _normalise_horizons(config.horizons_seconds),
         "account_currency": _id(config.account_currency, name="account_currency").upper(),
         "quote_currency": _instrument_quote_currency(config.instrument, config.quote_currency),
+        "economics_version": _normalise_economics_version(config.economics_version),
     }
     values.update(_normalise_config_latencies(config))
     values.update(_normalise_config_costs(config))
@@ -1269,6 +1379,7 @@ def _normalise_config_retention(config: CFDConfig) -> dict[str, Any]:
 
 
 def _validate_config(config: CFDConfig) -> None:
+    _normalise_economics_version(config.economics_version)
     if (
         isinstance(config.price_precision, bool)
         or not isinstance(config.price_precision, int)
@@ -1376,6 +1487,13 @@ class CFDTrade:
     reason: str | None = None
     lineage: Mapping[str, Any] | None = None
     product: str = CFD_PRODUCT
+    economics_version: str = CFD_ECONOMICS_VERSION
+    # v2 keeps the quote-reference prices alongside execution prices.  This
+    # makes the explicit slippage cost auditable without changing the legacy
+    # fields or silently reinterpreting a v1 snapshot.
+    entry_reference_price: Decimal | None = None
+    close_reference_price: Decimal | None = None
+    reference_gross_pnl_quote: Decimal | None = None
 
     def __post_init__(self) -> None:
         values = _normalise_trade_values(self)
@@ -1471,6 +1589,10 @@ class CFDTrade:
             "quality": self.quality,
             "reason": self.reason,
             "lineage": _jsonable(self.lineage),
+            "economics_version": self.economics_version,
+            "entry_reference_price": dec(self.entry_reference_price),
+            "close_reference_price": dec(self.close_reference_price),
+            "reference_gross_pnl_quote": dec(self.reference_gross_pnl_quote),
             "economic_result": self.economic_result.to_dict(),
         }
 
@@ -1497,6 +1619,7 @@ def _normalise_trade_values(trade: CFDTrade) -> dict[str, Any]:
         "quote_currency": trade.quote_currency.upper() if trade.quote_currency else None,
         "lineage": dict(trade.lineage or {}),
         "product": trade.product,
+        "economics_version": _normalise_economics_version(trade.economics_version),
     }
     values.update(
         {
@@ -1523,6 +1646,9 @@ def _normalise_trade_values(trade: CFDTrade) -> dict[str, Any]:
                 "pip_size",
                 "entry_price",
                 "close_price",
+                "entry_reference_price",
+                "close_reference_price",
+                "reference_gross_pnl_quote",
                 "pips",
                 "gross_pnl_quote",
                 "commission_quote",
@@ -1547,6 +1673,7 @@ def _optional_decimal(value: Any, name: str) -> Decimal | None:
 
 
 def _validate_trade(trade: CFDTrade) -> None:
+    _normalise_economics_version(trade.economics_version)
     if (
         isinstance(trade.price_precision, bool)
         or not isinstance(trade.price_precision, int)
@@ -1559,9 +1686,16 @@ def _validate_trade(trade: CFDTrade) -> None:
 
 def _quote_costs(trade: CFDTrade) -> Decimal | None:
     commission, slippage, financing = (trade.commission_quote, trade.slippage_quote, trade.financing_quote)
-    if commission is None or slippage is None or financing is None:
+    if commission is None or financing is None:
         return None
     with decimal_context():
+        if trade.economics_version == CFD_ECONOMICS_VERSION:
+            # v2 embeds slippage in the executed prices.  The field remains
+            # available as an informational decomposition, but it is not a
+            # second monetary deduction.
+            return commission + financing
+        if slippage is None:
+            return None
         return commission + slippage + financing
 
 
@@ -1585,6 +1719,11 @@ class CFDReplayResult:
         return self.trades[item]
 
     @property
+    def economics_version(self) -> str | None:
+        versions = {trade.economics_version for trade in self.trades}
+        return next(iter(versions)) if len(versions) == 1 else None
+
+    @property
     def closed(self) -> tuple[CFDTrade, ...]:
         # A close fill with unknown commission/conversion is still a closed
         # position. EconomicState carries the independent uncertainty.
@@ -1593,6 +1732,7 @@ class CFDReplayResult:
     def to_dict(self) -> dict[str, Any]:
         return {
             "product": CFD_PRODUCT,
+            "economics_version": self.economics_version,
             "capture_complete": self.capture_complete,
             "finished": self.finished,
             "trades": [item.to_dict() for item in self.trades],
@@ -1668,7 +1808,15 @@ def _book_side_choice(
 
 
 def _book_side_fields(quote: CFDQuote, side: str) -> dict[str, Any]:
-    names = ("", "_source_timestamp", "_received_at", "_available_at", "_quality", "_timestamp_known")
+    names = (
+        "",
+        "_source_timestamp",
+        "_received_at",
+        "_available_at",
+        "_quality",
+        "_quality_reasons",
+        "_timestamp_known",
+    )
     return {
         f"{side}{suffix}" if suffix else side: getattr(quote, f"{side}{suffix}" if suffix else side) for suffix in names
     }
@@ -1709,6 +1857,8 @@ def _merge_book_quote(
             ask_available_at=values["ask_available_at"],
             bid_quality=values["bid_quality"],
             ask_quality=values["ask_quality"],
+            bid_quality_reasons=values["bid_quality_reasons"],
+            ask_quality_reasons=values["ask_quality_reasons"],
             bid_timestamp_known=values["bid_timestamp_known"],
             ask_timestamp_known=values["ask_timestamp_known"],
             updated_sides=tuple(updated),
@@ -1746,7 +1896,13 @@ def _build_trade(config: CFDConfig, trade_id: str, signal: CFDSignal, horizon: D
         account_currency=config.account_currency,
         quote_currency=config.quote_currency,
         quality=signal.quality,
-        lineage={"parent_signal_id": signal.signal_id, "strategy": signal.strategy, "config_hash": config.config_hash},
+        lineage={
+            "parent_signal_id": signal.signal_id,
+            "strategy": signal.strategy,
+            "config_hash": config.config_hash,
+            "economics_version": config.economics_version,
+        },
+        economics_version=config.economics_version,
     )
 
 
@@ -1890,6 +2046,7 @@ class CFDSimulator:
             "quotes_ingested": 0,
             "quotes_duplicate": 0,
             "quotes_out_of_order": 0,
+            "quotes_instrument_mismatch": 0,
             "quotes_blocked": 0,
             "terminal_evicted": 0,
             "archive_required": 0,
@@ -2190,6 +2347,22 @@ class CFDSimulator:
         if self._finished:
             self._event({"event": "quote_ignored", "quote_id": quote_obj.identity, "reason": "SESSION_FINISHED"})
             return ()
+        # Reject before clock advancement, deduplication or book mutation. A
+        # wrong-symbol quote must not be able to contaminate a later partial
+        # update for the configured instrument.
+        if quote_obj.instrument != self.config.instrument:
+            self._counters["quotes_instrument_mismatch"] += 1
+            self._counters["quotes_blocked"] += 1
+            self._event(
+                {
+                    "event": "quote_blocked",
+                    "quote_id": quote_obj.identity,
+                    "reason": "INSTRUMENT_MISMATCH",
+                    "instrument": quote_obj.instrument,
+                    "expected_instrument": self.config.instrument,
+                }
+            )
+            return ()
         watermark = quote_obj.available_ts
         if not self._accept_quote_clock(quote_obj, watermark):
             return ()
@@ -2355,6 +2528,7 @@ class CFDSimulator:
         if raw is None:
             return None
         price = _entry_price(raw, trade.direction, self.config.slippage_price, self._quantize)
+        reference_price = self._quantize(raw) if trade.economics_version == CFD_ECONOMICS_VERSION else None
         close_target = max(quote.available_ts, target) + _timedelta_seconds(
             trade.horizon_seconds + self.config.close_latency_seconds
         )
@@ -2365,6 +2539,7 @@ class CFDSimulator:
             entry_available_at=quote.available_ts,
             entry_quote_id=quote.identity,
             entry_price=price,
+            entry_reference_price=reference_price,
             entry_side="ask" if trade.direction is Direction.LONG else "bid",
             close_target_at=close_target,
             quality=quote.quality,
@@ -2389,6 +2564,8 @@ class CFDSimulator:
             close_available_at=quote.available_ts,
             close_quote_id=quote.identity,
             close_price=values["price"],
+            close_reference_price=values["reference_close"],
+            reference_gross_pnl_quote=values["reference_gross"],
             pips=values["pips"],
             gross_pnl_quote=values["gross"],
             commission_quote=values["commission"],
@@ -2405,16 +2582,27 @@ class CFDSimulator:
 
     def _close_values(self, trade: CFDTrade, quote: CFDQuote, raw: Decimal) -> dict[str, Any]:
         assert trade.entry_price is not None and trade.entry_available_at is not None
-        price, sign, gross, pips = self._close_price_values(trade, raw)
+        reference_close: Decimal | None = None
+        reference_gross: Decimal | None = None
+        if trade.economics_version == CFD_ECONOMICS_VERSION:
+            price, reference_close, gross, pips, slippage, reference_gross = self._close_price_values_v2(trade, raw)
+        else:
+            price, _sign, gross, pips = self._close_price_values(trade, raw)
+            slippage = self._slippage_cost(trade)
         commission = self._commission_value(trade)
-        slippage = self._slippage_cost(trade)
         financing, financing_missing = self._financing_value(trade, quote)
-        costs_quote = self._costs_value(commission, slippage, financing)
+        costs_quote = self._costs_value(
+            commission,
+            D0 if trade.economics_version == CFD_ECONOMICS_VERSION else slippage,
+            financing,
+        )
         gross_account, costs_account, net, unknown_reason = self._economic_values(
             gross, costs_quote, financing_missing, commission is None
         )
         return {
             "price": self._quantize(price),
+            "reference_close": reference_close,
+            "reference_gross": reference_gross,
             "pips": pips,
             "gross": gross,
             "commission": commission,
@@ -2438,6 +2626,48 @@ class CFDSimulator:
             gross = (price - trade.entry_price) * trade.units * sign
             pips = ((price - trade.entry_price) / trade.pip_size) * sign
         return price, sign, gross, pips
+
+    def _close_price_values_v2(
+        self, trade: CFDTrade, raw: Decimal
+    ) -> tuple[Decimal, Decimal, Decimal, Decimal, Decimal, Decimal]:
+        """Calculate v2 economics from quantized reference and execution prices.
+
+        ``entry_price``/``close_price`` remain the adverse execution prices,
+        while gross/pips are calculated from those execution prices.  The
+        reference gross and slippage impact are retained separately for
+        diagnostics; slippage is not deducted a second time.
+        """
+
+        assert trade.entry_price is not None
+        reference_entry = trade.entry_reference_price
+        if reference_entry is None:
+            # Defensive compatibility for a v2 mapping created before the
+            # reference fields were added.  New v2 trades always persist them.
+            with decimal_context():
+                reference_entry = (
+                    trade.entry_price - self.config.slippage_price
+                    if trade.direction is Direction.LONG
+                    else trade.entry_price + self.config.slippage_price
+                )
+            reference_entry = self._quantize(reference_entry)
+        reference_close = self._quantize(raw)
+        with decimal_context():
+            execution_close = (
+                raw - self.config.slippage_price
+                if trade.direction is Direction.LONG
+                else raw + self.config.slippage_price
+            )
+            execution_close = self._quantize(execution_close)
+            sign = D1 if trade.direction is Direction.LONG else Decimal("-1")
+            reference_gross = (reference_close - reference_entry) * trade.units * sign
+            execution_gross = (execution_close - trade.entry_price) * trade.units * sign
+            slippage = reference_gross - execution_gross
+            if slippage < D0:
+                # Tick rounding can erase or very rarely reverse a sub-tick
+                # adverse move; never report a negative cost.
+                slippage = D0
+            execution_pips = ((execution_close - trade.entry_price) / trade.pip_size) * sign
+        return execution_close, reference_close, execution_gross, execution_pips, slippage, reference_gross
 
     def _commission_value(self, trade: CFDTrade) -> Decimal | None:
         if not self.config.commission_known:
@@ -2533,51 +2763,120 @@ class CFDSimulator:
 
     def replay(
         self,
-        signals: Iterable[CFDSignal | Mapping[str, Any]],
-        quotes: Iterable[CFDQuote | Mapping[str, Any]],
+        signals: Iterable[CFDSignal | CFDQuote | Mapping[str, Any]] = (),
+        quotes: Iterable[CFDQuote | Mapping[str, Any]] | None = None,
         *,
         capture_complete: bool = True,
+        records: Iterable[CFDSignal | CFDQuote | Mapping[str, Any]] | None = None,
     ) -> CFDReplayResult:
-        """Feed caller-provided causal order through ``submit``/``on_quote``.
+        """Feed caller-provided records through ``submit``/``on_quote``.
 
-        The old implementation sorted by market timestamps.  This method now
-        preserves the order supplied by the capture/session, so delayed or
-        out-of-order observations cannot be made causal by a retrospective
-        sort.  If a caller has a reordered historical file it must restore its
-        durable ingest sequence before calling replay.
+        The two-iterable form is retained for compatibility and submits all
+        signals before consuming quotes.  New causal captures should use the
+        single ``records`` iterable (or :meth:`replay_interleaved`) so signals
+        and quotes remain interleaved in their observed order.  No form sorts
+        by market timestamps.
         """
 
         if not isinstance(capture_complete, bool):
             raise CFDSimulationError("capture_complete debe ser booleano")
+        signal_items = list(signals)
+        if records is not None:
+            if quotes is not None or signal_items:
+                raise CFDSimulationError("records no puede combinarse con signals/quotes")
+            return self._replay_interleaved(records, capture_complete=capture_complete)
+        if quotes is None:
+            return self._replay_interleaved(signal_items, capture_complete=capture_complete)
+        quote_items = list(quotes)
+        if any(_is_quote_record(item) for item in signal_items):
+            if quote_items:
+                raise CFDSimulationError("una captura intercalada no puede combinarse con quotes separados")
+            return self._replay_interleaved(signal_items, capture_complete=capture_complete)
+        return self._replay_separate(signal_items, quote_items, capture_complete=capture_complete)
+
+    def _replay_separate(
+        self,
+        signals: Sequence[CFDSignal | CFDQuote | Mapping[str, Any]],
+        quotes: Sequence[CFDQuote | Mapping[str, Any]],
+        *,
+        capture_complete: bool,
+    ) -> CFDReplayResult:
         for signal in signals:
+            if isinstance(signal, CFDQuote):
+                raise CFDSimulationError("quotes deben ir en el segundo iterable de replay")
             self.submit_all(signal if isinstance(signal, CFDSignal) else CFDSignal.from_mapping(signal))
-        last_watermark: datetime | None = None
         for quote in quotes:
-            if isinstance(quote, CFDQuote):
-                self.on_quote(quote, capture_complete=False)
-                last_watermark = self._last_watermark
-                continue
-            try:
-                quote_obj = CFDQuote.from_mapping(quote)
-            except (CFDSimulationError, TypeError, ValueError):
-                self.on_quote(quote, capture_complete=False)
-                continue
-            self.on_quote(quote_obj, capture_complete=False)
-            last_watermark = self._last_watermark
+            self._replay_quote(quote)
+        return self._finish_replay(capture_complete=capture_complete)
+
+    def _replay_quote(self, quote: CFDQuote | Mapping[str, Any]) -> None:
+        if isinstance(quote, CFDQuote):
+            self.on_quote(quote, capture_complete=False)
+            return
+        try:
+            quote_obj = CFDQuote.from_mapping(quote)
+        except (CFDSimulationError, TypeError, ValueError):
+            self.on_quote(quote, capture_complete=False)
+            return
+        self.on_quote(quote_obj, capture_complete=False)
+
+    def _finish_replay(self, *, capture_complete: bool) -> CFDReplayResult:
+        last_watermark = self._last_watermark
         if capture_complete:
             return self.finish(last_watermark, capture_complete=True)
         if last_watermark is not None:
             self.advance(last_watermark, capture_complete=False)
         return self._result(capture_complete=False)
 
+    def _replay_interleaved(
+        self,
+        records: Iterable[CFDSignal | CFDQuote | Mapping[str, Any]],
+        *,
+        capture_complete: bool,
+    ) -> CFDReplayResult:
+        """Replay a single causal stream without a retrospective sort."""
+
+        for record in records:
+            self._replay_record(record)
+        return self._finish_replay(capture_complete=capture_complete)
+
+    def _replay_record(self, record: CFDSignal | CFDQuote | Mapping[str, Any]) -> None:
+        if isinstance(record, CFDSignal):
+            self.submit_all(record)
+        elif isinstance(record, CFDQuote):
+            self.on_quote(record, capture_complete=False)
+        elif isinstance(record, Mapping):
+            selected = _ingest_kind(record, None)
+            if selected == "signal":
+                self.submit_all(CFDSignal.from_mapping(record))
+            elif selected == "quote":
+                self.on_quote(record, capture_complete=False)
+            else:
+                raise CFDSimulationError(f"tipo de replay no soportado: {selected!r}")
+        else:
+            raise CFDSimulationError(f"registro de replay no soportado: {type(record).__name__}")
+
+    def replay_interleaved(
+        self,
+        records: Iterable[CFDSignal | CFDQuote | Mapping[str, Any]],
+        *,
+        capture_complete: bool = True,
+    ) -> CFDReplayResult:
+        """Public explicit entry point for an interleaved causal capture."""
+
+        return self._replay_interleaved(records, capture_complete=capture_complete)
+
+    replay_records = replay_interleaved
+
     def stream(
         self,
-        signals: Iterable[CFDSignal | Mapping[str, Any]],
-        quotes: Iterable[CFDQuote | Mapping[str, Any]],
+        signals: Iterable[CFDSignal | CFDQuote | Mapping[str, Any]] = (),
+        quotes: Iterable[CFDQuote | Mapping[str, Any]] | None = None,
         *,
         capture_complete: bool = False,
+        records: Iterable[CFDSignal | CFDQuote | Mapping[str, Any]] | None = None,
     ) -> CFDReplayResult:
-        return self.replay(signals, quotes, capture_complete=capture_complete)
+        return self.replay(signals, quotes, capture_complete=capture_complete, records=records)
 
     def snapshot(self) -> dict[str, Any]:
         """Return a versioned, exact checkpoint of active and retained state."""
@@ -2585,6 +2884,7 @@ class CFDSimulator:
         state: dict[str, Any] = {
             "snapshot_version": CFD_SNAPSHOT_VERSION,
             "product": CFD_PRODUCT,
+            "economics_version": self.config.economics_version,
             "config": self.config.to_dict(),
             "config_hash": self.config.config_hash,
             "decimal_policy_version": DECIMAL_POLICY_VERSION,
@@ -2634,24 +2934,43 @@ class CFDSimulator:
         self._quote_order.clear()
 
     def _restore_trades(self, snapshot: Mapping[str, Any]) -> None:
+        economics_version = _snapshot_economics_version(snapshot)
         for raw_trade in snapshot.get("trades", ()):
-            trade = raw_trade if isinstance(raw_trade, CFDTrade) else CFDTrade.from_mapping(raw_trade)
+            if isinstance(raw_trade, CFDTrade):
+                trade = raw_trade
+            else:
+                if not isinstance(raw_trade, Mapping):
+                    raise CFDSimulationError("trade inválido en snapshot CFD")
+                trade_data = dict(raw_trade)
+                trade_data.setdefault("economics_version", economics_version)
+                trade = CFDTrade.from_mapping(trade_data)
             if trade.trade_id in self._trades:
                 raise CFDSimulationError(f"trade duplicado en snapshot: {trade.trade_id}")
+            if trade.economics_version != self.config.economics_version:
+                raise CFDSimulationError("trade y snapshot usan economics_version distintos")
             self._trades[trade.trade_id] = trade
-        for trade_id in snapshot.get("terminal_order", ()):
-            self._restore_terminal_id(str(trade_id))
+        terminal_ids = [str(trade_id) for trade_id in snapshot.get("terminal_order", ())]
+        if len(set(terminal_ids)) != len(terminal_ids):
+            raise CFDSimulationError("terminal_order duplicado en snapshot CFD")
+        for trade_id in terminal_ids:
+            self._restore_terminal_id(trade_id)
+        if self._active_count() > self.config.max_active_trades:
+            raise CFDSimulationError("snapshot excede la capacidad activa CFD")
 
     def _restore_terminal_id(self, trade_id: str) -> None:
         trade = self._trades.get(trade_id)
-        if trade is not None and trade.is_terminal:
-            self._terminal_order.append(trade_id)
+        if trade is None or not trade.is_terminal:
+            raise CFDSimulationError(f"terminal_order referencia trade no terminal: {trade_id}")
+        self._terminal_order.append(trade_id)
 
     def _restore_history(self, snapshot: Mapping[str, Any]) -> None:
         for event in snapshot.get("events", ()):
             if isinstance(event, Mapping):
                 self._events.append(dict(event))
-        for quote_id in snapshot.get("seen_quote_ids", ()):
+        quote_ids = [str(quote_id) for quote_id in snapshot.get("seen_quote_ids", ())]
+        if len(set(quote_ids)) != len(quote_ids):
+            raise CFDSimulationError("seen_quote_ids duplicados en snapshot CFD")
+        for quote_id in quote_ids:
             self._quote_order.append(str(quote_id))
             self._seen_quotes.add(str(quote_id))
         while len(self._quote_order) > self.config.quote_id_retention:
@@ -2660,6 +2979,8 @@ class CFDSimulator:
     def _restore_book_and_clock(self, snapshot: Mapping[str, Any]) -> None:
         raw_book = snapshot.get("quote_book")
         self._book = _QuoteBook(CFDQuote.from_mapping(raw_book) if isinstance(raw_book, Mapping) else None)
+        if self._book.current is not None and self._book.current.instrument != self.config.instrument:
+            raise CFDSimulationError("quote_book usa un instrumento distinto al snapshot")
         raw_watermark = snapshot.get("last_watermark")
         self._last_watermark = _utc(raw_watermark, name="last_watermark") if raw_watermark is not None else None
         raw_sequence = snapshot.get("last_sequence")
@@ -2709,11 +3030,43 @@ def _validate_snapshot(
     if snapshot.get("decimal_policy_version") != DECIMAL_POLICY_VERSION:
         raise CFDSimulationError("snapshot usa una política Decimal distinta")
     _validate_snapshot_hash(snapshot)
-    selected = config if config is not None else snapshot.get("config", {})
-    restored = selected if isinstance(selected, CFDConfig) else CFDConfig.from_mapping(selected)
-    if restored.config_hash != snapshot.get("config_hash"):
+    economics_version = _snapshot_economics_version(snapshot)
+    raw_config = snapshot.get("config")
+    selected = raw_config if config is None else config
+    if isinstance(selected, CFDConfig):
+        restored = selected
+    else:
+        if not isinstance(selected, Mapping):
+            raise CFDSimulationError("snapshot CFD no contiene una configuración válida")
+        config_data = dict(selected)
+        config_data.setdefault("economics_version", economics_version)
+        restored = CFDConfig.from_mapping(config_data)
+    if restored.economics_version != economics_version:
+        raise CFDSimulationError("configuración y snapshot usan economics_version distintos")
+    expected_config_hash = snapshot.get("config_hash")
+    legacy_config_hash = _digest(raw_config) if economics_version == CFD_ECONOMICS_LEGACY_VERSION else None
+    if restored.config_hash != expected_config_hash and legacy_config_hash != expected_config_hash:
         raise CFDSimulationError("configuración CFD distinta a la del snapshot")
     return restored
+
+
+def _snapshot_economics_version(snapshot: Mapping[str, Any]) -> str:
+    """Resolve the version while treating pre-H1 snapshots as legacy v1."""
+
+    raw_top = snapshot.get("economics_version")
+    raw_config = snapshot.get("config")
+    raw_config_version = raw_config.get("economics_version") if isinstance(raw_config, Mapping) else None
+    if raw_top is not None and raw_config_version is not None:
+        top = _normalise_economics_version(raw_top, default=CFD_ECONOMICS_LEGACY_VERSION)
+        config_version = _normalise_economics_version(raw_config_version, default=CFD_ECONOMICS_LEGACY_VERSION)
+        if top != config_version:
+            raise CFDSimulationError("snapshot y configuración usan economics_version distintos")
+        return top
+    if raw_top is not None:
+        return _normalise_economics_version(raw_top, default=CFD_ECONOMICS_LEGACY_VERSION)
+    if raw_config_version is not None:
+        return _normalise_economics_version(raw_config_version, default=CFD_ECONOMICS_LEGACY_VERSION)
+    return CFD_ECONOMICS_LEGACY_VERSION
 
 
 def _validate_snapshot_hash(snapshot: Mapping[str, Any]) -> None:
@@ -2742,6 +3095,14 @@ def _ingest_kind(item: Mapping[str, Any], kind: str | None) -> str:
     if not selected:
         return "quote"
     return selected
+
+
+def _is_quote_record(item: Any) -> bool:
+    if isinstance(item, CFDQuote):
+        return True
+    if isinstance(item, Mapping):
+        return _ingest_kind(item, None) == "quote"
+    return False
 
 
 def _sequence_int(value: Any) -> int | None:
@@ -2784,6 +3145,10 @@ __all__ = [
     "CFDSimulator",
     "CFDTrade",
     "CFD_SNAPSHOT_VERSION",
+    "CFD_ECONOMICS_LEGACY_VERSION",
+    "CFD_ECONOMICS_VERSION",
+    "ECONOMICS_VERSION",
+    "LEGACY_ECONOMICS_VERSION",
     "CFD_PRODUCT",
     "Direction",
     "EconomicResult",

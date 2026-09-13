@@ -11,10 +11,9 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-# Optional official Spotware SDK; normal MTF Lab operation remains stdlib/offline.
-# Direct pins match requirements-ctrader.lock; install the lock for all
-# transitive pins used by the validated SDK environment.
-ctrader = ["ctrader-open-api==0.9.2", "service-identity==24.2.0"]
+# Optional Protobuf runtime for the bundled Spotware-generated cTrader codec;
+# normal MTF Lab operation remains stdlib/offline.
+ctrader = ["protobuf==7.36.1"]
 # Development-only checks; never part of the offline/runtime dependency set.
 dev = [
     "build==1.6.1",
@@ -31,11 +30,13 @@ mtf-lab = "mtf_lab.ops.cli:main"
 include = ["mtf_lab*"]
 
 [tool.setuptools.package-data]
-mtf_lab = ["resources/config/*.toml"]
+mtf_lab = ["resources/config/*.toml", "data/protobuf_generated/*.pyi"]
+"mtf_lab.resources" = ["licenses/*.txt", "provenance/*.json"]
 
 [tool.ruff]
 target-version = "py311"
 line-length = 120
+extend-exclude = ["mtf_lab/data/protobuf_generated"]
 
 [tool.ruff.lint]
 # Keep one explicit, reproducible lint contract instead of inheriting an

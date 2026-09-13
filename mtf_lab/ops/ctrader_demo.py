@@ -214,7 +214,7 @@ def run_ctrader_fixture(report_path: str | Path | None = None) -> dict[str, Any]
     official_probe = _official_demo_probe(start)
     dep = dependency_report()
     limitation_sdk = (
-        "Codec/SDK cTrader instalado y serialización local comprobada; TCP/TLS/OAuth real no probado."
+        "Codec Protobuf generado utilizable y serialización local comprobada; TCP/TLS/OAuth real no probado."
         if dep.codec_operational
         else "SDK/codec cTrader no disponible en el intérprete de esta corrida; TCP/TLS/OAuth real no probado."
     )

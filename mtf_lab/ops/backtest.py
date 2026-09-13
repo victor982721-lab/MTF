@@ -27,6 +27,15 @@ class _ModelDumpRecord(Protocol):
     def model_dump(self) -> Mapping[str, Any]: ...
 
 
+def _gross_results(results: Sequence[SimulationResult]) -> list[float]:
+    """Undo the recorded absolute cost, never reclassify by net outcome."""
+    return [
+        float(result.net_result) + float(result.assumptions.get("costs", 0.0))
+        for result in results
+        if result.net_result is not None
+    ]
+
+
 def _row(value: Any) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
@@ -376,7 +385,8 @@ class BacktestRunner:
     def _summarize_results(self, results: Sequence[SimulationResult], selected: Sequence[Any]) -> dict[str, Any]:
         counts = Counter(result.outcome.value for result in results)
         settled = sorted(
-            (result for result in results if result.net_result is not None), key=lambda item: item.detected_ts
+            (result for result in results if result.net_result is not None),
+            key=lambda item: (parse_ts(item.final_available_ts or item.expiry_ts), item.simulation_id),
         )
         equity = 0.0
         peak = 0.0
@@ -393,8 +403,8 @@ class BacktestRunner:
         return {
             "counts": counts,
             "net": equity,
-            "gross_wins": sum(max(0.0, float(result.net_result or 0)) for result in results),
-            "gross_losses": sum(min(0.0, float(result.net_result or 0)) for result in results),
+            "gross_wins": sum(max(0.0, value) for value in _gross_results(results)),
+            "gross_losses": sum(min(0.0, value) for value in _gross_results(results)),
             "drawdown": drawdown,
             "groups": groups,
             "start": min((_signal_ts(signal) for signal in selected), default=None),

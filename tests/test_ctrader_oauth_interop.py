@@ -4,10 +4,11 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import tempfile
 import traceback
 import unittest
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -21,8 +22,11 @@ from mtf_lab.ops.ctrader_activation import (
     OAuthTokenCandidate,
     OAuthTokenPayload,
     RealAccountForbidden,
+    ReauthorizationRequired,
     SecureTokenStore,
+    UnsafeTokenStore,
     VerifiedAccountAuthorization,
+    open_authorization_browser,
     scopes_from_permission_scope,
     validate_demo_server_endpoint,
     verify_server_account_discovery,
@@ -132,7 +136,7 @@ class CTraderOAuthInteropTests(unittest.TestCase):
             candidate.bind_connection(0)
 
     def test_installed_official_descriptor_matches_permission_scope_contract(self) -> None:
-        from ctrader_open_api.messages import OpenApiMessages_pb2 as messages
+        from mtf_lab.data.protobuf_generated import OpenApiMessages_pb2 as messages
 
         field = messages.ProtoOAGetAccountListByAccessTokenRes.DESCRIPTOR.fields_by_name["permissionScope"]
         self.assertEqual(field.enum_type.full_name, "ProtoOAClientPermissionScope")
@@ -306,6 +310,298 @@ class CTraderOAuthInteropTests(unittest.TestCase):
         self.assertNotIn("secret-fixture", trace)
         self.assertNotIn("openapi.ctrader.com/apps/token?client_secret", trace)
 
+    def test_oauth_helpers_reject_secret_query_extensions(self) -> None:
+        with self.assertRaises(OAuthHTTPError):
+            build_token_request(
+                "https://openapi.ctrader.com/apps/token",
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": "refresh-fixture",
+                    "client_id": "client-fixture",
+                    "client_secret": "secret-fixture",
+                    "password": "unexpected-secret",
+                },
+            )
+        with self.assertRaises(ActivationError):
+            open_authorization_browser(
+                "https://id.ctrader.com/my/settings/openapi/grantingaccess/?client_id=client&client_secret=secret",
+                allow_browser=True,
+                opener=lambda _url: self.fail("no se debe abrir una URL con secretos"),
+            )
+        opened: list[str] = []
+        self.assertTrue(
+            open_authorization_browser(
+                "https://id.ctrader.com/authorize",
+                allow_browser=True,
+                opener=lambda url: opened.append(url) or True,
+            )
+        )
+        self.assertEqual(opened, ["https://id.ctrader.com/authorize"])
+        with self.assertRaises(OAuthHTTPError):
+            request_token(
+                "https://openapi.ctrader.com/apps/token",
+                {
+                    "grant_type": "refresh_token",
+                    "refresh_token": "refresh-fixture",
+                    "client_id": "client-fixture",
+                    "client_secret": "secret-fixture",
+                },
+                "not-a-timeout",
+            )
+
+    def test_attempt_and_token_file_identity_aliases_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            attempt_root = root / "attempts"
+            attempt_store = OAuthAttemptStore.for_fixture(attempt_root, project_root=project)
+            assistant = LoopbackOAuthAssistant(
+                _app(),
+                attempts=attempt_store,
+                tokens=SecureTokenStore.for_fixture(root / "tokens", project_root=project),
+                fixture_mode=True,
+            )
+            attempt = assistant.begin(client_id="client-fixture", requested_scopes=["accounts"], token_ref="query")
+            attempt_path = attempt_root / f".oauth-attempt-{attempt.attempt_id}.json"
+            hardlink = root / "attempt-hardlink.json"
+            hardlink.hardlink_to(attempt_path)
+            with self.assertRaises(UnsafeTokenStore):
+                attempt_store.load(attempt.attempt_id)
+            with self.assertRaises(UnsafeTokenStore):
+                attempt_store.save(attempt)
+            hardlink.unlink()
+
+            copied_path = attempt_root / ".oauth-attempt-other.json"
+            shutil.copyfile(attempt_path, copied_path)
+            os.chmod(copied_path, 0o600)
+            with self.assertRaises(UnsafeTokenStore):
+                attempt_store.load("other")
+
+            token_store = SecureTokenStore.for_fixture(root / "tokens-identity", project_root=project)
+            token_store.rotate(
+                "source",
+                access_token="access-fixture",
+                refresh_token="refresh-fixture",
+                granted_scopes=["accounts"],
+                expires_at=NOW + timedelta(hours=1),
+                now=NOW,
+                fixture_payload=True,
+            )
+            shutil.copyfile(root / "tokens-identity/source.json", root / "tokens-identity/other.json")
+            os.chmod(root / "tokens-identity/other.json", 0o600)
+            with self.assertRaises(UnsafeTokenStore):
+                token_store.read("other")
+
+    def test_refresh_transaction_blocks_reuse_and_requires_explicit_reauth(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            token_root = root / "tokens"
+            attempt_root = root / "attempts"
+            tokens = SecureTokenStore.for_fixture(token_root, project_root=project)
+            tokens.rotate(
+                "query",
+                access_token="old-access-fixture",
+                refresh_token="one-use-refresh-fixture",
+                granted_scopes=["accounts"],
+                expires_at=NOW + timedelta(hours=1),
+                now=NOW,
+                fixture_payload=True,
+            )
+            first = LoopbackOAuthAssistant(
+                _app(),
+                attempts=OAuthAttemptStore.for_fixture(attempt_root, project_root=project),
+                tokens=tokens,
+                fixture_mode=True,
+            )
+            calls: list[str] = []
+
+            def requester(_url: str, params: dict[str, str], _timeout: float) -> dict[str, object]:
+                calls.append(params.get("refresh_token", params.get("code", "")))
+                return {
+                    "accessToken": "new-access-fixture",
+                    "refreshToken": "new-refresh-fixture",
+                    "expiresIn": 3600,
+                }
+
+            candidate = first.refresh_unpersisted(
+                "query",
+                client_id="client-fixture",
+                client_secret="secret-fixture",
+                requester=requester,
+            )
+            self.assertEqual(calls, ["one-use-refresh-fixture"])
+            self.assertEqual(tokens.transaction_state("query"), "IN_FLIGHT")
+            marker = (token_root / ".oauth-transaction-query.json").read_text(encoding="utf-8")
+            self.assertNotIn("one-use-refresh-fixture", marker)
+            self.assertNotIn("secret-fixture", marker)
+            self.assertRaises(
+                ReauthorizationRequired,
+                first.refresh_unpersisted,
+                "query",
+                client_id="client-fixture",
+                client_secret="secret-fixture",
+                requester=requester,
+            )
+            with self.assertRaises(ReauthorizationRequired):
+                tokens.read("query")
+            first.abandon_candidate(candidate)
+            self.assertEqual(tokens.transaction_state("query"), "UNKNOWN")
+            with self.assertRaises(ReauthorizationRequired):
+                first.refresh_unpersisted(
+                    "query",
+                    client_id="client-fixture",
+                    client_secret="secret-fixture",
+                    requester=requester,
+                )
+            reauth_attempt = first.begin(
+                client_id="client-fixture",
+                requested_scopes=["accounts"],
+                token_ref="query",
+                now=NOW,
+            )
+            first.prepare_reauthorization(
+                reauth_attempt,
+                client_id="client-fixture",
+                profile_scopes=["accounts"],
+            )
+            self.assertEqual(tokens.transaction_state("query"), "REAUTH_PENDING")
+            with self.assertRaises(ReauthorizationRequired):
+                tokens.read("query")
+            first.receive_callback(
+                reauth_attempt.attempt_id,
+                f"{_app().redirect_uri}?code=reauth-code&state={reauth_attempt.csrf_state}",
+                now=NOW,
+            )
+            exchanged = first.exchange_unpersisted(
+                reauth_attempt.attempt_id,
+                token_ref="query",
+                server_endpoint="demo.ctraderapi.com:5035",
+                client_id="client-fixture",
+                client_secret="secret-fixture",
+                profile_scopes=["accounts"],
+                requester=requester,
+                now=NOW,
+            ).bind_connection(1)
+            verification = verify_server_demo_discovery(
+                {
+                    "accessToken": "new-access-fixture",
+                    "permissionScope": "SCOPE_VIEW",
+                    "records": [{"account_id": 202, "environment": "DEMO"}],
+                },
+                requested_scopes=["accounts"],
+                token_candidate=exchanged,
+            )
+            refreshed = first.persist_verified_token(
+                reauth_attempt.attempt_id,
+                token_ref="query",
+                candidate=exchanged,
+                verification=verification,
+                server_endpoint="demo.ctraderapi.com:5035",
+                now=NOW,
+            )
+            self.assertEqual(refreshed.generation, 2)
+            self.assertIsNone(tokens.transaction_state("query"))
+            self.assertEqual(calls, ["one-use-refresh-fixture", "reauth-code"])
+
+    def test_exchange_binds_attempt_to_current_profile_before_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            attempt_store = OAuthAttemptStore.for_fixture(root / "attempts", project_root=project)
+            assistant = LoopbackOAuthAssistant(
+                _app(),
+                attempts=attempt_store,
+                tokens=SecureTokenStore.for_fixture(root / "tokens", project_root=project),
+                fixture_mode=True,
+            )
+            attempt = assistant.begin(
+                client_id="client-fixture",
+                requested_scopes=["trading"],
+                token_ref="execution",
+                now=NOW,
+            )
+            assistant.receive_callback(
+                attempt.attempt_id,
+                f"{_app().redirect_uri}?code=code-fixture&state={attempt.csrf_state}",
+                now=NOW,
+            )
+            calls: list[dict[str, str]] = []
+            with self.assertRaises(ReauthorizationRequired):
+                assistant.exchange_unpersisted(
+                    attempt.attempt_id,
+                    token_ref="execution",
+                    client_id="client-fixture",
+                    client_secret="secret-fixture",
+                    profile_scopes=["accounts"],
+                    requester=lambda _url, params, _timeout: calls.append(dict(params)) or {},
+                    now=NOW,
+                )
+            self.assertEqual(calls, [])
+            self.assertIsNone(assistant.tokens.transaction_state("execution"))
+
+    def test_failed_attempt_persistence_leaves_token_outcome_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            project = root / "project"
+            project.mkdir()
+            token_root = root / "tokens"
+            attempts = OAuthAttemptStore(token_root, project_root=project)
+            tokens = SecureTokenStore(token_root, project_root=project)
+            assistant = LoopbackOAuthAssistant(_app(), attempts=attempts, tokens=tokens)
+            attempt = assistant.begin(
+                client_id="client-fixture",
+                requested_scopes=["accounts"],
+                token_ref="query-fixture",
+                now=NOW,
+            )
+            assistant.receive_callback(
+                attempt.attempt_id,
+                f"{_app().redirect_uri}?code=code-fixture&state={attempt.csrf_state}",
+                now=NOW,
+            )
+            candidate = assistant.exchange_unpersisted(
+                attempt.attempt_id,
+                token_ref="query-fixture",
+                server_endpoint="demo.ctraderapi.com:5035",
+                client_id="client-fixture",
+                client_secret="secret-fixture",
+                requester=lambda _url, _params, _timeout: {
+                    "accessToken": "access-fixture",
+                    "refreshToken": "refresh-fixture",
+                    "expiresIn": 3600,
+                },
+                now=NOW,
+            ).bind_connection(1)
+            verification = verify_server_demo_discovery(
+                {
+                    "accessToken": "access-fixture",
+                    "permissionScope": "SCOPE_VIEW",
+                    "records": [{"account_id": 202, "environment": "DEMO"}],
+                },
+                requested_scopes=["accounts"],
+                token_candidate=candidate,
+            )
+            with (
+                mock.patch.object(attempts, "save", side_effect=OSError("attempt store fault")),
+                self.assertRaises(OSError),
+            ):
+                assistant.persist_verified_token(
+                    attempt.attempt_id,
+                    token_ref="query-fixture",
+                    candidate=candidate,
+                    verification=verification,
+                    server_endpoint="demo.ctraderapi.com:5035",
+                    now=NOW,
+                )
+            self.assertEqual(tokens.transaction_state("query-fixture"), "UNKNOWN")
+            with self.assertRaises(ReauthorizationRequired):
+                tokens.read("query-fixture")
+            self.assertEqual(attempts.load(attempt.attempt_id).phase.value, "CALLBACK_RECEIVED")
+
     def test_cli_real_exchange_probes_demo_permission_before_persisting(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             base = Path(temp)
@@ -313,7 +609,11 @@ class CTraderOAuthInteropTests(unittest.TestCase):
             attempts = OAuthAttemptStore(token_root, project_root=ROOT)
             tokens = SecureTokenStore(token_root, project_root=ROOT)
             assistant = LoopbackOAuthAssistant(_app(), attempts=attempts, tokens=tokens)
-            attempt = assistant.begin(client_id="client-fixture", requested_scopes=["accounts"])
+            attempt = assistant.begin(
+                client_id="client-fixture",
+                requested_scopes=["accounts"],
+                token_ref="ctrader-query-demo",
+            )
             assistant.receive_callback(
                 attempt.attempt_id,
                 f"{_app().redirect_uri}?code=code-fixture&state={attempt.csrf_state}",
@@ -392,7 +692,11 @@ class CTraderOAuthInteropTests(unittest.TestCase):
             attempts = OAuthAttemptStore(token_root, project_root=ROOT)
             tokens = SecureTokenStore(token_root, project_root=ROOT)
             assistant = LoopbackOAuthAssistant(_app(), attempts=attempts, tokens=tokens)
-            attempt = assistant.begin(client_id="client-fixture", requested_scopes=["accounts"])
+            attempt = assistant.begin(
+                client_id="client-fixture",
+                requested_scopes=["accounts"],
+                token_ref="ctrader-query-demo",
+            )
             assistant.receive_callback(
                 attempt.attempt_id,
                 f"{_app().redirect_uri}?code=code-fixture&state={attempt.csrf_state}",
@@ -453,6 +757,9 @@ class CTraderOAuthInteropTests(unittest.TestCase):
             self.assertEqual(code, 2)
             self.assertEqual(output["state"], "RealAccountForbidden")
             self.assertFalse((token_root / "ctrader-query-demo.json").exists())
+            self.assertEqual(
+                SecureTokenStore(token_root, project_root=ROOT).transaction_state("ctrader-query-demo"), "UNKNOWN"
+            )
             self.assertNotIn("access-fixture", json.dumps(output))
 
     def test_cli_real_refresh_uses_post_query_transport_and_redacts_tokens(self) -> None:
@@ -532,9 +839,9 @@ class CTraderOAuthInteropTests(unittest.TestCase):
             project = root / "project"
             project.mkdir()
             token_root = root / "tokens"
-            attempts = OAuthAttemptStore(token_root, project_root=project)
-            tokens = SecureTokenStore(token_root, project_root=project)
-            assistant = LoopbackOAuthAssistant(_app(), attempts=attempts, tokens=tokens)
+            attempts = OAuthAttemptStore.for_fixture(token_root, project_root=project)
+            tokens = SecureTokenStore.for_fixture(token_root, project_root=project)
+            assistant = LoopbackOAuthAssistant(_app(), attempts=attempts, tokens=tokens, fixture_mode=True)
             attempt = assistant.begin(client_id="client-fixture", requested_scopes=["accounts"], now=NOW)
             assistant.receive_callback(
                 attempt.attempt_id,
@@ -583,9 +890,9 @@ class CTraderOAuthInteropTests(unittest.TestCase):
             project = root / "project"
             project.mkdir()
             token_root = root / "tokens"
-            attempts = OAuthAttemptStore(token_root, project_root=project)
-            tokens = SecureTokenStore(token_root, project_root=project)
-            assistant = LoopbackOAuthAssistant(_app(), attempts=attempts, tokens=tokens)
+            attempts = OAuthAttemptStore.for_fixture(token_root, project_root=project)
+            tokens = SecureTokenStore.for_fixture(token_root, project_root=project)
+            assistant = LoopbackOAuthAssistant(_app(), attempts=attempts, tokens=tokens, fixture_mode=True)
             attempt = assistant.begin(client_id="client-fixture", requested_scopes=["accounts"], now=NOW)
             assistant.receive_callback(
                 attempt.attempt_id,

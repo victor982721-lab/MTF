@@ -1,0 +1,7 @@
+# Build/validation runtime for the pinned generated cTrader messages.
+# protoc itself is a separately hashed official binary in
+# manifests/ctrader-protobuf-91.json; it is not installed from PyPI.
+protobuf==7.36.1 \
+    --hash=sha256:97198b77e369a0abd8e262b8f6c7266c55ddb796a3a12c76d7b8881188ed83aa
+types-protobuf==7.35.1.20260906 \
+    --hash=sha256:5155e48569e0dabff303fdf578db96cd31ea9a4a63b18018a4ceac6b0ae17462

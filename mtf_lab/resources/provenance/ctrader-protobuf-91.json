@@ -1,0 +1,79 @@
+{
+  "generated": [
+    {
+      "name": "OpenApiCommonMessages_pb2.py",
+      "sha256": "b683495c4c0632625a9cb59a7ce9ec3842d38544f89fceed081de3772f512220"
+    },
+    {
+      "name": "OpenApiCommonMessages_pb2.pyi",
+      "sha256": "f46eaf0b00b395ec4fde541354fa74eeb588ff19639d0ea9da829ebc4116bf71"
+    },
+    {
+      "name": "OpenApiCommonModelMessages_pb2.py",
+      "sha256": "c30c76c4a26459c13f7b708ecff0171766fb8b6a51cca1a9c2d8af910cb5182c"
+    },
+    {
+      "name": "OpenApiCommonModelMessages_pb2.pyi",
+      "sha256": "a44bfbcffda7862e1e1b285677c92ef45b46111dcca1aa17dd19a60d5bf26c9d"
+    },
+    {
+      "name": "OpenApiMessages_pb2.py",
+      "sha256": "fd48fba8d20b5f22fd619cbd3285991d45724697f6731cd61786bb0562f07eb2"
+    },
+    {
+      "name": "OpenApiMessages_pb2.pyi",
+      "sha256": "ced21f909bd699b20180b6534f7c5dc4c8b39dfa64c3db8c99e4460c116d3851"
+    },
+    {
+      "name": "OpenApiModelMessages_pb2.py",
+      "sha256": "72364d9a9f7d04c9d462d61fd20a8a7170db33588871c324b935ebdc77ea3d8b"
+    },
+    {
+      "name": "OpenApiModelMessages_pb2.pyi",
+      "sha256": "8306decfa5716ff6fce19b84039a216a32d0549ce05cd53a869992bfd8a9913b"
+    },
+    {
+      "name": "__init__.py",
+      "sha256": "08ab416c8bc75691221492c1e514f2065ef7a0edcdc04096b7b891096f8ca93b"
+    }
+  ],
+  "licenses": [
+    {
+      "path": "licenses/spotware-openapi-proto-messages-MIT.txt",
+      "sha256": "d3fc4cfe3604a0d96b55f7808c530e428aa74f349364eaee195339dfa95d5213",
+      "spdx": "MIT"
+    },
+    {
+      "path": "licenses/protobuf-7.36.1-BSD-3-Clause.txt",
+      "sha256": "6e5e117324afd944dcf67f36cf329843bc1a92229a8cd9bb573d7a83130fea7d",
+      "spdx": "BSD-3-Clause"
+    }
+  ],
+  "schema": {
+    "commit": "017413087c1c23c1866bbf07ff24d56574047253",
+    "files": [
+      {
+        "name": "OpenApiCommonMessages.proto",
+        "sha256": "9816cd24b340dcc4eb28548eb4dd16735995d2a61889337591e5c4d8021652a2"
+      },
+      {
+        "name": "OpenApiCommonModelMessages.proto",
+        "sha256": "b95d7df670a7e890a53ec08f676198ace7bb0a074a4b07ff0b493c4be00a0dea"
+      },
+      {
+        "name": "OpenApiMessages.proto",
+        "sha256": "a342d27a5298d9b58b6011843f267fe1e1e71af189bcfa5d1dc99abaf9c9d34f"
+      },
+      {
+        "name": "OpenApiModelMessages.proto",
+        "sha256": "c2d34d07e663f9b43d6b5806ae2b706f460aa55afd847aa83343d3d9955201ee"
+      }
+    ],
+    "repository": "https://github.com/spotware/openapi-proto-messages",
+    "tag": "91"
+  },
+  "toolchain": {
+    "protobuf": "7.36.1",
+    "protoc": "36.1"
+  }
+}

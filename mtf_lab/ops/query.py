@@ -17,7 +17,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
-from .persistence import SQLiteStore, canonical_json, utc_iso
+from .persistence import SQLiteStore, canonical_json, project_cfd_additive_fields, utc_iso
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -943,6 +943,8 @@ class QueryService:
     def _decode_cfd_trade(cls, result: dict[str, Any]) -> dict[str, Any]:
         result["lineage"] = _decode_json(result.pop("lineage_json", None), {}) or {}
         result["payload"] = _decode_json(result.pop("payload_json", None), {}) or {}
+        payload = result["payload"] if isinstance(result["payload"], Mapping) else None
+        project_cfd_additive_fields(result, payload)
         result["terminal"] = bool(int(result.get("terminal", 0)))
         result["close_observed"] = bool(int(result.get("close_observed", 0)))
         result["lifecycle_state"] = result.get("state")
@@ -958,9 +960,14 @@ class QueryService:
         }.get(economic_state, "UNKNOWN")
         result["economic_result"] = {
             "state": economic_state,
+            "economics_version": result.get("economics_version"),
             "net_pnl": result.get("net_pnl"),
             "gross_pnl_quote": result.get("gross_pnl_quote"),
             "costs_quote": result.get("costs_quote"),
+            "slippage_quote": result.get("slippage_quote"),
+            "entry_reference_price": result.get("entry_reference_price"),
+            "close_reference_price": result.get("close_reference_price"),
+            "reference_gross_pnl_quote": result.get("reference_gross_pnl_quote"),
             "gross_pnl_account": result.get("gross_pnl_account"),
             "costs_account": result.get("costs_account"),
             "reason": result.get("economic_reason"),

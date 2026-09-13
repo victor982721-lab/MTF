@@ -100,6 +100,19 @@ def cmd_cfd_paper(args: argparse.Namespace) -> int:
     return _emit(CfdPaperService().run(args))
 
 
+def cmd_research(args: argparse.Namespace) -> int:
+    from .research import research_command
+
+    code, payload = research_command(args)
+    return _emit(CommandResult.json(payload, code=code, stderr=code != 0))
+
+
+def cmd_ctrader_supervise(args: argparse.Namespace) -> int:
+    from .supervision import CommandService
+
+    return _emit(CommandService().run(args))
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     from .application_services import _config_for, _db_for
     from .ui import serve
@@ -107,7 +120,14 @@ def cmd_ui(args: argparse.Namespace) -> int:
     config = _config_for(args)
     db = _db_for(args, config)
     print(f"UI local: http://{args.host}:{args.port}/ (sólo lectura)", flush=True)
-    serve(db, host=args.host, port=args.port, session_id=args.session, duration=args.duration)
+    serve(
+        db,
+        host=args.host,
+        port=args.port,
+        session_id=args.session,
+        duration=args.duration,
+        supervisor_state=getattr(args, "supervisor_state", None),
+    )
     return 0
 
 
@@ -120,6 +140,8 @@ __all__ = [
     "cmd_report",
     "cmd_watch",
     "cmd_cfd_paper",
+    "cmd_research",
+    "cmd_ctrader_supervise",
     "cmd_ui",
 ]
 

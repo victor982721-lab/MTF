@@ -63,6 +63,7 @@ from .ctrader_executor import (
     _decimal_value,
     verify_demo_account,
 )
+from .volume_rules import VolumeGrid, VolumeRuleError
 
 DEMO_PROTOBUF_ENDPOINT = "demo.ctraderapi.com:5035"
 LIVE_PROTOBUF_ENDPOINT = "live.ctraderapi.com:5035"
@@ -76,6 +77,7 @@ PAYLOAD_TYPES.update(
     {
         "ProtoOAExecutionEvent": 2126,
         "ProtoOAOrderErrorEvent": 2132,
+        "ProtoOACancelOrderReq": 2108,
         "ProtoOAOrderListRes": 2176,
         "ProtoOADealListRes": 2134,
         "ProtoOADealListByPositionIdRes": 2180,
@@ -94,6 +96,13 @@ _RESPONSE_TYPES: dict[int, frozenset[int]] = {
         }
     ),
     PAYLOAD_TYPES["ProtoOAClosePositionReq"]: frozenset(
+        {
+            PAYLOAD_TYPES["ProtoOAExecutionEvent"],
+            PAYLOAD_TYPES["ProtoOAOrderErrorEvent"],
+            PAYLOAD_TYPES["ProtoOAErrorRes"],
+        }
+    ),
+    PAYLOAD_TYPES["ProtoOACancelOrderReq"]: frozenset(
         {
             PAYLOAD_TYPES["ProtoOAExecutionEvent"],
             PAYLOAD_TYPES["ProtoOAOrderErrorEvent"],
@@ -651,6 +660,7 @@ class CTraderDemoTransport:
         config: CTraderDemoTransportConfig | None = None,
         clock: Callable[[], datetime] | None = None,
         server_observation: ServerAccountObservation | Mapping[str, Any] | None = None,
+        volume_grid: VolumeGrid | Mapping[str, Any] | None = None,
     ) -> None:
         _validate_transport_gateway(account, client)
         account_obj = account if isinstance(account, DemoAccount) else DemoAccount.from_mapping(account)
@@ -676,11 +686,51 @@ class CTraderDemoTransport:
         self.symbol_ids = {str(key).upper(): int(value) for key, value in (symbol_ids or {}).items()}
         self.symbol_names = {int(key): str(value).upper() for key, value in (symbol_names or {}).items()}
         self.server_observation = observation
+        try:
+            self.volume_grid = (
+                volume_grid
+                if isinstance(volume_grid, VolumeGrid)
+                else VolumeGrid.from_mapping(volume_grid, volume_scale=config_obj.volume_scale)
+                if volume_grid is not None
+                else None
+            )
+        except VolumeRuleError as exc:
+            raise OfficialMessageError(f"invalid observed symbol volume grid: {exc}") from exc
+        if self.volume_grid is not None and self.volume_grid.volume_scale != config_obj.volume_scale:
+            raise OfficialMessageError("observed volume grid scale differs from transport volume_scale")
         self._snapshots: dict[str, OrderSnapshot] = {}
         self._requested_quantities: dict[str, DecimalValue] = {}
         self._intent_created_at: dict[str, datetime] = {}
         self._position_clients: dict[str, str] = {}
         self._seen_deals: set[tuple[str, str, str]] = set()
+        self._intent_kinds: dict[str, str] = {}
+        self._close_positions: dict[str, str] = {}
+        self._registered_intents: dict[str, ExecutionIntent] = {}
+
+    def register_intent(self, intent: ExecutionIntent) -> None:
+        if intent.account_id != self.account_id:
+            raise OfficialCorrelationError("intent account id does not match the DEMO transport")
+        if intent.kind not in {"OPEN", "CLOSE"}:
+            raise OfficialMessageError("intent kind must be OPEN or CLOSE")
+        previous = self._registered_intents.get(intent.intent_id)
+        if previous is not None and previous != intent:
+            raise OfficialCorrelationError(f"intent id already registered with a different payload: {intent.intent_id}")
+        if previous is not None:
+            return
+        self._registered_intents[intent.intent_id] = intent
+        self._intent_kinds[intent.intent_id] = intent.kind
+        self._requested_quantities[intent.intent_id] = _decimal_value(intent.quantity, "intent quantity", positive=True)
+        self._intent_created_at[intent.intent_id] = _parse_time(intent.created_at)
+        if intent.kind == "CLOSE" and intent.position_id is not None:
+            self._close_positions[intent.intent_id] = intent.position_id
+
+    def validate_open_quantity(self, quantity: Any) -> int:
+        if self.volume_grid is None:
+            raise OfficialMessageError("opening requires observed minVolume/maxVolume/stepVolume metadata")
+        try:
+            return self.volume_grid.validate_open_quantity(quantity)
+        except VolumeRuleError as exc:
+            raise OfficialMessageError(str(exc)) from exc
 
     def verify_endpoint(self, endpoint: str) -> bool:
         text = str(endpoint).strip().lower()
@@ -702,9 +752,12 @@ class CTraderDemoTransport:
         return request
 
     def build_new_order(self, intent: ExecutionIntent) -> Any:
+        if intent.account_id != self.account_id or intent.kind != "OPEN":
+            raise OfficialCorrelationError("new order requires an OPEN intent for the selected DEMO account")
         symbol_id = self.symbol_ids.get(intent.symbol.upper())
         if symbol_id is None:
             raise OfficialMessageError(f"symbol id not configured for DEMO transport: {intent.symbol}")
+        protocol_volume = self.validate_open_quantity(intent.quantity)
         request = self._message("ProtoOANewOrderReq")
         _set(request, "ctidTraderAccountId", _int_id(self.account_id, "account_id"))
         _set(request, "symbolId", int(symbol_id))
@@ -714,16 +767,26 @@ class CTraderDemoTransport:
             "tradeSide",
             self._enum("ProtoOATradeSide", intent.side.value, message=request, field_name="tradeSide"),
         )
-        _set(request, "volume", _volume_to_protocol(intent.quantity, self.config.volume_scale))
+        _set(request, "volume", protocol_volume)
         _set(request, "clientOrderId", intent.intent_id)
         _set(request, "label", intent.intent_id)
+        _set_order_options(request, intent.metadata)
         return request
 
     def build_close_position(self, position: Position, *, client_order_id: str) -> Any:
+        if position.account_id != self.account_id or position.owner != "mtf-lab":
+            raise DemoAccountRequired("official transport refuses a foreign position")
         request = self._message("ProtoOAClosePositionReq")
         _set(request, "ctidTraderAccountId", _int_id(self.account_id, "account_id"))
         _set(request, "positionId", _int_id(position.position_id, "position_id"))
-        _set(request, "volume", _volume_to_protocol(position.quantity, self.config.volume_scale))
+        if self.volume_grid is not None:
+            try:
+                protocol_volume = self.volume_grid.validate_close_quantity(position.quantity)
+            except VolumeRuleError as exc:
+                raise OfficialMessageError(str(exc)) from exc
+        else:
+            protocol_volume = _volume_to_protocol(position.quantity, self.config.volume_scale)
+        _set(request, "volume", protocol_volume)
         # ProtoOAClosePositionReq has no clientOrderId field.  Correlation is
         # carried by the WireMessage request id in CTraderClientGateway.
         return request
@@ -775,6 +838,9 @@ class CTraderDemoTransport:
 
     def submit(self, intent: ExecutionIntent, *, timeout_seconds: float) -> OrderSnapshot:
         message = self.build_new_order(intent)
+        # Validate the observed volume grid before retaining a correlation
+        # record or crossing the gateway boundary.
+        self.register_intent(intent)
         self._requested_quantities[intent.intent_id] = _decimal_value(intent.quantity, "intent quantity", positive=True)
         self._intent_created_at[intent.intent_id] = _parse_time(intent.created_at)
         response = self._send(message, client_msg_id=intent.intent_id, timeout_seconds=timeout_seconds)
@@ -794,57 +860,78 @@ class CTraderDemoTransport:
             client_msg_id=f"reconcile:{key}",
             timeout_seconds=self.config.timeout_seconds,
         )
-        matching = self._matching_order_response(response, key)
+        self._check_account(response, required=True)
+        closing = self._intent_kinds.get(key) == "CLOSE"
+        expected_position_id = self._close_positions.get(key) if closing else None
+        matching = self._matching_order_response(response, key, expected_position_id=expected_position_id)
         if matching is not None:
             return self._snapshot_from_response(
                 matching,
                 client_order_id=key,
                 requested_quantity=self._requested_quantity(matching, key),
-                closing=False,
+                closing=closing,
+                require_account=False,
+                require_client_correlation=not closing,
+                expected_position_id=expected_position_id,
             )
-        return self._recover_from_history(key)
+        closing = self._intent_kinds.get(key) == "CLOSE"
+        return self._recover_from_history(
+            key,
+            closing=closing,
+            expected_position_id=self._close_positions.get(key) if closing else None,
+        )
 
-    def _recover_from_history(self, key: str) -> OrderSnapshot | None:
+    def _recover_from_history(
+        self, key: str, *, closing: bool = False, expected_position_id: str | None = None
+    ) -> OrderSnapshot | None:
         if not self._history_available():
             # A fixture without historical descriptors cannot prove a current
             # state. Never return a local snapshot as a server observation.
             return None
-        order = self._find_historical_order(key)
+        order = self._find_historical_order(key, expected_position_id=expected_position_id)
         if order is None:
             return None
         requested = self._requested_quantity(order, key)
         order_id = _field(order, "orderId", "order_id", default=None)
         detail = self._history_detail(key, order_id)
         combined = detail or order
-        deal_response = self._history_deals(key)
+        deal_response = self._history_deals(key, order_id=order_id, expected_position_id=expected_position_id)
         if deal_response is not None and _many(deal_response, "deal", "deals"):
             combined = _merge_response_details(combined, deal_response)
         return self._snapshot_from_response(
             combined,
             client_order_id=key,
             requested_quantity=requested,
-            closing=False,
+            closing=closing,
+            require_client_correlation=not closing,
+            expected_position_id=expected_position_id,
         )
 
     def _history_detail(self, key: str, order_id: Any) -> Any | None:
         if order_id is None or not self._message_available("ProtoOAOrderDetailsReq"):
             return None
-        return self._send(
+        response = self._send(
             self.build_order_details(order_id),
             client_msg_id=f"history-detail:{key}:{order_id}",
             timeout_seconds=self.config.timeout_seconds,
         )
+        self._check_account(response, required=True)
+        return response
 
-    def _history_deals(self, key: str) -> Any | None:
+    def _history_deals(
+        self, key: str, *, order_id: Any | None = None, expected_position_id: str | None = None
+    ) -> Any | None:
         if not self._message_available("ProtoOADealListReq"):
             return None
         now = _parse_time(self.clock())
         start = self._intent_created_at.get(key, now - timedelta(seconds=self.config.history_window_seconds))
-        return self._send(
+        response = self._send(
             self.build_deal_list(from_timestamp=start, to_timestamp=now),
             client_msg_id=f"history-deals:{key}",
             timeout_seconds=self.config.timeout_seconds,
         )
+        self._check_account(response, required=True)
+        return _filter_history_deals(response, order_id=order_id, expected_position_id=expected_position_id)
 
     def list_positions(self, account_id: str) -> Sequence[Position]:
         if str(account_id) != self.account_id:
@@ -854,7 +941,7 @@ class CTraderDemoTransport:
             client_msg_id="reconcile:positions",
             timeout_seconds=self.config.timeout_seconds,
         )
-        self._check_account(response)
+        self._check_account(response, required=True)
         positions: list[Position] = []
         for raw in _many(response, "position", "positions"):
             position = self._position_from_proto(raw)
@@ -863,6 +950,10 @@ class CTraderDemoTransport:
         return tuple(positions)
 
     def close_position(self, position: Position, *, client_order_id: str, timeout_seconds: float) -> OrderSnapshot:
+        if position.account_id != self.account_id or position.owner != "mtf-lab":
+            raise DemoAccountRequired("official transport refuses a foreign position")
+        self._intent_kinds[str(client_order_id)] = "CLOSE"
+        self._close_positions[str(client_order_id)] = position.position_id
         self._requested_quantities[client_order_id] = _decimal_value(
             position.quantity, "position quantity", positive=True
         )
@@ -878,6 +969,39 @@ class CTraderDemoTransport:
             client_order_id=client_order_id,
             requested_quantity=position.quantity,
             closing=True,
+            expected_position_id=position.position_id,
+            require_client_correlation=False,
+        )
+
+    def cancel_order(
+        self, order_id: str, *, client_order_id: str | None = None, timeout_seconds: float
+    ) -> OrderSnapshot:
+        key = str(client_order_id or "")
+        known = self._snapshots.get(key) if key else None
+        if known is None and not key:
+            raise OfficialMessageError("cancel requires a known client_order_id or cached order")
+        target_order = str(order_id or (known.order_id if known else ""))
+        if not target_order:
+            raise OfficialMessageError("cancel requires a known order id")
+        if known is not None and known.order_id is not None and str(known.order_id) != target_order:
+            raise OfficialCorrelationError("cancel order id does not match the known client correlation")
+        request = self._message("ProtoOACancelOrderReq")
+        _set(request, "ctidTraderAccountId", _int_id(self.account_id, "account_id"))
+        _set(request, "orderId", _int_id(target_order, "order_id"))
+        response = self._send(
+            request,
+            client_msg_id=f"cancel:{key or target_order}",
+            timeout_seconds=timeout_seconds,
+        )
+        if response is None:
+            raise OfficialTimeoutError("official cTrader cancel returned no response")
+        requested = known.requested_quantity if known is not None else self._requested_quantity(response, key)
+        return self._snapshot_from_response(
+            response,
+            client_order_id=key or target_order,
+            requested_quantity=requested,
+            closing=False,
+            require_client_correlation=False,
         )
 
     def _message(self, name: str) -> Any:
@@ -928,6 +1052,9 @@ class CTraderDemoTransport:
         order = _field(response, "order", "order_data", default=None) or response
         raw = _field(order, "volume", "requestedVolume", "requested_volume", default=None)
         if raw is None:
+            trade_data = _field(order, "tradeData", "trade_data", default=None)
+            raw = _field(trade_data, "volume", "requestedVolume", "requested_volume", default=None)
+        if raw is None:
             raise OfficialMessageError(f"requested quantity unavailable for {key}; no se asumió cantidad=1")
         quantity = _volume_from_protocol(raw, self.config.volume_scale)
         if quantity <= 0:
@@ -941,13 +1068,29 @@ class CTraderDemoTransport:
         client_order_id: str,
         requested_quantity: Decimal | DecimalValue | float,
         closing: bool,
+        require_client_correlation: bool = True,
+        require_account: bool = True,
+        expected_position_id: str | None = None,
     ) -> OrderSnapshot:
         if response is None:
             raise OfficialTimeoutError("official cTrader transport returned no response")
-        self._check_account(response)
+        self._check_account(response, required=require_account)
         requested = _decimal_value(requested_quantity, "requested quantity", positive=True)
         order = _response_order(response)
-        _validate_response_correlation(response, order, client_order_id)
+        _validate_response_correlation(
+            response,
+            order,
+            client_order_id,
+            required=require_client_correlation,
+        )
+        if closing:
+            _validate_close_response_kind(
+                response,
+                order,
+                requested_quantity=requested,
+                expected_position_id=expected_position_id,
+                volume_scale=self.config.volume_scale,
+            )
         error_code = _field(response, "errorCode", "error_code", default=None)
         description = _field(response, "description", default=None)
         execution = _enum_field_name(response, "executionType", "execution_type")
@@ -955,6 +1098,31 @@ class CTraderDemoTransport:
         deal_items = _many(response, "deal", "deals")
         deal = deal_items[0] if deal_items else _field(response, "deal", default=None)
         deal_status = _enum_field_name(deal, "dealStatus", "deal_status") if deal is not None else ""
+        order_id = _response_order_id(order, deal)
+        position_ids = _position_ids(response, order, deal_items or deal)
+        previous = self._snapshots.get(str(client_order_id))
+        if previous is not None:
+            if previous.order_id is not None and order_id is not None and str(previous.order_id) != str(order_id):
+                raise OfficialCorrelationError(
+                    "same client correlation returned a different server order id",
+                    phase=SendPhase.RESPONSE_RECEIVED,
+                )
+            if previous.position_ids and position_ids and set(previous.position_ids) != set(position_ids):
+                raise OfficialCorrelationError(
+                    "same client correlation returned a different position identity",
+                    phase=SendPhase.RESPONSE_RECEIVED,
+                )
+        if (
+            expected_position_id is not None
+            and error_code is None
+            and execution not in {"ORDER_REJECTED", "ORDER_CANCELLED", "ORDER_EXPIRED", "ORDER_CANCEL_REJECTED"}
+            and order_status not in {"ORDER_STATUS_REJECTED", "ORDER_STATUS_CANCELLED", "ORDER_STATUS_EXPIRED"}
+            and str(expected_position_id) not in position_ids
+        ):
+            raise OfficialResponseError(
+                "close response lacks the requested position identity",
+                phase=SendPhase.RESPONSE_RECEIVED,
+            )
         fills = self._merge_fills(client_order_id, response, deal, requested)
         filled = _response_filled_quantity(self, response, order, fills)
         if filled > requested:
@@ -969,8 +1137,7 @@ class CTraderDemoTransport:
             error_code=str(error_code) if error_code is not None else None,
         )
         reject_reason = _response_reason(error_code, description, state, execution, order_status, deal_status)
-        order_id = _response_order_id(order, deal)
-        position_ids = _position_ids(response, order, deal_items or deal)
+        stop_loss, take_profit = _response_protection(response, order)
         snapshot = OrderSnapshot(
             str(order_id) if order_id is not None else None,
             str(client_order_id),
@@ -982,6 +1149,8 @@ class CTraderDemoTransport:
             tuple(position_ids),
             _parse_time(self.clock()),
             reason,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
         )
         self._snapshots[str(client_order_id)] = snapshot
         for pid in position_ids:
@@ -1063,9 +1232,12 @@ class CTraderDemoTransport:
         if components is None:
             return None
         pid, symbol, volume, price, side_raw, client_id = components
-        side = _trade_side(
-            side_raw, owner=_field(raw, "tradeData", "trade_data", default=None) or raw, field_name="tradeSide"
-        )
+        trade = _field(raw, "tradeData", "trade_data", default=None) or raw
+        opened_raw = _field(trade, "openTimestamp", "open_timestamp", default=None)
+        opened_at = _ms_time(opened_raw) if opened_raw is not None else None
+        stop_loss = _optional_server_price(raw, "stopLoss", "stop_loss")
+        take_profit = _optional_server_price(raw, "takeProfit", "take_profit")
+        side = _trade_side(side_raw, owner=trade, field_name="tradeSide")
         owner = "mtf-lab" if client_id and str(client_id) in self._requested_quantities else "external"
         return Position(
             str(pid),
@@ -1076,6 +1248,9 @@ class CTraderDemoTransport:
             price,
             str(client_id) if client_id else None,
             owner=owner,
+            opened_at=opened_at,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
         )
 
     def _position_components(self, raw: Any) -> tuple[Any, str, DecimalValue, DecimalValue, Any, Any] | None:
@@ -1107,14 +1282,22 @@ class CTraderDemoTransport:
         )
         return pid, symbol, volume, price, side_raw, client_id
 
-    def _check_account(self, response: Any) -> None:
+    def _check_account(self, response: Any, *, required: bool = False) -> None:
         if response is None:
+            if required:
+                raise OfficialResponseError(
+                    "official response lacks account identity", phase=SendPhase.RESPONSE_RECEIVED
+                )
             return
         account_id = _field(response, "ctidTraderAccountId", "ctid_trader_account_id", default=None)
+        if account_id is None and required:
+            raise OfficialResponseError("official response lacks account identity", phase=SendPhase.RESPONSE_RECEIVED)
         if account_id is not None and str(account_id) != self.account_id:
             raise OfficialCorrelationError("official response account id mismatch")
 
-    def _matching_order_response(self, response: Any, key: str) -> Any | None:
+    def _matching_order_response(
+        self, response: Any, key: str, *, expected_position_id: str | None = None
+    ) -> Any | None:
         if response is None:
             return None
         self._check_account(response)
@@ -1123,11 +1306,34 @@ class CTraderDemoTransport:
         if _field(response, "executionType", "execution_type", default=None) is not None:
             candidate = _field(response, "order", "order_data", default=None) or response
             candidate_id = _field(candidate, "clientOrderId", "client_order_id", "label", default=None)
-            if candidate_id is None or str(candidate_id) == key:
+            if (
+                candidate_id is not None
+                and str(candidate_id) == key
+                and (
+                    expected_position_id is None
+                    or _is_closing_order(candidate, expected_position_id, response=response)
+                )
+            ):
+                return response
+            if (
+                candidate_id is None
+                and expected_position_id is not None
+                and _is_closing_order(candidate, expected_position_id, response=response)
+            ):
                 return response
         for order in _many(response, "order", "orders"):
             candidate_id = _field(order, "clientOrderId", "client_order_id", "label", default=None)
-            if candidate_id is not None and str(candidate_id) == key:
+            if (
+                candidate_id is not None
+                and str(candidate_id) == key
+                and (expected_position_id is None or _is_closing_order(order, expected_position_id, response=response))
+            ):
+                return order
+            if (
+                candidate_id is None
+                and expected_position_id is not None
+                and _is_closing_order(order, expected_position_id, response=response)
+            ):
                 return order
         return None
 
@@ -1138,7 +1344,7 @@ class CTraderDemoTransport:
         factory = getattr(self.proto, name, None)
         return factory is not None or (isinstance(self.proto, Mapping) and name in self.proto)
 
-    def _find_historical_order(self, key: str) -> Any | None:
+    def _find_historical_order(self, key: str, *, expected_position_id: str | None = None) -> Any | None:
         now = _parse_time(self.clock())
         start = self._intent_created_at.get(key, now - timedelta(seconds=self.config.history_window_seconds))
         seen: set[tuple[str, str]] = set()
@@ -1149,8 +1355,10 @@ class CTraderDemoTransport:
                 client_msg_id=f"history-orders:{key}:{page}",
                 timeout_seconds=self.config.timeout_seconds,
             )
-            self._check_account(response)
-            order, identities, has_more, next_to = _historical_page(response, key)
+            self._check_account(response, required=True)
+            order, identities, has_more, next_to = _historical_page(
+                response, key, expected_position_id=expected_position_id
+            )
             if order is not None:
                 return order
             if not identities or identities.issubset(seen) or not has_more:
@@ -1168,7 +1376,7 @@ class CTraderOfficialDemoTransport(CTraderDemoTransport):
 
 def load_official_proto() -> Any:
     try:
-        return importlib.import_module("ctrader_open_api.messages.OpenApiMessages_pb2")
+        return importlib.import_module("mtf_lab.data.protobuf_generated.OpenApiMessages_pb2")
     except Exception as exc:
         raise OfficialSDKUnavailable("install/inject Spotware OpenApiPy generated protobuf module") from exc
 
@@ -1208,7 +1416,7 @@ def _authenticated_session_identity(session: AuthenticatedSession) -> tuple[str,
 def _authenticated_session_policy(session: AuthenticatedSession) -> frozenset[str]:
     scopes = _normalize_scopes(session.scopes)
     if not _scope_has_trading(scopes):
-        raise ScopeRejected("la sesión autenticada no observa permiso de trading")
+        raise ScopeRejected("la sesión autenticada no observa permiso exacto de trading")
     return scopes
 
 
@@ -1294,6 +1502,8 @@ def _validate_observation(
         raise RealAccountForbidden("server observation is not DEMO")
     if observation.endpoint.lower() != DEMO_PROTOBUF_ENDPOINT:
         raise EndpointRejected("server observation endpoint does not match official DEMO endpoint")
+    if not observation.valid_at(clock()):
+        raise DemoAccountRequired("la evidencia del servidor está vencida")
     if isinstance(client, CTraderClientGateway) and (
         not observation.session_id or not observation.matches_session(client.session, at=clock())
     ):
@@ -1334,7 +1544,7 @@ def _normalize_scopes(value: Iterable[str] | str) -> frozenset[str]:
 
 
 def _scope_has_trading(scopes: frozenset[str]) -> bool:
-    return bool({"trading", "trade", "scope_trade", "scope:trade", "trading:write"} & set(scopes))
+    return "trading" in scopes
 
 
 def _payload_type_for_message(message: Any) -> int:
@@ -1388,6 +1598,87 @@ def _set_optional_timestamp(message: Any, name: str, value: datetime | None) -> 
     if value is None:
         return
     _set(message, name, _timestamp_ms(value))
+
+
+def _set_optional_field(message: Any, name: str, value: Any) -> None:
+    """Set an optional generated field when the installed schema exposes it."""
+
+    if value is None or _field_declared(message, name) is False:
+        return
+    _set(message, name, value)
+
+
+def _validated_order_options(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    raw = metadata.get("order_options", {}) if isinstance(metadata, Mapping) else {}
+    if not isinstance(raw, Mapping):
+        raise OfficialMessageError("order_options must be a mapping")
+    return raw
+
+
+def _set_numeric_order_option(message: Any, raw: Mapping[str, Any], source: str, target: str) -> None:
+    if source not in raw:
+        return
+    value = raw[source]
+    if target in {"trailingStopLoss", "guaranteedStopLoss"}:
+        if not isinstance(value, bool):
+            raise OfficialMessageError(f"{source} must be boolean")
+    else:
+        if isinstance(value, bool):
+            raise OfficialMessageError(f"{source} must be integer")
+        try:
+            value = int(value)
+        except (TypeError, ValueError) as exc:
+            raise OfficialMessageError(f"{source} must be integer") from exc
+        if value <= 0 and target != "slippageInPoints":
+            raise OfficialMessageError(f"{source} must be positive")
+        if value < 0:
+            raise OfficialMessageError(f"{source} must be non-negative")
+    _set_optional_field(message, target, value)
+
+
+def _set_price_order_option(message: Any, raw: Mapping[str, Any], source: str, target: str) -> None:
+    if source not in raw or raw[source] is None:
+        return
+    try:
+        value = float(raw[source])
+    except (TypeError, ValueError) as exc:
+        raise OfficialMessageError(f"{source} must be finite") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise OfficialMessageError(f"{source} must be finite and positive")
+    _set_optional_field(message, target, value)
+
+
+def _set_expiration_order_option(message: Any, raw: Mapping[str, Any]) -> None:
+    if raw.get("expiration_timestamp") is None:
+        return
+    expiration = raw["expiration_timestamp"]
+    if isinstance(expiration, datetime):
+        expiration = _timestamp_ms(expiration)
+    else:
+        try:
+            expiration = int(expiration)
+        except (TypeError, ValueError) as exc:
+            raise OfficialMessageError("expiration_timestamp must be milliseconds") from exc
+    if expiration <= 0:
+        raise OfficialMessageError("expiration_timestamp must be positive")
+    _set_optional_field(message, "expirationTimestamp", expiration)
+
+
+def _set_order_options(message: Any, metadata: Mapping[str, Any]) -> None:
+    raw = _validated_order_options(metadata)
+    for source, target in (
+        ("relative_stop_loss", "relativeStopLoss"),
+        ("relative_take_profit", "relativeTakeProfit"),
+        ("slippage_in_points", "slippageInPoints"),
+        ("trailing_stop_loss", "trailingStopLoss"),
+        ("guaranteed_stop_loss", "guaranteedStopLoss"),
+    ):
+        _set_numeric_order_option(message, raw, source, target)
+    for source, target in (("stop_loss", "stopLoss"), ("take_profit", "takeProfit")):
+        _set_price_order_option(message, raw, source, target)
+    _set_expiration_order_option(message, raw)
+    if raw.get("comment") is not None:
+        _set_optional_field(message, "comment", str(raw["comment"]))
 
 
 def _timestamp_ms(value: datetime) -> int:
@@ -1492,6 +1783,10 @@ def _unknown_enum_name(value: Any) -> str:
         return f"__UNKNOWN_{value}"
 
 
+def _protocol_true(value: Any) -> bool:
+    return value is True or (isinstance(value, int) and not isinstance(value, bool) and value == 1)
+
+
 def _fixture_enum_name(value: Any) -> str:
     if isinstance(value, str):
         return value.strip().upper()
@@ -1569,9 +1864,14 @@ def _response_order(response: Any) -> Any:
     return _field(response, "order", "order_data", default=None) or response
 
 
-def _validate_response_correlation(response: Any, order: Any, client_order_id: str) -> None:
+def _validate_response_correlation(response: Any, order: Any, client_order_id: str, *, required: bool = True) -> None:
     response_client = _field(response, "clientOrderId", "client_order_id", "clientMsgId", "client_msg_id", default=None)
     order_client = _field(order, "clientOrderId", "client_order_id", "label", default=None)
+    if required and response_client is None and order_client is None:
+        raise OfficialCorrelationError(
+            "official response lacks client correlation",
+            phase=SendPhase.RESPONSE_RECEIVED,
+        )
     if response_client is not None and str(response_client) != str(client_order_id):
         raise OfficialCorrelationError(
             "official response client correlation mismatch", phase=SendPhase.RESPONSE_RECEIVED
@@ -1603,6 +1903,32 @@ def _response_reason(
 def _response_order_id(order: Any, deal: Any) -> Any:
     order_id = _field(order, "orderId", "order_id", default=None)
     return order_id if order_id is not None else _field(deal, "orderId", "order_id", default=None)
+
+
+def _optional_server_price(owner: Any, *names: str) -> DecimalValue | None:
+    raw = _field(owner, *names, default=None)
+    if raw is None:
+        return None
+    try:
+        return _decimal_value(raw, names[0], positive=True)
+    except ValueError as exc:
+        raise OfficialResponseError(
+            f"official response has invalid {names[0]}", phase=SendPhase.RESPONSE_RECEIVED
+        ) from exc
+
+
+def _response_protection(response: Any, order: Any) -> tuple[DecimalValue | None, DecimalValue | None]:
+    stop_loss = _optional_server_price(order, "stopLoss", "stop_loss")
+    take_profit = _optional_server_price(order, "takeProfit", "take_profit")
+    position = _field(response, "position", default=None)
+    positions = _many(response, "position", "positions")
+    if positions:
+        position = positions[0]
+    if stop_loss is None:
+        stop_loss = _optional_server_price(position, "stopLoss", "stop_loss")
+    if take_profit is None:
+        take_profit = _optional_server_price(position, "takeProfit", "take_profit")
+    return stop_loss, take_profit
 
 
 def _position_ids(response: Any, order: Any, deal: Any) -> list[str]:
@@ -1774,14 +2100,79 @@ def _state_from_exact_evidence(
     return OrderState.SUBMITTED, None
 
 
-def _historical_page(response: Any, key: str) -> tuple[Any | None, set[tuple[str, str]], bool, datetime | None]:
+def _is_closing_order(order: Any, expected_position_id: str, *, response: Any | None = None) -> bool:
+    """Accept a position-id match only when the protocol marks a close."""
+
+    closing = _field(order, "closingOrder", "closing_order", default=None)
+    if not _protocol_true(closing):
+        return False
+    owner = response if response is not None else order
+    deal = _field(owner, "deal", default=None)
+    return str(expected_position_id) in _position_ids(owner, order, deal)
+
+
+def _validate_close_response_kind(
+    response: Any,
+    order: Any,
+    *,
+    requested_quantity: DecimalValue,
+    expected_position_id: str | None,
+    volume_scale: int,
+) -> None:
+    """Validate close marker, identity and optional protocol quantity."""
+
+    # Error responses have no order-kind envelope; their explicit error code
+    # is enough to classify a rejected close without inventing one.
+    if _field(response, "errorCode", "error_code", default=None) is not None:
+        return
+    execution = _enum_field_name(response, "executionType", "execution_type")
+    order_status = _enum_field_name(order, "orderStatus", "order_status")
+    if execution in {"ORDER_REJECTED", "ORDER_CANCELLED", "ORDER_EXPIRED", "ORDER_CANCEL_REJECTED"} or order_status in {
+        "ORDER_STATUS_REJECTED",
+        "ORDER_STATUS_CANCELLED",
+        "ORDER_STATUS_EXPIRED",
+    }:
+        return
+    closing = _field(order, "closingOrder", "closing_order", default=None)
+    if not _protocol_true(closing):
+        raise OfficialResponseError(
+            "close response lacks closingOrder=true",
+            phase=SendPhase.RESPONSE_RECEIVED,
+        )
+    if expected_position_id is not None and not _is_closing_order(order, expected_position_id, response=response):
+        raise OfficialResponseError(
+            "close response lacks the requested position identity",
+            phase=SendPhase.RESPONSE_RECEIVED,
+        )
+    trade_data = _field(order, "tradeData", "trade_data", default=None)
+    raw_volume = _field(order, "volume", "requestedVolume", "requested_volume", default=None)
+    if raw_volume is None:
+        raw_volume = _field(trade_data, "volume", "requestedVolume", "requested_volume", default=None)
+    if raw_volume is not None:
+        observed_quantity = _volume_from_protocol(raw_volume, volume_scale)
+        if observed_quantity != requested_quantity:
+            raise OfficialCorrelationError(
+                "close response quantity does not match requested position quantity",
+                phase=SendPhase.RESPONSE_RECEIVED,
+            )
+
+
+def _historical_page(
+    response: Any, key: str, *, expected_position_id: str | None = None
+) -> tuple[Any | None, set[tuple[str, str]], bool, datetime | None]:
     if response is None:
         return None, set(), False, None
     identities: set[tuple[str, str]] = set()
     timestamps: list[datetime] = []
     for order in _many(response, "order", "orders"):
         candidate = _field(order, "clientOrderId", "client_order_id", "label", default=None)
-        if candidate is not None and str(candidate) == key:
+        if (
+            candidate is not None
+            and str(candidate) == key
+            and (expected_position_id is None or _is_closing_order(order, expected_position_id))
+        ):
+            return order, identities, False, None
+        if expected_position_id is not None and _is_closing_order(order, expected_position_id):
             return order, identities, False, None
         order_id = str(_field(order, "orderId", "order_id", default=""))
         identities.add((order_id, str(candidate or "")))
@@ -1792,6 +2183,34 @@ def _historical_page(response: Any, key: str) -> tuple[Any | None, set[tuple[str
     has_more = bool(_field(response, "hasMore", "has_more", default=False))
     next_to = min(timestamps) - timedelta(milliseconds=1) if timestamps else None
     return None, identities, has_more, next_to
+
+
+def _filter_history_deals(
+    response: Any, *, order_id: Any | None, expected_position_id: str | None
+) -> Mapping[str, Any] | None:
+    """Keep only deals proven to belong to the recovered order/position."""
+
+    candidates = _many(response, "deal", "deals")
+    if not candidates:
+        return None
+    if order_id is None and expected_position_id is None:
+        return {"deals": []}
+    relevant: list[Any] = []
+    for deal in candidates:
+        if order_id is not None:
+            observed_order = _field(deal, "orderId", "order_id", default=None)
+            if observed_order is None or str(observed_order) != str(order_id):
+                continue
+        if expected_position_id is not None:
+            observed_position = _field(deal, "positionId", "position_id", default=None)
+            if observed_position is None or str(observed_position) != str(expected_position_id):
+                continue
+        relevant.append(deal)
+    filtered: dict[str, Any] = {"deals": relevant}
+    account_id = _field(response, "ctidTraderAccountId", "ctid_trader_account_id", default=None)
+    if account_id is not None:
+        filtered["ctidTraderAccountId"] = account_id
+    return filtered
 
 
 def _merge_response_details(primary: Any, secondary: Any) -> Any:

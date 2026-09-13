@@ -16,6 +16,11 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 
 ## Estado actual
 
+La evolución H0–H6 hacia una DEMO fiable se documenta en la
+[matriz de implementación y aceptación](docs/demo_reliability_plan.md). Su
+validación local, la instalación operativa y las ventanas de 72 horas/30
+sesiones son estados distintos. Ningún comando nuevo activa trading por defecto.
+
 ### IMPLEMENTADO Y COMPROBADO OFFLINE
 
 - Ingesta local/sintética, normalización causal, M1/M5/M15, indicadores
@@ -27,10 +32,13 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 - Calidad bid/ask hasta el fill, base `native` para trendbars, cantidades y
   contabilidad `Decimal`, simulación CFD PAPER incremental y persistencia SQLite
   schema v4 con migración aditiva desde v3.
-- Codec/framing Protobuf oficial instalado, transporte DEMO controlado,
+- Codec/framing Protobuf generado desde schemas oficiales y probado en un
+  runtime aislado mantenido; transporte DEMO controlado,
   correlación, heartbeat, backpressure, respuestas de ejecución, reconciliación
   y rechazo fail-closed de REAL/LIVE. Las pruebas usan gateway/transporte
   local o falso; no contactan el bróker.
+  El venv operativo anterior no se actualiza con estos cambios y debe pasar
+  `ctrader doctor` antes de cualquier uso externo.
 - Instalación editable y wheel, imports desde cwd ajeno, configuraciones TOML
   empaquetadas, lanzadores, fixtures CFD/cTrader, UI de sólo lectura, suite
   offline, lint/formato/tipos y auditoría arquitectónica.
@@ -126,19 +134,22 @@ XDG del usuario; las credenciales y OAuth no forman parte de esta instalación.
 
 ### Extra cTrader reproducible
 
-El SDK oficial es opcional para el núcleo. Para reproducir exactamente el
-entorno validado, primero instala el lock completo y después registra el extra
-sin resolver versiones nuevas:
+El codec usa mensajes generados desde los schemas oficiales Spotware release
+91, conservados en el paquete. Protobuf es opcional para el núcleo; el SDK
+antiguo no es una dependencia ni un fallback. Para una instalación autorizada
+en un entorno nuevo, el lock fija el runtime y sus hashes:
 
 ```bash
-.venv/bin/python -m pip install --requirement requirements-ctrader.lock
+.venv/bin/python -m pip install --require-hashes --requirement requirements-ctrader.lock
 .venv/bin/python -m pip check
 ```
 
-`requirements-ctrader.lock` fija `ctrader-open-api==0.9.2`, Protobuf, Twisted,
-TLS y transitivas observadas. Las versiones del entorno vivo y sus hashes de
-archivos están en los manifests de ingeniería; no se incluye ningún token o
-store.
+`requirements-ctrader.lock` fija `protobuf==7.36.1`. El
+[manifest del codec](manifests/ctrader-protobuf-91.json) conserva schemas,
+generador, licencias y hashes. No se descargan schemas en ejecución ni se usa
+`--no-deps` para forzar combinaciones incompatibles. La implementación no
+actualiza el venv operativo existente. `ctrader doctor` separa presencia de
+dependencias, codec utilizable y preparación externa no verificada.
 
 ### Herramientas de desarrollo
 
