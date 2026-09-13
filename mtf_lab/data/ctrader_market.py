@@ -346,6 +346,12 @@ class CTraderHistoryResult:
     complete: bool
     has_more: bool
     issues: tuple[str, ...] = ()
+    # The compact public summary intentionally omits payload bytes.  Query
+    # callers that explicitly request a capture export use these detached raw
+    # response pages plus their receive metadata to preserve native trendbars
+    # without reconstructing bid/ask quotes.
+    raw_pages: tuple[Mapping[str, Any], ...] = ()
+    page_metadata: tuple[Mapping[str, Any], ...] = ()
 
     def __iter__(self) -> Iterator[Bar]:
         return iter(self.bars)
@@ -361,6 +367,7 @@ class CTraderHistoryResult:
             "complete": self.complete,
             "has_more": self.has_more,
             "issues": list(self.issues),
+            "raw_page_count": len(self.raw_pages),
         }
 
 
@@ -431,8 +438,10 @@ class CTraderProvider:
     def authenticate(self, **kwargs: Any) -> AuthState:
         return self.client.authenticate(**kwargs)
 
-    def discover_accounts(self, *, token_provider: Callable[[str], str] | None = None) -> dict[str, Any]:
-        return self.client.discover_accounts(token_provider=token_provider)
+    def discover_accounts(
+        self, *, token_provider: Callable[[str], str] | None = None, include_token: bool = False
+    ) -> dict[str, Any]:
+        return self.client.discover_accounts(token_provider=token_provider, include_token=include_token)
 
     def authorize_account(self, account_id: int, *, token_provider: Callable[[str], str] | None = None) -> AuthState:
         return self.client.authorize_account(account_id, token_provider=token_provider)
@@ -606,12 +615,26 @@ class CTraderProvider:
         cursor_to = to_timestamp
         collected: dict[tuple[datetime, int], Bar] = {}
         issues: list[str] = []
+        raw_pages: list[Mapping[str, Any]] = []
+        page_metadata: list[Mapping[str, Any]] = []
         pages = 0
         has_more = False
         previous_earliest: datetime | None = None
         while pages < max_pages:
             page = self.fetch(timeframe, count=count, from_timestamp=start_bound, to_timestamp=cursor_to)
             pages += 1
+            raw_pages.append(message_to_mapping(page.response.payload))
+            page_metadata.append(
+                {
+                    "received_at": page.response.received_at,
+                    "available_at": page.response.available_at,
+                    "ingest_sequence": page.response.ingest_sequence,
+                    "connection_generation": page.response.connection_generation,
+                    "source_identity": page.response.source_identity,
+                    "request": page.request.to_dict(),
+                    "response_type": page.response.payload_type_name,
+                }
+            )
             issues.extend(page.issues)
             has_more = page.has_more
             for bar in page.bars:
@@ -631,7 +654,12 @@ class CTraderProvider:
         else:
             issues.append("histórico excedió max_pages; cobertura incompleta")
         bars = tuple(sorted(collected.values(), key=lambda item: (item.interval_start, item.revision)))
-        complete = not has_more and not any("incompleta" in issue or "abierto" in issue for issue in issues)
+        # Any normalization issue, including an invalid trendbar or an empty
+        # page, makes the historical result partial.  A false hasMore flag is
+        # not sufficient evidence of a complete native series.
+        if not bars:
+            issues.append("histórico sin barras válidas; cobertura incompleta")
+        complete = bool(bars) and not has_more and not issues
         return CTraderHistoryResult(
             bars,
             _period_name(_period_code(timeframe)),
@@ -639,6 +667,8 @@ class CTraderProvider:
             complete,
             has_more,
             tuple(issues),
+            tuple(raw_pages),
+            tuple(page_metadata),
         )
 
     def subscribe_spots(self, *, subscribe_to_spot_timestamp: bool = True) -> WireMessage:

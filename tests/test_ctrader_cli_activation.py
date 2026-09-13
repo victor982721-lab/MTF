@@ -10,6 +10,13 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
+from mtf_lab.data.capture import CaptureEnvelope, MessageClass
+from mtf_lab.data.ctrader import (
+    CTraderHistoryResult,
+    CTraderInstrumentSpec,
+    normalize_trendbar,
+)
+from mtf_lab.data.paper_fixture import synthetic_ctrader_payloads
 from mtf_lab.ops import cli
 from mtf_lab.ops.ctrader_activation import SecureTokenStore
 
@@ -150,6 +157,7 @@ class CTraderCLIActivationTests(unittest.TestCase):
             class Status:
                 auth = "AUTHENTICATED"
                 action = ""
+                generation = 1
 
                 def to_dict(self) -> dict:
                     return {"connection": "CONNECTED", "auth": "AUTHENTICATED", "action": ""}
@@ -171,8 +179,12 @@ class CTraderCLIActivationTests(unittest.TestCase):
                     assert authorize_selected is False
                     return "ACCOUNT_REQUIRED"
 
-                def discover_accounts(self):
-                    return {"records": [{"account_id": 7, "environment": "DEMO"}], "permissionScope": "SCOPE_VIEW"}
+                def discover_accounts(self, *, include_token: bool = False):
+                    return {
+                        "accessToken": "local-test-access",
+                        "records": [{"account_id": 7, "environment": "DEMO"}],
+                        "permissionScope": "SCOPE_VIEW",
+                    }
 
                 def authorize_account(self, account_id, *, token_provider):
                     assert account_id == 7
@@ -227,6 +239,7 @@ class CTraderCLIActivationTests(unittest.TestCase):
 
             class Status:
                 action = "Seleccione una cuenta DEMO descubierta antes de autenticarla."
+                generation = 1
 
                 def to_dict(self) -> dict:
                     return {
@@ -237,6 +250,7 @@ class CTraderCLIActivationTests(unittest.TestCase):
 
             class Provider:
                 def __init__(self, config):
+                    self.config = config
                     self.status = Status()
 
                 def connect(self):
@@ -250,8 +264,12 @@ class CTraderCLIActivationTests(unittest.TestCase):
                     calls.extend(("application_auth", "account_discovery"))
                     return "ACCOUNT_REQUIRED"
 
-                def discover_accounts(self):
-                    return {"records": [{"account_id": 7, "environment": "DEMO"}], "permissionScope": "SCOPE_VIEW"}
+                def discover_accounts(self, *, include_token: bool = False):
+                    return {
+                        "accessToken": "local-test-access",
+                        "records": [{"account_id": 7, "environment": "DEMO"}],
+                        "permissionScope": "SCOPE_VIEW",
+                    }
 
                 def authorize_account(self, account_id, *, token_provider):
                     calls.append("account_auth")
@@ -283,6 +301,202 @@ class CTraderCLIActivationTests(unittest.TestCase):
             discovery = json.loads(Path(output["discovery_path"]).read_text(encoding="utf-8"))
             self.assertEqual(discovery["accounts"][0]["account_id"], 7)
             self.assertEqual(calls, ["connect", "authenticate", "application_auth", "account_discovery", "close"])
+
+    def test_query_exports_native_history_capture_and_cfd_paper_has_no_quote_fills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            config, token_dir = write_query_config(base, selected=True)
+            SecureTokenStore(token_dir, project_root=ROOT).rotate(
+                "ctrader-query-demo",
+                access_token="local-test-access",
+                refresh_token="local-test-refresh",
+                granted_scopes=["accounts"],
+                expires_at=datetime.now(UTC) + timedelta(hours=1),
+            )
+
+            start = datetime(2026, 1, 1, tzinfo=UTC)
+            rows = synthetic_ctrader_payloads(start=start, symbol_id=99, count=190)
+            spec = CTraderInstrumentSpec(symbol="EUR/USD", symbol_id=99)
+            raw_bars = [row["trendbar"][0] for row in rows]
+            received = (
+                start + timedelta(minutes=95, seconds=1),
+                start + timedelta(minutes=190, seconds=1),
+            )
+            pages = (
+                {
+                    "period": 1,
+                    "symbolId": 99,
+                    "trendbar": raw_bars[:95],
+                    "hasMore": True,
+                },
+                {
+                    "period": 1,
+                    "symbolId": 99,
+                    "trendbar": raw_bars[95:],
+                    "hasMore": False,
+                },
+            )
+            bars = tuple(
+                normalize_trendbar(
+                    raw,
+                    spec=spec,
+                    received_at=received[0 if index < 95 else 1],
+                    available_at=received[0 if index < 95 else 1],
+                )
+                for index, raw in enumerate(raw_bars)
+            )
+            page_metadata = tuple(
+                {
+                    "received_at": when,
+                    "available_at": when,
+                    "ingest_sequence": index,
+                    "connection_generation": 1,
+                    "source_identity": f"fake-history-page-{index}",
+                    "request": {
+                        "payload_type": "PROTO_OA_GET_TRENDBARS_REQ",
+                        "payload": {"period": 1, "symbolId": 99, "count": 95},
+                    },
+                    "response_type": "PROTO_OA_GET_TRENDBARS_RES",
+                }
+                for index, when in enumerate(received)
+            )
+            history = CTraderHistoryResult(
+                bars,
+                "M1",
+                2,
+                True,
+                False,
+                (),
+                pages,
+                page_metadata,
+            )
+            capture_path = base / "history.jsonl"
+            query_report = base / "query-report.json"
+            calls: list[str] = []
+
+            class Status:
+                generation = 1
+                action = ""
+
+                def to_dict(self) -> dict[str, object]:
+                    return {"connection": "CONNECTED", "auth": "AUTHENTICATED", "generation": 1, "action": ""}
+
+            class Provider:
+                def __init__(self, provider_config):
+                    self.config = provider_config
+                    self.spec = spec
+                    self.status = Status()
+
+                def connect(self):
+                    calls.append("connect")
+
+                def authenticate(self, *, secret_provider, token_provider, authorize_selected=True):
+                    calls.append("authenticate")
+                    secret_provider("CTRADER_CLIENT_SECRET")
+                    token_provider("ctrader-query-demo")
+                    assert authorize_selected is False
+                    return "ACCOUNT_REQUIRED"
+
+                def discover_accounts(self, *, include_token: bool = False):
+                    calls.append("discover")
+                    return {
+                        "accessToken": "local-test-access",
+                        "records": [{"account_id": 7, "environment": "DEMO"}],
+                        "permissionScope": "SCOPE_VIEW",
+                    }
+
+                def authorize_account(self, account_id, *, token_provider):
+                    calls.append("account_auth")
+                    assert account_id == 7
+                    assert token_provider("ctrader-query-demo") == "local-test-access"
+
+                def resolve_symbol(self):
+                    calls.append("catalog")
+                    return {"selected": 99}
+
+                def fetch_history(self, timeframe, count, max_pages):
+                    calls.append("history")
+                    assert (timeframe, count, max_pages) == ("M1", 500, 20)
+                    return history
+
+                def close(self):
+                    calls.append("close")
+
+            env = {
+                "CTRADER_CLIENT_ID": "public-fixture-client",
+                "CTRADER_CLIENT_SECRET": "runtime-secret",
+            }
+            with (
+                mock.patch.dict(os.environ, env, clear=False),
+                mock.patch("mtf_lab.data.ctrader.CTraderProvider", Provider),
+            ):
+                query_code, query_output = run_cli(
+                    [
+                        "ctrader",
+                        "query",
+                        "--config",
+                        str(config),
+                        "--network",
+                        "--capture",
+                        str(capture_path),
+                        "--report",
+                        str(query_report),
+                    ]
+                )
+            self.assertEqual(query_code, 0)
+            self.assertEqual(
+                calls, ["connect", "authenticate", "discover", "account_auth", "catalog", "history", "close"]
+            )
+            self.assertEqual(query_output["capture"]["analysis_basis"], "native")
+            self.assertEqual(query_output["capture"]["native_bars"], 190)
+            self.assertEqual(query_output["capture"]["quote_events"], 0)
+            self.assertEqual(query_output["capture"]["paper_fills"], 0)
+            self.assertTrue(query_report.is_file())
+            self.assertEqual(
+                json.loads(query_report.read_text(encoding="utf-8"))["capture"]["message_class"], "trendbar"
+            )
+
+            envelopes = [
+                CaptureEnvelope.from_mapping(json.loads(line))
+                for line in capture_path.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual(
+                [item.message_class for item in envelopes],
+                [MessageClass.TRENDBAR, MessageClass.TRENDBAR, MessageClass.END],
+            )
+            self.assertTrue(all("bid" not in item.payload and "ask" not in item.payload for item in envelopes[:2]))
+            self.assertEqual(envelopes[0].payload["capture_kind"], "historical_trendbars")
+
+            native_config = base / "native-pipeline.toml"
+            native_text = (ROOT / "config" / "ctrader_pipeline_fixture.toml").read_text(encoding="utf-8")
+            native_config.write_text(
+                native_text.replace('price_base = "mid"', 'price_base = "native"'), encoding="utf-8"
+            )
+            paper_db = base / "native-paper.sqlite3"
+            paper_report = base / "native-paper.json"
+            paper_code, paper_output = run_cli(
+                [
+                    "cfd-paper",
+                    "--config",
+                    str(native_config),
+                    "--input",
+                    str(capture_path),
+                    "--db",
+                    str(paper_db),
+                    "--report",
+                    str(paper_report),
+                    "--price-base",
+                    "native",
+                    "--order",
+                    "market_time_corrected",
+                ]
+            )
+            self.assertEqual(paper_code, 0)
+            self.assertEqual(paper_output["analysis_basis"], "native")
+            self.assertEqual(paper_output["capture"]["quote_event_count"], 0)
+            self.assertEqual(paper_output["capture"]["bar_count"], 190)
+            self.assertEqual(paper_output["trades"], [])
+            self.assertTrue(paper_report.is_file())
 
 
 if __name__ == "__main__":

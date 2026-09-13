@@ -921,16 +921,19 @@ class CTraderClient:
         self._session_evidence = None
         self._set_status(auth=AuthState.AUTHENTICATED, action="")
 
-    def _copy_account_discovery(self) -> dict[str, Any]:
+    def _copy_account_discovery(self, *, include_token: bool = False) -> dict[str, Any]:
         if self._account_discovery is None:
             raise CTraderAuthError(
                 "no hay cuentas observadas; autentique la aplicación primero",
                 action="Ejecute application auth y descubra las cuentas autorizadas",
             )
-        return {
+        snapshot = {
             "records": [dict(record) for record in self._account_discovery["records"]],
             "permissionScope": self._account_discovery.get("permissionScope"),
         }
+        if include_token and "accessToken" in self._account_discovery:
+            snapshot["accessToken"] = self._account_discovery["accessToken"]
+        return snapshot
 
     def _discover_accounts_for_token(self, token: str) -> dict[str, Any]:
         response = self.request(
@@ -938,15 +941,22 @@ class CTraderClient:
             {"accessToken": token},
         )
         self._account_discovery = normalize_account_payload(response.payload)
+        # Keep the server echo in memory for explicit token-binding checks.
+        # Ordinary discovery snapshots remain redacted by default.
+        token_echo = read_field(response.payload, "accessToken", "access_token", default=None)
+        if isinstance(token_echo, str):
+            self._account_discovery["accessToken"] = token_echo
         return self._copy_account_discovery()
 
     def discover_accounts(
         self,
         *,
         token_provider: Callable[[str], str] | None = None,
+        include_token: bool = False,
     ) -> dict[str, Any]:
+        """Return account observations; opt-in token echoes must never be logged."""
         if self._account_discovery is not None:
-            return self._copy_account_discovery()
+            return self._copy_account_discovery(include_token=include_token)
         if not self._application_authenticated:
             self._set_status(
                 auth=AuthState.REQUIRED,
@@ -964,7 +974,8 @@ class CTraderClient:
             self._set_status(auth=AuthState.INVALID, action="La referencia de token no devolvió un valor")
             raise CTraderAuthError("token_provider vacío", action=self._status.action)
         try:
-            return self._discover_accounts_for_token(token)
+            self._discover_accounts_for_token(token)
+            return self._copy_account_discovery(include_token=include_token)
         finally:
             token = ""
 

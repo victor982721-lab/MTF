@@ -10,6 +10,50 @@ producir un servidor autenticado.
 
 ## Estado actual
 
+### Preparación externa DEMO — 2026-09-12
+
+Se verificó en el navegador una sesión cTrader ID autenticada y la cuenta
+Pepperstone DEMO vinculada. Esta observación de la interfaz no equivale a una
+sesión Open API de MTF. La aplicación **MTF Lab** se registró y el portal confirma
+**`Submitted`** (en revisión), todavía no **`Approved`**. Se verificó que el contacto
+autorizado quedó guardado; no se duplican aquí sus datos personales. Víctor autorizó los términos de Open API y la comunicación del contacto
+a Spotware y a los brokers para soporte; no debe repetirse ese consentimiento
+mientras no cambie su alcance.
+
+El perfil inicial es `config/ctrader_query.toml`, exclusivamente **DEMO** y
+scope **`accounts`**. El callback configurado es
+`http://127.0.0.1:8767/oauth/callback`. El doctor local observa el SDK, pero informa
+`APP_CREDENTIALS_REQUIRED`; el portal ya ofrece credenciales de aplicación, pero
+no se han exportado a almacenamiento local ni realizado OAuth para MTF. Cualquier cuenta REAL/LIVE queda fuera de esta tarea;
+no se habilitan órdenes ni se mueven fondos. La aceptación de Open API no se
+presenta como validación contractual general de Pepperstone.
+
+#### Preparación local verificada
+
+La integración de consulta de lectura e importación del histórico nativo quedó
+validada con **422/422 pruebas**, sin fallos ni omisiones, Ruff/formato, mypy y
+Pyright en verde. La suite se ejecutó con HOME/XDG/TMP/estado aislados y cero
+intentos de red externa; los imports/smokes no activaron el SDK por defecto.
+El [receipt compacto](../reports/quality/ctrader-demo-preparation-20260912.json)
+conserva la identidad de los inputs y las métricas del gate final. En el cierre inicial, los cambios
+quedaron locales y todavía sin commit, publicación ni instalación de release;
+ese receipt describe la preparación anterior a su consolidación en Git.
+
+El intercambio y refresh mantienen el token en memoria hasta verificar el eco
+del servidor, el permiso efectivo, los endpoints y la generación de conexión.
+La consulta revalida esa evidencia fresca: esta fase rechaza permisos de trading
+no pedidos e inventarios con cuentas REAL/LIVE. El discovery público permanece
+sin tokens; el acceso al eco sensible es explícito e interno a la verificación.
+
+El histórico se exporta con metadatos mínimos de cuenta/entorno/especificación,
+archivos privados y publicación sin reemplazo. La reproducción exige
+`price_base=native` y `order=market_time_corrected`, conserva la recepción original
+y no fabrica bid/ask ni fills. Las capturas parciales, vacías o incompatibles no
+se presentan como análisis completo. La ruta y los comandos están en el README.
+Esto no habilita un stream continuo ni operaciones DEMO: **la conexión real de
+MTF por Open API sigue pendiente de aprobación y OAuth**.
+
+
 ### IMPLEMENTADO Y COMPROBADO OFFLINE
 
 - La fachada `mtf_lab.data.ctrader` separa configuración, Protobuf/codec,

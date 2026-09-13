@@ -33,6 +33,10 @@ class CaptureContractError(ValueError):
 
 class MessageClass(StrEnum):
     SPOT = "spot"
+    # Historical cTrader trendbar responses are market evidence but do not
+    # contain a bid/ask quote.  Keeping them distinct from SpotEvent avoids
+    # relabelling a history response as a live quote capture.
+    TRENDBAR = "trendbar"
     CLOCK = "clock"
     CONNECTION = "connection"
     REVISION = "revision"
@@ -112,8 +116,16 @@ class CaptureEnvelope:
             raise CaptureContractError("unknown availability policy")
         if self.availability_policy == "observed" and self.received_at is None:
             raise CaptureContractError("observed capture requires original received_at")
-        if self.received_at and self.available_at and self.available_at < self.received_at:
+        if (
+            self.availability_policy == "observed"
+            and self.received_at
+            and self.available_at
+            and self.available_at < self.received_at
+        ):
             raise CaptureContractError("available_at cannot precede receipt")
+        # ``historical_event_time`` intentionally keeps the original receipt
+        # beside a reconstructed market-time watermark.  The distinction is
+        # explicit in the policy; it must not be relabelled as observed.
 
     @property
     def observation_id(self) -> str:

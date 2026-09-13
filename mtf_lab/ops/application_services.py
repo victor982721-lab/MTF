@@ -1580,17 +1580,151 @@ class CfdPaperService:
         if not found:
             raise ConfigError(f"la sesión {session_id} no contiene envelopes de captura durables")
 
+    @staticmethod
+    def _historical_capture_preflight(
+        config: EffectiveConfig, args: argparse.Namespace
+    ) -> tuple[Mapping[str, Any] | None, Any | None, Path | None] | CommandResult:
+        from ..data.ctrader import CTraderInstrumentSpec
+        from .ctrader_history_export import CAPTURE_KIND, CAPTURE_ORDER, inspect_historical_capture
+
+        input_path = Path(args.input).expanduser() if getattr(args, "input", None) else None
+        if input_path is None:
+            return None, None, None
+        try:
+            metadata = inspect_historical_capture(input_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "CAPTURE_METADATA_INVALID",
+                    "network_performed": False,
+                    "error": type(exc).__name__,
+                    "next_action": "Revise la captura; no se abrió red ni se creó una sesión PAPER.",
+                },
+                code=2,
+                stderr=True,
+            )
+        if metadata is None or metadata.get("capture_kind") != CAPTURE_KIND:
+            return metadata, None, input_path
+        if str(getattr(args, "price_base", None) or config.price_base).strip().lower() != "native":
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "HISTORICAL_NATIVE_REQUIRED",
+                    "network_performed": False,
+                    "capture_kind": CAPTURE_KIND,
+                    "next_action": "Use --price-base native; trendbars históricos no contienen bid/ask.",
+                },
+                code=2,
+                stderr=True,
+            )
+        if (
+            str(metadata.get("capture_order", "")) != CAPTURE_ORDER
+            or str(getattr(args, "order", "as_observed")) != CAPTURE_ORDER
+        ):
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "HISTORICAL_ORDER_REQUIRED",
+                    "network_performed": False,
+                    "capture_kind": CAPTURE_KIND,
+                    "next_action": "Use --order market_time_corrected; no se fingió recepción cronológica.",
+                },
+                code=2,
+                stderr=True,
+            )
+        if (
+            str(metadata.get("capture_status", "PARTIAL")) != "COMPLETE"
+            or metadata.get("complete") is not True
+            or metadata.get("has_more") is True
+            or metadata.get("issues")
+        ):
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "PARTIAL_HISTORY_CAPTURE",
+                    "network_performed": False,
+                    "capture_kind": CAPTURE_KIND,
+                    "complete": metadata.get("complete", False),
+                    "has_more": metadata.get("has_more"),
+                    "issues": list(metadata.get("issues", ())),
+                    "next_action": "No se analiza una captura histórica parcial; repita la consulta y exportación.",
+                },
+                code=2,
+                stderr=True,
+            )
+        spec_raw = metadata.get("instrument_spec")
+        if not isinstance(spec_raw, Mapping):
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "CAPTURE_SPEC_REQUIRED",
+                    "network_performed": False,
+                    "next_action": "La captura no contiene la especificación observada del instrumento.",
+                },
+                code=2,
+                stderr=True,
+            )
+        observed_symbol = str(spec_raw.get("symbol", "")).strip().upper().replace("-", "/")
+        configured_symbol = str(config.instrument).strip().upper().replace("-", "/")
+        configured_cfd_symbol = str(config.cfd.get("instrument", config.instrument)).strip().upper().replace("-", "/")
+        if not observed_symbol or configured_symbol != observed_symbol or configured_cfd_symbol != observed_symbol:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "CAPTURE_SPEC_MISMATCH",
+                    "network_performed": False,
+                    "observed_symbol": observed_symbol,
+                    "configured_symbol": configured_symbol,
+                    "next_action": "Use una configuración cuyo instrumento y CFD coincidan con la captura.",
+                },
+                code=2,
+                stderr=True,
+            )
+        try:
+            observed_spec = CTraderInstrumentSpec(
+                symbol=observed_symbol,
+                symbol_id=int(spec_raw["symbol_id"]),
+                digits=int(spec_raw["digits"]),
+                pip_position=int(spec_raw["pip_position"]),
+                price_scale=int(spec_raw["price_scale"]),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "CAPTURE_SPEC_INVALID",
+                    "network_performed": False,
+                    "error": type(exc).__name__,
+                    "next_action": "La especificación observada no es utilizable; repita discovery/catálogo.",
+                },
+                code=2,
+                stderr=True,
+            )
+        return metadata, observed_spec, input_path
+
     def run(self, args: argparse.Namespace) -> CommandResult:
         from ..data.ctrader import CTraderInstrumentSpec
         from .ctrader_pipeline import CTraderPipeline, synthetic_ctrader_capture
 
         config = _config_for(args)
+        preflight = self._historical_capture_preflight(config, args)
+        if isinstance(preflight, CommandResult):
+            return preflight
+        historical_metadata, observed_spec, input_path = preflight
+        requested_price_base = getattr(args, "price_base", None)
+        if requested_price_base:
+            config = _override_config(config, price_base=str(requested_price_base), mode="REPLAY")
         config, analysis_basis = self._pipeline_config(config)
-        capture_source = "local_file" if getattr(args, "input", None) else "synthetic_fixture"
-        symbol_id = _int_or_default(config.ctrader.get("symbol_id"), 99)
-        spec = CTraderInstrumentSpec(
+        capture_source = "local_file" if input_path is not None else "synthetic_fixture"
+        symbol_id = (
+            int(observed_spec.symbol_id)
+            if observed_spec is not None
+            else _int_or_default(config.ctrader.get("symbol_id"), 99)
+        )
+        spec = observed_spec or CTraderInstrumentSpec(
             symbol=config.instrument,
-            symbol_id=int(symbol_id),
+            symbol_id=symbol_id,
             digits=int(config.ctrader.get("digits", 5)),
             pip_position=int(config.ctrader.get("pip_position", 4)),
             price_scale=int(config.ctrader.get("price_scale", 100_000)),
@@ -1598,8 +1732,8 @@ class CfdPaperService:
         db = _db_for(args, config)
         db.parent.mkdir(parents=True, exist_ok=True)
         with SQLiteStore(db) as store:
-            if getattr(args, "input", None):
-                capture_input: CTraderCapture | Iterable[Any] = self._capture_input(Path(args.input))
+            if input_path is not None:
+                capture_input: CTraderCapture | Iterable[Any] = self._capture_input(input_path)
             elif getattr(args, "session", None):
                 capture_source = "sqlite_capture_envelopes"
                 capture_input = self._durable_input(store, str(args.session))
@@ -1643,6 +1777,12 @@ class CfdPaperService:
             "snapshot_hash": result.snapshot_hash,
             "next_action": "Revise la sesión en UI/reporte; las señales y fills son paper locales, no órdenes DEMO.",
         }
+        if historical_metadata is not None:
+            summary["historical_capture"] = {
+                "capture_kind": historical_metadata.get("capture_kind"),
+                "capture_order": historical_metadata.get("capture_order"),
+                "observed_spec": historical_metadata.get("instrument_spec"),
+            }
         if getattr(args, "report", None):
             target = Path(args.report).expanduser()
             target.parent.mkdir(parents=True, exist_ok=True)

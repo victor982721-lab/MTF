@@ -233,6 +233,21 @@ class CausalNormalizer:
             self.generation = envelope.connection_generation
         if envelope.message_class is MessageClass.CONNECTION:
             self.provider.reset_discontinuity()
+        if envelope.message_class is MessageClass.TRENDBAR:
+            # A historical GetTrendbars response is deliberately kept out of
+            # the SpotEvent/quote path.  The provider already owns the native
+            # relative-OHLC decoder; use it only for its embedded trendbars
+            # and discard any accidental quote legs rather than inventing
+            # bid/ask evidence from history.
+            result = self.provider.normalize_spot(
+                envelope.payload,
+                received_at=envelope.received_at,
+                available_at=envelope.available_at,
+                snapshot=False,
+                sequence=envelope.ingest_sequence,
+            )
+            bars = tuple(self._bar(item, envelope) for item in result.bars)
+            return replace(result, records=bars, quote_events=(), bars=bars, quote_quality=None)
         if envelope.message_class not in {MessageClass.SPOT, MessageClass.REVISION}:
             return CTraderNormalizationResult((), (), ())
         payload_time = parse_instant(envelope.payload.get("timestamp"), unit="ms")
@@ -356,7 +371,11 @@ def normalize_ctrader_capture(
         "coverage_end": instant_text(observed.observed_end) if observed.observed_end else None,
     }
     return CTraderCapture(
-        tuple(item.to_dict()["payload"] for item in envelopes if item.message_class is MessageClass.SPOT),
+        tuple(
+            item.to_dict()["payload"]
+            for item in envelopes
+            if item.message_class in {MessageClass.SPOT, MessageClass.TRENDBAR}
+        ),
         tuple(records),
         tuple(quotes),
         tuple(bars),

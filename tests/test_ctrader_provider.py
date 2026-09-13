@@ -459,6 +459,7 @@ class CTraderProviderTests(unittest.TestCase):
                             {"ctidTraderAccountId": 7, "isLive": False, "traderLogin": 1234},
                             {"ctidTraderAccountId": 8},
                         ],
+                        "accessToken": "SERVER_ECHO_TOKEN",
                     },
                     request.client_msg_id,
                 )
@@ -485,6 +486,12 @@ class CTraderProviderTests(unittest.TestCase):
         self.assertEqual(client.status.auth, AuthState.ACCOUNT_REQUIRED)
         discovery = provider.discover_accounts()
         self.assertEqual(discovery["permissionScope"], "SCOPE_VIEW")
+        self.assertNotIn("accessToken", discovery)
+        proof = provider.discover_accounts(include_token=True)
+        self.assertEqual(proof["accessToken"], "SERVER_ECHO_TOKEN")
+        proof["accessToken"] = "caller-change"
+        self.assertEqual(provider.discover_accounts(include_token=True)["accessToken"], "SERVER_ECHO_TOKEN")
+        self.assertNotIn("SERVER_ECHO_TOKEN", str(provider.discover_accounts()))
         self.assertEqual(discovery["records"][0]["account_id"], 7)
         self.assertEqual(discovery["records"][0]["environment"], "DEMO")
         self.assertEqual(discovery["records"][0]["trader_login"], 1234)

@@ -86,6 +86,11 @@ def _scope_set(values: Sequence[str] | Set[str]) -> frozenset[str]:
     return result
 
 
+def _oauth_scope_set(values: Sequence[str] | Set[str]) -> frozenset[str]:
+    scopes = _scope_set(values)
+    return frozenset({"accounts", "trading"}) if scopes == frozenset({"trading"}) else scopes
+
+
 def _is_loopback_redirect(uri: str) -> bool:
     parsed = urlparse(uri)
     return (
@@ -209,9 +214,9 @@ class OAuthTokenPayload:
             parsed_scopes = None
             if raw_scopes is not None:
                 if isinstance(raw_scopes, str):
-                    parsed_scopes = _scope_set(raw_scopes.replace(",", " ").split())
+                    parsed_scopes = _oauth_scope_set(raw_scopes.replace(",", " ").split())
                 else:
-                    parsed_scopes = _scope_set(raw_scopes)
+                    parsed_scopes = _oauth_scope_set(raw_scopes)
             return cls(
                 access_token=str(access) if access is not None else "",
                 refresh_token=(str(refresh) if refresh is not None else None),
@@ -219,8 +224,77 @@ class OAuthTokenPayload:
                 token_type=str(token_type),
                 scopes=parsed_scopes,
             )
-        except (TypeError, ValueError) as exc:
-            raise ActivationError("respuesta OAuth incompleta") from exc
+        except (TypeError, ValueError):
+            raise ActivationError("respuesta OAuth incompleta") from None
+
+
+_DEMO_SERVER_ENDPOINTS = frozenset({"demo.ctraderapi.com:5035", "demo.ctraderapi.com:5036"})
+
+
+def validate_demo_server_endpoint(value: str) -> str:
+    endpoint = str(value).strip().lower()
+    if endpoint not in _DEMO_SERVER_ENDPOINTS:
+        raise RealAccountForbidden("el endpoint de activación no es DEMO")
+    return endpoint
+
+
+@dataclasses.dataclass(frozen=True, slots=True, repr=False)
+class OAuthTokenCandidate:
+    """In-memory token bound to one OAuth endpoint, ref and next generation."""
+
+    payload: OAuthTokenPayload = dataclasses.field(repr=False)
+    token_ref: str
+    token_url: str
+    store_generation: int
+    server_endpoint: str = ""
+    connection_generation: int = 0
+    token_fingerprint: str = dataclasses.field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.payload, OAuthTokenPayload):
+            raise ActivationError("candidate OAuth inválido")
+        if not _TOKEN_REF.fullmatch(str(self.token_ref).strip()):
+            raise ActivationError("token_ref de candidate inválido")
+        parsed = urlparse(str(self.token_url).strip())
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ActivationError("token_url del candidate no es HTTPS base")
+        if isinstance(self.store_generation, bool) or int(self.store_generation) < 1:
+            raise ActivationError("store_generation de candidate inválida")
+        object.__setattr__(self, "token_ref", str(self.token_ref).strip())
+        object.__setattr__(self, "token_url", str(self.token_url).strip())
+        object.__setattr__(self, "store_generation", int(self.store_generation))
+        endpoint = str(self.server_endpoint).strip()
+        if endpoint:
+            endpoint = validate_demo_server_endpoint(endpoint)
+        object.__setattr__(self, "server_endpoint", endpoint)
+        if isinstance(self.connection_generation, bool) or int(self.connection_generation) < 0:
+            raise ActivationError("connection_generation de candidate inválida")
+        object.__setattr__(self, "connection_generation", int(self.connection_generation))
+        object.__setattr__(self, "token_fingerprint", hashlib.sha256(self.payload.access_token.encode()).hexdigest())
+
+    @property
+    def access_token(self) -> str:
+        return self.payload.access_token
+
+    def bind_connection(self, generation: int) -> OAuthTokenCandidate:
+        if isinstance(generation, bool) or int(generation) < 1:
+            raise ActivationError("connection_generation inválida")
+        return dataclasses.replace(self, connection_generation=int(generation))
+
+    def __repr__(self) -> str:
+        return (
+            f"OAuthTokenCandidate(token_ref={self.token_ref!r}, store_generation={self.store_generation}, "
+            f"connection_generation={self.connection_generation}, secrets='REDACTED')"
+        )
+
+    __str__ = __repr__
 
 
 def build_authorization_url(
@@ -355,8 +429,8 @@ def _safe_token_request(
         raise ActivationError("intercambio OAuth requiere un transporte explícito")
     try:
         response = requester(app.token_url, dict(params), timeout)
-    except Exception as exc:
-        raise ActivationError("falló la solicitud OAuth; revise conectividad y estado de la aplicación") from exc
+    except Exception:
+        raise ActivationError("falló la solicitud OAuth; revise conectividad y estado de la aplicación") from None
     return OAuthTokenPayload.from_response(cast(Mapping[str, Any], response))
 
 
@@ -540,6 +614,343 @@ class BrokerAccount:
             "label": self.label,
             "permissions": sorted(self.permissions),
         }
+
+
+# These are the exact values documented by Spotware for
+# ProtoOAGetAccountListByAccessTokenRes.permissionScope.  Do not replace this
+# map with substring matching: a requested OAuth scope is not evidence that the
+# server granted it.
+_PERMISSION_SCOPE_VALUES = {
+    0: "SCOPE_VIEW",
+    1: "SCOPE_TRADE",
+}
+_PERMISSION_SCOPE_SCOPES = {
+    "SCOPE_VIEW": frozenset({"accounts"}),
+    "SCOPE_TRADE": frozenset({"accounts", "trading"}),
+}
+
+
+def _permission_scope_name(value: Any) -> str:
+    """Resolve only the official cTrader permission-scope enum values."""
+
+    named = getattr(value, "name", None)
+    if named is not None:
+        value = named
+    if isinstance(value, bool) or value is None:
+        raise ActivationError("permissionScope cTrader ausente o inválido")
+    if isinstance(value, int):
+        name = _PERMISSION_SCOPE_VALUES.get(value)
+        if name is None:
+            raise ActivationError("permissionScope cTrader desconocido")
+        return name
+    text = str(value).strip().upper()
+    if text.isdigit():
+        name = _PERMISSION_SCOPE_VALUES.get(int(text))
+        if name is None:
+            raise ActivationError("permissionScope cTrader desconocido")
+        return name
+    if text not in _PERMISSION_SCOPE_SCOPES:
+        raise ActivationError("permissionScope cTrader desconocido")
+    return text
+
+
+def scopes_from_permission_scope(value: Any) -> frozenset[str]:
+    """Map server-observed ``permissionScope`` to the exact granted scopes."""
+
+    return _PERMISSION_SCOPE_SCOPES[_permission_scope_name(value)]
+
+
+def _validate_binding_fields(
+    *,
+    token_fingerprint: str,
+    token_ref: str,
+    token_url: str,
+    store_generation: int,
+    server_endpoint: str,
+    connection_generation: int,
+) -> None:
+    fields = (
+        str(token_fingerprint),
+        str(token_ref),
+        str(token_url),
+        int(store_generation),
+        str(server_endpoint),
+        int(connection_generation),
+    )
+    if not any(fields):
+        return
+    if not all(fields):
+        raise ActivationError("evidencia de token incompleta")
+    if len(fields[0]) != 64 or any(char not in "0123456789abcdef" for char in fields[0].lower()):
+        raise ActivationError("fingerprint de token inválido")
+    parsed = urlparse(fields[2])
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ActivationError("endpoint de evidencia no es HTTPS base")
+    if fields[3] < 1 or fields[5] < 1:
+        raise ActivationError("generation de evidencia inválida")
+    validate_demo_server_endpoint(fields[4])
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class VerifiedDemoAuthorization:
+    """Server proof that the OAuth grant exposes DEMO accounts only."""
+
+    authorized_account_ids: tuple[str, ...]
+    environment: str
+    permission_scope: str
+    granted_scopes: frozenset[str]
+    token_fingerprint: str = ""
+    token_ref: str = ""
+    token_url: str = ""
+    store_generation: int = 0
+    server_endpoint: str = ""
+    connection_generation: int = 0
+
+    def __post_init__(self) -> None:
+        account_ids = tuple(str(item).strip() for item in self.authorized_account_ids if str(item).strip())
+        if not account_ids or len(set(account_ids)) != len(account_ids):
+            raise ActivationError("la evidencia DEMO requiere cuentas autorizadas únicas")
+        environment = str(self.environment).strip().upper()
+        if environment != "DEMO":
+            raise RealAccountForbidden("la evidencia de activación debe ser exclusivamente DEMO")
+        scope_name = _permission_scope_name(self.permission_scope)
+        scopes = _scope_set(self.granted_scopes)
+        if scopes != _PERMISSION_SCOPE_SCOPES[scope_name]:
+            raise ActivationError("scopes no coinciden con permissionScope observado")
+        object.__setattr__(self, "authorized_account_ids", account_ids)
+        object.__setattr__(self, "environment", environment)
+        object.__setattr__(self, "permission_scope", scope_name)
+        object.__setattr__(self, "granted_scopes", scopes)
+        _validate_binding_fields(
+            token_fingerprint=self.token_fingerprint,
+            token_ref=self.token_ref,
+            token_url=self.token_url,
+            store_generation=self.store_generation,
+            server_endpoint=self.server_endpoint,
+            connection_generation=self.connection_generation,
+        )
+        object.__setattr__(self, "token_ref", str(self.token_ref).strip())
+        object.__setattr__(self, "token_url", str(self.token_url).strip())
+        object.__setattr__(self, "store_generation", int(self.store_generation))
+        object.__setattr__(self, "server_endpoint", str(self.server_endpoint).strip())
+
+    def redacted(self) -> dict[str, Any]:
+        return {
+            "authorized_account_ids": [redact_identifier(item) for item in self.authorized_account_ids],
+            "environment": self.environment,
+            "permission_scope": self.permission_scope,
+            "granted_scopes": sorted(self.granted_scopes),
+            "token_bound": bool(self.token_fingerprint),
+            "source": "ProtoOAGetAccountListByAccessTokenRes.permissionScope",
+        }
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class VerifiedAccountAuthorization:
+    """Server evidence required before persisting an OAuth token.
+
+    The evidence must come from ``ProtoOAGetAccountListByAccessTokenRes`` (or
+    the lossless normalized mapping produced from it).  It is deliberately
+    separate from an OAuth request, login page, or requested scope.
+    """
+
+    selected_account_id: str
+    environment: str
+    permission_scope: str
+    granted_scopes: frozenset[str]
+    token_fingerprint: str = ""
+    token_ref: str = ""
+    token_url: str = ""
+    store_generation: int = 0
+    server_endpoint: str = ""
+    connection_generation: int = 0
+
+    def __post_init__(self) -> None:
+        account_id = str(self.selected_account_id).strip()
+        if not account_id:
+            raise ActivationError("la evidencia DEMO requiere account_id")
+        environment = str(self.environment).strip().upper()
+        if environment != "DEMO":
+            raise RealAccountForbidden("la evidencia de activación debe ser una cuenta DEMO")
+        scope_name = _permission_scope_name(self.permission_scope)
+        scopes = _scope_set(self.granted_scopes)
+        if scopes != _PERMISSION_SCOPE_SCOPES[scope_name]:
+            raise ActivationError("scopes no coinciden con permissionScope observado")
+        object.__setattr__(self, "selected_account_id", account_id)
+        object.__setattr__(self, "environment", environment)
+        object.__setattr__(self, "permission_scope", scope_name)
+        object.__setattr__(self, "granted_scopes", scopes)
+        _validate_binding_fields(
+            token_fingerprint=self.token_fingerprint,
+            token_ref=self.token_ref,
+            token_url=self.token_url,
+            store_generation=self.store_generation,
+            server_endpoint=self.server_endpoint,
+            connection_generation=self.connection_generation,
+        )
+        object.__setattr__(self, "token_ref", str(self.token_ref).strip())
+        object.__setattr__(self, "token_url", str(self.token_url).strip())
+        object.__setattr__(self, "store_generation", int(self.store_generation))
+        object.__setattr__(self, "server_endpoint", str(self.server_endpoint).strip())
+
+    def redacted(self) -> dict[str, Any]:
+        return {
+            "selected_account_id": redact_identifier(self.selected_account_id),
+            "environment": self.environment,
+            "permission_scope": self.permission_scope,
+            "granted_scopes": sorted(self.granted_scopes),
+            "token_bound": bool(self.token_fingerprint),
+            "source": "ProtoOAGetAccountListByAccessTokenRes.permissionScope",
+        }
+
+
+def verify_server_account_discovery(
+    discovery: Mapping[str, Any],
+    *,
+    requested_scopes: Sequence[str] | Set[str],
+    selected_account_id: str | int,
+    expected_environment: str = "DEMO",
+    token_candidate: OAuthTokenCandidate | None = None,
+) -> VerifiedAccountAuthorization:
+    """Verify permission and DEMO identity from a server account response.
+
+    ``permissionScope`` is the exact cTrader enum field.  Account metadata or
+    the OAuth request alone cannot satisfy this function.  The grant must be
+    limited to server-observed DEMO accounts before an account is selected.
+    """
+
+    demo = verify_server_demo_discovery(
+        discovery,
+        requested_scopes=requested_scopes,
+        expected_environment=expected_environment,
+        token_candidate=token_candidate,
+    )
+    selected_text = str(selected_account_id).strip()
+    if selected_text not in demo.authorized_account_ids:
+        raise ActivationError("la cuenta seleccionada no coincide exactamente con el descubrimiento")
+    return VerifiedAccountAuthorization(
+        selected_account_id=selected_text,
+        environment=demo.environment,
+        permission_scope=demo.permission_scope,
+        granted_scopes=demo.granted_scopes,
+        token_fingerprint=demo.token_fingerprint,
+        token_ref=demo.token_ref,
+        token_url=demo.token_url,
+        store_generation=demo.store_generation,
+        server_endpoint=demo.server_endpoint,
+        connection_generation=demo.connection_generation,
+    )
+
+
+def _normalized_server_accounts(discovery: Mapping[str, Any]) -> tuple[BrokerAccount, ...]:
+    raw_records = discovery.get("records", discovery.get("accounts", ()))
+    if isinstance(raw_records, (str, bytes, Mapping)):
+        raw_records = (raw_records,)
+    try:
+        records = tuple(raw_records)
+    except TypeError as exc:
+        raise ActivationError("descubrimiento cTrader sin cuentas") from exc
+    normalized: list[BrokerAccount] = []
+    for item in records:
+        if isinstance(item, BrokerAccount):
+            normalized.append(item)
+        elif isinstance(item, Mapping):
+            normalized.append(BrokerAccount.from_mapping(item))
+        else:
+            raise ActivationError("registro de cuenta cTrader inválido")
+    if not normalized:
+        raise ActivationError("descubrimiento cTrader sin cuentas")
+    return tuple(normalized)
+
+
+def _verify_access_token_echo(discovery: Mapping[str, Any], candidate: OAuthTokenCandidate | None) -> None:
+    if candidate is None:
+        return
+    observed = discovery.get("accessToken", discovery.get("access_token"))
+    if not isinstance(observed, str) or not observed:
+        raise ActivationError("la respuesta de discovery no contiene accessToken observado")
+    if not secrets.compare_digest(observed, candidate.access_token):
+        raise ActivationError("el accessToken de discovery no corresponde al candidate")
+
+
+def verify_server_demo_discovery(
+    discovery: Mapping[str, Any],
+    *,
+    requested_scopes: Sequence[str] | Set[str],
+    expected_environment: str = "DEMO",
+    token_candidate: OAuthTokenCandidate | None = None,
+) -> VerifiedDemoAuthorization:
+    """Verify that the OAuth grant exposes only server-observed DEMO accounts."""
+
+    if not isinstance(discovery, Mapping):
+        raise ActivationError("descubrimiento cTrader inválido")
+    if str(expected_environment).strip().upper() != "DEMO":
+        raise RealAccountForbidden("la verificación sólo admite environment=DEMO")
+    requested = _scope_set(requested_scopes)
+    if not requested:
+        raise ActivationError("requested_scopes no puede estar vacío")
+    # cTrader's single ``trading`` OAuth value is full account+trading access;
+    # normalize it before comparing with the server enum.
+    if requested == frozenset({"trading"}):
+        requested = frozenset({"accounts", "trading"})
+    permission = discovery.get("permissionScope", discovery.get("permission_scope"))
+    granted = scopes_from_permission_scope(permission)
+    if granted != requested:
+        raise ActivationError("permissionScope observado no coincide con el alcance solicitado")
+    _verify_access_token_echo(discovery, token_candidate)
+    normalized = _normalized_server_accounts(discovery)
+    environments = {item.environment for item in normalized}
+    if "LIVE" in environments or "REAL" in environments:
+        raise RealAccountForbidden("el consentimiento OAuth incluye una cuenta REAL/LIVE")
+    if environments != {"DEMO"}:
+        raise ActivationError("el entorno de todas las cuentas autorizadas no está observado como DEMO")
+    return VerifiedDemoAuthorization(
+        authorized_account_ids=tuple(item.account_id for item in normalized),
+        environment="DEMO",
+        permission_scope=_permission_scope_name(permission),
+        granted_scopes=granted,
+        token_fingerprint=token_candidate.token_fingerprint if token_candidate else "",
+        token_ref=token_candidate.token_ref if token_candidate else "",
+        token_url=token_candidate.token_url if token_candidate else "",
+        store_generation=token_candidate.store_generation if token_candidate else 0,
+        server_endpoint=token_candidate.server_endpoint if token_candidate else "",
+        connection_generation=token_candidate.connection_generation if token_candidate else 0,
+    )
+
+
+def _require_candidate_binding(
+    candidate: OAuthTokenCandidate,
+    verification: VerifiedDemoAuthorization | VerifiedAccountAuthorization,
+    *,
+    token_ref: str,
+    token_url: str,
+    server_endpoint: str,
+) -> None:
+    if not isinstance(candidate, OAuthTokenCandidate):
+        raise ActivationError("se requiere candidate OAuth no persistido")
+    if not verification.token_fingerprint:
+        raise ActivationError("la evidencia de permiso no está ligada al token")
+    if (
+        verification.token_fingerprint != candidate.token_fingerprint
+        or verification.token_ref != candidate.token_ref
+        or verification.token_url != candidate.token_url
+        or verification.store_generation != candidate.store_generation
+        or not candidate.server_endpoint
+        or not candidate.connection_generation
+        or verification.server_endpoint != candidate.server_endpoint
+        or verification.connection_generation != candidate.connection_generation
+        or candidate.token_ref != str(token_ref).strip()
+        or candidate.token_url != str(token_url).strip()
+        or candidate.server_endpoint != validate_demo_server_endpoint(server_endpoint)
+    ):
+        raise ActivationError("la evidencia de permiso no corresponde al token y generación activos")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1253,6 +1664,14 @@ class LoopbackOAuthAssistant:
         self.fixture_mode = bool(fixture_mode)
         self.code_ttl_seconds = int(code_ttl_seconds)
 
+    def _next_generation(self, token_ref: str) -> int:
+        if not _TOKEN_REF.fullmatch(str(token_ref).strip()):
+            raise ActivationError("token_ref inválido")
+        target = self.tokens.root / f"{str(token_ref).strip()}.json"
+        if not target.exists():
+            return 1
+        return self.tokens.metadata(str(token_ref).strip()).generation + 1
+
     def begin(
         self,
         *,
@@ -1386,18 +1805,25 @@ class LoopbackOAuthAssistant:
         self.attempts.save(updated)
         return updated
 
-    def exchange(
+    def exchange_unpersisted(
         self,
         attempt_id: str,
         *,
+        token_ref: str,
+        server_endpoint: str = "",
         client_id: str,
         client_secret: str,
-        token_ref: str,
-        observed_scopes: Sequence[str] | Set[str] | None = None,
         requester: Any,
         now: datetime | None = None,
         timeout: float = 10.0,
-    ) -> TokenMetadata:
+    ) -> OAuthTokenCandidate:
+        """Exchange the callback code without persisting an unverified token.
+
+        The caller must use the returned token immediately to obtain the
+        server account response and then call :meth:`persist_verified_token`.
+        The payload is kept in memory only; its repr/str is redacted.
+        """
+
         instant = _utc(now or datetime.now(UTC))
         attempt = self.attempts.load(attempt_id)
         if attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
@@ -1408,9 +1834,6 @@ class LoopbackOAuthAssistant:
             seconds=self.code_ttl_seconds
         ):
             raise ActivationError("el código OAuth caducó; inicia un intento nuevo")
-        scopes = _scope_set(observed_scopes) if observed_scopes is not None else None
-        if scopes is not None and not attempt.requested_scopes.issubset(scopes):
-            raise ActivationError("los scopes observados no cubren los solicitados")
         payload = exchange_authorization_code(
             self.app,
             client_id=client_id,
@@ -1419,11 +1842,37 @@ class LoopbackOAuthAssistant:
             requester=requester,
             timeout=timeout,
         )
-        if payload.scopes is not None:
-            if scopes is not None and not payload.scopes.issubset(scopes):
-                raise ActivationError("los scopes declarados por OAuth no coinciden con los observados")
-            scopes = payload.scopes
-        if scopes is None or not attempt.requested_scopes.issubset(scopes):
+        return OAuthTokenCandidate(
+            payload=payload,
+            token_ref=token_ref,
+            token_url=self.app.token_url,
+            store_generation=self._next_generation(token_ref),
+            server_endpoint=server_endpoint,
+        )
+
+    def _persist_payload(
+        self,
+        attempt_id: str,
+        *,
+        token_ref: str,
+        candidate: OAuthTokenCandidate,
+        observed_scopes: Sequence[str] | Set[str],
+        now: datetime,
+    ) -> TokenMetadata:
+        """Persist a payload after a caller supplied observed scopes."""
+
+        attempt = self.attempts.load(attempt_id)
+        if attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
+            raise ActivationError("el intento no está listo para persistencia")
+        if candidate.token_ref != str(token_ref).strip() or candidate.token_url != self.app.token_url:
+            raise ActivationError("candidate OAuth no corresponde al destino de persistencia")
+        if candidate.store_generation != self._next_generation(token_ref):
+            raise ActivationError("store_generation OAuth cambió antes de persistir")
+        payload = candidate.payload
+        scopes = _scope_set(observed_scopes)
+        if payload.scopes is not None and payload.scopes != scopes:
+            raise ActivationError("los scopes del token no coinciden con la evidencia observada")
+        if not attempt.requested_scopes.issubset(scopes):
             raise ActivationError("los scopes observados no cubren los solicitados")
         if payload.refresh_token is None:
             raise ActivationError("el proveedor no devolvió refresh_token; no se persistió el intercambio")
@@ -1432,8 +1881,8 @@ class LoopbackOAuthAssistant:
             access_token=payload.access_token,
             refresh_token=payload.refresh_token,
             granted_scopes=scopes,
-            expires_at=instant + timedelta(seconds=payload.expires_in),
-            now=instant,
+            expires_at=now + timedelta(seconds=payload.expires_in),
+            now=now,
             fixture_payload=self.fixture_mode,
         )
         self.attempts.save(
@@ -1446,6 +1895,173 @@ class LoopbackOAuthAssistant:
         )
         return metadata
 
+    def persist_verified_token(
+        self,
+        attempt_id: str,
+        *,
+        token_ref: str,
+        candidate: OAuthTokenCandidate,
+        verification: VerifiedDemoAuthorization | VerifiedAccountAuthorization,
+        server_endpoint: str,
+        now: datetime | None = None,
+    ) -> TokenMetadata:
+        """Persist a token only after exact server DEMO/scope verification."""
+
+        instant = _utc(now or datetime.now(UTC))
+        attempt = self.attempts.load(attempt_id)
+        if attempt.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
+            raise ActivationError("el intento no está listo para persistencia")
+        # The authorization code was already exchanged by exchange_unpersisted;
+        # do not reapply its one-minute lifetime to the in-memory access token.
+        if not isinstance(verification, (VerifiedDemoAuthorization, VerifiedAccountAuthorization)):
+            raise ActivationError("se requiere evidencia de cuentas DEMO del servidor")
+        _require_candidate_binding(
+            candidate,
+            verification,
+            token_ref=token_ref,
+            token_url=self.app.token_url,
+            server_endpoint=server_endpoint,
+        )
+        if not attempt.requested_scopes.issubset(verification.granted_scopes):
+            raise ActivationError("la evidencia de permiso no cubre los scopes solicitados")
+        return self._persist_payload(
+            attempt_id,
+            token_ref=token_ref,
+            candidate=candidate,
+            observed_scopes=verification.granted_scopes,
+            now=instant,
+        )
+
+    def refresh_unpersisted(
+        self,
+        token_ref: str,
+        *,
+        server_endpoint: str = "",
+        client_id: str,
+        client_secret: str,
+        requester: Any,
+        timeout: float = 10.0,
+    ) -> OAuthTokenCandidate:
+        """Rotate access credentials in memory without writing an unverified token."""
+
+        lease = self.tokens.read(token_ref)
+        if not lease.refresh_token:
+            raise ActivationError("el sobre activo no contiene refresh_token")
+        payload = refresh_access_token(
+            self.app,
+            client_id=client_id,
+            client_secret=client_secret,
+            refresh_token=lease.refresh_token,
+            requester=requester,
+            timeout=timeout,
+        )
+        return OAuthTokenCandidate(
+            payload=payload,
+            token_ref=token_ref,
+            token_url=self.app.token_url,
+            store_generation=lease.metadata.generation + 1,
+            server_endpoint=server_endpoint,
+        )
+
+    def _rotate_payload(
+        self,
+        token_ref: str,
+        *,
+        candidate: OAuthTokenCandidate,
+        observed_scopes: Sequence[str] | Set[str],
+        now: datetime,
+    ) -> TokenMetadata:
+        if candidate.token_ref != str(token_ref).strip() or candidate.token_url != self.app.token_url:
+            raise ActivationError("candidate OAuth no corresponde al destino de rotación")
+        if candidate.store_generation != self._next_generation(token_ref):
+            raise ActivationError("store_generation OAuth cambió antes de rotar")
+        payload = candidate.payload
+        scopes = _scope_set(observed_scopes)
+        if payload.scopes is not None and payload.scopes != scopes:
+            raise ActivationError("los scopes del token no coinciden con la evidencia observada")
+        if payload.refresh_token is None:
+            raise ActivationError("refresh sin token de rotación; se conserva intacto el sobre previo")
+        return self.tokens.rotate(
+            token_ref,
+            access_token=payload.access_token,
+            refresh_token=payload.refresh_token,
+            granted_scopes=scopes,
+            expires_at=now + timedelta(seconds=payload.expires_in),
+            now=now,
+            fixture_payload=self.fixture_mode,
+        )
+
+    def persist_verified_refresh(
+        self,
+        token_ref: str,
+        *,
+        candidate: OAuthTokenCandidate,
+        verification: VerifiedDemoAuthorization | VerifiedAccountAuthorization,
+        server_endpoint: str,
+        now: datetime | None = None,
+    ) -> TokenMetadata:
+        """Persist a refreshed token only after a fresh server DEMO probe."""
+
+        if not isinstance(verification, (VerifiedDemoAuthorization, VerifiedAccountAuthorization)):
+            raise ActivationError("se requiere evidencia de cuentas DEMO del servidor")
+        _require_candidate_binding(
+            candidate,
+            verification,
+            token_ref=token_ref,
+            token_url=self.app.token_url,
+            server_endpoint=server_endpoint,
+        )
+        instant = _utc(now or datetime.now(UTC))
+        return self._rotate_payload(
+            token_ref,
+            candidate=candidate,
+            observed_scopes=verification.granted_scopes,
+            now=instant,
+        )
+
+    def exchange(
+        self,
+        attempt_id: str,
+        *,
+        client_id: str,
+        client_secret: str,
+        token_ref: str,
+        observed_scopes: Sequence[str] | Set[str] | None = None,
+        requester: Any,
+        now: datetime | None = None,
+        timeout: float = 10.0,
+    ) -> TokenMetadata:
+        if not self.fixture_mode:
+            raise ActivationError("exchange legado sólo está permitido en stores fixture aislados")
+        instant = _utc(now or datetime.now(UTC))
+        attempt = self.attempts.load(attempt_id)
+        scopes = _scope_set(observed_scopes) if observed_scopes is not None else None
+        if scopes is not None and not attempt.requested_scopes.issubset(scopes):
+            raise ActivationError("los scopes observados no cubren los solicitados")
+        candidate = self.exchange_unpersisted(
+            attempt_id,
+            token_ref=token_ref,
+            client_id=client_id,
+            client_secret=client_secret,
+            requester=requester,
+            now=instant,
+            timeout=timeout,
+        )
+        scopes = scopes if scopes is not None else candidate.payload.scopes
+        if scopes is None:
+            raise ActivationError("requiere permissionScope observado por la API antes de persistir")
+        if candidate.payload.scopes is not None and _scope_set(scopes) != candidate.payload.scopes:
+            raise ActivationError("los scopes declarados por OAuth no coinciden con los observados")
+        if not attempt.requested_scopes.issubset(_scope_set(scopes)):
+            raise ActivationError("los scopes observados no cubren los solicitados")
+        return self._persist_payload(
+            attempt_id,
+            token_ref=token_ref,
+            candidate=candidate,
+            observed_scopes=scopes,
+            now=instant,
+        )
+
     def refresh(
         self,
         token_ref: str,
@@ -1457,6 +2073,8 @@ class LoopbackOAuthAssistant:
         now: datetime | None = None,
         timeout: float = 10.0,
     ) -> TokenMetadata:
+        if not self.fixture_mode:
+            raise ActivationError("refresh legado sólo está permitido en stores fixture aislados")
         instant = _utc(now or datetime.now(UTC))
         lease = self.tokens.read(token_ref)
         if not lease.refresh_token:
@@ -1616,6 +2234,9 @@ __all__ = [
     "ActivationStatus",
     "BrokerAccount",
     "OAuthAppConfig",
+    "OAuthTokenCandidate",
+    "VerifiedDemoAuthorization",
+    "VerifiedAccountAuthorization",
     "RealAccountForbidden",
     "SecureTokenStore",
     "SUPPORTED_SCOPES",
@@ -1625,4 +2246,8 @@ __all__ = [
     "evaluate_activation",
     "redact_identifier",
     "select_demo_account",
+    "scopes_from_permission_scope",
+    "validate_demo_server_endpoint",
+    "verify_server_demo_discovery",
+    "verify_server_account_discovery",
 ]

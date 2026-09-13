@@ -234,6 +234,13 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     q.add_argument("--fixture", action="store_true")
     q.add_argument("--network", action="store_true")
     q.add_argument("--report", type=Path)
+    q.add_argument(
+        "--capture",
+        "--capture-output",
+        dest="capture",
+        type=Path,
+        help="exporta histórico nativo como captura versionada; no incluye bid/ask ni fills",
+    )
     q.set_defaults(func=callbacks["ctrader_query"])
 
     q = csubs.add_parser("demo", help="ejecutor DEMO local: requiere --activate explícito y nunca usa servidor")
@@ -255,6 +262,11 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     p.add_argument("--db", type=Path)
     p.add_argument("--max-candles", type=int, default=256)
     p.add_argument("--chunk-size", type=int, default=128, help="cantidad de sobres por commit incremental")
+    p.add_argument(
+        "--price-base",
+        choices=["native", "bid", "ask", "mid"],
+        help="base explícita para la captura; use native con exportaciones históricas de trendbars",
+    )
     p.add_argument(
         "--order",
         choices=["as_observed", "market_time_corrected"],

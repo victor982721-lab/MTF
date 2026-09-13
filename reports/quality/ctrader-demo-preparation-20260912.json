@@ -1,0 +1,94 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-09-12T17:39:02-06:00",
+  "scope": "Preparación local cTrader DEMO, lectura de cuentas propias e histórico nativo; sin OAuth real ni órdenes",
+  "identity": {
+    "baseline_commit": "ea288085690ccfc617e6bcd5ba44f20925633f8f",
+    "branch": "main",
+    "head": "42fcc8ecd13b6c9cb20bd41cb571e5c6925faac2",
+    "head_tree_hash": "06d73c94a3a84d674d2d5760bfc49d1a51f0b091",
+    "main": "42fcc8ecd13b6c9cb20bd41cb571e5c6925faac2",
+    "origin_main": "42fcc8ecd13b6c9cb20bd41cb571e5c6925faac2",
+    "scope_identity_sha256": "54d20b77471019677416bea2dd85618e994a63b6b65763a2024d92add1642f3a",
+    "source_content_sha256_after": "97626d23568efea68fb1330fab1d615bffd642b1347f636e0773a9a7cdf666e2",
+    "source_content_sha256_before": "97626d23568efea68fb1330fab1d615bffd642b1347f636e0773a9a7cdf666e2"
+  },
+  "executable_inputs": {
+    "count": 140,
+    "sha256": "3a7bf24a9701883e95d43cad65ea9e51e81811f1137f3993af710612aaca2a6c",
+    "unchanged_after_validation": true
+  },
+  "validation": {
+    "quality_gate_ok": true,
+    "static_checks": {
+      "architecture": true,
+      "compilation": true,
+      "document_links": true,
+      "git_cached_diff_check": true,
+      "git_diff_check": true,
+      "mypy": true,
+      "pip_check": true,
+      "pyright": true,
+      "ruff": true,
+      "ruff_format": true,
+      "scope": true
+    },
+    "tests": {
+      "consistent": true,
+      "discovered": 422,
+      "executed": 422,
+      "expected_failures": 0,
+      "failed": 0,
+      "passed": 422,
+      "skipped": 0,
+      "tests_run": 422,
+      "unexpected_successes": 0
+    },
+    "coverage": {
+      "branch_percent": 61.605,
+      "covered_branches": 4215,
+      "covered_lines": 17497,
+      "error": null,
+      "line_percent": 80.005,
+      "num_branches": 6842,
+      "num_statements": 21870,
+      "ok": true,
+      "threshold_percent": 60.0
+    },
+    "network_attempts": 0,
+    "guard_evidence": {
+      "runtime_log": true,
+      "write_log": true
+    },
+    "source_integrity": {
+      "added": [],
+      "after_content_sha256": "97626d23568efea68fb1330fab1d615bffd642b1347f636e0773a9a7cdf666e2",
+      "before_content_sha256": "97626d23568efea68fb1330fab1d615bffd642b1347f636e0773a9a7cdf666e2",
+      "changed": [],
+      "ok": true,
+      "removed": []
+    },
+    "independent_review": "Sin hallazgos bloqueantes en integración estática; más regresiones de forma/tipado validadas en gate final"
+  },
+  "external_state": {
+    "registration": "SUBMITTED",
+    "approved": false,
+    "mtf_api_connected": false,
+    "oauth_completed": false,
+    "credentials_stored_locally": false,
+    "orders_sent": false,
+    "real_accounts_modified": false
+  },
+  "delivery": {
+    "local_changes": true,
+    "committed": false,
+    "published": false,
+    "release_installed": false
+  },
+  "resolved_diagnostics": [
+    "Perfil import-smoke incorrecto para focales con fixtures: se usó después el perfil suite canónico aislado, sin cambiar barreras del proyecto.",
+    "Primer global: 421 pruebas pasaron; dos errores de tipado corregidos.",
+    "Segundo global: 422 pruebas pasaron; formato de una regresión corregido.",
+    "Global final completo: todos los controles requeridos aprobados desde los bytes finales."
+  ]
+}

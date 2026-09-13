@@ -278,6 +278,29 @@ es sólo inspección y no puede autorizar un fill observado. Los reportes son
 compactos; `--include-payloads` sólo debe usarse cuando se necesite revisar
 payloads sintéticos completos.
 
+Después de una consulta cTrader DEMO autorizada, `query --capture` puede
+exportar las respuestas históricas como envelopes de captura versionados:
+
+```bash
+./mtf-lab ctrader query \
+  --config config/ctrader_query.toml \
+  --network \
+  --capture runtime/ctrader-history.jsonl \
+  --report runtime/ctrader-query.json
+./mtf-lab cfd-paper \
+  --config config/ctrader_pipeline_fixture.toml \
+  --input runtime/ctrader-history.jsonl \
+  --price-base native \
+  --order market_time_corrected \
+  --db runtime/ctrader-native-paper.sqlite3 \
+  --report runtime/ctrader-native-paper.json
+```
+
+La exportación conserva payload, procedencia y barras nativas; no inventa
+bid/ask ni fills. `--price-base native` es obligatorio para analizar esa
+captura histórica: el resultado puede contener señales MTF, pero no fills
+PAPER porque las respuestas históricas no son cotizaciones bid/ask.
+
 ### UI fixture
 
 La UI es de sólo lectura y no recalcula reglas financieras. Genera primero la

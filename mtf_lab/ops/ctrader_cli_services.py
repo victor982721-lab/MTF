@@ -14,8 +14,6 @@ import socket
 import ssl
 import sys
 import tempfile
-import urllib.parse
-import urllib.request
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -28,10 +26,35 @@ from .application_services import (
     CommandResult,
     _config_for,
 )
+from .ctrader_oauth_http import request_token
 
 
 def _json_error(payload: Mapping[str, Any], *, code: int = 2) -> CommandResult:
     return CommandResult.json(dict(payload), code=code, stderr=False)
+
+
+_SAFE_ERROR_CODES = frozenset(
+    {
+        "ActivationError",
+        "UnsafeTokenStore",
+        "RealAccountForbidden",
+        "OAuthHTTPError",
+        "CTraderError",
+        "CTraderConfigurationError",
+        "CTraderDependencyError",
+        "CTraderTransportError",
+        "CTraderProtocolError",
+        "CTraderAuthError",
+        "CTraderRequestTimeout",
+        "CTraderRequestCancelled",
+        "CTraderDataError",
+    }
+)
+
+
+def _safe_error_code(exc: BaseException) -> str:
+    name = type(exc).__name__
+    return name if name in _SAFE_ERROR_CODES else "OPERATION_FAILED"
 
 
 def _ctrader_activation_payload(config: Any) -> dict[str, Any]:
@@ -295,26 +318,9 @@ def _fixture_oauth_response(*, refreshed: bool = False) -> dict[str, Any]:
 
 
 def _oauth_http_request(url: str, params: Mapping[str, str], timeout: float) -> Mapping[str, Any]:
-    """POST form data to a validated OAuth endpoint without echoing secrets."""
-    encoded = urllib.parse.urlencode(dict(params)).encode("utf-8")
-    request = urllib.request.Request(
-        str(url),
-        data=encoded,
-        method="POST",
-        headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=float(timeout)) as response:
-            body = response.read(128 * 1024)
-    except Exception as exc:
-        raise RuntimeError("solicitud OAuth falló; revise conectividad y estado de la aplicación") from exc
-    try:
-        parsed = json.loads(body.decode("utf-8"))
-    except Exception as exc:
-        raise RuntimeError("respuesta OAuth no es JSON válido") from exc
-    if not isinstance(parsed, Mapping):
-        raise RuntimeError("respuesta OAuth no es un objeto")
-    return parsed
+    """Use the documented cTrader OAuth HTTP shape without echoing secrets."""
+
+    return request_token(str(url), params, float(timeout))
 
 
 def _read_callback_input(args: argparse.Namespace) -> str:
@@ -348,6 +354,73 @@ def _read_callback_input(args: argparse.Namespace) -> str:
     return value
 
 
+def _write_text_atomic(path: str | Path, text: str, *, overwrite: bool = True) -> Path:
+    """Write a private CLI artifact atomically beside its final path."""
+
+    target = Path(path).expanduser()
+    if not overwrite and (target.exists() or target.is_symlink()):
+        raise FileExistsError(f"el artefacto ya existe: {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            temporary.write(text)
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        assert temporary_path is not None
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, target)
+        os.chmod(target, 0o600)
+    finally:
+        if temporary_path is not None:
+            with suppress(FileNotFoundError):
+                temporary_path.unlink()
+    return target
+
+
+def _export_history_capture(
+    path: str | Path,
+    context: QueryContext,
+    provider: Any,
+    history: Any,
+    *,
+    catalog: Any,
+    observed: Mapping[str, Any],
+) -> dict[str, Any]:
+    from .ctrader_history_export import export_history_capture
+
+    provider_config = getattr(provider, "config", None)
+    host = str(getattr(provider_config, "host", "demo.ctraderapi.com"))
+    port = int(getattr(provider_config, "port", 5035))
+    return export_history_capture(
+        path,
+        history=history,
+        spec=provider.spec,
+        catalog=catalog,
+        environment=context.profile.environment,
+        account_id=context.profile.account_id,
+        endpoint=f"{host}:{port}",
+        permission_scope=(
+            observed.get("permissionScope", observed.get("permission_scope")) if isinstance(observed, Mapping) else None
+        ),
+        discovery=observed if isinstance(observed, Mapping) else None,
+    )
+
+
+def _write_query_report(path: str | Path, payload: Mapping[str, Any]) -> Path:
+    return _write_text_atomic(
+        path, json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n"
+    )
+
+
 @dataclass
 class QueryContext:
     config: Any
@@ -357,6 +430,7 @@ class QueryContext:
     app: Any
     lease: Any
     client_secret: str
+    capture_path: Path | None = None
     sequence: list[str] = field(default_factory=list)
     network_performed: bool = False
 
@@ -400,7 +474,7 @@ class CTraderCliService:
                 "state": "INVALID_PROFILE",
                 "ready": False,
                 "next_action": "Corrija el perfil cTrader; no se modificó nada.",
-                "error": type(exc).__name__,
+                "error": _safe_error_code(exc),
             }
             output["diagnostic_ok"] = False
         if getattr(args, "network", False):
@@ -414,7 +488,7 @@ class CTraderCliService:
                     "requested": True,
                     "state": "ERROR",
                     "account_authorized": False,
-                    "error": f"{type(exc).__name__}: {exc}",
+                    "error": _safe_error_code(exc),
                     "note": "No se probó OAuth ni una cuenta; revise DNS/TCP/TLS.",
                 }
                 output["diagnostic_ok"] = False
@@ -554,10 +628,10 @@ class CTraderCliService:
             return _json_error(
                 {
                     "ok": False,
-                    "state": type(exc).__name__,
+                    "state": _safe_error_code(exc),
                     "network_performed": False,
                     "next_action": "No se recibió un callback válido; reanude el intento sin exponer el código.",
-                    "error": str(exc),
+                    "error": _safe_error_code(exc),
                 }
             )
         return CommandResult.json(
@@ -617,7 +691,90 @@ class CTraderCliService:
                 "gateway_adapter_used": False,
             }
         output["fixture_store_removed"] = not root.exists()
-        return CommandResult.json(output)
+        return CommandResult.json(output, code=0 if output.get("ok") else 2, stderr=not bool(output.get("ok")))
+
+    @staticmethod
+    def _verify_unpersisted_demo(
+        config: Any,
+        profile: Any,
+        app: Any,
+        payload: Any,
+        client_secret: str,
+        requested_scopes: Any,
+    ) -> Any:
+        """Probe account permission with the raw token before persistence."""
+
+        from ..data.ctrader import CTraderProvider
+        from .ctrader_activation import (
+            ActivationError,
+            RealAccountForbidden,
+            validate_demo_server_endpoint,
+            verify_server_demo_discovery,
+        )
+
+        provider_config = _ctrader_config(config)
+        if str(provider_config.environment).upper() != "DEMO" or str(provider_config.host) != "demo.ctraderapi.com":
+            raise RealAccountForbidden("la sonda OAuth sólo admite demo.ctraderapi.com")
+        server_endpoint = validate_demo_server_endpoint(f"{provider_config.host}:{provider_config.port}")
+        if str(payload.server_endpoint) != server_endpoint:
+            raise ActivationError("candidate OAuth no corresponde al endpoint DEMO observado")
+        provider = CTraderProvider(provider_config)
+        try:
+            provider.connect()
+            connection_generation = int(getattr(getattr(provider, "status", None), "generation", 0) or 0)
+            if connection_generation < 1:
+                raise ActivationError("la sesión DEMO no emitió connection_generation observable")
+            candidate = payload.bind_connection(connection_generation)
+            provider.authenticate(
+                secret_provider=CTraderCliService._secret_provider(app, client_secret, []),
+                token_provider=lambda ref: candidate.access_token if ref == profile.token_ref else "",
+                authorize_selected=False,
+            )
+            observed = provider.discover_accounts(include_token=True)
+            verification = verify_server_demo_discovery(
+                observed,
+                requested_scopes=requested_scopes,
+                expected_environment="DEMO",
+                token_candidate=candidate,
+            )
+            return candidate, verification, observed
+        finally:
+            with suppress(Exception):
+                provider.close()
+
+    @staticmethod
+    def _verify_current_query_session(context: QueryContext, provider: Any, observed: Mapping[str, Any]) -> Any:
+        from .ctrader_activation import (
+            ActivationError,
+            OAuthTokenCandidate,
+            OAuthTokenPayload,
+            validate_demo_server_endpoint,
+            verify_server_demo_discovery,
+        )
+
+        endpoint = validate_demo_server_endpoint(f"{provider.config.host}:{provider.config.port}")
+        connection_generation = int(getattr(getattr(provider, "status", None), "generation", 0) or 0)
+        if connection_generation < 1:
+            raise ActivationError("la sesión DEMO no emitió connection_generation observable")
+        remaining = max(1, int((context.metadata.expires_at - datetime.now(UTC)).total_seconds()))
+        payload = OAuthTokenPayload(
+            access_token=context.lease.access_token,
+            expires_in=remaining,
+            scopes=context.metadata.granted_scopes,
+        )
+        candidate = OAuthTokenCandidate(
+            payload=payload,
+            token_ref=context.profile.token_ref,
+            token_url=context.app.token_url,
+            store_generation=context.metadata.generation,
+            server_endpoint=endpoint,
+        ).bind_connection(connection_generation)
+        return verify_server_demo_discovery(
+            observed,
+            requested_scopes=context.profile.required_scopes,
+            expected_environment="DEMO",
+            token_candidate=candidate,
+        )
 
     @staticmethod
     def _real_exchange(args: argparse.Namespace) -> CommandResult:
@@ -665,33 +822,58 @@ class CTraderCliService:
                 }
             )
         network_performed = False
+        raw_payload = None
         try:
             tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
             attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
             assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
+            provider_config = _ctrader_config(config)
+            server_endpoint = f"{provider_config.host}:{provider_config.port}"
             pending = attempts.load(args.attempt_id)
             if pending.phase is not OAuthAttemptPhase.CALLBACK_RECEIVED:
                 assistant.receive_callback(args.attempt_id, _read_callback_input(args))
             network_performed = True
-            metadata = assistant.exchange(
+            raw_payload = assistant.exchange_unpersisted(
                 args.attempt_id,
+                token_ref=profile.token_ref,
+                server_endpoint=server_endpoint,
                 client_id=client_id,
                 client_secret=client_secret,
-                token_ref=profile.token_ref,
-                observed_scopes=None,
                 requester=_oauth_http_request,
+            )
+            candidate, verification, observed = CTraderCliService._verify_unpersisted_demo(
+                config,
+                profile,
+                app,
+                raw_payload,
+                client_secret,
+                pending.requested_scopes,
+            )
+            discovery_path = _persist_discovery(
+                config,
+                token_ref=profile.token_ref,
+                observed=observed,
+                observed_at=datetime.now(UTC),
+            )
+            metadata = assistant.persist_verified_token(
+                args.attempt_id,
+                token_ref=profile.token_ref,
+                candidate=candidate,
+                verification=verification,
+                server_endpoint=server_endpoint,
             )
         except Exception as exc:
             return _json_error(
                 {
                     "ok": False,
-                    "state": type(exc).__name__,
+                    "state": _safe_error_code(exc),
                     "network_performed": network_performed,
                     "next_action": "No se guardó un token incompleto; revise callback, aplicación y código vigente.",
-                    "error": str(exc),
+                    "error": _safe_error_code(exc),
                 }
             )
         finally:
+            raw_payload = None
             client_secret = ""
         return CommandResult.json(
             {
@@ -699,7 +881,10 @@ class CTraderCliService:
                 "network_performed": network_performed,
                 "token": metadata.to_dict(),
                 "secrets": "REDACTED",
-                "next_action": "Descubra las cuentas autorizadas antes de seleccionar una cuenta DEMO.",
+                "permission": verification.redacted(),
+                "discovery_path": str(discovery_path),
+                "accounts": [account.redacted() for account in CTraderCliService._accounts(observed)],
+                "next_action": "Seleccione explícitamente una cuenta DEMO observada antes de consultar mercado.",
             }
         )
 
@@ -779,33 +964,64 @@ class CTraderCliService:
                 }
             )
         network_performed = False
+        raw_payload = None
         try:
             tokens = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT)
             attempts = OAuthAttemptStore(profile.token_store_dir, project_root=PROJECT_ROOT)
             assistant = LoopbackOAuthAssistant(app, attempts=attempts, tokens=tokens)
-            existing = tokens.read(profile.token_ref)
+            provider_config = _ctrader_config(config)
+            server_endpoint = f"{provider_config.host}:{provider_config.port}"
             network_performed = True
-            metadata = assistant.refresh(
+            raw_payload = assistant.refresh_unpersisted(
                 profile.token_ref,
+                server_endpoint=server_endpoint,
                 client_id=client_id,
                 client_secret=client_secret,
-                observed_scopes=existing.metadata.granted_scopes,
                 requester=_oauth_http_request,
+            )
+            candidate, verification, observed = CTraderCliService._verify_unpersisted_demo(
+                config,
+                profile,
+                app,
+                raw_payload,
+                client_secret,
+                profile.required_scopes,
+            )
+            discovery_path = _persist_discovery(
+                config,
+                token_ref=profile.token_ref,
+                observed=observed,
+                observed_at=datetime.now(UTC),
+            )
+            metadata = assistant.persist_verified_refresh(
+                profile.token_ref,
+                candidate=candidate,
+                verification=verification,
+                server_endpoint=server_endpoint,
             )
         except Exception as exc:
             return _json_error(
                 {
                     "ok": False,
-                    "state": type(exc).__name__,
+                    "state": _safe_error_code(exc),
                     "network_performed": network_performed,
                     "next_action": "No se modificó el token previo; revise conectividad y la autorización vigente.",
-                    "error": str(exc),
+                    "error": _safe_error_code(exc),
                 }
             )
         finally:
+            raw_payload = None
             client_secret = ""
         return CommandResult.json(
-            {"ok": True, "network_performed": network_performed, "token": metadata.to_dict(), "secrets": "REDACTED"}
+            {
+                "ok": True,
+                "network_performed": network_performed,
+                "token": metadata.to_dict(),
+                "permission": verification.redacted(),
+                "discovery_path": str(discovery_path),
+                "accounts": [account.redacted() for account in CTraderCliService._accounts(observed)],
+                "secrets": "REDACTED",
+            }
         )
 
     def _selection_data(self, args: argparse.Namespace, config: Any) -> tuple[Any, Any, list[Any]] | CommandResult:
@@ -870,7 +1086,7 @@ class CTraderCliService:
                     "state": "ACCOUNT_DISCOVERY_INVALID",
                     "network_performed": False,
                     "next_action": "La respuesta no contiene cuentas observadas válidas; repita discovery desde el servidor.",
-                    "error": type(exc).__name__,
+                    "error": _safe_error_code(exc),
                 }
             )
 
@@ -899,7 +1115,7 @@ class CTraderCliService:
                     "state": "SELECTION_PERSISTENCE_FAILED",
                     "network_performed": False,
                     "next_action": "No se modificó TOML; corrija el store externo y repita la selección.",
-                    "error": type(exc).__name__,
+                    "error": _safe_error_code(exc),
                 }
             )
         output["selection_persisted"] = True
@@ -918,7 +1134,26 @@ class CTraderCliService:
     def query(self, args: argparse.Namespace) -> CommandResult:
         if getattr(args, "fixture", False):
             return self.fixture(args)
-        return self._query_network(args) if getattr(args, "network", False) else self._query_preflight(args)
+        result = self._query_network(args) if getattr(args, "network", False) else self._query_preflight(args)
+        report_path = getattr(args, "report", None)
+        if report_path is None or not isinstance(result.payload, Mapping):
+            return result
+        output = dict(result.payload)
+        target = Path(report_path).expanduser()
+        output["report_path"] = str(target)
+        try:
+            _write_query_report(target, output)
+        except Exception as exc:
+            return _json_error(
+                {
+                    "ok": False,
+                    "state": "REPORT_WRITE_FAILED",
+                    "network_performed": bool(output.get("network_performed", False)),
+                    "error": _safe_error_code(exc),
+                    "next_action": "Elija una ruta de reporte escribible; no se modificó la sesión cTrader.",
+                }
+            )
+        return CommandResult.json(output, code=result.code, stderr=result.stderr)
 
     def _query_preflight(self, args: argparse.Namespace) -> CommandResult:
         from .ctrader_commands import status_command
@@ -984,7 +1219,17 @@ class CTraderCliService:
                 }
             )
         lease = SecureTokenStore(profile.token_store_dir, project_root=PROJECT_ROOT).read(profile.token_ref)
-        return QueryContext(config, metadata, status_before, profile, app, lease, client_secret)
+        capture_path = getattr(args, "capture", None)
+        return QueryContext(
+            config,
+            metadata,
+            status_before,
+            profile,
+            app,
+            lease,
+            client_secret,
+            Path(capture_path).expanduser() if capture_path is not None else None,
+        )
 
     def _connect_and_discover(self, context: QueryContext) -> tuple[Any, Any]:
         from ..data.ctrader import CTraderProvider
@@ -998,12 +1243,13 @@ class CTraderCliService:
             token_provider=self._token_provider(context.profile, context.lease, context.sequence),
             authorize_selected=False,
         )
-        return provider, provider.discover_accounts()
+        return provider, provider.discover_accounts(include_token=True)
 
     def _query_observation(self, context: QueryContext, provider: Any, observed: Any) -> CommandResult:
         from .ctrader_commands import status_command
 
         accounts = self._accounts(observed)
+        fresh_verification = self._verify_current_query_session(context, provider, observed)
         discovery_path = self._try_persist_discovery(context.config, context.profile, observed)
         status_after = status_command(
             _activation_payload_with_selection(context.config),
@@ -1019,10 +1265,13 @@ class CTraderCliService:
                 "sequence": context.sequence,
                 "state": status_after["status"]["state"],
                 "accounts": [account.redacted() for account in accounts],
-                "permission_scope": observed.get("permissionScope") if isinstance(observed, Mapping) else None,
+                "permission_scope": fresh_verification.permission_scope,
                 "discovery_path": str(discovery_path) if discovery_path else None,
                 "activation": status_after,
-                "status": provider.status.to_dict(),
+                "status": {
+                    key: provider.status.to_dict().get(key)
+                    for key in ("connection", "dependency", "auth", "generation", "needs_reconciliation")
+                },
                 "next_action": status_after["status"]["next_action"],
             }
             return CommandResult.json(output, code=2)
@@ -1037,12 +1286,13 @@ class CTraderCliService:
             "M1", count=int(context.config.ctrader.get("historical_count", 500)), max_pages=20
         )
         context.sequence.append("history")
+        capture_info: Mapping[str, Any] | None = None
         output = {
             "ok": True,
             "network_performed": True,
             "sequence": context.sequence,
             "accounts": [account.redacted() for account in accounts],
-            "permission_scope": observed.get("permissionScope") if isinstance(observed, Mapping) else None,
+            "permission_scope": fresh_verification.permission_scope,
             "discovery_path": str(discovery_path) if discovery_path else None,
             "activation": status_after,
             "catalog": catalog.to_dict() if hasattr(catalog, "to_dict") else catalog,
@@ -1050,7 +1300,41 @@ class CTraderCliService:
             "status": provider.status.to_dict(),
             "next_action": "Cuenta DEMO observada, catálogo e histórico obtenidos; las cotizaciones siguen siendo de consulta.",
         }
-        return CommandResult.json(output)
+        if context.capture_path is not None:
+            try:
+                capture_info = _export_history_capture(
+                    context.capture_path,
+                    context,
+                    provider,
+                    history,
+                    catalog=catalog,
+                    observed=observed,
+                )
+            except Exception as exc:
+                issues = list(getattr(exc, "issues", ()))
+                return _json_error(
+                    {
+                        "ok": False,
+                        "network_performed": True,
+                        "sequence": context.sequence,
+                        "state": _safe_error_code(exc),
+                        "complete": False,
+                        "has_more": bool(getattr(history, "has_more", False)),
+                        "issues": issues or list(getattr(history, "issues", ())),
+                        "error": _safe_error_code(exc),
+                        "next_action": "No se exportó una captura utilizable; conserve la consulta y repita discovery/histórico.",
+                    }
+                )
+        if capture_info is not None:
+            output["capture"] = dict(capture_info)
+            output["ok"] = bool(capture_info.get("complete", False))
+            output["next_action"] = (
+                "Captura histórica nativa exportada; pásela a cfd-paper con --price-base native "
+                "--order market_time_corrected. No contiene bid/ask ni fills PAPER."
+                if output["ok"]
+                else "Captura histórica PARTIAL; no se autoriza pasarla a cfd-paper."
+            )
+        return CommandResult.json(output, code=0 if output.get("ok") else 2, stderr=not bool(output.get("ok")))
 
     def _query_network(self, args: argparse.Namespace) -> CommandResult:
         context = self._prepare_query(args)
@@ -1061,17 +1345,14 @@ class CTraderCliService:
             provider, observed = self._connect_and_discover(context)
             return self._query_observation(context, provider, observed)
         except Exception as exc:
-            provider_status = provider.status.to_dict() if provider is not None else {}
-            action = provider_status.get("action") if isinstance(provider_status, Mapping) else None
             return _json_error(
                 {
                     "ok": False,
                     "network_performed": context.network_performed,
                     "sequence": context.sequence,
-                    "state": type(exc).__name__,
-                    "status": provider_status,
-                    "next_action": action
-                    or "Conecte, autentique la aplicación y descubra cuentas antes de seleccionar una cuenta DEMO.",
+                    "state": _safe_error_code(exc),
+                    "error": _safe_error_code(exc),
+                    "next_action": "Conecte, autentique la aplicación y descubra cuentas antes de seleccionar una cuenta DEMO.",
                 }
             )
         finally:

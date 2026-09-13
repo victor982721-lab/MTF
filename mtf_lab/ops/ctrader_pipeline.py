@@ -198,9 +198,16 @@ class CTraderPipeline:
         coverage: CaptureCoverage | None = None,
         provenance: Mapping[str, Any] | None = None,
         resume: bool = True,
+        order: CaptureOrder = "as_observed",
     ) -> CTraderPaperSession:
         return CTraderPaperSession(
-            self, dataset_id=dataset_id, session_id=session_id, coverage=coverage, provenance=provenance, resume=resume
+            self,
+            dataset_id=dataset_id,
+            session_id=session_id,
+            coverage=coverage,
+            provenance=provenance,
+            resume=resume,
+            order=order,
         )
 
     def run(
@@ -215,23 +222,35 @@ class CTraderPipeline:
         chunk_size: int = 128,
         order: CaptureOrder = "as_observed",
     ) -> CTraderPipelineResult:
-        if order != "as_observed":
-            raise CTraderPipelineError("market-time corrected captures are inspection-only, not as-observed PAPER")
+        if order not in {"as_observed", "market_time_corrected"}:
+            raise CTraderPipelineError(f"unsupported replay order: {order}")
+        if order == "market_time_corrected" and self.analysis_basis != "native":
+            raise CTraderPipelineError(
+                "market-time corrected historical replay requires price_base='native'; "
+                "bid/ask PAPER cannot be reconstructed from trendbars"
+            )
         if isinstance(capture, CTraderCapture):
-            return self._run_capture(capture, session_id, capture_complete, finish_session, chunk_size)
+            return self._run_capture(capture, session_id, capture_complete, finish_session, chunk_size, order)
         with CaptureIndex(capture_envelopes(capture, received_at=received_at), mode=order) as index:
             identity = capture_identity(index.capture_hash, self.spec, quote_basis)
             last = index.last_envelope
             coverage = _coverage_from_dict(last.payload) if last and last.message_class is MessageClass.END else None
-            session = self.open_session(dataset_id=identity, session_id=session_id, coverage=coverage)
+            session = self.open_session(dataset_id=identity, session_id=session_id, coverage=coverage, order=order)
             session.ingest_many(index.iter_after(session.cursor), chunk_size=chunk_size)
             return session.finish(capture_complete=capture_complete, finish_session=finish_session)
 
     def _run_capture(
-        self, capture: CTraderCapture, session_id: str | None, complete: bool, finish: bool, chunk_size: int
+        self,
+        capture: CTraderCapture,
+        session_id: str | None,
+        complete: bool,
+        finish: bool,
+        chunk_size: int,
+        order: CaptureOrder,
     ) -> CTraderPipelineResult:
-        if capture.provenance.get("order", "as_observed") != "as_observed":
-            raise CTraderPipelineError("corrected market-time captures cannot be relabeled as as-observed PAPER")
+        capture_order = capture.provenance.get("order", "as_observed")
+        if capture_order != order:
+            raise CTraderPipelineError("capture provenance order does not match the requested replay order")
         if capture.provenance.get("instrument") != self.spec.symbol:
             raise CTraderPipelineError("capture/spec instrument mismatch")
         if not capture.envelopes:
@@ -241,8 +260,9 @@ class CTraderPipeline:
             session_id=session_id,
             coverage=capture.coverage,
             provenance=capture.provenance,
+            order=order,
         )
-        with CaptureIndex(capture.envelopes) as index:
+        with CaptureIndex(capture.envelopes, mode=order) as index:
             session.ingest_many(index.iter_after(session.cursor), chunk_size=chunk_size)
         result = session.finish(capture_complete=complete, finish_session=finish)
         return replace(result, capture=replace(result.capture, payloads=capture.payloads, envelopes=capture.envelopes))
@@ -266,12 +286,14 @@ class CTraderPaperSession:
         coverage: CaptureCoverage | None,
         provenance: Mapping[str, Any] | None,
         resume: bool,
+        order: CaptureOrder,
     ) -> None:
         self.pipeline = pipeline
         self.store = pipeline.store
         self.dataset_id = dataset_id
         self.stream_identity_hash = fingerprint({"stream_ref": dataset_id, "capture_contract": 1})
-        self.input_prefix_hash = fingerprint({"capture_version": 1, "order": "as_observed"})
+        self.order: CaptureOrder = order
+        self.input_prefix_hash = fingerprint({"capture_version": 1, "order": order})
         self.coverage = replace(
             coverage or CaptureCoverage(), observed_start=None, observed_end=None, availability_known=False
         )
@@ -281,7 +303,7 @@ class CTraderPaperSession:
                 "provider": "ctrader-open-api",
                 "instrument": pipeline.spec.symbol,
                 "mode": pipeline.mode,
-                "order": "as_observed",
+                "order": order,
             }
         )
         self.cursor: tuple[str, int] | None = None
@@ -399,7 +421,7 @@ class CTraderPaperSession:
             raise
 
     def _ingest(self, envelope: CaptureEnvelope) -> None:
-        key = ordering_key(envelope)
+        key = ordering_key(envelope, self.order)
         inserted = self.store.save_capture_envelope(self.session_id, envelope.to_dict())
         if self.cursor is not None and key <= self.cursor:
             if inserted:
@@ -638,6 +660,7 @@ class CTraderPaperSession:
             "schema_version": PAPER_SESSION_VERSION,
             "product": PAPER_PRODUCT,
             "dataset_id": self.dataset_id,
+            "order": self.order,
             "input_prefix_hash": self.input_prefix_hash,
             "max_ingest_sequence": self.max_ingest_sequence,
             "cfd_signals": [item.to_dict() for item in self._cfd_signals],
@@ -666,6 +689,7 @@ class CTraderPaperSession:
                 "schema_version",
                 "product",
                 "dataset_id",
+                "order",
                 "input_prefix_hash",
                 "max_ingest_sequence",
                 "cfd_signals",
@@ -725,6 +749,8 @@ class CTraderPaperSession:
             raise CTraderPipelineError("PAPER checkpoint integrity mismatch")
         if state.get("schema_version") != PAPER_SESSION_VERSION or state.get("product") != PAPER_PRODUCT:
             raise CTraderPipelineError("unsupported PAPER session snapshot contract")
+        if state.get("order", "as_observed") != self.order:
+            raise CTraderPipelineError("snapshot replay order mismatch")
         if state.get("dataset_id") != self.dataset_id or state.get("config_hash") != fingerprint(
             self.pipeline.session_config()
         ):
