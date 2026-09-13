@@ -716,7 +716,7 @@ class CTraderProvider:
                 },
             )
         ]
-        for timeframe in tuple(timeframes or self.config.timeframes):
+        for timeframe in tuple(self.config.timeframes if timeframes is None else timeframes):
             period = _period_code(timeframe)
             responses.append(
                 self.client.request(

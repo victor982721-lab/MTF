@@ -168,6 +168,13 @@ def cmd_ctrader_query(args: argparse.Namespace) -> int:
     return _emit(CTraderCliService().query(args))
 
 
+def cmd_ctrader_watch(args: argparse.Namespace) -> int:
+    from .ctrader_cli_services import CTraderCliService
+    from .ctrader_watch_cli import CTraderWatchCliService
+
+    return _emit(CTraderWatchCliService(CTraderCliService()).run(args))
+
+
 def cmd_ctrader_demo(args: argparse.Namespace) -> int:
     from .ctrader_cli_services import CTraderCliService
 
@@ -188,6 +195,7 @@ __all__ += [
     "cmd_ctrader_token_refresh",
     "cmd_ctrader_select",
     "cmd_ctrader_query",
+    "cmd_ctrader_watch",
     "cmd_ctrader_demo",
     "cmd_ctrader_fixture",
 ]

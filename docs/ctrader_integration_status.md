@@ -50,8 +50,21 @@ archivos privados y publicación sin reemplazo. La reproducción exige
 `price_base=native` y `order=market_time_corrected`, conserva la recepción original
 y no fabrica bid/ask ni fills. Las capturas parciales, vacías o incompatibles no
 se presentan como análisis completo. La ruta y los comandos están en el README.
-Esto no habilita un stream continuo ni operaciones DEMO: **la conexión real de
-MTF por Open API sigue pendiente de aprobación y OAuth**.
+Esa preparación de 422 pruebas no incluía aún el runner continuo. **La conexión
+real de MTF por Open API sigue pendiente de aprobación y OAuth**.
+
+### Runner y observabilidad offline — 2026-09-12
+
+La base anterior se consolidó en el commit local `9d066c6`, sin publicarla ni
+instalar una release. El alcance posterior añade `ctrader watch`, composición
+de lectura del proveedor existente con runtime MTF, límites, checkpoint
+atómico, reanudación exacta y parada cooperativa. La UI separa procedencia,
+frescura y estado de feed, y hace visibles los fallos de refresco. El
+[manual de uso](ctrader_watch.md) documenta fixtures y límites de recuperación.
+
+Este alcance no usa OAuth, cuentas ni conexión real al bróker. La ruta externa
+se conserva para activación posterior; el compromiso de conexión DEMO no se
+cierra con una validación sintética.
 
 
 ### IMPLEMENTADO Y COMPROBADO OFFLINE
@@ -97,18 +110,18 @@ historia y respuestas de aceptación/rechazo. Un timeout ambiguo permanece
 La ejecución externa permanece deshabilitada y **REAL/LIVE se rechaza
 fail-closed**. Ningún fixture prueba que una orden haya llegado a un servidor.
 
-### INTERVENCIÓN DEL USUARIO PENDIENTE
+### ETAPAS EXTERNAS PENDIENTES
 
 Los únicos bloqueos externos de esta fase son:
 
-1. Registrar y obtener la aprobación de una aplicación cTrader.
+1. Obtener la aprobación de Spotware para la aplicación ya registrada.
 2. Disponer fuera del repositorio de `CTRADER_CLIENT_ID` y
    `CTRADER_CLIENT_SECRET`.
 3. Completar OAuth y consentir el alcance requerido.
 4. Descubrir las cuentas realmente autorizadas y seleccionar explícitamente una
    cuenta **DEMO**.
-5. Verificar catálogo, condiciones del bróker y la ruta autorizada contra el
-   servidor **DEMO**, incluida ejecución y reconciliación.
+5. Verificar catálogo, condiciones del bróker y la ruta de lectura autorizada
+   contra el servidor **DEMO**; cualquier ejecución exige otro alcance expreso.
 6. Confirmar las condiciones contractuales de Pepperstone aplicables a México,
    almacenamiento/redistribución de datos y costes; no están verificadas.
 

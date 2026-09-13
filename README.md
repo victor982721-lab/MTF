@@ -34,6 +34,10 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 - Instalación editable y wheel, imports desde cwd ajeno, configuraciones TOML
   empaquetadas, lanzadores, fixtures CFD/cTrader, UI de sólo lectura, suite
   offline, lint/formato/tipos y auditoría arquitectónica.
+- Runner `ctrader watch` de lectura, acotado y reanudable, con fixture sobre el
+  mismo proveedor y panel de procedencia/frescura/estado/errores. El
+  [manual de observación continua](docs/ctrader_watch.md) separa el uso offline
+  de la activación externa todavía pendiente.
 
 El alcance vigente de calidad está en [calidad global](docs/refactor_quality.md).
 La evidencia histórica de integración offline está en el [informe de ingeniería](reports/engineering/latest/engineering_consolidation.md),
@@ -54,17 +58,18 @@ comisiones, conversiones, fills, posiciones, historia ni respuestas de un
 servidor cTrader real. Un timeout ambiguo permanece `UNKNOWN` y exige
 reconciliación; no autoriza reintentar una orden.
 
-### INTERVENCIÓN DEL USUARIO PENDIENTE
+### ETAPAS EXTERNAS PENDIENTES
 
 La lista queda limitada a hechos, decisiones y autorizaciones externas:
 
-1. Registrar/aprobar la aplicación cTrader.
+1. Obtener aprobación de Spotware: la aplicación ya fue registrada y la última
+   observación documentada es `Submitted`, no `Approved`.
 2. Disponer fuera del repositorio de `CTRADER_CLIENT_ID` y
    `CTRADER_CLIENT_SECRET`.
 3. Completar OAuth y consentir el alcance aplicable.
 4. Descubrir cuentas autorizadas y seleccionar explícitamente una cuenta DEMO.
-5. Verificar con el servidor DEMO el catálogo, condiciones, permisos, ruta de
-   ejecución y reconciliación.
+5. Verificar con el servidor DEMO el catálogo, condiciones, permisos y la ruta
+   de lectura autorizada. Cualquier ejecución requiere otro alcance expreso.
 6. Confirmar las condiciones contractuales de Pepperstone relevantes para
    México, almacenamiento/redistribución de datos y costes.
 
@@ -198,7 +203,7 @@ mtf-lab backtest --db PATH [--session ID] [--partition all|exploration|evaluatio
 mtf-lab report [--db PATH] [--latest] [--output PATH]
 mtf-lab watch [--instrument BTC/USD] [--duration SECONDS] [--max-events N]
 mtf-lab ui [--host 127.0.0.1] [--port 8765] [--db PATH] [--duration SECONDS]
-mtf-lab ctrader {doctor,query,fixture,...}
+mtf-lab ctrader {doctor,query,watch,fixture,...}
 mtf-lab cfd-paper [--config CONFIG] [--db PATH] [--chunk-size N]
 ```
 

@@ -241,7 +241,7 @@ def _ctrader_config(config: Any) -> Any:
     values = {key: value for key, value in raw.items() if key in allowed}
     values.setdefault("environment", "demo")
     values.setdefault("symbol", config.instrument)
-    values.setdefault("quote_basis", "mid")
+    values.setdefault("quote_basis", config.price_base if config.price_base in {"mid", "bid", "ask"} else "mid")
     values.setdefault("timeframes", tuple(tf.name for tf in config.timeframes))
     if values.get("account_id") in {"", None}:
         values.pop("account_id", None)
@@ -1233,19 +1233,34 @@ class CTraderCliService:
 
     def _connect_and_discover(self, context: QueryContext) -> tuple[Any, Any]:
         from ..data.ctrader import CTraderProvider
+        from .ctrader_activation import RealAccountForbidden, validate_demo_server_endpoint
 
-        provider = CTraderProvider(_ctrader_config(context.config))
-        provider.connect()
-        context.network_performed = True
-        context.sequence.append("connect")
-        provider.authenticate(
-            secret_provider=self._secret_provider(context.app, context.client_secret, context.sequence),
-            token_provider=self._token_provider(context.profile, context.lease, context.sequence),
-            authorize_selected=False,
-        )
-        return provider, provider.discover_accounts(include_token=True)
+        provider_config = _ctrader_config(context.config)
+        if str(provider_config.environment).upper() != "DEMO":
+            raise RealAccountForbidden("la consulta sólo admite entorno DEMO")
+        # Pin the destination before constructing a transport or resolving any
+        # secret. A DEMO label alone does not constrain configurable host/port.
+        validate_demo_server_endpoint(f"{provider_config.host}:{provider_config.port}")
+        provider = CTraderProvider(provider_config)
+        try:
+            context.network_performed = True
+            provider.connect()
+            context.sequence.append("connect")
+            provider.authenticate(
+                secret_provider=self._secret_provider(context.app, context.client_secret, context.sequence),
+                token_provider=self._token_provider(context.profile, context.lease, context.sequence),
+                authorize_selected=False,
+            )
+            return provider, provider.discover_accounts(include_token=True)
+        except BaseException:
+            # A failure before returning must not strand an already connected
+            # provider where the caller has no handle to close it.
+            provider.close()
+            raise
 
-    def _query_observation(self, context: QueryContext, provider: Any, observed: Any) -> CommandResult:
+    def _authorize_readonly_provider(
+        self, context: QueryContext, provider: Any, observed: Any
+    ) -> tuple[Any, dict[str, Any]] | CommandResult:
         from .ctrader_commands import status_command
 
         accounts = self._accounts(observed)
@@ -1282,12 +1297,7 @@ class CTraderCliService:
         context.sequence.append("account_auth")
         catalog = provider.resolve_symbol()
         context.sequence.append("catalog")
-        history = provider.fetch_history(
-            "M1", count=int(context.config.ctrader.get("historical_count", 500)), max_pages=20
-        )
-        context.sequence.append("history")
-        capture_info: Mapping[str, Any] | None = None
-        output = {
+        return catalog, {
             "ok": True,
             "network_performed": True,
             "sequence": context.sequence,
@@ -1296,6 +1306,20 @@ class CTraderCliService:
             "discovery_path": str(discovery_path) if discovery_path else None,
             "activation": status_after,
             "catalog": catalog.to_dict() if hasattr(catalog, "to_dict") else catalog,
+        }
+
+    def _query_observation(self, context: QueryContext, provider: Any, observed: Any) -> CommandResult:
+        ready = self._authorize_readonly_provider(context, provider, observed)
+        if isinstance(ready, CommandResult):
+            return ready
+        catalog, observation = ready
+        history = provider.fetch_history(
+            "M1", count=int(context.config.ctrader.get("historical_count", 500)), max_pages=20
+        )
+        context.sequence.append("history")
+        capture_info: Mapping[str, Any] | None = None
+        output = {
+            **observation,
             "history": history.to_dict() if hasattr(history, "to_dict") else history,
             "status": provider.status.to_dict(),
             "next_action": "Cuenta DEMO observada, catálogo e histórico obtenidos; las cotizaciones siguen siendo de consulta.",

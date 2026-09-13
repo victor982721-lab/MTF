@@ -34,6 +34,7 @@ def _default_handlers() -> dict[str, Handler]:
         cmd_ctrader_select,
         cmd_ctrader_token_exchange,
         cmd_ctrader_token_refresh,
+        cmd_ctrader_watch,
         cmd_demo,
         cmd_doctor,
         cmd_import,
@@ -59,6 +60,7 @@ def _default_handlers() -> dict[str, Handler]:
         "ctrader_token_exchange": cmd_ctrader_token_exchange,
         "ctrader_token_refresh": cmd_ctrader_token_refresh,
         "ctrader_query": cmd_ctrader_query,
+        "ctrader_watch": cmd_ctrader_watch,
         "ctrader_demo": cmd_ctrader_demo,
         "ctrader_fixture": cmd_ctrader_fixture,
         "cfd_paper": cmd_cfd_paper,
@@ -242,6 +244,28 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
         help="exporta histórico nativo como captura versionada; no incluye bid/ask ni fills",
     )
     q.set_defaults(func=callbacks["ctrader_query"])
+
+    q = csubs.add_parser("watch", help="observación continua cTrader de sólo lectura; nunca envía órdenes")
+    q.add_argument("--config", type=Path, default=_packaged_config_path("ctrader_query.toml"))
+    source = q.add_mutually_exclusive_group(required=True)
+    source.add_argument("--fixture", action="store_true", help="transportes y precios sintéticos, sin red")
+    source.add_argument("--network", action="store_true", help="sesión DEMO ya autorizada con scope accounts")
+    q.add_argument("--db", type=Path, required=True, help="base de salida explícita; no usa la DB predeterminada")
+    q.add_argument("--session", help="sesión existente; requiere --resume")
+    q.add_argument("--resume", action="store_true", help="restaura checkpoint; no presume continuidad del feed")
+    q.add_argument("--duration", type=float, default=30.0)
+    q.add_argument(
+        "--max-events",
+        "--max-messages",
+        dest="max_events",
+        type=int,
+        default=1000,
+        help="mensajes atómicos del stream por corrida, no velas ni ticks normalizados",
+    )
+    q.add_argument("--idle-timeout", type=float, default=5.0)
+    q.add_argument("--checkpoint-every", type=int, default=100)
+    q.add_argument("--report", type=Path)
+    q.set_defaults(func=callbacks["ctrader_watch"])
 
     q = csubs.add_parser("demo", help="ejecutor DEMO local: requiere --activate explícito y nunca usa servidor")
     q.add_argument("--activate", action="store_true")
