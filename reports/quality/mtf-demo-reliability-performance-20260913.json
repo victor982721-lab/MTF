@@ -1,0 +1,2056 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-09-13T01:24:19-06:00",
+  "validated_source_commit": "c1246cc173725e9dc22ae813e3f2f9b6f96bf5e6",
+  "validated_source_sha256": "0ae7135177b2530e0efbd23a69c331a1fda941ddac8c8676bd981a4611c05b81",
+  "input": {
+    "config_hash": "c1e71c30dddae6dfa72706f49a6dcc7a2954ed8182a8313e182634ddf7e7c580",
+    "config_path": "config/fixture_cfd.toml",
+    "coverage": {
+      "availability_known": true,
+      "continuity": "CONTINUOUS",
+      "coverage_satisfied": true,
+      "dataset_end_declared": true,
+      "observed_end": "2026-02-12T03:10:01.000000Z",
+      "observed_start": "2026-02-12T00:01:01.000000Z",
+      "requested_end": "2026-02-12T03:10:01.000000Z",
+      "requested_start": "2026-02-12T00:01:01.000000Z"
+    },
+    "envelope_count": 191,
+    "fixture": "synthetic_ctrader_payloads",
+    "frame_bytes": 12052,
+    "instrument": "EUR/USD",
+    "market_event_count": 190,
+    "mode": "REPLAY",
+    "seed": 42,
+    "sha256": "43ae5472990ac26213d57a67c18281992d4cb575f037f7024da00ca1fd63d8fc",
+    "timeframes": [
+      "M1",
+      "M5",
+      "M15"
+    ]
+  },
+  "codec": {
+    "available": true,
+    "backend": "bundled_official_generated",
+    "codec_backend": "bundled_official_generated",
+    "codec_operational": true,
+    "codec_state": "AVAILABLE",
+    "decoded_envelopes": 191,
+    "frame_count": 190,
+    "message": "",
+    "protobuf_implementation": "upb",
+    "protobuf_module": "google.protobuf",
+    "protobuf_state": "AVAILABLE",
+    "protobuf_version": "7.36.1",
+    "schema_revision": "openapi-proto-messages@91:017413087c1c23c1866bbf07ff24d56574047253",
+    "sdk_module": "ctrader_open_api",
+    "sdk_state": "MISSING",
+    "sdk_version": null,
+    "security_state": "PATCH_REQUIREMENT_SATISFIED",
+    "status": "available"
+  },
+  "decode": {
+    "decoded_input_hashes": {
+      "memory": "262d52d7c7537b23845d6b815e5b727d7b43334c5905c508165ea07e9ad26527",
+      "timing": "262d52d7c7537b23845d6b815e5b727d7b43334c5905c508165ea07e9ad26527"
+    },
+    "memory": {
+      "bytes_work_new": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "maxrss_bytes": {
+        "p50": 53645312.0,
+        "p95": 53704294.4,
+        "p99": 53709537.28
+      },
+      "maxrss_scope": "process_high_water_total",
+      "python_current_delta_bytes": {
+        "p50": 176460.0,
+        "p95": 233012.4,
+        "p99": 238039.28
+      },
+      "python_peak_delta_bytes": {
+        "p50": 180584.0,
+        "p95": 237151.7,
+        "p99": 242179.94
+      },
+      "sample_count": 2,
+      "sqlite_artifact_delta_bytes": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      },
+      "sqlite_artifact_size_bytes": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0
+      }
+    },
+    "memory_pass": "memory_with_tracemalloc",
+    "timing": {
+      "cpu_seconds": {
+        "p50": 0.017401292,
+        "p95": 0.0229053176,
+        "p99": 0.02339456432
+      },
+      "sample_count": 2,
+      "wall_seconds": {
+        "p50": 0.0174099065,
+        "p95": 0.02291497745,
+        "p99": 0.023404317089999998
+      }
+    },
+    "timing_pass": "speed_without_tracemalloc"
+  },
+  "measurement_contract": {
+    "maxrss_scope": "process_high_water_total",
+    "memory": {
+      "elapsed_is_speed_stat": false,
+      "tracemalloc": true
+    },
+    "timing": {
+      "elapsed_is_speed_stat": true,
+      "tracemalloc": false
+    }
+  },
+  "variants": {
+    "atomic_batch": {
+      "batch_size": 128,
+      "durable_hashes": [
+        "5faec4ed13e441b795af83e4fc1ad6ac521e4ae71cc7636869da27a34536f7ae"
+      ],
+      "functional_hashes": [
+        "2d6344e13d6c518b1d76fd4728181400aa0d87416aee338a0f50a13cccff2b29"
+      ],
+      "iterations": 3,
+      "mode": "public_ingest_many_one_atomic_batch_per_chunk",
+      "phases": {
+        "checkpoint": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 1704585.0,
+              "p95": 1704585.0,
+              "p99": 1704585.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 6761198.0,
+              "p95": 6761198.0,
+              "p99": 6761198.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.234861943,
+              "p95": 0.2349013333,
+              "p99": 0.23490483465999998
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.235717777,
+              "p95": 0.2423780344,
+              "p99": 0.24297005727999998
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "finish": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 1714445.0,
+              "p95": 1714452.2,
+              "p99": 1714452.84
+            },
+            "python_peak_delta_bytes": {
+              "p50": 8472828.0,
+              "p95": 8474954.7,
+              "p99": 8475143.74
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.609904822,
+              "p95": 0.6307526236000001,
+              "p99": 0.63260576152
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.610059731,
+              "p95": 0.6308333591,
+              "p99": 0.6326799038200001
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "ingest": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 11141712.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129921024.0,
+              "p99": 129921024.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 1228036.0,
+              "p95": 1675869.75,
+              "p99": 1675874.75
+            },
+            "python_peak_delta_bytes": {
+              "p50": 7391026.5,
+              "p95": 8647479.25,
+              "p99": 8647604.65
+            },
+            "sample_count": 6,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 6489528.0,
+              "p95": 9304368.0,
+              "p99": 9304368.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 11940808.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.5657024884999999,
+              "p95": 0.5819614715,
+              "p99": 0.5830516495
+            },
+            "sample_count": 6,
+            "wall_seconds": {
+              "p50": 0.5823876415,
+              "p95": 0.59222237825,
+              "p99": 0.5933062140500001
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_candles": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 444705.0,
+              "p95": 444705.0,
+              "p99": 444705.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 516030.0,
+              "p95": 516030.0,
+              "p99": 516030.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.002588849,
+              "p95": 0.0026316314000000003,
+              "p99": 0.00263543428
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.002591211,
+              "p95": 0.0026355261,
+              "p99": 0.00263946522
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_capture_envelopes": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 185123.0,
+              "p95": 185123.0,
+              "p99": 185123.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 190594.0,
+              "p95": 190594.0,
+              "p99": 190594.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.001432521,
+              "p95": 0.0014414669999999999,
+              "p99": 0.0014422622
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.001439267,
+              "p95": 0.0014445473000000001,
+              "p99": 0.00144501666
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_cfd_trades": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 47815.0,
+              "p95": 47815.0,
+              "p99": 47815.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 61446.0,
+              "p95": 61446.0,
+              "p99": 61446.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.000312407,
+              "p95": 0.00033271099999999997,
+              "p99": 0.00033451579999999997
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.000318192,
+              "p95": 0.00033962639999999996,
+              "p99": 0.00034153168
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_decisions": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 581640.0,
+              "p95": 581640.0,
+              "p99": 581640.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 705459.0,
+              "p95": 705459.0,
+              "p99": 705459.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.001368409,
+              "p95": 0.0018292837,
+              "p99": 0.0018702503400000001
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.001371592,
+              "p95": 0.0018367273,
+              "p99": 0.00187807266
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_events": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 772171.0,
+              "p95": 772171.0,
+              "p99": 772171.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 952162.0,
+              "p95": 952162.0,
+              "p99": 952162.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.001778426,
+              "p95": 0.0018778471999999998,
+              "p99": 0.0018866846399999998
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.001786234,
+              "p95": 0.0018864265,
+              "p99": 0.0018953325
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_indicators": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 463853.0,
+              "p95": 463853.0,
+              "p99": 463853.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 535210.0,
+              "p95": 535210.0,
+              "p99": 535210.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.00230073,
+              "p95": 0.0023458424999999996,
+              "p99": 0.0023498524999999997
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.00230752,
+              "p95": 0.0023490685,
+              "p99": 0.0023527617
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_signals": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 7730.0,
+              "p95": 7730.0,
+              "p99": 7730.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 10428.0,
+              "p95": 10428.0,
+              "p99": 10428.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.000121619,
+              "p95": 0.0001466147,
+              "p99": 0.00014883654000000002
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.000124455,
+              "p95": 0.0001531173,
+              "p99": 0.00015566506
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_snapshot": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 12979056.0,
+              "p95": 12979056.0,
+              "p99": 12979056.0
+            },
+            "maxrss_bytes": {
+              "p50": 128884736.0,
+              "p95": 129817395.2,
+              "p99": 129900298.24
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 753368.0,
+              "p95": 753392.3,
+              "p99": 753394.46
+            },
+            "python_peak_delta_bytes": {
+              "p50": 4791471.0,
+              "p95": 4791475.5,
+              "p99": 4791475.9
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 13778152.0,
+              "p95": 13778152.0,
+              "p99": 13778152.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.02605498,
+              "p95": 0.0262349674,
+              "p99": 0.02625096628
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.026058851,
+              "p95": 0.026268352999999998,
+              "p99": 0.0262869754
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        }
+      },
+      "query_hashes": [
+        "7e924be70f26fe150d4cf5ec2de41861c9ffe01dc203642937733f74de712e3f"
+      ]
+    },
+    "unbatched": {
+      "batch_size": 1,
+      "durable_hashes": [
+        "5faec4ed13e441b795af83e4fc1ad6ac521e4ae71cc7636869da27a34536f7ae"
+      ],
+      "functional_hashes": [
+        "2d6344e13d6c518b1d76fd4728181400aa0d87416aee338a0f50a13cccff2b29"
+      ],
+      "iterations": 3,
+      "mode": "public_ingest_one_atomic_batch_per_envelope",
+      "phases": {
+        "checkpoint": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15769944.0,
+              "p95": 15769944.0,
+              "p99": 15769944.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 1704589.0,
+              "p95": 1704589.0,
+              "p99": 1704589.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 6761202.0,
+              "p95": 6761202.0,
+              "p99": 6761202.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16569040.0,
+              "p95": 16569040.0,
+              "p99": 16569040.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.231857506,
+              "p95": 0.2420320312,
+              "p99": 0.24293643344000002
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.231887353,
+              "p95": 0.2420957209,
+              "p99": 0.24300313138000001
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "finish": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 1714747.0,
+              "p95": 1714801.9,
+              "p99": 1714806.78
+            },
+            "python_peak_delta_bytes": {
+              "p50": 8475492.0,
+              "p95": 8475492.9,
+              "p99": 8475492.98
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 8192.0,
+              "p95": 8192.0,
+              "p99": 8192.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.620237665,
+              "p95": 0.6221333242,
+              "p99": 0.62230182724
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.634495204,
+              "p95": 0.6346796545000001,
+              "p99": 0.6346960501000001
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "ingest": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 8165368.0,
+              "p95": 15059680.0,
+              "p99": 15536134.07999999
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 13186.0,
+              "p95": 24332.4,
+              "p99": 38544.039999999964
+            },
+            "python_peak_delta_bytes": {
+              "p50": 3856271.0,
+              "p95": 8008917.6,
+              "p99": 8441934.159999998
+            },
+            "sample_count": 573,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 366680.0,
+              "p99": 565095.3599999966
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 8964464.0,
+              "p95": 15858776.0,
+              "p99": 16335230.07999999
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.169037094,
+              "p95": 0.35240499799999997,
+              "p99": 0.3713232662
+            },
+            "sample_count": 573,
+            "wall_seconds": {
+              "p50": 0.174281501,
+              "p95": 0.36174068379999996,
+              "p99": 0.3782469629599999
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_candles": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 462577.0,
+              "p95": 462577.0,
+              "p99": 462577.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 533902.0,
+              "p95": 533902.0,
+              "p99": 533902.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.002595277,
+              "p95": 0.0026618419,
+              "p99": 0.00266775878
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.002602951,
+              "p95": 0.0026655568,
+              "p99": 0.0026711217600000003
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_capture_envelopes": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 184995.0,
+              "p95": 184995.0,
+              "p99": 184995.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 190466.0,
+              "p95": 190466.0,
+              "p99": 190466.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.001431786,
+              "p95": 0.0014424104999999998,
+              "p99": 0.0014433548999999999
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.001436965,
+              "p95": 0.0014494732,
+              "p99": 0.00145058504
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_cfd_trades": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 47815.0,
+              "p95": 47815.0,
+              "p99": 47815.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 61446.0,
+              "p95": 61446.0,
+              "p99": 61446.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.000311074,
+              "p95": 0.0003217138,
+              "p99": 0.00032265956
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.000313443,
+              "p95": 0.0003279006,
+              "p99": 0.00032918572
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_decisions": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 581632.0,
+              "p95": 581632.0,
+              "p99": 581632.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 705451.0,
+              "p95": 705451.0,
+              "p99": 705451.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.001369533,
+              "p95": 0.0013710909,
+              "p99": 0.00137122938
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.001372434,
+              "p95": 0.0013780895999999999,
+              "p99": 0.00137859232
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_events": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 772179.0,
+              "p95": 772179.0,
+              "p99": 772179.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 952170.0,
+              "p95": 952170.0,
+              "p99": 952170.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.001774763,
+              "p95": 0.0018265661,
+              "p99": 0.00183117082
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.001779112,
+              "p95": 0.0018372556,
+              "p99": 0.00184242392
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_indicators": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 463885.0,
+              "p95": 463885.0,
+              "p99": 463885.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 535242.0,
+              "p95": 535242.0,
+              "p99": 535242.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.002351966,
+              "p95": 0.0026908925,
+              "p99": 0.0027210193
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.002358509,
+              "p95": 0.0026990626999999997,
+              "p99": 0.00272933414
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_signals": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 7730.0,
+              "p95": 7730.0,
+              "p99": 7730.0
+            },
+            "python_peak_delta_bytes": {
+              "p50": 10428.0,
+              "p95": 10428.0,
+              "p99": 10428.0
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.000113364,
+              "p95": 0.0001153656,
+              "p99": 0.00011554352000000001
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.000120614,
+              "p95": 0.00012275060000000002,
+              "p99": 0.00012294052000000002
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        },
+        "query_snapshot": {
+          "memory": {
+            "bytes_work_new": {
+              "p50": 15778136.0,
+              "p95": 15778136.0,
+              "p99": 15778136.0
+            },
+            "maxrss_bytes": {
+              "p50": 131891200.0,
+              "p95": 131891200.0,
+              "p99": 131891200.0
+            },
+            "maxrss_scope": "process_high_water_total",
+            "python_current_delta_bytes": {
+              "p50": 735491.0,
+              "p95": 735491.9,
+              "p99": 735491.98
+            },
+            "python_peak_delta_bytes": {
+              "p50": 4773727.0,
+              "p95": 4773727.9,
+              "p99": 4773727.98
+            },
+            "sample_count": 3,
+            "sqlite_artifact_delta_bytes": {
+              "p50": 0.0,
+              "p95": 0.0,
+              "p99": 0.0
+            },
+            "sqlite_artifact_size_bytes": {
+              "p50": 16577232.0,
+              "p95": 16577232.0,
+              "p99": 16577232.0
+            }
+          },
+          "memory_pass": "memory_with_tracemalloc",
+          "timing": {
+            "cpu_seconds": {
+              "p50": 0.025580529,
+              "p95": 0.0255877722,
+              "p99": 0.025588416040000003
+            },
+            "sample_count": 3,
+            "wall_seconds": {
+              "p50": 0.025589248,
+              "p95": 0.0256153615,
+              "p99": 0.025617682699999998
+            }
+          },
+          "timing_pass": "speed_without_tracemalloc"
+        }
+      },
+      "query_hashes": [
+        "7e924be70f26fe150d4cf5ec2de41861c9ffe01dc203642937733f74de712e3f"
+      ]
+    }
+  },
+  "equivalence": {
+    "codec_pass_match": true,
+    "durable_hashes": {
+      "atomic_batch": [
+        "5faec4ed13e441b795af83e4fc1ad6ac521e4ae71cc7636869da27a34536f7ae"
+      ],
+      "unbatched": [
+        "5faec4ed13e441b795af83e4fc1ad6ac521e4ae71cc7636869da27a34536f7ae"
+      ]
+    },
+    "durable_match": true,
+    "functional_hashes": {
+      "atomic_batch": [
+        "2d6344e13d6c518b1d76fd4728181400aa0d87416aee338a0f50a13cccff2b29"
+      ],
+      "unbatched": [
+        "2d6344e13d6c518b1d76fd4728181400aa0d87416aee338a0f50a13cccff2b29"
+      ]
+    },
+    "functional_match": true,
+    "functional_pass_match": true,
+    "input_identity_match": true,
+    "input_sha256": {
+      "atomic_batch": [
+        "43ae5472990ac26213d57a67c18281992d4cb575f037f7024da00ca1fd63d8fc"
+      ],
+      "unbatched": [
+        "43ae5472990ac26213d57a67c18281992d4cb575f037f7024da00ca1fd63d8fc"
+      ]
+    },
+    "query_hashes": {
+      "atomic_batch": [
+        "7e924be70f26fe150d4cf5ec2de41861c9ffe01dc203642937733f74de712e3f"
+      ],
+      "unbatched": [
+        "7e924be70f26fe150d4cf5ec2de41861c9ffe01dc203642937733f74de712e3f"
+      ]
+    },
+    "query_match": true
+  },
+  "cpu_attribution": {
+    "schema_version": 1,
+    "source_sha256": "0ae7135177b2530e0efbd23a69c331a1fda941ddac8c8676bd981a4611c05b81",
+    "input_events": 190,
+    "seed": 42,
+    "profiler": "cProfile with time.process_time",
+    "instrumented": true,
+    "timing_semantics": "Diagnostic CPU attribution only, not unbiased latency or throughput; cumulative times overlap and must not be summed across nested calls. Speed quantiles come from the independent unprofiled benchmark.",
+    "measurement_passes": [
+      {
+        "unprofiled_same_context": {
+          "functional_hash": "9ce7c50e6a928f546b3fb27e262e88f04cccdb0c1f2885ebb3edba3cc9c30ecd",
+          "durable_hash": "b52ac6ba435b071bcb0d9610a7d572ea2a68a995883ec1db0c47146ce52d117b",
+          "query_hash": "b38dbc6b873667ea2c2ab22dcdc740f258a2485ca3c7f724852904a2ae2552fd",
+          "input_sha256": "43ae5472990ac26213d57a67c18281992d4cb575f037f7024da00ca1fd63d8fc"
+        },
+        "variant": "atomic_batch",
+        "functional_hash": "9ce7c50e6a928f546b3fb27e262e88f04cccdb0c1f2885ebb3edba3cc9c30ecd",
+        "durable_hash": "b52ac6ba435b071bcb0d9610a7d572ea2a68a995883ec1db0c47146ce52d117b",
+        "query_hash": "b38dbc6b873667ea2c2ab22dcdc740f258a2485ca3c7f724852904a2ae2552fd",
+        "input_sha256": "43ae5472990ac26213d57a67c18281992d4cb575f037f7024da00ca1fd63d8fc",
+        "categories": {
+          "decode": [
+            {
+              "path": "mtf_lab/data/ctrader_protocol.py",
+              "line": 861,
+              "function": "decode",
+              "calls": 190,
+              "primitive_calls": 190,
+              "self_cpu_seconds": 0.00233203,
+              "cumulative_cpu_seconds": 0.02035363
+            }
+          ],
+          "indicators": [
+            {
+              "path": "mtf_lab/core/indicators.py",
+              "line": 527,
+              "function": "update",
+              "calls": 474,
+              "primitive_calls": 474,
+              "self_cpu_seconds": 0.0005442330000000001,
+              "cumulative_cpu_seconds": 0.0005803840000000001
+            },
+            {
+              "path": "mtf_lab/core/indicators.py",
+              "line": 555,
+              "function": "update",
+              "calls": 237,
+              "primitive_calls": 237,
+              "self_cpu_seconds": 0.000851699,
+              "cumulative_cpu_seconds": 0.0012368700000000002
+            },
+            {
+              "path": "mtf_lab/core/indicators.py",
+              "line": 595,
+              "function": "update",
+              "calls": 237,
+              "primitive_calls": 237,
+              "self_cpu_seconds": 0.0008806770000000001,
+              "cumulative_cpu_seconds": 0.001435707
+            },
+            {
+              "path": "mtf_lab/core/indicators.py",
+              "line": 892,
+              "function": "update",
+              "calls": 239,
+              "primitive_calls": 239,
+              "self_cpu_seconds": 0.005016556,
+              "cumulative_cpu_seconds": 0.014947651000000001
+            }
+          ],
+          "decisions": [
+            {
+              "path": "mtf_lab/core/strategy.py",
+              "line": 1218,
+              "function": "evaluate",
+              "calls": 26,
+              "primitive_calls": 26,
+              "self_cpu_seconds": 0.000494397,
+              "cumulative_cpu_seconds": 0.037444139
+            }
+          ],
+          "writes": [
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 1823,
+              "function": "save_event",
+              "calls": 190,
+              "primitive_calls": 190,
+              "self_cpu_seconds": 0.005114364000000001,
+              "cumulative_cpu_seconds": 0.516738079
+            },
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 1855,
+              "function": "save_candle",
+              "calls": 429,
+              "primitive_calls": 429,
+              "self_cpu_seconds": 0.017872288,
+              "cumulative_cpu_seconds": 1.8367268570000002
+            },
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 1912,
+              "function": "save_decision",
+              "calls": 146,
+              "primitive_calls": 146,
+              "self_cpu_seconds": 0.00300006,
+              "cumulative_cpu_seconds": 0.5535796030000001
+            },
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 1958,
+              "function": "save_signal",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 3.7507000000000005e-05,
+              "cumulative_cpu_seconds": 0.0022833230000000003
+            },
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 2088,
+              "function": "save_discard",
+              "calls": 328,
+              "primitive_calls": 328,
+              "self_cpu_seconds": 0.0062630540000000005,
+              "cumulative_cpu_seconds": 1.543204014
+            },
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 2343,
+              "function": "save_cfd_trade",
+              "calls": 12,
+              "primitive_calls": 12,
+              "self_cpu_seconds": 0.00016884200000000002,
+              "cumulative_cpu_seconds": 0.080970885
+            },
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 2435,
+              "function": "save_capture_envelope",
+              "calls": 191,
+              "primitive_calls": 191,
+              "self_cpu_seconds": 0.0038559790000000003,
+              "cumulative_cpu_seconds": 0.49145698000000004
+            },
+            {
+              "path": "mtf_lab/ops/persistence.py",
+              "line": 2544,
+              "function": "save_checkpoint",
+              "calls": 10,
+              "primitive_calls": 10,
+              "self_cpu_seconds": 0.000338814,
+              "cumulative_cpu_seconds": 10.168713095000001
+            }
+          ],
+          "checkpoints": [
+            {
+              "path": "mtf_lab/ops/ctrader_pipeline.py",
+              "line": 715,
+              "function": "checkpoint",
+              "calls": 4,
+              "primitive_calls": 4,
+              "self_cpu_seconds": 0.0036400580000000003,
+              "cumulative_cpu_seconds": 16.505757001000003
+            },
+            {
+              "path": "mtf_lab/runtime/consumers.py",
+              "line": 492,
+              "function": "checkpoint",
+              "calls": 14,
+              "primitive_calls": 14,
+              "self_cpu_seconds": 0.0021532310000000002,
+              "cumulative_cpu_seconds": 0.026171138
+            },
+            {
+              "path": "mtf_lab/runtime/integration.py",
+              "line": 891,
+              "function": "checkpoint",
+              "calls": 6,
+              "primitive_calls": 6,
+              "self_cpu_seconds": 8.7255e-05,
+              "cumulative_cpu_seconds": 6.43907609
+            },
+            {
+              "path": "mtf_lab/runtime/processor.py",
+              "line": 1283,
+              "function": "checkpoint",
+              "calls": 14,
+              "primitive_calls": 14,
+              "self_cpu_seconds": 0.013264909,
+              "cumulative_cpu_seconds": 0.57641569
+            }
+          ],
+          "queries": [
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 35,
+              "function": "to_dict",
+              "calls": 7,
+              "primitive_calls": 7,
+              "self_cpu_seconds": 1.057e-05,
+              "cumulative_cpu_seconds": 1.057e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 69,
+              "function": "_parse_time",
+              "calls": 24,
+              "primitive_calls": 24,
+              "self_cpu_seconds": 1.7452e-05,
+              "cumulative_cpu_seconds": 1.7452e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 75,
+              "function": "_decode_json",
+              "calls": 692,
+              "primitive_calls": 692,
+              "self_cpu_seconds": 0.001724257,
+              "cumulative_cpu_seconds": 0.018334490000000002
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 84,
+              "function": "_as_mapping",
+              "calls": 41,
+              "primitive_calls": 41,
+              "self_cpu_seconds": 6.1432e-05,
+              "cumulative_cpu_seconds": 0.00023751700000000002
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 92,
+              "function": "_normalized_text",
+              "calls": 15,
+              "primitive_calls": 15,
+              "self_cpu_seconds": 3.5695e-05,
+              "cumulative_cpu_seconds": 5.8539e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 104,
+              "function": "_explicit_bool",
+              "calls": 4,
+              "primitive_calls": 4,
+              "self_cpu_seconds": 1.2555000000000001e-05,
+              "cumulative_cpu_seconds": 2.1379e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 111,
+              "function": "_safe_reference",
+              "calls": 2,
+              "primitive_calls": 2,
+              "self_cpu_seconds": 1.6724e-05,
+              "cumulative_cpu_seconds": 2.5609e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 120,
+              "function": "<genexpr>",
+              "calls": 6,
+              "primitive_calls": 6,
+              "self_cpu_seconds": 5.81e-06,
+              "cumulative_cpu_seconds": 5.81e-06
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 127,
+              "function": "_resolve_query_alias",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 8.22e-07,
+              "cumulative_cpu_seconds": 8.22e-07
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 135,
+              "function": "_resolve_query_state",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 7.32e-07,
+              "cumulative_cpu_seconds": 7.32e-07
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 145,
+              "function": "_append_query_equals",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 6.693e-06,
+              "cumulative_cpu_seconds": 9.488000000000001e-06
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 156,
+              "function": "_append_query_cfd_options",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 9.310000000000001e-07,
+              "cumulative_cpu_seconds": 9.310000000000001e-07
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 176,
+              "function": "_append_query_cfd_ranges",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 8.620000000000001e-07,
+              "cumulative_cpu_seconds": 8.620000000000001e-07
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 190,
+              "function": "_cfd_query_where",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 9.647000000000001e-06,
+              "cumulative_cpu_seconds": 2.2392000000000002e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 240,
+              "function": "_query_cursor_condition",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 1.593e-06,
+              "cumulative_cpu_seconds": 1.593e-06
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 253,
+              "function": "_query_cfd_cursor_pair",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 1.7040000000000001e-06,
+              "cumulative_cpu_seconds": 1.7040000000000001e-06
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 291,
+              "function": "_snapshot_context",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 4.4482000000000005e-05,
+              "cumulative_cpu_seconds": 0.000126047
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 337,
+              "function": "_source_class",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 8.005e-06,
+              "cumulative_cpu_seconds": 1.8134e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 387,
+              "function": "_snapshot_provenance",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 9.44e-05,
+              "cumulative_cpu_seconds": 0.000246606
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 502,
+              "function": "_snapshot_last_data",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 1.6151000000000002e-05,
+              "cumulative_cpu_seconds": 0.000693287
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 553,
+              "function": "_snapshot_errors",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 1.8134e-05,
+              "cumulative_cpu_seconds": 5.7348e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 571,
+              "function": "_snapshot_process",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 2.4636000000000003e-05,
+              "cumulative_cpu_seconds": 6.982200000000001e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 596,
+              "function": "_feed_age_limit",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 1.3457e-05,
+              "cumulative_cpu_seconds": 3.5166e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 616,
+              "function": "_snapshot_coverage",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 3.0558e-05,
+              "cumulative_cpu_seconds": 0.000668548
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 632,
+              "function": "_snapshot_cfd_lifecycle",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 7.074e-06,
+              "cumulative_cpu_seconds": 5.3812000000000006e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 654,
+              "function": "_checkpoint_names",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 2.1579e-05,
+              "cumulative_cpu_seconds": 7.1615e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 675,
+              "function": "_session_analysis_ids",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 3.0947e-05,
+              "cumulative_cpu_seconds": 0.000304323
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 700,
+              "function": "_checkpoint_analysis_key",
+              "calls": 4,
+              "primitive_calls": 4,
+              "self_cpu_seconds": 1.0252000000000001e-05,
+              "cumulative_cpu_seconds": 1.6783000000000002e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 709,
+              "function": "_checkpoint_warmup_pending",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 3.8383e-05,
+              "cumulative_cpu_seconds": 0.00011175100000000001
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 734,
+              "function": "<genexpr>",
+              "calls": 12,
+              "primitive_calls": 12,
+              "self_cpu_seconds": 1.5399e-05,
+              "cumulative_cpu_seconds": 2.2082000000000003e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 739,
+              "function": "_select_checkpoint",
+              "calls": 2,
+              "primitive_calls": 2,
+              "self_cpu_seconds": 5.2925000000000006e-05,
+              "cumulative_cpu_seconds": 0.01149084
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 758,
+              "function": "<genexpr>",
+              "calls": 2,
+              "primitive_calls": 2,
+              "self_cpu_seconds": 5.57e-06,
+              "cumulative_cpu_seconds": 9.498000000000001e-06
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 767,
+              "function": "_apply_checkpoint_projection",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 4.9510000000000005e-05,
+              "cumulative_cpu_seconds": 0.011775015000000002
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 839,
+              "function": "__init__",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 3.446e-06,
+              "cumulative_cpu_seconds": 4.328e-06
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 843,
+              "function": "_filter_hash",
+              "calls": 9,
+              "primitive_calls": 9,
+              "self_cpu_seconds": 5.5861000000000006e-05,
+              "cumulative_cpu_seconds": 0.002171675
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 847,
+              "function": "_cursor",
+              "calls": 9,
+              "primitive_calls": 9,
+              "self_cpu_seconds": 7.1615e-05,
+              "cumulative_cpu_seconds": 0.002508989
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 876,
+              "function": "_read_cursor",
+              "calls": 6,
+              "primitive_calls": 6,
+              "self_cpu_seconds": 5.911000000000001e-06,
+              "cumulative_cpu_seconds": 5.911000000000001e-06
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 902,
+              "function": "_row_dict",
+              "calls": 686,
+              "primitive_calls": 686,
+              "self_cpu_seconds": 0.002597706,
+              "cumulative_cpu_seconds": 0.002597706
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 906,
+              "function": "_decode_candle",
+              "calls": 557,
+              "primitive_calls": 557,
+              "self_cpu_seconds": 0.005396972000000001,
+              "cumulative_cpu_seconds": 0.028945898
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 923,
+              "function": "_decode_payload",
+              "calls": 129,
+              "primitive_calls": 129,
+              "self_cpu_seconds": 0.00031331800000000004,
+              "cumulative_cpu_seconds": 0.00505475
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 934,
+              "function": "_economic_state",
+              "calls": 3,
+              "primitive_calls": 3,
+              "self_cpu_seconds": 8.117e-06,
+              "cumulative_cpu_seconds": 1.3355e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 942,
+              "function": "_decode_cfd_trade",
+              "calls": 3,
+              "primitive_calls": 3,
+              "self_cpu_seconds": 6.511100000000001e-05,
+              "cumulative_cpu_seconds": 0.000373902
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 996,
+              "function": "_decode_row",
+              "calls": 689,
+              "primitive_calls": 689,
+              "self_cpu_seconds": 0.0012472210000000002,
+              "cumulative_cpu_seconds": 0.035621771
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1010,
+              "function": "_append_time_filters",
+              "calls": 11,
+              "primitive_calls": 11,
+              "self_cpu_seconds": 2.9169e-05,
+              "cumulative_cpu_seconds": 4.5157e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1024,
+              "function": "_append_dimension_filters",
+              "calls": 11,
+              "primitive_calls": 11,
+              "self_cpu_seconds": 2.0667e-05,
+              "cumulative_cpu_seconds": 3.1369000000000004e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1044,
+              "function": "_append_revision_filter",
+              "calls": 11,
+              "primitive_calls": 11,
+              "self_cpu_seconds": 1.4596e-05,
+              "cumulative_cpu_seconds": 1.8864e-05
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1055,
+              "function": "_base_where",
+              "calls": 11,
+              "primitive_calls": 11,
+              "self_cpu_seconds": 7.619400000000001e-05,
+              "cumulative_cpu_seconds": 0.000185088
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1095,
+              "function": "_page_table",
+              "calls": 5,
+              "primitive_calls": 5,
+              "self_cpu_seconds": 0.00062201,
+              "cumulative_cpu_seconds": 0.019923771
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1196,
+              "function": "query_events",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 1.5089e-05,
+              "cumulative_cpu_seconds": 0.00393965
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1199,
+              "function": "query_candles",
+              "calls": 2,
+              "primitive_calls": 2,
+              "self_cpu_seconds": 2.3895e-05,
+              "cumulative_cpu_seconds": 0.011680324
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1202,
+              "function": "query_signals",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 5.1195e-05,
+              "cumulative_cpu_seconds": 0.000524017
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1205,
+              "function": "query_decisions",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 1.2053000000000001e-05,
+              "cumulative_cpu_seconds": 0.0038820120000000002
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1478,
+              "function": "query_cfd_trades",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 8.7803e-05,
+              "cumulative_cpu_seconds": 0.000693324
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1543,
+              "function": "query_capture_envelopes",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 6.8961e-05,
+              "cumulative_cpu_seconds": 0.012052660000000001
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1589,
+              "function": "query_indicators",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 3.226e-06,
+              "cumulative_cpu_seconds": 0.005694038
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1592,
+              "function": "query_gaps",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 0.003652138,
+              "cumulative_cpu_seconds": 0.034500577000000004
+            },
+            {
+              "path": "mtf_lab/ops/query.py",
+              "line": 1757,
+              "function": "snapshot",
+              "calls": 1,
+              "primitive_calls": 1,
+              "self_cpu_seconds": 0.0016339400000000002,
+              "cumulative_cpu_seconds": 0.050865289
+            }
+          ]
+        }
+      }
+    ],
+    "functional_durable_query_equivalence_to_unprofiled": true,
+    "source_unchanged": true
+  },
+  "status_cache": {
+    "schema_version": 1,
+    "measurement": "Controlled in-memory transport query count, not broker latency",
+    "iterations_per_route": 100,
+    "fresh_status_position_queries": 100,
+    "cached_status_position_queries": 0,
+    "risk_payload_equal": true,
+    "clock": "fixed_fixture",
+    "source": "tests/test_executor_status_cache.py",
+    "external_network": false,
+    "stale_generation_and_unknown_fail_closed": "covered by the full 653-test gate"
+  },
+  "interpretation": {
+    "ingest_quantile_unit": "one API call: batch up to 128 envelopes versus one envelope; do not divide these quantiles to claim whole-prefix speedup",
+    "batching": "existing durable atomic_batch path measured, not a newly invented storage mode",
+    "new_optimization": "bounded generation-aware status cache; open/close/management continue fresh reconciliation",
+    "profiles": "independent CPU-instrumented atomic-batch pass; confirmed equal functional/durable/query results against its own unprofiled identical context; not speed statistics"
+  },
+  "limitations": [
+    "Synthetic fixture only; no broker, network, market, fill or profitability claim.",
+    "maxrss is reported as cumulative process high-water total and is not attributable to an individual operation; use a fresh subprocess for isolated baselines.",
+    "bytes_work_new measures positive SQLite-artifact footprint growth from the memory-pass baseline, not physical write amplification.",
+    "The unbatched route intentionally pays the existing one-envelope checkpoint cost; it is not a durability-disabled fast path.",
+    "A missing or vulnerable Protobuf runtime is reported explicitly and uses only a JSON fixture fallback.",
+    "Memory-pass elapsed time is intentionally excluded from speed statistics because tracemalloc is active."
+  ]
+}

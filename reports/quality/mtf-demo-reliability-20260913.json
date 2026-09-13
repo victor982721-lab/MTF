@@ -1,0 +1,335 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-09-13T01:24:19-06:00",
+  "scope": "Local H0-H6 implementation and validation only; operational endurance and external DEMO acceptance remain open",
+  "identity": {
+    "implementation_base_commit": "6d50a1abf57d3fb5dc31ae0876ec45cfd0b8d7b1",
+    "validated_source_commit": "c1246cc173725e9dc22ae813e3f2f9b6f96bf5e6",
+    "validated_source_tree": "cef6c4f3b008c249c2be1eaffca9f20288526255",
+    "validated_source_manifest_sha256": "0ae7135177b2530e0efbd23a69c331a1fda941ddac8c8676bd981a4611c05b81",
+    "validated_source_file_count": 240,
+    "scope_identity_sha256": "7ba88e3f5b701773ac078bcf4b162d5b4058f27ac179c9b53ae06e8c24ae742a",
+    "protected_inputs": {
+      "algorithm": "sha256 of canonical JSON(path -> sha256), excluding only docs/ and reports/; includes root README, upstream bytes, configs, licenses, locks and tools",
+      "count": 226,
+      "sha256": "ca71d444e8ef72464dffa7333ada5d1049b4cefc69541f0c63495e83e6a940d2",
+      "unchanged_at_closure": true
+    }
+  },
+  "validation": {
+    "quality_gate_ok": true,
+    "static_checks": {
+      "architecture": true,
+      "compilation": true,
+      "document_links": true,
+      "git_cached_diff_check": true,
+      "git_diff_check": true,
+      "mypy": true,
+      "pip_check": true,
+      "pyright": true,
+      "ruff": true,
+      "ruff_format": true,
+      "scope": true
+    },
+    "tests": {
+      "consistent": true,
+      "discovered": 653,
+      "executed": 653,
+      "expected_failures": 0,
+      "failed": 0,
+      "passed": 653,
+      "skipped": 0,
+      "tests_run": 653,
+      "unexpected_successes": 0
+    },
+    "coverage": {
+      "branch_percent": 62.396,
+      "covered_branches": 6614,
+      "covered_lines": 25888,
+      "error": null,
+      "line_percent": 79.392,
+      "num_branches": 10600,
+      "num_statements": 32608,
+      "ok": true,
+      "threshold_percent": 60.0
+    },
+    "node": "v22.22.1",
+    "required_ui_javascript": true,
+    "network_attempts": 0,
+    "write_attempts_outside_guard": 0,
+    "guard_evidence": {
+      "runtime_log": true,
+      "write_log": true
+    },
+    "source_integrity": {
+      "added": [],
+      "after_content_sha256": "0ae7135177b2530e0efbd23a69c331a1fda941ddac8c8676bd981a4611c05b81",
+      "before_content_sha256": "0ae7135177b2530e0efbd23a69c331a1fda941ddac8c8676bd981a4611c05b81",
+      "changed": [],
+      "ok": true,
+      "removed": []
+    },
+    "visual": {
+      "schema_version": 1,
+      "verified_at": "2026-09-13T04:11:27.441754+00:00",
+      "source_ui_sha256": "ac4aa0be4ba6c3387384a0123f7f50445bbf15c2ffe43ca99ec517b68a154266",
+      "data": "SYNTHETIC_FIXTURE",
+      "account_operation": false,
+      "desktop_viewport": [
+        1265,
+        744
+      ],
+      "readiness": "NO_RUNTIME_EVIDENCE correctly blocked",
+      "checks": {
+        "top_panel_readable": true,
+        "readiness_distinct_from_http_health": true,
+        "fixture_provenance_visible": true,
+        "cfd_rows": 3,
+        "horizons_visible": [
+          60,
+          180,
+          300
+        ],
+        "economics_v2_visible": true,
+        "alternative_scenarios_notice_visible": true,
+        "whole_page_horizontal_overflow": false,
+        "console_errors": 0
+      },
+      "server_and_temporary_browser_closed": true
+    },
+    "systemd_template": {
+      "sha256": "a0098bafe5611b6721ded0a075cfc49a4a7104e8d7eae56020de98baf0eb1743",
+      "verification_returncode": 0,
+      "installed": false,
+      "started": false
+    },
+    "data_directory_metadata": {
+      "entries": 2,
+      "unchanged": true,
+      "databases_not_opened_for_verification": true
+    }
+  },
+  "compatibility": {
+    "trend_pullback_strategy_and_existing_configs_unchanged_from_base": true,
+    "legacy_binary_product_retained_and_separate": true,
+    "legacy_economics_preserved": "explicit cfd-economics-v1; new results cfd-economics-v2",
+    "generated_style_exception": "only mtf_lab/data/protobuf_generated; protoc --check verified 9 files",
+    "upstream_whitespace_exception": "only 3 exact upstream paths in .gitattributes; whitespace diagnostics disabled without filters/eol changes; all 5 upstream file hashes and Git raw blobs preserved"
+  },
+  "dependencies": {
+    "codec": "Spotware release 91 / protoc 36.1 / protobuf 7.36.1 upb",
+    "schemas_generated_check": "PASSED",
+    "official_provenance": "manifests/ctrader-protobuf-91.json",
+    "installed_component_inventory": "manifests/components-local-20260913.json",
+    "operational_venv_changed": false,
+    "sqlite_external_wal_readiness": "VENDOR_BACKPORT_NOT_VERIFIED; see manifests/sqlite-wal-review-20260913.json"
+  },
+  "delivery": {
+    "wheel": {
+      "path": "dist/b46320fd698a23a964f9f962b0db7508e7db153b008d82bb103c253c6e4e9d22/mtf_lab-0.1.0-py3-none-any.whl",
+      "sha256": "b46320fd698a23a964f9f962b0db7508e7db153b008d82bb103c253c6e4e9d22",
+      "reproducible_builds": 2,
+      "byte_equal": true,
+      "members": 107,
+      "resource_byte_checks": [
+        "mtf_lab/data/protobuf_generated/OpenApiCommonMessages_pb2.py",
+        "mtf_lab/data/protobuf_generated/OpenApiCommonMessages_pb2.pyi",
+        "mtf_lab/data/protobuf_generated/OpenApiCommonModelMessages_pb2.py",
+        "mtf_lab/data/protobuf_generated/OpenApiCommonModelMessages_pb2.pyi",
+        "mtf_lab/data/protobuf_generated/OpenApiMessages_pb2.py",
+        "mtf_lab/data/protobuf_generated/OpenApiMessages_pb2.pyi",
+        "mtf_lab/data/protobuf_generated/OpenApiModelMessages_pb2.py",
+        "mtf_lab/data/protobuf_generated/OpenApiModelMessages_pb2.pyi",
+        "mtf_lab/data/protobuf_generated/__init__.py",
+        "mtf_lab/resources/config/ctrader_demo.toml",
+        "mtf_lab/resources/config/ctrader_pipeline_fixture.toml",
+        "mtf_lab/resources/config/ctrader_query.toml",
+        "mtf_lab/resources/config/default.toml",
+        "mtf_lab/resources/config/fixture_cfd.toml",
+        "mtf_lab/resources/config/kraken.toml",
+        "mtf_lab/resources/licenses/protobuf-7.36.1-BSD-3-Clause.txt",
+        "mtf_lab/resources/licenses/spotware-openapi-proto-messages-MIT.txt",
+        "mtf_lab/resources/provenance/ctrader-protobuf-91.json"
+      ]
+    },
+    "isolated_installed_smoke": {
+      "protobuf": "7.36.1",
+      "backend": "upb",
+      "proto2_presence": true,
+      "outside_checkout": true,
+      "help_ok": true,
+      "pip_check": true,
+      "production_venv_untouched": true
+    },
+    "temporary_qa_venv_removed": true,
+    "local_commits_only": true,
+    "published": false,
+    "operational_release_installed": false,
+    "service_enabled": false,
+    "documentation_only_closure_paths": [
+      "docs/demo_reliability_plan.md",
+      "docs/refactor_quality.md",
+      "docs/ctrader_integration_status.md",
+      "reports/quality/mtf-demo-reliability-20260913.json",
+      "reports/quality/mtf-demo-reliability-performance-20260913.json"
+    ]
+  },
+  "research_acceptance": {
+    "synthetic_only": true,
+    "validation": {
+      "ok": true,
+      "state": "VALID",
+      "schema": "mtf-lab.research-manifest.v1",
+      "trial_count": 9,
+      "result_count": 9,
+      "errors": []
+    },
+    "summary": {
+      "result_count": 9,
+      "trial_count": 9,
+      "trials_registered_before_results": true,
+      "family": {
+        "trial_count": 9,
+        "evidence": "PSR_DSR_bootstrap_only",
+        "holdout_family_aligned": true
+      },
+      "decision_counts": {
+        "EVIDENCE_INSUFFICIENT": 9
+      },
+      "decision_policy": {
+        "fixture": "EVIDENCE_INSUFFICIENT",
+        "insufficient_inputs_or_costs_or_holdout": "NOT_ASSESSED",
+        "evaluable_sample": "REQUIRES_HUMAN_REVIEW",
+        "auto_accept": "PROHIBITED",
+        "auto_promote": "PROHIBITED",
+        "basis": "evidence_gates_only_not_pnl_or_sharpe"
+      },
+      "unknown_cost_results": 0,
+      "leakage_violation_results": 0
+    },
+    "compare": {
+      "state": "COMPARED",
+      "row_count": 10,
+      "mismatches": {}
+    },
+    "manifest_integrity_hash": "10d64c3a48009c037116e8fb3e77a824afffa76e415fab80598dceb40caa7d38",
+    "source_code_hash": "6e471b37dcbd8988e30d51399d7b4f8c532eee52d27c6b067fac4b3fc3562734",
+    "data_hash": "b6a6959fad6c5608c2bf8c77bd930bd31bd016cbadd01bd15a3904c716b4df49",
+    "separated_variant_horizon_ledger_counts": [
+      {
+        "variant": "trend_pullback_v1",
+        "horizon_seconds": "60",
+        "ledger_count": 1
+      },
+      {
+        "variant": "trend_pullback_v1",
+        "horizon_seconds": "180",
+        "ledger_count": 1
+      },
+      {
+        "variant": "trend_pullback_v1",
+        "horizon_seconds": "300",
+        "ledger_count": 1
+      },
+      {
+        "variant": "m1_trigger_reference",
+        "horizon_seconds": "60",
+        "ledger_count": 2
+      },
+      {
+        "variant": "m1_trigger_reference",
+        "horizon_seconds": "180",
+        "ledger_count": 2
+      },
+      {
+        "variant": "m1_trigger_reference",
+        "horizon_seconds": "300",
+        "ledger_count": 2
+      },
+      {
+        "variant": "donchian20_m5_v1",
+        "horizon_seconds": "60",
+        "ledger_count": 0
+      },
+      {
+        "variant": "donchian20_m5_v1",
+        "horizon_seconds": "180",
+        "ledger_count": 0
+      },
+      {
+        "variant": "donchian20_m5_v1",
+        "horizon_seconds": "300",
+        "ledger_count": 0
+      }
+    ],
+    "strategy_conclusion": "INSUFFICIENT; synthetic fixtures are not market evidence or profitability"
+  },
+  "supervisor_smoke": {
+    "ok": true,
+    "state": "STOPPED",
+    "mode": "observe",
+    "source": "SYNTHETIC_FIXTURE",
+    "messages": 190,
+    "events": 190,
+    "signals": 0,
+    "stop_reason": "MAX_EVENTS",
+    "clean_stop": true,
+    "execution_enabled": false,
+    "network_attempted": false
+  },
+  "soak_smoke": {
+    "status": "PASS",
+    "acceptance": false,
+    "clock_mode": "real",
+    "runner_mode": "local_supervisor_fixture",
+    "cycles": 1,
+    "progress_counter": 198,
+    "failed_reasons": [],
+    "code_fence_complete": true,
+    "wallclock_elapsed_real_seconds": 6.17299,
+    "restore_scope": {
+      "bookkeeping": {
+        "hash": "3bf169c09508065e8e69e3612c5e5825e02519bfe02a076a7c4e8ee6320dc78b",
+        "scope": "bookkeeping",
+        "status": "VERIFIED"
+      },
+      "restore_model": {
+        "capture_hash": "b6a6959fad6c5608c2bf8c77bd930bd31bd016cbadd01bd15a3904c716b4df49",
+        "compare_hash": "44250fd525c7587fc326b119017c33e88a1d1575ef2ee3417f7abc46738363ed",
+        "corrupt_checkpoint_rejected": true,
+        "full_hash": "cbfcec5f77b97047822a6dbb93ea31888c3d7403545abfba8b5b643f11f39590",
+        "full_signals": 1,
+        "quotes": 190,
+        "restored_hash": "cbfcec5f77b97047822a6dbb93ea31888c3d7403545abfba8b5b643f11f39590",
+        "restored_signals": 1,
+        "scope": "restore_model",
+        "status": "VERIFIED"
+      }
+    },
+    "minimum_required_seconds": 259200
+  },
+  "performance_evidence": {
+    "path": "reports/quality/mtf-demo-reliability-performance-20260913.json",
+    "sha256": "fdb420c841787a412122be511ddc32ff46673839b96d12d81bfe83b5627037f7",
+    "same_input_functional_durable_query_equivalence": true,
+    "cache_position_queries_per_100_projections": {
+      "fresh": 100,
+      "cached": 0
+    },
+    "broker_latency_or_throughput_claim": false
+  },
+  "operational_gates": {
+    "local_72h_actual": "NOT_RUN; smoke is 6 seconds and cannot satisfy this window",
+    "sqlite_patch_or_approved_operational_runtime": "PENDING",
+    "external_application_and_readonly_connection": "MTF-DEM-001; no new portal observation in this task",
+    "authorized_shadow_and_demo_commissioning": "NOT_PERFORMED",
+    "demo_30_market_sessions": "NOT_RUN",
+    "real_money": "EXCLUDED",
+    "oauth_scope_or_order_authorization": "NOT_EXPANDED"
+  },
+  "commitments": {
+    "local_implementation_closed": "MTF-REL-001",
+    "operational_validation_remaining": "MTF-VAL-001",
+    "external_connection_unchanged": "MTF-DEM-001"
+  }
+}

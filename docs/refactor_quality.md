@@ -133,3 +133,23 @@ La revisión independiente no dejó bloqueantes. El cierre posterior es sólo
 documentación y receipt; conserva los mismos inputs no documentales y deja
 commits locales, sin push ni instalación de release. La conexión real DEMO
 permanece como compromiso externo independiente.
+
+## Evolución CFD y fiabilidad DEMO — 2026-09-13
+
+La ampliación local desde `6d50a1a` quedó validada en `c1246cc`: **653/653 pruebas**,
+cero omisiones y cero intentos de red/escrituras fuera del guard. Los gates de
+Ruff, formato, mypy estricto, Pyright, arquitectura, codec y empaquetado aprobaron.
+Cobertura: **25,888/32,608 líneas (79.392%)** y **6,614/10,600 ramas (62.396%)**;
+ambos umbrales siguen en 60%. No se reemplaza el resultado histórico anterior.
+
+El [comprobante](../reports/quality/mtf-demo-reliability-20260913.json) identifica
+SHA/árbol/inputs, wheel reproducible, QA de UI, aislamiento y preservación de datos.
+La [medición por rutas](../reports/quality/mtf-demo-reliability-performance-20260913.json)
+separa velocidad, memoria y perfil CPU diagnóstico. Sólo tres archivos upstream
+con whitespace original tienen una regla exacta `-whitespace`; no hay filtros de
+limpieza/EOL y sus bytes y blobs se conservaron. La excepción de estilo del codec
+generado permanece acotada y comprobada con protoc.
+
+El cierre posterior sólo modifica documentación y comprobantes. No se publicó,
+instaló la release operativa ni activó DEMO. Las 72 horas locales, el gate SQLite
+y la aceptación externa permanecen separados en la matriz H0–H6.

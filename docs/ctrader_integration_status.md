@@ -161,3 +161,16 @@ para reproducir el gate offline.
 El [borrador de consulta Pepperstone](pepperstone_ctrader_openapi_draft.md) es
 sólo un borrador local y no acredita validación contractual ni fue enviado por
 esta entrega.
+
+## Cierre de implementación local H0–H6 — 2026-09-13
+
+Código validado: `c1246cc173725e9dc22ae813e3f2f9b6f96bf5e6`, **653/653 pruebas**,
+codec generado operativo en el runtime candidato, wheel reproducible y smoke
+instalado aislado. El [comprobante local](../reports/quality/mtf-demo-reliability-20260913.json)
+y la [matriz H0–H6](demo_reliability_plan.md) detallan alcance y evidencia.
+Esto cierra `MTF-REL-001`, no la operación desatendida: `MTF-VAL-001` conserva
+72 horas reales, resolución/verificación SQLite y aceptación de piloto; las
+30 sesiones DEMO no se realizaron. No hubo nueva lectura del portal, OAuth,
+ampliación de scopes, conexión API/órdenes, push ni instalación operativa.
+`MTF-DEM-001` mantiene su estado externo por separado; no se reinterpreta la
+observación histórica de la aplicación como aprobación vigente.

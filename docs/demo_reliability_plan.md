@@ -12,26 +12,32 @@ previos sin ampliarlos.
 La base de implementación es `6d50a1abf57d3fb5dc31ae0876ec45cfd0b8d7b1`, observada
 limpia el 2026-09-12, e incluye la entrega previa del observador y panel. Las
 pruebas de esa base no validan los cambios de esta evolución. Compromiso:
-`MTF-REL-001`; la conexión externa sigue separada en `MTF-DEM-001`.
+`MTF-REL-001` (implementación local cerrada); la aceptación restante se conserva
+en `MTF-VAL-001` y la conexión externa en `MTF-DEM-001`.
 
 ## Matriz de entrega
 
 | ID | Requisito | Pruebas y evidencia canónica | Estado local |
 |---|---|---|---|
-| H0 | Preservar base, decisiones y trabajo previo | Base Git indicada arriba; matriz y comprobante final de inputs | Base identificada |
-| H1-E | Slippage una vez, fills cuantizados, economía versionada | [Economía v2](../tests/test_cfd_economics_v2.py), [persistencia v1/v2](../tests/test_cfd_economics_persistence.py) | Validación final pendiente |
-| H1-C | Identidad antes del estado, disponibilidad por pierna, replay causal | [Causalidad](../tests/test_cfd_causality_v2.py), [fronteras heredadas](../tests/test_reliability_boundaries.py) | Validación final pendiente |
-| H1-D | Codec fijado, presencia proto2 y dependencias | [Codec](../tests/test_generated_codec.py), [procedencia y hashes](../manifests/ctrader-protobuf-91.json), [SQLite](../manifests/sqlite-wal-review-20260913.json) | Codec integrado; SQLite conserva gate |
-| H2 | Backtest CFD separado del binario: detector, bid/ask, ledger y equity | [Backtest y escenarios](../tests/test_cfd_backtest.py) | Validación final pendiente |
-| H3-R | Trials completos, holdout 20%, walk-forward 40% + 4x10%, purga | [Registro](../tests/test_research.py), [validación semántica](../tests/test_research_validation.py), [métricas](../tests/test_research_statistics.py) | Validación final pendiente |
-| H3-S | Baseline intacta, control M1 y Donchian20 M5 causal | [Estrategias](../tests/test_strategy_extensions.py), [snapshots públicos](../tests/test_indicator_snapshots.py) | Validación final pendiente |
-| H4 | Permisos exactos, propiedad durable, cierre residual y exposición total | [Contratos de ejecución](../tests/test_ctrader_demo_contracts.py), [riesgo observado](../tests/test_ctrader_account_risk.py), [integración](../tests/test_execution_risk_integration.py) | Validación final pendiente |
-| H5 | Supervisor, readiness, alertas locales y OAuth/journal seguros | [Supervisor](../tests/test_supervision.py), [fronteras](../tests/test_supervision_boundaries.py), [OAuth](../tests/test_ctrader_oauth_interop.py), [readiness](../tests/test_readiness.py) | Validación final pendiente |
-| H6 | Medidas reales por ruta, caché segura y empaquetado | [Benchmark](../tests/test_benchmark_reliability.py), [consultas](../tests/test_executor_status_cache.py), [wheel](../tests/test_packaging_delivery.py), [soak](../tests/test_soak_reliability.py) | Validación final pendiente |
+| H0 | Preservar base, decisiones y trabajo previo | Base Git indicada arriba; matriz y comprobante final de inputs | Verificado localmente |
+| H1-E | Slippage una vez, fills cuantizados, economía versionada | [Economía v2](../tests/test_cfd_economics_v2.py), [persistencia v1/v2](../tests/test_cfd_economics_persistence.py) | Verificado localmente |
+| H1-C | Identidad antes del estado, disponibilidad por pierna, replay causal | [Causalidad](../tests/test_cfd_causality_v2.py), [fronteras heredadas](../tests/test_reliability_boundaries.py) | Verificado localmente |
+| H1-D | Codec fijado, presencia proto2 y dependencias | [Codec](../tests/test_generated_codec.py), [procedencia y hashes](../manifests/ctrader-protobuf-91.json), [SQLite](../manifests/sqlite-wal-review-20260913.json) | Codec verificado; SQLite conserva gate |
+| H2 | Backtest CFD separado del binario: detector, bid/ask, ledger y equity | [Backtest y escenarios](../tests/test_cfd_backtest.py) | Verificado localmente |
+| H3-R | Trials completos, holdout 20%, walk-forward 40% + 4x10%, purga | [Registro](../tests/test_research.py), [validación semántica](../tests/test_research_validation.py), [métricas](../tests/test_research_statistics.py) | Verificado localmente |
+| H3-S | Baseline intacta, control M1 y Donchian20 M5 causal | [Estrategias](../tests/test_strategy_extensions.py), [snapshots públicos](../tests/test_indicator_snapshots.py) | Verificado localmente |
+| H4 | Permisos exactos, propiedad durable, cierre residual y exposición total | [Contratos de ejecución](../tests/test_ctrader_demo_contracts.py), [riesgo observado](../tests/test_ctrader_account_risk.py), [integración](../tests/test_execution_risk_integration.py) | Verificado localmente |
+| H5 | Supervisor, readiness, alertas locales y OAuth/journal seguros | [Supervisor](../tests/test_supervision.py), [fronteras](../tests/test_supervision_boundaries.py), [OAuth](../tests/test_ctrader_oauth_interop.py), [readiness](../tests/test_readiness.py) | Verificado localmente |
+| H6 | Medidas reales por ruta, caché segura y empaquetado | [Benchmark](../tests/test_benchmark_reliability.py), [consultas](../tests/test_executor_status_cache.py), [wheel](../tests/test_packaging_delivery.py), [soak](../tests/test_soak_reliability.py) | Verificado localmente |
 
-La implementación local está ensamblada. El cierre de validación integrada
-queda sujeto al receipt final; los resultados focales no se suman para simular
-una suite completa. Ninguna fila equivale a aprobación operativa externa.
+La validación integrada de `c1246cc173725e9dc22ae813e3f2f9b6f96bf5e6` pasó
+**653/653 pruebas**, sin omisiones, red externa ni escrituras fuera del guard.
+Ruff/formato, mypy, Pyright y arquitectura aprobaron el ámbito completo.
+Cobertura: **79.392% líneas y 62.396% ramas**, con umbral independiente 60% sin
+reducir. El [comprobante de entrega](../reports/quality/mtf-demo-reliability-20260913.json)
+vincula los bytes congelados, las pruebas, el wheel y sus límites. Las ediciones
+posteriores son sólo documentación y comprobantes; no alteran los inputs
+protegidos ni el README empaquetado. Ninguna fila aprueba operación externa.
 
 Los costes económicos y límites de riesgo ausentes bloquean evaluación o
 entradas; no se inventan ceros. La reducción de exposición sólo toca posiciones
@@ -80,7 +86,11 @@ ejecución sintética, no fills observados. `ioc_partial --fill-fraction 0.5`
 simula la ejecución de esa fracción y cancela el residual; cantidades solicitada,
 ejecutada, cancelada y rechazada se conservan separadas. Los costes se calculan
 sobre la cantidad efectiva; la comisión fija no se prorratea indebidamente.
-Los escenarios y parámetros quedan registrados antes de producir resultados.
+Los escenarios, parámetros e hipótesis quedan registrados antes de producir
+resultados. La publicación inicial del manifiesto es exclusiva: nunca sustituye
+un intento existente; actualizaciones en curso exigen identidad y lock propios.
+Las decisiones distinguen evidencia sintética insuficiente, `NOT_ASSESSED` y
+revisión humana requerida, sin aceptar/promover automáticamente por PnL o Sharpe.
 
 `ctrader supervise --mode observe --fixture --state-dir <directorio-privado>
 --db <base-aislada> --duration 30` ejercita el supervisor sin bróker. El modo
@@ -132,7 +142,17 @@ se rechazan redirects, parámetros extra, aliases y hardlinks inseguros.
 
 `tools/benchmark_reliability.py` compara rutas reales con timing sin
 `tracemalloc` y un pase de memoria separado, sobre entradas idénticas y con
-equivalencia funcional. No extrapola latencia ni rentabilidad del bróker.
+equivalencia funcional. No extrapola latencia ni rentabilidad del bróker. Las
+[mediciones finales](../reports/quality/mtf-demo-reliability-performance-20260913.json)
+conservaron igualdad de inputs, resultados funcionales, persistencia y consultas
+en 190 eventos, tres repeticiones y pases independientes de tiempo/memoria.
+Los cuantiles de ingestión son por llamada (lote frente a registro); no se dividen
+para inventar un speedup de toda la carga. El perfil CPU separado atribuye
+codec, indicadores, decisiones, escritura, checkpoints y consultas; sus tiempos
+instrumentados no son latencia de producción ni se suman cuando están anidados.
+La mejora nueva de proyección pasó de 100 a 0 consultas de posiciones para 100
+lecturas de un snapshot válido, con igual riesgo y sin eliminar reconciliación
+fresca en aperturas, cierres y gestión.
 `tools/soak_reliability.py --dry-run` muestra la preparación sin iniciar una
 unidad; `--smoke` es siempre insuficiente para las 72 horas. El runner real
 exige tiempo de pared/monotónico, cercas de código/entradas, progreso útil y
@@ -150,3 +170,21 @@ esa ventana.
 El cierre local distingue comportamiento implementado y probado de operación
 externa pendiente. No se exige encontrar una estrategia rentable; rechazarla o
 declarar evidencia insuficiente es un resultado válido.
+
+## Entrega local y siguiente fase
+
+Dos builds independientes produjeron el mismo wheel SHA-256
+`b46320fd698a23a964f9f962b0db7508e7db153b008d82bb103c253c6e4e9d22`.
+Se comprobaron 18 recursos contra sus bytes fuente y se ejecutaron los comandos
+instalados desde otro cwd, dentro de un venv efímero con estado aislado. Ese
+entorno de QA ya se retiró; `.venv` operativo no se sustituyó. La ejecución de
+desarrollo validada usa `runtime/implementation/runtime-venv/bin/python`, no la
+aptitud presumida del launcher operativo.
+
+El smoke de resistencia duró aproximadamente seis segundos de reloj real;
+restauró el modelo, obtuvo igualdad del replay y rechazó un checkpoint corrupto.
+Su `acceptance=false` es deliberado. La comparación sintética de nueve intentos
+(variantes/horizontes separados) validó el contrato y concluyó evidencia
+insuficiente, no rentabilidad. No comenzó ninguna corrida de 72 horas, sesión
+externa o servicio instalado. Los gates de la sección anterior permanecen vivos
+en `MTF-VAL-001` y `MTF-DEM-001`.
