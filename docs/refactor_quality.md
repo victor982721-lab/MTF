@@ -98,3 +98,29 @@ documental y el receipt. El estado de `data/` mantuvo tamaño, mtime e inode en
 la verificación integrada, sin abrir sus bases.
 
 La autenticación y la observación del servidor siguen reservadas para Víctor.
+
+## Ampliación verificada: runner continuo y observabilidad — 2026-09-12
+
+La base cTrader de **422 pruebas** se consolidó en `9d066c6`; el runner continuo
+de lectura, su CLI y el panel observacional quedaron en `f6bcb1e`. El gate
+global desde este último SHA pasó **457/457 pruebas**, cero fallos, cero
+omitidas y cero intentos de red externa. No se redujo el alcance: Ruff/formato
+cubre 127 fuentes, mypy/Pyright todo el paquete y tooling, y la auditoría
+arquitectónica sigue sin violaciones estrictas.
+
+Cobertura de esta ampliación: **18,481/22,964 líneas (80.478 %)** y
+**4,506/7,222 ramas (62.393 %)**. HOME/XDG/TMP/estado estuvieron aislados; los
+fuentes no cambiaron durante la corrida. Los metadatos de los dos archivos
+presentes en `data/` se conservaron sin abrirlos para verificarlos.
+
+El [receipt compacto](../reports/quality/ctrader-watch-observability-20260912.json)
+vincula el SHA y los inputs con límites/parada, checkpoint atómico, rechazo de
+reanudación ambigua, validación del endpoint antes de credenciales y la
+proyección observacional. El QA visual usó una fixture aislada y un servidor
+loopback de sólo lectura; comprobó las tarjetas, el aviso de error y la
+recuperación sin perder el último dato bueno. El servidor temporal se cerró.
+
+La revisión independiente no dejó bloqueantes. El cierre posterior es sólo
+documentación y receipt; conserva los mismos inputs no documentales y deja
+commits locales, sin push ni instalación de release. La conexión real DEMO
+permanece como compromiso externo independiente.

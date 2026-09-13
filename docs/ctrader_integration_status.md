@@ -66,6 +66,15 @@ Este alcance no usa OAuth, cuentas ni conexión real al bróker. La ruta externa
 se conserva para activación posterior; el compromiso de conexión DEMO no se
 cierra con una validación sintética.
 
+El commit local de implementación `f6bcb1e` pasó el gate global con **457/457
+pruebas**, cero fallos/omisiones/intentos de red externa, Ruff/formato, mypy,
+Pyright y auditoría arquitectónica en verde. Los fuentes permanecieron
+idénticos durante la corrida. El [receipt de esta ampliación](../reports/quality/ctrader-watch-observability-20260912.json)
+incluye identidad, cobertura, revisión y QA visual: pausa/continuidad/warmup
+correctos, error visible, datos previos conservados y recuperación automática.
+El cierre posterior sólo agrega documentación/evidencia; no publica ni instala
+una release.
+
 
 ### IMPLEMENTADO Y COMPROBADO OFFLINE
 

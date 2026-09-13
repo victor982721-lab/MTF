@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-09-12T20:32:59-06:00",
+  "scope": "Runner cTrader continuo de lectura y panel observacional, validación offline; sin activar bróker ni publicar/instalar release",
+  "identity": {
+    "consolidated_baseline_commit": "9d066c61f7efa173cf00a12e1db132995c18b3d2",
+    "validated_source_commit": "f6bcb1ec313c7a64e35078806e6c97fe9ea63b7f",
+    "validated_source_tree": "22318322c45f74b41504050dc7b165eabd608cfc",
+    "validated_source_manifest_sha256": "c94cd5af1aa17e4ab2643a7906c941b469039d881028097b332a6a680d568076",
+    "validated_source_file_count": 169,
+    "non_documentation_inputs": {
+      "count": 153,
+      "sha256": "0a27f7c8af9b2a4a3429bd61c7444b7f75fc3640c595f49634c0efc0de0c86e0",
+      "algorithm": "sha256 of canonical JSON(path -> file sha256); excludes Markdown and docs/reports",
+      "unchanged_at_receipt": true
+    },
+    "scope_identity_sha256": "b7802dbf32c73c31d4aa36b3e7315d4118c672f25dde50c6539f384c6956b530"
+  },
+  "validation": {
+    "quality_gate_ok": true,
+    "static_checks": {
+      "architecture": true,
+      "compilation": true,
+      "document_links": true,
+      "git_cached_diff_check": true,
+      "git_diff_check": true,
+      "mypy": true,
+      "pip_check": true,
+      "pyright": true,
+      "ruff": true,
+      "ruff_format": true,
+      "scope": true
+    },
+    "tests": {
+      "consistent": true,
+      "discovered": 457,
+      "executed": 457,
+      "expected_failures": 0,
+      "failed": 0,
+      "passed": 457,
+      "skipped": 0,
+      "tests_run": 457,
+      "unexpected_successes": 0
+    },
+    "coverage": {
+      "branch_percent": 62.393,
+      "covered_branches": 4506,
+      "covered_lines": 18481,
+      "error": null,
+      "line_percent": 80.478,
+      "num_branches": 7222,
+      "num_statements": 22964,
+      "ok": true,
+      "threshold_percent": 60.0
+    },
+    "network_attempts": 0,
+    "guard_evidence": {
+      "runtime_log": true,
+      "write_log": true
+    },
+    "source_integrity": {
+      "added": [],
+      "after_content_sha256": "c94cd5af1aa17e4ab2643a7906c941b469039d881028097b332a6a680d568076",
+      "before_content_sha256": "c94cd5af1aa17e4ab2643a7906c941b469039d881028097b332a6a680d568076",
+      "changed": [],
+      "ok": true,
+      "removed": []
+    },
+    "independent_review": "Five final findings corrected; final read-only review found no blockers",
+    "visual": {
+      "verified_at": "2026-09-12T20:25:02-06:00",
+      "method": "CUA in-app browser; isolated fixture CLI and loopback read-only HTTP UI",
+      "source_sha256": {
+        "mtf_lab/ops/ui.py": "40e69fc899bf4778766654d7d0ac4782a5239dbb33fec60a6f0c8be5ae570237",
+        "mtf_lab/ops/query.py": "9816ce377e049fac207f07c73415bf43b557e177d2808f2d7497faa6c8dde9b5"
+      },
+      "observed": {
+        "fixture": "FIXTURE",
+        "capture_state": "PAUSED",
+        "connection": "DISCONNECTED",
+        "feed_active": false,
+        "continuity": "CONTINUOUS",
+        "freshness": "NOT_APPLICABLE",
+        "warmup_pending": {
+          "M1": 0,
+          "M5": 34,
+          "M15": 45
+        },
+        "counts": {
+          "events": 80,
+          "candles": 99,
+          "decisions": 0,
+          "signals": 0,
+          "discards": 0,
+          "simulations": 0,
+          "analyses": 1,
+          "cfd_trades": 0,
+          "capture_envelopes": 80,
+          "signal_memberships": 0,
+          "signals_total": 0
+        }
+      },
+      "checks": {
+        "all_observability_cards_visible_without_overlap": true,
+        "controlled_refresh_failure_visible": true,
+        "previous_data_preserved_on_failure": true,
+        "automatic_refresh_recovered": true,
+        "server_closed": true,
+        "temporary_browser_tab_closed": true
+      },
+      "external_network_attempts": [],
+      "synthetic_only": true
+    },
+    "data_directory_metadata": {
+      "entries": 2,
+      "unchanged": true,
+      "files_not_opened_for_verification": true
+    }
+  },
+  "requirements": {
+    "continuous_provider_runtime_path": "Production CTraderClient/CTraderProvider polling and normalization with controlled transport; actual CLI fixture produced 80 events and 99 candles",
+    "read_only_boundary": "No executor; selected DEMO/accounts inventory and canonical endpoint checked before authentication; REAL/LIVE and scope mismatches reject",
+    "bounds_and_stop": "Per-invocation wire-message/duration/idle bounds and cooperative SIGINT/SIGTERM with post-poll checks",
+    "checkpoint_and_recovery": "Atomic runtime/watch checkpoint; exact analysis/config required; post-checkpoint capture rejects without deletion; new connections never infer continuity",
+    "observability": "Explicit fixture/replay/observed/unknown provenance; exact checkpoint projection; paused feed inactive; missing TTL is unknown; refresh errors preserve last good data and recover"
+  },
+  "delivery": {
+    "local_commits_only": true,
+    "published": false,
+    "release_installed": false,
+    "documentation_only_closure_paths": [
+      "docs/ctrader_integration_status.md",
+      "docs/refactor_quality.md",
+      "reports/quality/ctrader-watch-observability-20260912.json"
+    ]
+  },
+  "external_connection": {
+    "pending_id": "MTF-DEM-001",
+    "not_completed_by_this_receipt": true,
+    "oauth_performed_in_this_phase": false,
+    "broker_connection_performed_in_this_phase": false,
+    "real_accounts_or_orders_modified": false
+  },
+  "resolved_preflight_diagnostics": [
+    "Strict checkpoint selection and durable frontier gaps",
+    "Post-poll duration/idle race",
+    "Pre-authentication endpoint pin",
+    "Observability checkpoint routing and unknown TTL",
+    "Import-cycle/type/format preflight diagnostics; AST preserved by final formatter"
+  ]
+}
