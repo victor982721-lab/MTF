@@ -24,6 +24,7 @@ import enum
 import fcntl
 import hashlib
 import json
+import math
 import os
 import stat
 import threading
@@ -33,6 +34,21 @@ from decimal import ROUND_HALF_EVEN, Context, Decimal, InvalidOperation
 from pathlib import Path
 from types import NotImplementedType
 from typing import Any, Protocol, cast, runtime_checkable
+
+from ..core.models import parse_timeframe
+from ..core.risk_exit import (
+    EXIT_NONE,
+    EXIT_STOP_LOSS,
+    EXIT_TAKE_PROFIT,
+    EXIT_TIME,
+    EXIT_UNKNOWN,
+    EntryPlan,
+    ExitDecision,
+    RiskExitPolicy,
+    evaluate_exit,
+    plan_entry,
+)
+from ..core.risk_exit import serialize as serialize_risk_exit
 
 # ---------------------------------------------------------------------------
 # Errors and normalized records
@@ -96,6 +112,7 @@ _LATCHED_RISK_BREACHES = frozenset({"max_daily_loss_exceeded", "max_drawdown_exc
 _PROTECTION_RISK_HALT = "protection_unverified"
 _HOLDING_RISK_HALT = "opened_at_unobserved"
 _HOLDING_FUTURE_HALT = "opened_at_future"
+_RISK_BAR_CLOCK_BASIS = "UTC_TIMEFRAME_BOUNDARIES_NO_OHLC_IMPUTATION"
 
 
 class SendPhase(str, enum.Enum):  # noqa: UP042 - preserve public string enum behavior
@@ -1358,6 +1375,11 @@ class DemoTransport:
             requested_price = intent.requested_price
             if requested_price is None:
                 raise CorrelationError("OPEN intent lacks requested price")
+            options = intent.metadata.get("order_options", {}) if isinstance(intent.metadata, Mapping) else {}
+            if not isinstance(options, Mapping):
+                raise CorrelationError("intent order_options is not a mapping")
+            stop_loss = _optional_decimal(options.get("stop_loss"), "demo stop_loss")
+            take_profit = _optional_decimal(options.get("take_profit"), "demo take_profit")
             fill = Fill(f"{order_id}-fill-1", quantity, requested_price, now)
             position_id = f"demo-position-{self._counter:06d}"
             position = Position(
@@ -1368,6 +1390,9 @@ class DemoTransport:
                 quantity,
                 requested_price,
                 intent.intent_id,
+                opened_at=now,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
             )
             self.positions_by_id[position_id] = position
             state = OrderState.FILLED if quantity >= intent.quantity - _DECIMAL_TOLERANCE else OrderState.PARTIAL
@@ -1380,6 +1405,8 @@ class DemoTransport:
                 fills=(fill,),
                 position_ids=(position_id,),
                 observed_at=now,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
             )
             self.orders[intent.intent_id] = snapshot
             return snapshot
@@ -1649,9 +1676,231 @@ def _parse_risk_metric(name: str, value: Any) -> DecimalValue | None:
     if value is None:
         return None
     parsed = _decimal_value(value, name)
-    if name in {"equity", "margin_level", "used_margin"} and parsed < 0:
+    if name in {"equity", "margin_level", "used_margin", "margin_available", "margin_required"} and parsed < 0:
         raise ValueError(f"{name} must be non-negative")
     return parsed
+
+
+def _optional_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(getattr(value, "value", value)).strip()
+    return text or None
+
+
+def _copy_optional_mapping(value: Mapping[str, Any] | None, name: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise RiskLimitRejected(f"{name} debe ser una tabla")
+    return dict(value)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return _decimal_text(value)
+    if isinstance(value, datetime):
+        return _iso(value)
+    if isinstance(value, Mapping):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_json_safe(item) for item in value), key=str)
+    return value
+
+
+def _coerce_risk_exit_policy(value: RiskExitPolicy | Mapping[str, Any] | None) -> RiskExitPolicy | None:
+    if value is None:
+        return None
+    if isinstance(value, RiskExitPolicy):
+        return value
+    if not isinstance(value, Mapping):
+        raise RiskLimitRejected("risk_exit_policy debe ser RiskExitPolicy o una tabla")
+    try:
+        return RiskExitPolicy.from_mapping(value)
+    except (TypeError, ValueError) as exc:
+        raise RiskLimitRejected(f"política RiskExit inválida: {exc}") from exc
+
+
+def _runtime_time(value: Any, name: str, reasons: list[str]) -> tuple[str | None, datetime | None]:
+    if value is None:
+        reasons.append(f"{name}_unknown")
+        return None, None
+    try:
+        parsed = _parse_time(value)
+    except (TypeError, ValueError):
+        reasons.append(f"{name}_invalid")
+        return None, None
+    return _iso(parsed), parsed
+
+
+def _runtime_nonnegative_int(value: Any, name: str, reasons: list[str]) -> int | None:
+    if value is None:
+        reasons.append(f"{name}_unknown")
+        return None
+    if isinstance(value, bool):
+        reasons.append(f"{name}_invalid")
+        return None
+    try:
+        text = str(value).strip()
+        if not text or (text.startswith("+") and not text[1:].isdigit()) or not text.lstrip("-").isdigit():
+            raise ValueError
+        parsed = int(text)
+    except (TypeError, ValueError):
+        reasons.append(f"{name}_invalid")
+        return None
+    if parsed < 0:
+        reasons.append(f"{name}_invalid")
+        return None
+    return parsed
+
+
+def _runtime_positive_decimal(value: Any, name: str, reasons: list[str]) -> str | None:
+    if value is None:
+        reasons.append(f"{name}_unknown")
+        return None
+    try:
+        return _decimal_text(_decimal_value(value, name, positive=True))
+    except ValueError:
+        reasons.append(f"{name}_invalid")
+        return None
+
+
+def _runtime_input(snapshot: Any) -> tuple[dict[str, Any], Mapping[str, Any], list[str]]:
+    reasons: list[str] = []
+    try:
+        data = _as_mapping(snapshot)
+    except (TypeError, ValueError):
+        data = {}
+        reasons.append("runtime_snapshot_invalid")
+    latest = data.get("latest_trigger")
+    latest_data = latest if isinstance(latest, Mapping) else {}
+    return data, latest_data, reasons
+
+
+def _runtime_clock_fields(data: Mapping[str, Any], latest: Mapping[str, Any], reasons: list[str]) -> dict[str, Any]:
+    raw_timeframe = _optional_text(data.get("trigger_timeframe", latest.get("timeframe")))
+    timeframe: str | None = None
+    seconds: int | None = None
+    if raw_timeframe is None:
+        reasons.append("trigger_timeframe_unknown")
+    else:
+        try:
+            parsed = parse_timeframe(raw_timeframe)
+            timeframe = parsed.name
+            seconds = parsed.seconds
+        except (TypeError, ValueError):
+            reasons.append("trigger_timeframe_invalid")
+    count = _runtime_nonnegative_int(
+        data.get("trigger_bar_count", data.get("risk_trigger_bar_count", data.get("closed_trigger_bar_count"))),
+        "trigger_bar_count",
+        reasons,
+    )
+    basis = _optional_text(data.get("risk_bar_clock_basis"))
+    if basis is None:
+        reasons.append("risk_bar_clock_basis_unknown")
+    elif basis.upper() != _RISK_BAR_CLOCK_BASIS:
+        reasons.append("risk_bar_clock_basis_invalid")
+    return {
+        "trigger_timeframe": timeframe,
+        "trigger_seconds": seconds,
+        "trigger_bar_count": count,
+        "risk_bar_clock_basis": basis.upper() if basis is not None else None,
+    }
+
+
+def _runtime_value_fields(data: Mapping[str, Any], latest: Mapping[str, Any], reasons: list[str]) -> dict[str, Any]:
+    latest_start_text, latest_start = _runtime_time(
+        data.get("latest_trigger_start", data.get("latest_trigger_bar_start", latest.get("start"))),
+        "latest_trigger_start",
+        reasons,
+    )
+    latest_end_text, latest_end = _runtime_time(
+        data.get("latest_trigger_end", data.get("latest_trigger_bar_end", latest.get("end"))),
+        "latest_trigger_end",
+        reasons,
+    )
+    latest_available_text, latest_available = _runtime_time(
+        data.get(
+            "latest_trigger_available_at",
+            data.get(
+                "latest_trigger_available", data.get("latest_trigger_bar_available_at", latest.get("available_at"))
+            ),
+        ),
+        "latest_trigger_available_at",
+        reasons,
+    )
+    atr = _runtime_positive_decimal(data.get("atr", data.get("atr_value", latest.get("atr"))), "atr", reasons)
+    last_market_text, last_market = _runtime_time(
+        data.get(
+            "last_market",
+            data.get("last_market_at", data.get("last_market_time", data.get("current_market"))),
+        ),
+        "last_market",
+        reasons,
+    )
+    last_available_text, last_available = _runtime_time(
+        data.get(
+            "last_available",
+            data.get("last_available_at", data.get("current_available", data.get("current_available_at"))),
+        ),
+        "last_available",
+        reasons,
+    )
+    data_mode = _optional_text(data.get("data_mode", data.get("market_data_mode")))
+    if data_mode is None:
+        reasons.append("data_mode_unknown")
+    else:
+        data_mode = data_mode.upper()
+    return {
+        "latest_trigger_start": latest_start_text,
+        "latest_trigger_start_dt": latest_start,
+        "latest_trigger_end": latest_end_text,
+        "latest_trigger_end_dt": latest_end,
+        "latest_trigger_available_at": latest_available_text,
+        "latest_trigger_available_dt": latest_available,
+        "atr": atr,
+        "last_market": last_market_text,
+        "last_market_dt": last_market,
+        "last_available": last_available_text,
+        "last_available_dt": last_available,
+        "data_mode": data_mode,
+    }
+
+
+def _runtime_validate_values(
+    fields: Mapping[str, Any],
+    reasons: list[str],
+    *,
+    expected_candidate: str | None,
+    candidate: str | None,
+    previous_count: Any,
+) -> None:
+    if expected_candidate is not None:
+        if candidate is None:
+            reasons.append("market_candidate_id_unknown")
+        elif candidate != expected_candidate:
+            reasons.append("market_candidate_id_mismatch")
+    start = fields.get("latest_trigger_start_dt")
+    end = fields.get("latest_trigger_end_dt")
+    available = fields.get("latest_trigger_available_dt")
+    market = fields.get("last_market_dt")
+    last_available = fields.get("last_available_dt")
+    if start is not None and end is not None and end <= start:
+        reasons.append("latest_trigger_interval_invalid")
+    if end is not None and available is not None and available < end:
+        reasons.append("latest_trigger_availability_invalid")
+    if market is not None and last_available is not None and last_available < market:
+        reasons.append("last_market_availability_invalid")
+    seconds = fields.get("trigger_seconds")
+    count = fields.get("trigger_bar_count")
+    if seconds is not None and market is not None and count is not None:
+        expected_count = math.floor(market.timestamp() / seconds)
+        if count != expected_count:
+            reasons.append("trigger_bar_count_not_utc_ordinal")
+    if isinstance(previous_count, int) and isinstance(count, int) and count < previous_count:
+        reasons.append("trigger_bar_count_regressed")
 
 
 class CTraderDemoExecutor:
@@ -1669,6 +1918,10 @@ class CTraderDemoExecutor:
         clock: Callable[[], datetime] | None = None,
         server_observation: Any | None = None,
         fixture_mode: bool = False,
+        risk_exit_policy: RiskExitPolicy | Mapping[str, Any] | None = None,
+        risk_contract_spec: Mapping[str, Any] | None = None,
+        risk_calendar: Mapping[str, Any] | None = None,
+        market_candidate_id: str | None = None,
     ):
         account = _prepare_executor_account(account, transport, server_observation)
         self.policy = policy or ExecutionPolicy()
@@ -1684,6 +1937,10 @@ class CTraderDemoExecutor:
         if not self._fixture_mode:
             _validate_external_execution_policy(self.policy)
         self.server_observation = server_observation or getattr(self.transport, "server_observation", None)
+        self._risk_exit_policy = _coerce_risk_exit_policy(risk_exit_policy)
+        self._risk_contract_spec = _copy_optional_mapping(risk_contract_spec, "risk_contract_spec")
+        self._risk_calendar = _copy_optional_mapping(risk_calendar, "risk_calendar")
+        self._market_candidate_id = _optional_text(market_candidate_id)
         self._active = False
         self._paused = False
         self._pause_reason: str | None = None
@@ -1694,9 +1951,42 @@ class CTraderDemoExecutor:
             "realized_daily_pnl": None,
             "unrealized_daily_pnl": None,
             "drawdown": None,
+            "high_water_equity": None,
+            "margin_available": None,
+            "margin_required": None,
             "margin_level": None,
             "used_margin": None,
         }
+        self._risk_exit_metrics: dict[str, Any] = {
+            "daily_loss": None,
+            "daily_anchor_equity": None,
+            "daily_anchor_cashflow_total": None,
+            "daily_cashflow_total": None,
+            "daily_anchor_day": None,
+            "daily_anchor_observed_at": None,
+            "daily_anchor_verified": False,
+            "daily_loss_state": "UNAVAILABLE",
+            "daily_loss_reason": None,
+            "cashflows_complete": False,
+            "cashflow_fingerprint": None,
+        }
+        self._runtime_snapshot: dict[str, Any] = {
+            "market_candidate_id": None,
+            "trigger_timeframe": None,
+            "trigger_bar_count": None,
+            "risk_bar_clock_basis": None,
+            "latest_trigger_start": None,
+            "latest_trigger_end": None,
+            "latest_trigger_available_at": None,
+            "atr": None,
+            "last_market": None,
+            "last_available": None,
+            "data_mode": None,
+            "runtime_state": "UNKNOWN",
+            "reasons": ["runtime_snapshot_unobserved"],
+        }
+        self._last_local_quote: Quote | None = None
+        self._risk_exit_due_at: dict[str, datetime] = {}
         self._risk_metrics_observed_at: datetime | None = None
         self._risk_metrics_generation: str | None = None
         self._intents: dict[str, ExecutionIntent] = {}
@@ -1741,10 +2031,24 @@ class CTraderDemoExecutor:
         realized_daily_pnl: Any = _UNSET,
         unrealized_daily_pnl: Any = _UNSET,
         drawdown: Any = _UNSET,
+        high_water_equity: Any = _UNSET,
+        margin_available: Any = _UNSET,
+        margin_required: Any = _UNSET,
         margin_level: Any = _UNSET,
         used_margin: Any = _UNSET,
         observed_at: Any = _UNSET,
         connection_generation: Any = _UNSET,
+        daily_loss: Any = _UNSET,
+        daily_anchor_equity: Any = _UNSET,
+        daily_anchor_cashflow_total: Any = _UNSET,
+        daily_cashflow_total: Any = _UNSET,
+        daily_anchor_day: Any = _UNSET,
+        daily_anchor_observed_at: Any = _UNSET,
+        daily_anchor_verified: Any = _UNSET,
+        daily_loss_state: Any = _UNSET,
+        daily_loss_reason: Any = _UNSET,
+        cashflows_complete: Any = _UNSET,
+        cashflow_fingerprint: Any = _UNSET,
     ) -> dict[str, Any]:
         """Record server-observed account metrics without inventing missing values."""
 
@@ -1755,10 +2059,26 @@ class CTraderDemoExecutor:
                 realized_daily_pnl,
                 unrealized_daily_pnl,
                 drawdown,
+                high_water_equity,
+                margin_available,
+                margin_required,
                 margin_level,
                 used_margin,
             )
             self._apply_risk_metric_identity(observed_at, connection_generation, metrics_changed)
+            self._apply_risk_exit_metrics(
+                daily_loss=daily_loss,
+                daily_anchor_equity=daily_anchor_equity,
+                daily_anchor_cashflow_total=daily_anchor_cashflow_total,
+                daily_cashflow_total=daily_cashflow_total,
+                daily_anchor_day=daily_anchor_day,
+                daily_anchor_observed_at=daily_anchor_observed_at,
+                daily_anchor_verified=daily_anchor_verified,
+                daily_loss_state=daily_loss_state,
+                daily_loss_reason=daily_loss_reason,
+                cashflows_complete=cashflows_complete,
+                cashflow_fingerprint=cashflow_fingerprint,
+            )
             return self.risk_status()
 
     def _apply_risk_metric_values(self, *values: Any) -> bool:
@@ -1768,6 +2088,9 @@ class CTraderDemoExecutor:
             "realized_daily_pnl",
             "unrealized_daily_pnl",
             "drawdown",
+            "high_water_equity",
+            "margin_available",
+            "margin_required",
             "margin_level",
             "used_margin",
         )
@@ -1782,13 +2105,57 @@ class CTraderDemoExecutor:
             # unrealized component eligible for an external gate.
             self._risk_metrics["realized_daily_pnl"] = None
             self._risk_metrics["unrealized_daily_pnl"] = None
-        if values[2] is not _UNSET or values[3] is not _UNSET:
+        if values[1] is _UNSET and (values[2] is not _UNSET or values[3] is not _UNSET):
             realized = self._risk_metrics["realized_daily_pnl"]
             unrealized = self._risk_metrics["unrealized_daily_pnl"]
             self._risk_metrics["daily_pnl"] = (
                 realized + unrealized if realized is not None and unrealized is not None else None
             )
         return changed
+
+    def _apply_risk_exit_metrics(self, **values: Any) -> None:
+        decimal_names = frozenset(
+            {"daily_loss", "daily_anchor_equity", "daily_anchor_cashflow_total", "daily_cashflow_total"}
+        )
+        boolean_names = frozenset({"daily_anchor_verified", "cashflows_complete"})
+        text_names = frozenset({"daily_anchor_day", "daily_loss_state", "daily_loss_reason", "cashflow_fingerprint"})
+        for name, value in values.items():
+            if value is _UNSET:
+                continue
+            if name in decimal_names:
+                self._set_risk_exit_decimal(name, value)
+            elif name == "daily_anchor_observed_at":
+                self._set_risk_exit_timestamp(name, value)
+            elif name in boolean_names:
+                self._set_risk_exit_boolean(name, value)
+            elif name in text_names:
+                self._risk_exit_metrics[name] = None if value is None else str(value)
+
+    def _set_risk_exit_decimal(self, name: str, value: Any) -> None:
+        if value is None:
+            self._risk_exit_metrics[name] = None
+            return
+        try:
+            parsed = _decimal_value(value, name)
+        except ValueError as exc:
+            raise RiskLimitRejected(f"{name} inválido") from exc
+        if name == "daily_anchor_equity" and parsed <= 0:
+            raise RiskLimitRejected("daily_anchor_equity debe ser positivo")
+        self._risk_exit_metrics[name] = parsed
+
+    def _set_risk_exit_timestamp(self, name: str, value: Any) -> None:
+        if value is None:
+            self._risk_exit_metrics[name] = None
+            return
+        try:
+            self._risk_exit_metrics[name] = _parse_time(value)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitRejected(f"{name} inválido") from exc
+
+    def _set_risk_exit_boolean(self, name: str, value: Any) -> None:
+        if not isinstance(value, bool):
+            raise RiskLimitRejected(f"{name} debe ser booleano")
+        self._risk_exit_metrics[name] = value
 
     def _apply_risk_metric_identity(self, observed_at: Any, connection_generation: Any, changed: bool) -> None:
         if observed_at is not _UNSET:
@@ -1825,11 +2192,253 @@ class CTraderDemoExecutor:
         current_generation = self._current_connection_generation()
         if current_generation is None or generation != current_generation:
             return "risk_metrics_generation_unobserved", None
+        if self._risk_exit_policy is not None:
+            # The percent daily budget is anchored to observed start-of-day
+            # equity.  A realized+unrealized pair is not an equivalent
+            # substitute: it loses floating exposure and cash-flow effects.
+            anchor = self._risk_exit_metrics
+            if anchor.get("daily_anchor_verified") is not True or anchor.get("daily_loss_state") != "READY":
+                return "daily_equity_anchor_unobserved", None
+            if anchor.get("cashflows_complete") is not True:
+                return "cashflow_history_unobserved", None
+            daily = self._risk_metrics["daily_pnl"]
+            if daily is None or anchor.get("daily_anchor_equity") is None:
+                return "daily_equity_anchor_unobserved", None
+            return None, daily
         realized = self._risk_metrics["realized_daily_pnl"]
         unrealized = self._risk_metrics["unrealized_daily_pnl"]
         if realized is None or unrealized is None:
             return "daily_pnl_components_unobserved", None
         return None, realized + unrealized
+
+    @property
+    def risk_exit_policy(self) -> RiskExitPolicy | None:
+        """The opt-in shared RiskExit policy, if this seam was configured."""
+
+        return self._risk_exit_policy
+
+    @property
+    def risk_exit_enabled(self) -> bool:
+        return self._risk_exit_policy is not None
+
+    def observe_runtime(self, snapshot: Any) -> dict[str, Any]:
+        """Record the public runtime snapshot without performing I/O.
+
+        The supervisor is the producer of this bounded payload.  This method
+        intentionally consumes only the agreed telemetry fields; it never
+        queries the provider, account, database or intent journal.  A missing
+        or contradictory field leaves the local runtime state UNKNOWN so a
+        RiskExit entry/temporal exit cannot be admitted on an invented clock.
+        """
+
+        with self._lock:
+            data, latest, reasons = _runtime_input(snapshot)
+            candidate = _optional_text(data.get("market_candidate_id", data.get("candidate_id")))
+            fields = _runtime_clock_fields(data, latest, reasons)
+            fields.update(_runtime_value_fields(data, latest, reasons))
+            _runtime_validate_values(
+                fields,
+                reasons,
+                expected_candidate=self._market_candidate_id,
+                candidate=candidate,
+                previous_count=self._runtime_snapshot.get("trigger_bar_count"),
+            )
+            normalized = {
+                "market_candidate_id": candidate,
+                "trigger_timeframe": fields["trigger_timeframe"],
+                "trigger_bar_count": fields["trigger_bar_count"],
+                "risk_bar_clock_basis": fields["risk_bar_clock_basis"],
+                "latest_trigger_start": fields["latest_trigger_start"],
+                "latest_trigger_end": fields["latest_trigger_end"],
+                "latest_trigger_available_at": fields["latest_trigger_available_at"],
+                "atr": fields["atr"],
+                "last_market": fields["last_market"],
+                "last_available": fields["last_available"],
+                "data_mode": fields["data_mode"],
+                "runtime_state": "VALID" if not reasons else "UNKNOWN",
+                "reasons": list(dict.fromkeys(reasons)),
+            }
+            self._runtime_snapshot = normalized
+            return self._runtime_snapshot_copy()
+
+    def runtime_snapshot(self) -> dict[str, Any]:
+        """Return the detached local runtime projection without I/O."""
+
+        with self._lock:
+            return self._runtime_snapshot_copy()
+
+    def _runtime_snapshot_copy(self) -> dict[str, Any]:
+        result = dict(self._runtime_snapshot)
+        result["reasons"] = list(self._runtime_snapshot.get("reasons", ()))
+        return result
+
+    def _risk_bars_held(self, intent: ExecutionIntent) -> int | None:
+        if (
+            self._runtime_snapshot.get("runtime_state") != "VALID"
+            or self._runtime_snapshot.get("risk_bar_clock_basis") != _RISK_BAR_CLOCK_BASIS
+        ):
+            return None
+        current = self._runtime_snapshot.get("trigger_bar_count")
+        entry = intent.metadata.get("risk_entry_bar_count", intent.metadata.get("entry_trigger_bar_count"))
+        if isinstance(current, bool) or isinstance(entry, bool):
+            return None
+        if not isinstance(current, int) or not isinstance(entry, int) or current < entry:
+            return None
+        return current - entry
+
+    def _opening_intent_for_position(self, position: Position) -> ExecutionIntent | None:
+        candidates: list[ExecutionIntent] = []
+        if position.client_order_id is not None:
+            intent = self._intents.get(str(position.client_order_id))
+            if intent is not None and intent.kind == "OPEN":
+                candidates.append(intent)
+        for intent in self._intents.values():
+            if intent.kind != "OPEN" or intent in candidates:
+                continue
+            result = self._results.get(intent.intent_id)
+            if result is not None and position.position_id in result.position_ids:
+                candidates.append(intent)
+        if len(candidates) != 1:
+            return None
+        return candidates[0]
+
+    def _emit_risk_exit_unknown(self, intent_id: str, reason: str) -> None:
+        self._emit(
+            "RISK_EXIT_UNKNOWN",
+            OrderState.UNKNOWN,
+            intent_id,
+            {"reason": reason, "no_blind_retry": True},
+        )
+
+    def _risk_exit_context(self, position: Position) -> tuple[ExecutionIntent, Mapping[str, Any], int] | None:
+        intent = self._opening_intent_for_position(position)
+        if intent is None:
+            self._emit_risk_exit_unknown(position.position_id, "entry_plan_unknown")
+            return None
+        raw_plan = intent.metadata.get("risk_exit_plan")
+        if not isinstance(raw_plan, Mapping):
+            self._emit_risk_exit_unknown(intent.intent_id, "entry_plan_unknown")
+            return None
+        if raw_plan.get("mode") != "DEMO_GATED" or raw_plan.get("eligible_for_demo") is not True:
+            self._emit_risk_exit_unknown(intent.intent_id, "entry_plan_not_demo_eligible")
+            return None
+        bars_held = self._risk_bars_held(intent)
+        if (
+            self._risk_exit_policy is not None
+            and self._risk_exit_policy.holding_profile == "INTRADAY"
+            and bars_held is None
+        ):
+            self._emit_risk_exit_unknown(intent.intent_id, "trigger_bar_clock_unknown")
+            return None
+        if position.opened_at is None:
+            self._emit_risk_exit_unknown(intent.intent_id, "position_opened_at_unknown")
+            return None
+        return intent, raw_plan, bars_held or 0
+
+    def _risk_exit_decision_for_position(
+        self, position: Position, quote: Quote
+    ) -> tuple[ExecutionIntent, ExitDecision] | None:
+        context = self._risk_exit_context(position)
+        if context is None:
+            return None
+        intent, raw_plan, bars_held = context
+        try:
+            self._check_quote(position.symbol, quote, position.side.opposite)
+            executable = quote.bid if position.side is Side.BUY else quote.ask
+            decision = self.evaluate_risk_exit(
+                raw_plan,
+                current_price=executable,
+                executable_price=executable,
+                observed_at=quote.available_at or quote.timestamp,
+                entry_at=position.opened_at,
+                bars_held=bars_held,
+                calendar_state=self._risk_calendar_for_entry(),
+                server_side_stop=True,
+            )
+        except (ExecutionError, ValueError) as exc:
+            self._emit_risk_exit_unknown(intent.intent_id, f"quote_or_plan_invalid:{type(exc).__name__}")
+            return None
+        return intent, decision
+
+    def _record_risk_exit_decision(self, intent: ExecutionIntent, decision: ExitDecision) -> None:
+        self._emit(
+            "RISK_EXIT_DECISION",
+            OrderState.UNKNOWN,
+            intent.intent_id,
+            {
+                "action": decision.action,
+                "reason": decision.reason,
+                "server_side_stop": decision.server_side,
+                "gap": decision.gap,
+                "bars_held": decision.bars_held,
+                "no_market_close_for_server_trigger": True,
+            },
+        )
+
+    def _risk_exit_close_if_due(
+        self,
+        position: Position,
+        intent: ExecutionIntent,
+        decision: ExitDecision,
+        results: list[OrderResult],
+    ) -> None:
+        if decision.triggered_at is None:
+            self._emit_risk_exit_unknown(intent.intent_id, "exit_trigger_time_unknown")
+            return
+        due_at = self._risk_exit_due_at.get(intent.intent_id)
+        if due_at is None:
+            due_at = decision.triggered_at + timedelta(seconds=float(decision.latency_seconds))
+            self._risk_exit_due_at[intent.intent_id] = due_at
+        now = _parse_time(self.clock())
+        if now < due_at:
+            self._emit(
+                "RISK_EXIT_PENDING",
+                OrderState.UNKNOWN,
+                intent.intent_id,
+                {"due_at": _iso(due_at), "no_blind_retry": True},
+            )
+            return
+        self._risk_exit_due_at.pop(intent.intent_id, None)
+        try:
+            results.append(self.close_position(position.position_id))
+        except BaseException as exc:
+            self._emit(
+                "RISK_EXIT_CLOSE_UNKNOWN",
+                OrderState.UNKNOWN,
+                intent.intent_id,
+                {"reason": type(exc).__name__, "no_blind_retry": True},
+            )
+
+    def _risk_exit_management(self, quote: Quote | None) -> tuple[OrderResult, ...]:
+        if self._risk_exit_policy is None:
+            return ()
+        if quote is None:
+            return ()
+        try:
+            positions = self._account_positions()
+        except BaseException:
+            self._risk_halt_reason = "position_reconciliation_failed"
+            return ()
+        results: list[OrderResult] = []
+        for position in positions:
+            if not self._position_is_owned(position):
+                continue
+            outcome = self._risk_exit_decision_for_position(position, quote)
+            if outcome is None:
+                continue
+            intent, decision = outcome
+            self._record_risk_exit_decision(intent, decision)
+            if decision.action in {EXIT_NONE, EXIT_UNKNOWN, EXIT_STOP_LOSS, EXIT_TAKE_PROFIT}:
+                # Stop/target levels are submitted and then observed as
+                # server-side protection.  Never duplicate them with a client
+                # market close while an account snapshot is reconciling.
+                if decision.action != EXIT_UNKNOWN:
+                    self._risk_exit_due_at.pop(intent.intent_id, None)
+                continue
+            if decision.action != EXIT_TIME:
+                continue
+            self._risk_exit_close_if_due(position, intent, decision, results)
+        return tuple(results)
 
     def _configured_risk_limit_reason(self, daily: DecimalValue | None) -> str | None:
         if self.policy.max_daily_loss is not None:
@@ -1903,6 +2512,273 @@ class CTraderDemoExecutor:
         # Keep a caller-supplied observation as a last, read-only fallback
         # for small adapters that expose the proof only on the executor.
         return read_generation(self.server_observation)
+
+    def _risk_contract_spec_for_entry(self, quote: Quote) -> Mapping[str, Any] | None:
+        base = self._risk_contract_spec
+        if base is None:
+            return None
+        result = dict(base)
+        expected_generation = result.get("connection_generation", result.get("generation"))
+        if expected_generation is not None:
+            current_generation = self._current_connection_generation()
+            if current_generation is None or str(current_generation) != str(expected_generation).strip():
+                result["known"] = False
+        # Spread is a time-varying quote observation, not a broker default.
+        # Only a complete, non-synthetic bid/ask may establish this field.
+        if result.get("spread_known") is None and quote.quality == "VALID" and not quote.synthetic:
+            result["spread_known"] = True
+        cost_values = (
+            "expected_cost_fixed",
+            "expected_commission_fixed",
+            "expected_cost_per_unit",
+            "expected_commission_per_unit",
+            "expected_exit_slippage_per_unit",
+            "expected_exit_slippage_pips",
+        )
+        has_cost_value = any(result.get(name) is not None for name in cost_values)
+        source = result.get("expected_cost_source", result.get("cost_estimate_source"))
+        currency = result.get("expected_cost_currency", result.get("cost_currency"))
+        has_cost_identity = bool(source) and bool(currency)
+        if has_cost_identity:
+            result.setdefault("expected_cost_source", str(source).strip())
+            result.setdefault("expected_cost_currency", str(currency).strip().upper())
+        if has_cost_value and not has_cost_identity:
+            # The core policy must not accept a bare fee number whose unit or
+            # provenance was not documented by the catalog producer.
+            result["expected_costs_known"] = False
+        return result
+
+    def _risk_calendar_for_entry(self) -> Mapping[str, Any] | None:
+        if self._risk_calendar is None:
+            return None
+        result = dict(self._risk_calendar)
+        # ``known=true`` without an explicit financing verdict is not enough
+        # for a DEMO gate.  Preserve a supplied false verdict; do not infer a
+        # broker financing rule from the mere presence of a calendar table.
+        if result.get("known") is True and "financing_known" not in result:
+            result["financing_known"] = False
+        return result
+
+    def _risk_state_for_entry(self) -> dict[str, Any]:
+        anchor_ready = self._risk_exit_policy is None or (
+            self._risk_exit_metrics.get("daily_anchor_verified") is True
+            and self._risk_exit_metrics.get("daily_loss_state") == "READY"
+            and self._risk_exit_metrics.get("daily_anchor_equity") is not None
+            and (self._fixture_mode or self._risk_exit_metrics.get("cashflows_complete") is True)
+        )
+        state: dict[str, Any] = {
+            "equity": self._risk_metrics.get("equity"),
+            "equity_source": "VIRTUAL_PAPER_ONLY" if self._fixture_mode else "OBSERVED_DEMO",
+            "daily_pnl": self._risk_metrics.get("daily_pnl") if anchor_ready else None,
+            "daily_anchor_equity": self._risk_exit_metrics.get("daily_anchor_equity") if anchor_ready else None,
+            "high_water_equity": self._risk_metrics.get("high_water_equity"),
+            "drawdown": self._risk_metrics.get("drawdown"),
+            "bar_clock_known": self._runtime_snapshot.get("runtime_state") == "VALID"
+            and self._runtime_snapshot.get("risk_bar_clock_basis") == _RISK_BAR_CLOCK_BASIS,
+            "risk_bar_clock_basis": self._runtime_snapshot.get("risk_bar_clock_basis"),
+            "risk_trigger_timeframe": self._runtime_snapshot.get("trigger_timeframe"),
+            "margin_available": self._risk_metrics.get("margin_available"),
+            "margin_required": self._risk_metrics.get("margin_required"),
+            "costs_known": False,
+        }
+        try:
+            positions = self._account_positions()
+        except BaseException:
+            # Do not turn an unavailable account snapshot into zero exposure.
+            positions = None
+        if positions is not None:
+            state["positions"] = len(positions)
+        active_intents = 0
+        for intent_id, intent in self._intents.items():
+            if intent.kind != "OPEN":
+                continue
+            result = self._results.get(intent_id)
+            if result is None or result.state not in _TERMINAL_STATES:
+                active_intents += 1
+        state["intents"] = active_intents
+        if self._risk_contract_spec is not None:
+            state["costs_known"] = self._risk_costs_known(self._risk_contract_spec)
+        return state
+
+    @staticmethod
+    def _risk_costs_known(spec: Mapping[str, Any]) -> bool:
+        fixed = any(spec.get(name) is not None for name in ("expected_cost_fixed", "expected_commission_fixed"))
+        variable = any(
+            spec.get(name) is not None for name in ("expected_cost_per_unit", "expected_commission_per_unit")
+        )
+        slippage = any(
+            spec.get(name) is not None for name in ("expected_exit_slippage_per_unit", "expected_exit_slippage_pips")
+        )
+        identity = bool(spec.get("expected_cost_source", spec.get("cost_estimate_source"))) and bool(
+            spec.get("expected_cost_currency", spec.get("cost_currency"))
+        )
+        return bool(spec.get("fees_known") is True and fixed and variable and slippage and identity)
+
+    def _risk_exit_metrics_dict(self) -> dict[str, Any]:
+        result = dict(self._risk_exit_metrics)
+        for key, value in tuple(result.items()):
+            if isinstance(value, Decimal):
+                result[key] = _decimal_text(value)
+        observed = result.get("daily_anchor_observed_at")
+        if isinstance(observed, datetime):
+            result["daily_anchor_observed_at"] = _iso(observed)
+        return result
+
+    def _runtime_entry_state(self, data: Mapping[str, Any]) -> Mapping[str, Any]:
+        runtime = self._runtime_snapshot
+        candidate = data.get("market_candidate_id", data.get("candidate_id"))
+        runtime_candidate = runtime.get("market_candidate_id")
+        if (
+            candidate is not None
+            and runtime_candidate is not None
+            and str(candidate).strip() != str(runtime_candidate).strip()
+        ):
+            raise RiskLimitRejected("signal market_candidate_id does not match the runtime snapshot")
+        if (
+            self._market_candidate_id is not None
+            and runtime_candidate is not None
+            and str(runtime_candidate).strip() != self._market_candidate_id
+        ):
+            raise RiskLimitRejected("runtime market_candidate_id does not match the configured candidate")
+        return runtime
+
+    def _risk_atr_for_entry(
+        self, data: Mapping[str, Any], values: Mapping[str, Any], runtime: Mapping[str, Any]
+    ) -> Any:
+        atr = data.get("risk_atr", data.get("atr", data.get("atr_value")))
+        if atr is None:
+            atr = values.get("risk_atr", values.get("atr", values.get("atr_value")))
+        runtime_atr = runtime.get("atr")
+        if atr is None:
+            return runtime_atr
+        if runtime.get("runtime_state") != "VALID":
+            return atr
+        if runtime_atr is None:
+            raise RiskLimitRejected("runtime ATR is unavailable")
+        try:
+            if _decimal_value(atr, "atr", positive=True) != _decimal_value(runtime_atr, "runtime atr", positive=True):
+                raise RiskLimitRejected("signal ATR does not match the runtime snapshot")
+        except ValueError as exc:
+            raise RiskLimitRejected("signal/runtime ATR is invalid") from exc
+        return atr
+
+    def risk_entry_plan(
+        self,
+        signal: Any,
+        quote: Quote | Mapping[str, Any],
+        *,
+        requested_quantity: DecimalValue | Decimal | float | str | None = None,
+    ) -> EntryPlan | None:
+        """Return the shared RiskExit plan for an entry, without sending it.
+
+        A missing policy keeps the legacy executor path unchanged.  When the
+        policy is enabled, every required fact is passed through unchanged;
+        missing equity, contract economics, calendar, cash-flow anchor or
+        account state remains a blocked plan rather than a guessed value.
+        """
+
+        policy = self._risk_exit_policy
+        if policy is None:
+            return None
+        quote_obj = quote if isinstance(quote, Quote) else Quote.from_mapping(quote)
+        data = _as_mapping(signal)
+        runtime = self._runtime_entry_state(data)
+        nested = data.get("values")
+        values = nested if isinstance(nested, Mapping) else {}
+        candidate = data.get(
+            "market_candidate_id",
+            data.get("candidate_id", values.get("market_candidate_id", values.get("candidate_id"))),
+        )
+        if (
+            self._market_candidate_id is not None
+            and str(candidate or runtime.get("market_candidate_id") or "").strip() != self._market_candidate_id
+        ):
+            raise RiskLimitRejected("signal market_candidate_id does not match the configured RiskExit candidate")
+        atr = self._risk_atr_for_entry(data, values, runtime)
+        source = "VIRTUAL_PAPER_ONLY" if self._fixture_mode else "OBSERVED_DEMO"
+        mode = data.get("risk_exit_mode", data.get("risk_mode"))
+        if mode is None and str(data.get("mode", "")).strip().upper() in {
+            "DIAGNOSTIC",
+            "VIRTUAL_DIAGNOSTIC",
+            "VIRTUAL_DIAGNOSTICS",
+        }:
+            mode = data.get("mode")
+        if mode is None:
+            mode = "DEMO_GATED"
+        try:
+            return plan_entry(
+                policy,
+                direction=data.get("side", data.get("direction")),
+                entry_price=quote_obj.price_for(Side.parse(data.get("side", data.get("direction")))),
+                atr=atr,
+                equity=self._risk_metrics.get("equity"),
+                available_at=quote_obj.available_at or quote_obj.timestamp,
+                contract_spec=self._risk_contract_spec_for_entry(quote_obj),
+                calendar_state=self._risk_calendar_for_entry(),
+                risk_state=self._risk_state_for_entry(),
+                requested_quantity=requested_quantity,
+                equity_source=source,
+                mode=str(mode),
+                executable_bid=quote_obj.bid,
+                executable_ask=quote_obj.ask,
+            )
+        except ValueError as exc:
+            raise RiskLimitRejected(f"RiskExit entry evidence is invalid: {exc}") from exc
+
+    @staticmethod
+    def _risk_exit_order_options(options: Mapping[str, Any], plan: EntryPlan) -> dict[str, Any]:
+        if plan.initial_stop is None or plan.take_profit is None:
+            raise RiskLimitRejected("RiskExit plan lacks immutable protective levels")
+        result = dict(options)
+        # Relative levels from the legacy execution policy must not silently
+        # compete with the shared ATR-derived absolute levels.
+        result.pop("relative_stop_loss", None)
+        result.pop("relative_take_profit", None)
+        for key, expected in (("stop_loss", plan.initial_stop), ("take_profit", plan.take_profit)):
+            existing = result.get(key)
+            if existing is not None:
+                try:
+                    if _decimal_value(existing, key, positive=True) != expected:
+                        raise RiskLimitRejected(f"{key} conflicts with the immutable RiskExit plan")
+                except ValueError as exc:
+                    raise RiskLimitRejected(f"{key} conflicts with the immutable RiskExit plan") from exc
+            result[key] = _decimal_text(expected)
+        return result
+
+    def evaluate_risk_exit(
+        self,
+        entry_plan: EntryPlan | Mapping[str, Any] | None,
+        *,
+        current_price: Any | None,
+        observed_at: Any,
+        entry_at: Any | None = None,
+        bars_held: int = 0,
+        gap: bool = False,
+        executable_price: Any | None = None,
+        favorable_price: Any | None = None,
+        adverse_price: Any | None = None,
+        server_side_stop: bool = False,
+        calendar_state: Mapping[str, Any] | None = None,
+    ) -> ExitDecision:
+        """Expose the shared tick-driven exit decision without submitting."""
+
+        if self._risk_exit_policy is None:
+            raise RiskLimitRejected("RiskExit no está configurado en este executor")
+        return evaluate_exit(
+            self._risk_exit_policy,
+            entry_plan,
+            current_price=current_price,
+            observed_at=observed_at,
+            entry_at=entry_at,
+            bars_held=bars_held,
+            calendar_state=calendar_state if calendar_state is not None else self._risk_calendar,
+            gap=gap,
+            executable_price=executable_price,
+            current_price_is_executable=executable_price is not None,
+            favorable_price=favorable_price,
+            adverse_price=adverse_price,
+            server_side_stop=server_side_stop,
+        )
 
     def _position_is_owned(self, position: Position) -> bool:
         if position.account_id != self.account.account_id:
@@ -2142,6 +3018,16 @@ class CTraderDemoExecutor:
             },
             "metrics_observed_at": _iso(self._risk_metrics_observed_at),
             "metrics_connection_generation": self._risk_metrics_generation,
+            "risk_exit": {
+                "enabled": self.risk_exit_enabled,
+                "candidate_id": self._market_candidate_id,
+                "policy_hash": self._risk_exit_policy.policy_hash if self._risk_exit_policy else None,
+                "policy": self._risk_exit_policy.serialize() if self._risk_exit_policy else None,
+                "contract_spec": _json_safe(self._risk_contract_spec),
+                "calendar": _json_safe(self._risk_calendar),
+                "metrics": self._risk_exit_metrics_dict(),
+                "runtime": self._runtime_snapshot_copy(),
+            },
             "recovery_required": self._recovery_required,
             "new_intents_enabled": self._active
             and not self._paused
@@ -2324,7 +3210,13 @@ class CTraderDemoExecutor:
         # demo position.
         return tuple(position for position in positions if self._position_is_owned(position))
 
-    def _resolve_quantity(self, requested: DecimalValue | float | str | None, *, kind: str = "OPEN") -> DecimalValue:
+    def _resolve_quantity(
+        self,
+        requested: DecimalValue | Decimal | float | str | None,
+        *,
+        kind: str = "OPEN",
+        enforce_fixed: bool = True,
+    ) -> DecimalValue:
         quantity = self.policy.fixed_quantity if requested is None and kind == "OPEN" else requested
         if quantity is None:
             quantity = self.policy.fixed_quantity if kind == "OPEN" else quantity
@@ -2338,7 +3230,8 @@ class CTraderDemoExecutor:
             if quantity > self.policy.max_quantity:
                 raise RiskLimitRejected("quantity cap exceeded")
             if (
-                self.policy.fixed_quantity is not None
+                enforce_fixed
+                and self.policy.fixed_quantity is not None
                 and abs(quantity - self.policy.fixed_quantity) > _DECIMAL_TOLERANCE
             ):
                 raise RiskLimitRejected("fixed quantity policy rejects variable sizing")
@@ -2351,7 +3244,15 @@ class CTraderDemoExecutor:
             self._risk_halt_reason = "position_reconciliation_failed"
             raise
 
-    def _check_open_limits(self, data: Mapping[str, Any], quantity: DecimalValue, quote: Quote, side: Side) -> None:
+    def _check_open_limits(
+        self,
+        data: Mapping[str, Any],
+        quantity: DecimalValue,
+        quote: Quote,
+        side: Side,
+        *,
+        risk_plan: EntryPlan | None = None,
+    ) -> None:
         validator = getattr(self.transport, "validate_open_quantity", None)
         if callable(validator):
             validator(quantity)
@@ -2377,7 +3278,7 @@ class CTraderDemoExecutor:
         ) + quantity * quote.price_for(side)
         if exposure > self.policy.max_exposure + _DECIMAL_TOLERANCE:
             raise RiskLimitRejected("max_exposure cap exceeded")
-        if self.policy.require_protective_stops and not _has_protective_stop(data, self.policy):
+        if self.policy.require_protective_stops and risk_plan is None and not _has_protective_stop(data, self.policy):
             raise RiskLimitRejected("protective stop/take-profit is required by policy")
 
     def _check_order_window(self) -> None:
@@ -2388,6 +3289,62 @@ class CTraderDemoExecutor:
         recent = sum(1 for item in self._intents.values() if item.kind == "OPEN" and item.created_at >= window)
         if recent >= self.policy.max_orders_per_window:
             raise RiskLimitRejected("max_orders_per_window cap exceeded")
+
+    def _resolve_entry_quantity(
+        self,
+        data: Mapping[str, Any],
+        quote: Quote,
+        requested: DecimalValue | Decimal | float | str | None,
+    ) -> tuple[DecimalValue, EntryPlan | None]:
+        risk_plan = self.risk_entry_plan(data, quote, requested_quantity=requested)
+        if risk_plan is None:
+            return self._resolve_quantity(requested, kind="OPEN"), None
+        if not risk_plan.allowed or not risk_plan.eligible_for_demo or risk_plan.mode != "DEMO_GATED":
+            reasons = ",".join(risk_plan.reasons) or "RISK_EXIT_NOT_ELIGIBLE"
+            raise RiskLimitRejected(f"RiskExit entry blocked: {reasons}")
+        if risk_plan.quantity is None:
+            raise RiskLimitRejected("RiskExit entry has no sized quantity")
+        return self._resolve_quantity(risk_plan.quantity, kind="OPEN", enforce_fixed=False), risk_plan
+
+    def _intent_metadata(
+        self,
+        quote: Quote,
+        data_mode: str | None,
+        options: Mapping[str, Any],
+        risk_plan: EntryPlan | None,
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "executor_version": self.VERSION,
+            "endpoint": self.account.endpoint,
+            "quote": quote.to_dict() if quote is not None else None,
+            "no_martingale": self.policy.no_martingale,
+            "virtual_only": self._virtual_only,
+            "data_mode": data_mode,
+            "order_options": dict(options),
+        }
+        if risk_plan is None:
+            return metadata
+        metadata["risk_exit_plan"] = serialize_risk_exit(risk_plan)
+        metadata["risk_exit_policy_hash"] = self._risk_exit_policy.policy_hash if self._risk_exit_policy else None
+        metadata["market_candidate_id"] = self._market_candidate_id
+        metadata["risk_exit_mode"] = risk_plan.mode
+        runtime = self._runtime_snapshot
+        metadata["risk_trigger_timeframe"] = runtime.get("trigger_timeframe")
+        metadata["risk_entry_bar_count"] = runtime.get("trigger_bar_count")
+        metadata["risk_trigger_bar_count"] = runtime.get("trigger_bar_count")
+        metadata["risk_bar_clock_basis"] = runtime.get("risk_bar_clock_basis")
+        metadata["risk_entry_bar_count_frozen"] = False
+        metadata["risk_entry_bar_count_source"] = "RUNTIME_UTC_ORDINAL_AT_INTENT"
+        # Preserve descriptive aliases for older journal readers while the
+        # risk_* names stay canonical across PAPER and DEMO.
+        metadata["entry_trigger_timeframe"] = runtime.get("trigger_timeframe")
+        metadata["entry_trigger_bar_count"] = runtime.get("trigger_bar_count")
+        metadata["entry_risk_bar_clock_basis"] = runtime.get("risk_bar_clock_basis")
+        metadata["entry_trigger_start"] = runtime.get("latest_trigger_start")
+        metadata["entry_trigger_end"] = runtime.get("latest_trigger_end")
+        metadata["entry_trigger_available_at"] = runtime.get("latest_trigger_available_at")
+        metadata["order_options"] = self._risk_exit_order_options(options, risk_plan)
+        return metadata
 
     def _make_intent(
         self,
@@ -2414,10 +3371,14 @@ class CTraderDemoExecutor:
         if data_mode is not None:
             data_mode = str(getattr(data_mode, "value", data_mode)).strip().upper() or None
         side = Side.parse(data.get("side", data.get("direction")))
-        q = self._resolve_quantity(quantity, kind=kind)
+        if kind == "OPEN":
+            q, risk_plan = self._resolve_entry_quantity(data, quote, quantity)
+        else:
+            risk_plan = None
+            q = self._resolve_quantity(quantity, kind=kind)
         self._check_quote(symbol, quote, side)
         if kind == "OPEN":
-            self._check_open_limits(data, q, quote, side)
+            self._check_open_limits(data, q, quote, side, risk_plan=risk_plan)
         if kind == "OPEN" and signal_id in self._signal_intents:
             raise DuplicateIntent(f"signal already has an execution intent: {signal_id}")
         nonce = f"{signal_id}|{self.account.account_id}|{symbol}|{side.value}|{kind}|{position_id or ''}"
@@ -2425,6 +3386,7 @@ class CTraderDemoExecutor:
         if intent_id in self._intents or intent_id in self._results or _store_has_intent(self.intent_store, intent_id):
             raise DuplicateIntent(f"intent already exists: {intent_id}")
         options = _order_options(data, self.policy) if kind == "OPEN" else {}
+        metadata = self._intent_metadata(quote, data_mode, options, risk_plan)
         return ExecutionIntent(
             intent_id,
             signal_id,
@@ -2436,15 +3398,7 @@ class CTraderDemoExecutor:
             self.account.account_id,
             kind,
             position_id,
-            {
-                "executor_version": self.VERSION,
-                "endpoint": self.account.endpoint,
-                "quote": quote.to_dict() if quote is not None else None,
-                "no_martingale": self.policy.no_martingale,
-                "virtual_only": self._virtual_only,
-                "data_mode": data_mode,
-                "order_options": options,
-            },
+            metadata,
         )
 
     def _make_close_intent(self, position: Position) -> ExecutionIntent:
@@ -2541,6 +3495,30 @@ class CTraderDemoExecutor:
         finally:
             self._inflight_ids.discard(intent.intent_id)
 
+    def _freeze_entry_bar_counter_at_fill(self, intent: ExecutionIntent) -> ExecutionIntent:
+        if self._risk_exit_policy is None or intent.kind != "OPEN":
+            return intent
+        if intent.metadata.get("risk_entry_bar_count_frozen") is True:
+            return intent
+        current = self._runtime_snapshot.get("trigger_bar_count")
+        if self._runtime_snapshot.get("runtime_state") != "VALID" or not isinstance(current, int):
+            return intent
+        metadata = dict(intent.metadata)
+        metadata["risk_entry_bar_count"] = current
+        metadata["risk_trigger_bar_count"] = current
+        metadata["risk_entry_bar_count_frozen"] = True
+        metadata["risk_entry_bar_count_source"] = "RUNTIME_UTC_ORDINAL_AT_FILL"
+        updated = dataclasses.replace(intent, metadata=metadata)
+        self._intents[intent.intent_id] = updated
+        return updated
+
+    def _maybe_freeze_entry_bar_counter(
+        self, intent: ExecutionIntent, snapshot: OrderSnapshot, state: OrderState
+    ) -> ExecutionIntent:
+        if snapshot.filled_quantity <= 0 or state not in {OrderState.PARTIAL, OrderState.FILLED}:
+            return intent
+        return self._freeze_entry_bar_counter_at_fill(intent)
+
     def submit_signal(
         self, signal: Any, quote: Quote | Mapping[str, Any], *, quantity: DecimalValue | float | str | None = None
     ) -> OrderResult:
@@ -2621,6 +3599,7 @@ class CTraderDemoExecutor:
             state = OrderState.PARTIAL if snapshot.filled_quantity < intent.quantity else OrderState.FILLED
         if state is OrderState.PARTIAL and snapshot.filled_quantity <= 0:
             state = OrderState.SUBMITTED
+        intent = self._maybe_freeze_entry_bar_counter(intent, snapshot, state)
         result = OrderResult(
             intent,
             state,
@@ -2735,9 +3714,21 @@ class CTraderDemoExecutor:
             self._update(intent, result)
             return result
 
-    def manage(self) -> tuple[OrderResult, ...]:
-        """Poll orders and close known own positions past the holding deadline."""
+    def manage(self, quote: Quote | Mapping[str, Any] | None = None) -> tuple[OrderResult, ...]:
+        """Poll orders and apply the opt-in shared exit policy.
+
+        ``quote`` is the latest complete local BBO supplied by the
+        composition root.  It is never fetched here.  Legacy executors keep
+        their existing absolute holding-time behavior; an enabled RiskExit
+        policy exclusively owns temporal exits so the two clocks cannot close
+        the same position inconsistently.
+        """
         with self._lock:
+            if quote is not None:
+                try:
+                    self._last_local_quote = quote if isinstance(quote, Quote) else Quote.from_mapping(quote)
+                except (TypeError, ValueError) as exc:
+                    raise RiskLimitRejected(f"latest local BBO is invalid: {exc}") from exc
             keys = [
                 key
                 for key, result in self._results.items()
@@ -2745,7 +3736,10 @@ class CTraderDemoExecutor:
                 in {OrderState.UNKNOWN, OrderState.PARTIAL, OrderState.CLOSE_PARTIAL, OrderState.SUBMITTED}
             ]
             results = [self.reconcile(key) for key in keys]
-            results.extend(self._holding_time_exits())
+            if self._risk_exit_policy is not None:
+                results.extend(self._risk_exit_management(self._last_local_quote))
+            else:
+                results.extend(self._holding_time_exits())
             return tuple(results)
 
     def _holding_time_exits(self) -> tuple[OrderResult, ...]:

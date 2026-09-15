@@ -7,12 +7,17 @@ settlement logic of its own and never writes to SQLite.
 
 from __future__ import annotations
 
+import json
+import os
+import stat
 import threading
+from collections.abc import Mapping
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from socketserver import BaseServer
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from .persistence import SQLiteStore, canonical_json
@@ -179,8 +184,366 @@ async function loadMoreCandles(cursor){let p=await get('/api/candles?'+qs({limit
 </script></body></html>"""
 
 
+# Snapshot mode deliberately has its own static page.  It never asks the
+# browser to supply a database path or a session identifier; all data comes
+# from the fixed, server-side snapshot selected by ``create_server``.
+SNAPSHOT_INDEX_HTML = r"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MTF Lab — snapshot</title><style>
+body{font-family:system-ui,sans-serif;max-width:1100px;margin:1rem auto;padding:0 1rem;color:#182230;background:#fafbfc}.card{border:1px solid #d7dfe8;border-radius:.5rem;background:#fff;padding:.7rem;margin:.6rem 0;overflow-wrap:anywhere}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:.7rem}.muted{color:#657487}.warn{color:#9a6700}.bad{color:#a32020}pre{white-space:pre-wrap;overflow:auto;max-height:28rem}table{border-collapse:collapse;width:100%}th,td{border:1px solid #d7dfe8;padding:.35rem;text-align:left}th{background:#eef3f8}
+</style></head><body><h1>MTF Lab — snapshot de investigación</h1>
+<p class="muted">Fuente fija de sólo lectura. Salud HTTP no equivale a readiness ni a permiso de operar.</p>
+<div id="summary" class="grid"></div><section class="card"><h2>Procedencia y frescura</h2><div id="provenance"></div></section>
+<section class="card"><h2>Datos publicados</h2><pre id="report">Cargando…</pre></section>
+<script>(async()=>{const esc=x=>String(x??'UNKNOWN').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));const get=p=>fetch(p,{cache:'no-store'}).then(r=>{if(!r.ok)throw Error('HTTP '+r.status);return r.json()});try{const [s,h]=await Promise.all([get('/api/status'),get('/api/health')]);const c=s.counts||{};document.getElementById('summary').innerHTML=Object.entries(c).map(([k,v])=>'<div class="card"><b>'+esc(k)+'</b><div>'+esc(v)+'</div></div>').join('')+'<div class="card"><b>Modo</b><div>'+esc(s.mode_label||s.mode)+'</div></div><div class="card"><b>Health</b><div>'+esc(h.ok===true?'OK · read-only':'UNKNOWN')+'</div></div>';document.getElementById('provenance').innerHTML='<pre>'+esc(JSON.stringify({provenance:s.provenance,staleness:s.staleness,readiness:'separate endpoint'},null,2))+'</pre>';document.getElementById('report').textContent=JSON.stringify(await get('/api/report'),null,2)}catch(e){document.getElementById('report').textContent='SNAPSHOT_UNAVAILABLE';document.getElementById('report').className='bad'}})();</script></body></html>"""
+
+
+SNAPSHOT_MAX_BYTES = 8 * 1024 * 1024
+SNAPSHOT_DEFAULT_MAX_AGE_SECONDS = 3600.0
+_SNAPSHOT_PRIVATE_KEYS = ("token", "secret", "password", "authorization", "api_key", "refresh")
+_SNAPSHOT_IDENTIFIER_KEYS = (
+    "account_id",
+    "accountid",
+    "account_key",
+    "session_id",
+    "email",
+    "phone",
+    "client_id",
+    "path",
+    "filename",
+    "file_name",
+)
+
+
+class SnapshotSecurityError(ValueError):
+    """The fixed dashboard snapshot is not a private regular file."""
+
+
+def _snapshot_redact(value: Any, *, key: str = "", max_items: int = 256) -> Any:
+    lowered = key.lower().replace("-", "_")
+    if any(item in lowered for item in _SNAPSHOT_PRIVATE_KEYS + _SNAPSHOT_IDENTIFIER_KEYS):
+        return "[REDACTED]"
+    if isinstance(value, str) and any(
+        marker in value.lower() for marker in ("token", "secret", "password", "api_key", "bearer ")
+    ):
+        return "[REDACTED]"
+    if isinstance(value, Mapping):
+        return {
+            str(name): _snapshot_redact(item, key=str(name), max_items=max_items)
+            for name, item in list(value.items())[:max_items]
+        }
+    if isinstance(value, (list, tuple)):
+        return [_snapshot_redact(item, max_items=max_items) for item in list(value)[:max_items]]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if hasattr(value, "isoformat"):
+        return str(value.isoformat())
+    return str(value)
+
+
+def _snapshot_path(value: str | Path) -> Path:
+    if isinstance(value, str) and ("://" in value or value.lower().startswith(("http:", "https:", "file:"))):
+        raise SnapshotSecurityError("snapshot JSON requiere una ruta fija local, no una URL")
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if any(component in {".", ".."} for component in path.parts):
+        raise SnapshotSecurityError("snapshot JSON requiere una ruta sin componentes relativos")
+    # Reject symlinked parent components too.  A writer may publish an atomic
+    # replacement, but the selected namespace itself must not be redirected.
+    current = Path(path.anchor)
+    for component in path.parts[1:-1]:
+        current /= component
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError as exc:
+            raise SnapshotSecurityError("directorio de snapshot inexistente") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise SnapshotSecurityError("el directorio de snapshot no puede ser symlink")
+    return path
+
+
+def _snapshot_timestamp(value: Mapping[str, Any]) -> datetime | None:
+    sources: list[Mapping[str, Any]] = [value]
+    for key in ("runtime_identity", "status"):
+        nested = value.get(key)
+        if isinstance(nested, Mapping):
+            sources.append(cast(Mapping[str, Any], nested))
+    for source in sources:
+        for key in ("published_at", "generated_at", "snapshot_at", "updated_at", "captured_at"):
+            candidate = source.get(key)
+            if candidate is not None:
+                text = str(candidate).strip().replace("Z", "+00:00")
+                try:
+                    parsed = datetime.fromisoformat(text)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if parsed.tzinfo is not None and parsed.utcoffset() is not None:
+                    return parsed.astimezone(UTC)
+    return None
+
+
+def _snapshot_limit(value: Mapping[str, Any], default_max_age: float) -> tuple[float, bool]:
+    raw_limit = value.get("valid_for_seconds", value.get("max_age_seconds"))
+    if raw_limit is None and isinstance(value.get("runtime_identity"), Mapping):
+        identity = cast(Mapping[str, Any], value["runtime_identity"])
+        raw_limit = identity.get("valid_for_seconds", identity.get("max_age_seconds"))
+    invalid_limit = raw_limit is not None
+    try:
+        limit = float(raw_limit) if raw_limit is not None and not isinstance(raw_limit, bool) else default_max_age
+    except (TypeError, ValueError):
+        limit = default_max_age
+    if raw_limit is None:
+        invalid_limit = False
+    elif not (limit > 0) or limit != limit or limit == float("inf"):
+        invalid_limit = True
+        limit = default_max_age
+    return limit, invalid_limit
+
+
+def _snapshot_age(value: Mapping[str, Any], *, now: datetime, default_max_age: float) -> dict[str, Any]:
+    timestamp = _snapshot_timestamp(value)
+    limit, invalid_limit = _snapshot_limit(value, default_max_age)
+    if timestamp is None:
+        return {
+            "state": "UNKNOWN",
+            "stale": False,
+            "age_seconds": None,
+            "max_age_seconds": limit,
+            "reason": "timestamp_missing_or_invalid",
+        }
+    if invalid_limit:
+        return {
+            "state": "UNKNOWN",
+            "stale": False,
+            "age_seconds": None,
+            "max_age_seconds": limit,
+            "reason": "valid_for_seconds_invalid",
+            "published_at": timestamp.isoformat().replace("+00:00", "Z"),
+        }
+    raw_age = (now - timestamp).total_seconds()
+    if raw_age < 0:
+        return {
+            "state": "UNKNOWN",
+            "stale": False,
+            "age_seconds": None,
+            "max_age_seconds": limit,
+            "reason": "timestamp_in_future_clock_skew",
+            "published_at": timestamp.isoformat().replace("+00:00", "Z"),
+        }
+    age = raw_age
+    stale = age > limit
+    return {
+        "state": "STALE" if stale else "FRESH",
+        "stale": stale,
+        "age_seconds": age,
+        "max_age_seconds": limit,
+        "reason": "max_age_exceeded" if stale else "within_declared_max_age",
+        "published_at": timestamp.isoformat().replace("+00:00", "Z"),
+    }
+
+
+class SnapshotReader:
+    """Read and validate one private fixed-path JSON snapshot per request."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        max_bytes: int = SNAPSHOT_MAX_BYTES,
+        max_age_seconds: float = SNAPSHOT_DEFAULT_MAX_AGE_SECONDS,
+    ):
+        self.path = _snapshot_path(path)
+        self.max_bytes = max(1, min(SNAPSHOT_MAX_BYTES, int(max_bytes)))
+        self.max_age_seconds = max(0.0, float(max_age_seconds))
+        self._validate_path()
+
+    def _validate_path(self) -> os.stat_result:
+        try:
+            info = os.lstat(self.path)
+        except OSError as exc:
+            raise SnapshotSecurityError("snapshot JSON no disponible") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise SnapshotSecurityError("snapshot JSON debe ser un archivo regular sin symlink")
+        if info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise SnapshotSecurityError("snapshot JSON debe pertenecer al usuario y tener nlink=1")
+        if info.st_size > self.max_bytes:
+            raise SnapshotSecurityError("snapshot JSON excede el límite de tamaño")
+        if stat.S_IMODE(info.st_mode) & 0o077:
+            raise SnapshotSecurityError("snapshot JSON debe ser privado (sin permisos de grupo/otros)")
+        return info
+
+    def load(self) -> dict[str, Any]:
+        expected = self._validate_path()
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(self.path, flags)
+        except OSError as exc:
+            raise SnapshotSecurityError("snapshot JSON no se pudo abrir de forma segura") from exc
+        try:
+            opened = os.fstat(fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_dev != expected.st_dev
+                or opened.st_ino != expected.st_ino
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or opened.st_size > self.max_bytes
+            ):
+                raise SnapshotSecurityError("snapshot JSON cambió de identidad durante la lectura")
+            chunks: list[bytes] = []
+            total = 0
+            while True:
+                chunk = os.read(fd, min(64 * 1024, self.max_bytes - total + 1))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                total += len(chunk)
+                if total > self.max_bytes:
+                    raise SnapshotSecurityError("snapshot JSON excede el límite de tamaño")
+
+            def reject_constant(value: str) -> None:
+                raise ValueError(f"constante JSON no finita: {value}")
+
+            try:
+                value = json.loads(b"".join(chunks).decode("utf-8"), parse_constant=reject_constant)
+            except (UnicodeDecodeError, ValueError) as exc:
+                raise SnapshotSecurityError("snapshot JSON inválido") from exc
+            final = os.fstat(fd)
+            if final.st_nlink != 1 or final.st_uid != os.getuid() or not stat.S_ISREG(final.st_mode):
+                raise SnapshotSecurityError("snapshot JSON perdió su identidad privada")
+        finally:
+            os.close(fd)
+        if not isinstance(value, Mapping):
+            raise SnapshotSecurityError("snapshot JSON debe contener un objeto")
+        return cast(dict[str, Any], _snapshot_redact(value))
+
+    def read(self) -> dict[str, Any]:
+        """Compatibility name for callers that treat the reader as a source."""
+
+        return self.load()
+
+    def projection(self) -> dict[str, Any]:
+        value = self.load()
+        now = datetime.now(UTC)
+        staleness = _snapshot_age(value, now=now, default_max_age=self.max_age_seconds)
+        provenance = value.get("provenance")
+        if not isinstance(provenance, Mapping):
+            provenance = {"status": "UNKNOWN", "labels": ["UNKNOWN"]}
+        return {
+            "snapshot": value,
+            "staleness": staleness,
+            "provenance": _snapshot_redact(provenance),
+            "redaction": {"applied": True, "private_keys": True, "raw_paths": True},
+        }
+
+
+def _snapshot_status(projection: Mapping[str, Any]) -> dict[str, Any]:
+    value = projection.get("snapshot")
+    raw = value if isinstance(value, Mapping) else {}
+    raw_status = raw.get("status")
+    raw_source = raw.get("source")
+    raw_counts = raw.get("counts")
+    status: Mapping[str, Any] = cast(Mapping[str, Any], raw_status) if isinstance(raw_status, Mapping) else {}
+    source: Mapping[str, Any] = cast(Mapping[str, Any], raw_source) if isinstance(raw_source, Mapping) else {}
+    counts: Mapping[str, Any] = cast(Mapping[str, Any], raw_counts) if isinstance(raw_counts, Mapping) else {}
+    if not counts:
+        counts = {
+            name: raw.get(name)
+            for name in ("messages", "events", "signals", "reconnects", "reconciliations")
+            if raw.get(name) is not None
+        }
+    staleness = projection.get("staleness")
+    stale = staleness.get("stale") if isinstance(staleness, Mapping) else False
+    result = dict(status)
+    result.update(
+        {
+            "mode": "SNAPSHOT",
+            "mode_label": "SNAPSHOT DE INVESTIGACIÓN",
+            "snapshot_mode": True,
+            "read_only": True,
+            "analysis_enabled": False,
+            "execution_enabled": False,
+            "ready": False,
+            "readiness": "separate_endpoint",
+            "counts": dict(counts),
+            "provider": result.get(
+                "provider", source.get("provider", raw.get("provider", raw.get("source", "UNKNOWN")))
+            ),
+            "instrument": result.get("instrument", source.get("instrument", raw.get("instrument", "UNKNOWN"))),
+            "provenance": projection.get("provenance", {"status": "UNKNOWN", "labels": ["UNKNOWN"]}),
+            "staleness": staleness or {"state": "UNKNOWN", "stale": False},
+            "stale": stale is True,
+            "redaction": projection.get("redaction", {"applied": True}),
+            # A report snapshot is not runtime evidence.  Keep readiness
+            # visibly blocked even if the payload contains a positive result.
+            "readiness_verified": False,
+        }
+    )
+    return result
+
+
+def _snapshot_items(value: Any) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        if isinstance(value.get("items"), list):
+            return dict(value)
+        return {"items": [dict(value)], "limit": 1}
+    if isinstance(value, list):
+        return {"items": value, "limit": len(value)}
+    return {"items": [], "limit": 0}
+
+
+def _snapshot_endpoint(projection: Mapping[str, Any], path: str) -> Any:
+    """Project a fixed snapshot without accepting path/session query input."""
+
+    value = projection.get("snapshot")
+    raw = value if isinstance(value, Mapping) else {}
+    if path == "/api/status":
+        return _snapshot_status(projection)
+    if path in {"/api/report", "/api/snapshot"}:
+        return {**dict(raw), "staleness": projection.get("staleness"), "redaction": projection.get("redaction")}
+    if path == "/api/poll":
+        return {"status": _snapshot_status(projection), "items": [], "snapshot": True}
+    if path == "/api/provenance":
+        return {
+            "provenance": projection.get("provenance", {"status": "UNKNOWN", "labels": ["UNKNOWN"]}),
+            "staleness": projection.get("staleness", {"state": "UNKNOWN", "stale": False}),
+            "redaction": projection.get("redaction", {"applied": True}),
+        }
+    if path == "/api/sessions":
+        sessions = raw.get("sessions", raw.get("session"))
+        return _snapshot_items(sessions).get("items", [])
+    aliases = {
+        "/api/candles": "candles",
+        "/api/indicators": "indicators",
+        "/api/revisions": "revisions",
+        "/api/events": "events",
+        "/api/signals": "signals",
+        "/api/decisions": "decisions",
+        "/api/discards": "discards",
+        "/api/conditions": "conditions",
+        "/api/gaps": "gaps",
+        "/api/simulations": "simulations",
+        "/api/cfd-trades": "cfd_trades",
+        "/api/cfd_trades": "cfd_trades",
+        "/api/captures": "captures",
+        "/api/capture-envelopes": "capture_envelopes",
+        "/api/capture_envelopes": "capture_envelopes",
+        "/api/results": "results",
+        "/api/evidence": "results",
+    }
+    if path in aliases:
+        value = raw.get(aliases[path])
+        if value is None and isinstance(raw.get("snapshot"), Mapping):
+            value = raw["snapshot"].get(aliases[path])
+        return _snapshot_items(value)
+    if path == "/api/query":
+        return {"items": [], "limit": 0, "snapshot": True}
+    raise LookupError("not found")
+
+
 def _json_bytes(data: Any) -> bytes:
-    return canonical_json(data).encode("utf-8")
+    return str(canonical_json(data)).encode("utf-8")
 
 
 def _bool_param(value: str | None) -> bool | None:
@@ -201,6 +564,10 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(self.server, MTFHTTPServer):
             raise RuntimeError("handler is attached to an unexpected server")
         return self.server
+
+    @property
+    def _snapshot_mode(self) -> bool:
+        return self._mtf_server.snapshot_reader is not None
 
     def log_message(self, format: str, *args: Any) -> None:
         return
@@ -358,12 +725,35 @@ class _Handler(BaseHTTPRequestHandler):
             return self._query_kind(sid, query, common)
         raise LookupError("not found")
 
+    def _handle_snapshot_api(self, path: str) -> None:
+        reader = self._mtf_server.snapshot_reader
+        if reader is None:
+            raise RuntimeError("snapshot mode is not configured")
+        try:
+            data = _snapshot_endpoint(reader.projection(), path)
+        except LookupError:
+            self._send({"error": "not found"}, status=HTTPStatus.NOT_FOUND)
+            return
+        except (OSError, ValueError, TypeError) as exc:
+            self._send({"error": "snapshot unavailable", "reason": str(exc)}, status=HTTPStatus.SERVICE_UNAVAILABLE)
+            return
+        self._send(data)
+
     def _session_list(self, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        if self._snapshot_mode:
+            reader = self._mtf_server.snapshot_reader
+            if reader is None:
+                return []
+            value = _snapshot_endpoint(reader.projection(), "/api/sessions")
+            return [dict(item) for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
         try:
             session_limit = max(1, min(100, int(query.get("limit", [50])[0])))
         except (TypeError, ValueError):
             session_limit = 50
-        return self._mtf_server.store.sessions(limit=session_limit)
+        store = self._mtf_server.store
+        if store is None:
+            return []
+        return store.sessions(limit=session_limit)
 
     def _handle_api(self, path: str, sid: str, query: dict[str, list[str]]) -> None:
         try:
@@ -384,15 +774,32 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query, keep_blank_values=True)
         if parsed.path in {"/", "/index.html"}:
-            self._send(INDEX_HTML, content_type="text/html; charset=utf-8")
+            self._send(
+                SNAPSHOT_INDEX_HTML if self._snapshot_mode else INDEX_HTML,
+                content_type="text/html; charset=utf-8",
+            )
             return
         if parsed.path == "/api/health":
-            self._send({"ok": True, "service": "mtf-lab-ui", "read_only": True})
+            self._send(
+                {
+                    "ok": True,
+                    "service": "mtf-lab-ui",
+                    "read_only": True,
+                    "snapshot_mode": self._snapshot_mode,
+                    "readiness": "separate_endpoint",
+                }
+            )
             return
         if parsed.path == "/api/readiness":
             from .readiness import read_supervisor_readiness
 
             self._send(read_supervisor_readiness(self._mtf_server.supervisor_state))
+            return
+        if self._snapshot_mode:
+            # Query/session values are intentionally ignored.  In snapshot
+            # mode the path selected when the server was created is the only
+            # data source; a URL cannot redirect it to another user file.
+            self._handle_snapshot_api(parsed.path)
             return
         if parsed.path == "/api/sessions":
             self._send(self._session_list(query))
@@ -408,22 +815,57 @@ class MTFHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
     supervisor_state: str | Path | None = None
+    snapshot_reader: SnapshotReader | None = None
+    snapshot_path: Path | None = None
 
-    def __init__(self, address: tuple[str, int], store: SQLiteStore, *, default_session: str | None = None):
+    def __init__(
+        self,
+        address: tuple[str, int],
+        store: SQLiteStore | None = None,
+        *,
+        default_session: str | None = None,
+        snapshot_reader: SnapshotReader | None = None,
+    ):
         super().__init__(address, _Handler)
         self.store = store
-        self.queries = QueryService(store)
+        # The handler only dereferences ``queries`` in DB mode.  Keep a
+        # non-optional annotation so the legacy query path remains unchanged;
+        # snapshot mode routes before reaching those methods.
+        self.queries: QueryService = cast(QueryService, QueryService(store) if store is not None else None)
         self.default_session = default_session
+        self.snapshot_reader = snapshot_reader
+        self.snapshot_path = snapshot_reader.path if snapshot_reader is not None else None
 
 
 def create_server(
-    db_path: str | Path,
+    db_path: str | Path | None = None,
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
     session_id: str | None = None,
     supervisor_state: str | Path | None = None,
+    snapshot_path: str | Path | None = None,
+    snapshot_json: str | Path | None = None,
+    dashboard_snapshot: str | Path | None = None,
+    snapshot_max_bytes: int = SNAPSHOT_MAX_BYTES,
+    snapshot_max_age_seconds: float = SNAPSHOT_DEFAULT_MAX_AGE_SECONDS,
 ) -> MTFHTTPServer:
+    requested_snapshots = [value for value in (snapshot_path, snapshot_json, dashboard_snapshot) if value is not None]
+    if len(requested_snapshots) > 1:
+        raise ValueError("use sólo un parámetro de snapshot")
+    if requested_snapshots:
+        if db_path is not None:
+            raise ValueError("snapshot_path y db_path son modos mutuamente excluyentes")
+        reader = SnapshotReader(
+            requested_snapshots[0],
+            max_bytes=snapshot_max_bytes,
+            max_age_seconds=snapshot_max_age_seconds,
+        )
+        server = MTFHTTPServer((host, int(port)), None, default_session=None, snapshot_reader=reader)
+        server.supervisor_state = supervisor_state
+        return server
+    if db_path is None:
+        raise ValueError("db_path es requerido fuera del modo snapshot")
     store = SQLiteStore(db_path, read_only=True)
     if session_id is None:
         sessions = store.sessions(limit=1)
@@ -434,16 +876,32 @@ def create_server(
 
 
 def serve(
-    db_path: str | Path,
+    db_path: str | Path | None = None,
     *,
     host: str = "127.0.0.1",
     port: int = 8765,
     session_id: str | None = None,
     duration: float | None = None,
     supervisor_state: str | Path | None = None,
+    snapshot_path: str | Path | None = None,
+    snapshot_json: str | Path | None = None,
+    dashboard_snapshot: str | Path | None = None,
+    snapshot_max_bytes: int = SNAPSHOT_MAX_BYTES,
+    snapshot_max_age_seconds: float = SNAPSHOT_DEFAULT_MAX_AGE_SECONDS,
 ) -> MTFHTTPServer:
     """Serve local read-only UI; optional duration makes smoke tests finite."""
-    server = create_server(db_path, host=host, port=port, session_id=session_id, supervisor_state=supervisor_state)
+    server = create_server(
+        db_path,
+        host=host,
+        port=port,
+        session_id=session_id,
+        supervisor_state=supervisor_state,
+        snapshot_path=snapshot_path,
+        snapshot_json=snapshot_json,
+        dashboard_snapshot=dashboard_snapshot,
+        snapshot_max_bytes=snapshot_max_bytes,
+        snapshot_max_age_seconds=snapshot_max_age_seconds,
+    )
     if duration is not None:
         timer = threading.Timer(max(0.0, float(duration)), server.shutdown)
         timer.daemon = True
@@ -452,8 +910,18 @@ def serve(
         server.serve_forever(poll_interval=0.2)
     finally:
         server.server_close()
-        server.store.close()
+        if server.store is not None:
+            server.store.close()
     return server
 
 
-__all__ = ["MTFHTTPServer", "create_server", "serve"]
+__all__ = [
+    "MTFHTTPServer",
+    "SNAPSHOT_DEFAULT_MAX_AGE_SECONDS",
+    "SNAPSHOT_INDEX_HTML",
+    "SNAPSHOT_MAX_BYTES",
+    "SnapshotReader",
+    "SnapshotSecurityError",
+    "create_server",
+    "serve",
+]

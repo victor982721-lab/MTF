@@ -10,6 +10,150 @@ producir un servidor autenticado.
 
 ## Estado actual
 
+### Validación DEMO conectada de sólo lectura — 2026-09-14
+
+El receipt privado, fuera del repositorio (SHA-256
+`a2d6af011fa43b05187c2aace05f6b5c51e592dc9a5e506f872b4cf1f43ac72e`; no se
+reproduce el identificador concreto), deja constancia de OAuth vigente con
+`SCOPE_VIEW`/`accounts` para una sola cuenta DEMO Winter. No se autorizó REAL,
+trading ni órdenes, y no se repitió OAuth.
+
+La consulta de sólo lectura verificó la secuencia connect → application auth →
+account discovery → account auth → catalog → history, con 1,940 símbolos y
+EUR/USD resuelto. El receipt
+`../runtime/market-evidence/connected-v18-20260914T195151Z.json` (SHA-256
+`168ef960a9aa2ef0bf10263045bbd3652e5683ace036524bc4e17878c78faf49`)
+conserva 9,999 barras M1 nativas en 20 páginas. El servidor indicó
+`hasMore=true`, por lo que la captura es `PARTIAL`, no una cobertura completa;
+no hay bid/ask ni fills PAPER. El contexto de periodo a nivel de respuesta se
+propaga ahora a trendbars cuyo campo hijo es opcional; una discrepancia de
+request/response o la ausencia de contexto queda rechazada fail-closed.
+
+La observación continua real conservó un evento, pero terminó bloqueada por
+`available_at < event_time` y calidad `CROSSED`/bid=ask. No se aplicó clamping,
+reordenamiento, dato sintético, reintento ni orden. El gate que impide pasar la
+captura parcial a PAPER está en
+`../runtime/market-evidence/connected-v18-partial-gate-20260914T195256Z.json`.
+La misma barrera se revalidó con el runtime V19 STAGED en
+`../runtime/market-evidence/connected-v19-partial-gate-20260914T2132Z/receipt.json`
+(SHA-256 `cb18e425f07581b0c12a3724de2123f65b4ff00ebeb28f995637392312ba3d10`):
+returncode 2, `PARTIAL_HISTORY_CAPTURE`, sin crear DB ni reporte.
+
+### Diagnóstico de lectura acotado — 2026-09-15
+
+El probe aislado reutilizó el OAuth DEMO vigente (`accounts`, `SCOPE_VIEW`) sin
+repetir OAuth ni abrir SQLite. El receipt completo es
+`../runtime/market-evidence/ctrader-diagnostic-20260915T004049Z/receipt.json`
+(SHA-256 `bdac08161c9bfd726c43b30b5cf802092c79da805e7f6b3fc4e3afe934eadcf5`);
+la evidencia de los 12 eventos está ligada por
+`fd77a9c2d53aad880e4057c972688ba03e7f293bddf4e9f826c34319deb1f51f`.
+
+Los 12 `SpotEvent` conservaron el timestamp original en milisegundos, los
+enteros relativos crudos de `bid`/`ask`, `symbolId`, escala 100000, cinco
+dígitos y pip 4. Los campos necesarios estuvieron presentes y no hubo
+actualizaciones parciales (12/12 con ambas piernas). Todos presentaron
+`bid == ask` y ninguno `bid > ask`; la regla vigente `bid >= ask -> CROSSED`
+los marcó `INVALID`/no operables. Los precios normalizados coincidieron con
+los enteros crudos escalados, por lo que esta igualdad proviene del servidor y
+no de la composición de piernas o de la normalización. Igualdad no se
+interpretó como corrupción automática ni como cotización válida.
+
+En esta ventana no se observó `available_at < event_time` (0/12); el caso
+anterior de `-1.576856 s` queda conservado en el receipt V18. NTP local estuvo
+sincronizado antes y después, y no se alteraron reloj, red o privacidad. La
+comparación cruda/recepción no muestra mutación del normalizador; sin una
+referencia independiente del reloj del servidor no es posible separar por
+completo desfase del servidor y desfase local. Por ese motivo no se aplicó una
+corrección ni se relajó el rechazo de timestamps futuros. Las regresiones de
+igualdad/CROSSED y timestamp futuro están en
+`../tests/test_ctrader_quote_quality.py`.
+
+Como contraste, la fixture offline recorrió captura → indicadores/señal →
+PAPER → SQLite → reportes y reanudación byte-equivalente: 190 barras sintéticas,
+una señal y tres trades PAPER cerrados. Su receipt es
+`../runtime/market-evidence/paper-report-e2e-20260914T194812Z-v18/paper-report-e2e-receipt.json`.
+Esto no demuestra frescura, continuidad, costes, fills ni rentabilidad del
+servidor.
+
+Las secciones fechadas más abajo que describen OAuth o aprobación como
+pendientes son antecedentes históricos; el estado vigente es el de esta
+sección. La lectura real sigue siendo un gate separado de operación y no abre
+la ejecución DEMO.
+
+### Captura histórica DEMO bounded V22 — 2026-09-15
+
+El receipt privado de la ventana acotada existente es
+`/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260915-m1-bounded-v22/window-receipt.json`.
+Conserva EUR/USD M1 en base de precio `native`, no fixture sintética: 1,327
+barras nativas en 3 páginas, de `2026-09-09T22:52:00Z` a
+`2026-09-10T20:59:00Z`, sin gaps ni incidencias. El raw
+`/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260915-m1-bounded-v22/history-native-bounded.jsonl`
+tiene SHA-256 `80022a3890ee6f3a867819e4c4b19b72cf5c2dfb71b18714d37464aa330f0dad`.
+La captura no contiene bid/ask, `quote_events=0` ni `paper_fills=0`; la
+consulta fue de sólo lectura en DEMO, sin órdenes y sin abrir SQLite.
+
+La consulta fuente conserva `source_has_more=true` (3,000 barras en 6 páginas),
+pero la selección bounded queda separada y satisfecha: `bounded_complete=true`,
+`bounded_has_more=false`, 1,327 barras seleccionadas/raw, inicio y fin cubiertos,
+fin exacto y cero gaps. Esto cierra únicamente la ventana solicitada; no
+re-etiqueta la fuente como completa ni acredita cobertura histórica adicional.
+
+El gate de continuidad/cobertura exige el marcador de selección bounded en todas
+las páginas raw y metadatos, y barras M1 adyacentes sobre `event_time`; sólo así
+emite `CONTINUOUS`. Un marcador ausente, un gap o una respuesta completa no
+bounded conserva continuidad `UNKNOWN` y bloqueo fail-closed. El `END` legacy de
+V22 no llevaba marcador; el fix compatible derivó continuidad sólo después de
+verificar esas condiciones. El replay local ya quedó comprobado sobre el raw
+existente: reporte y reanudación byte-equivalentes en
+`/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260915-m1-bounded-v22/`,
+SHA-256 del reporte `3beab3d08ace024fd812a3812420db4aadaed943953f9cc87a65ccb1dc0cdda0`,
+`coverage_satisfied=true`, `CONTINUOUS`, 142 señales y
+`paper_capture_complete=true`. No hubo bid/ask; 426 intents quedaron
+`UNKNOWN` por ausencia de cotización y `FILLED=0`. El receipt compacto es
+`../runtime/market-evidence/ctrader-real-history-paper-e2e-20260915.json`.
+La captura/replay no acredita rentabilidad, ventaja neta ni operación.
+
+La reanudación `cfd-paper --session` sin `--input` recupera la
+`instrument_spec` durable de las páginas históricas antes de crear un análisis;
+si falta, entra en conflicto o la configuración/orden no coincide, termina sin
+abrir un análisis nuevo. Esta protección evita sustituir el `symbol_id` observado
+por el fallback de una configuración fixture.
+La prueba focal del contrato queda en `../tests/test_ctrader_historical_paper_gate.py`.
+
+### Ruta `watch` → PAPER local y tick-data — 2026-09-15
+
+`ctrader watch` ya entrega las señales y los `SpotEvent` del único lector al
+producto local `FOREX_CFD_LOCAL_PAPER`. El sink persiste `cfd_trades`, conserva
+su `paper_analysis_id` en el checkpoint y exige bid/ask explícitos, ordenados y
+`VALID`; no crea un ejecutor, no envía órdenes y no convierte un fill local en
+un fill del servidor. La fixture de CLI produjo 3 fills y 3 cierres sobre 700
+mensajes sintéticos; receipt
+`../runtime/market-evidence/ctrader-watch-paper-fixture-20260915.json`
+(SHA-256 `c05ced74fb3578b50af9897911b8980486832bb6a922112e855e2c81c773be00`).
+
+La canaria conectada de sólo lectura reutilizó el OAuth DEMO vigente sin
+intercambio/refresh ni órdenes. El servidor entregó 27 eventos, pero el feed
+observado conservó `CROSSED`/bid=ask y una actualización parcial; el sink
+registró 0 fills y mantuvo el análisis bloqueado. Receipt compacto:
+`../runtime/market-evidence/ctrader-watch-live-paper-canary-20260915.json`
+(SHA-256 `cb99fad8cb09726a9616c7b9c5c358d2a2bcec7df0b30f4ad2fa2b360f4f9b95`).
+
+La misma ruta en el runtime V27 `STAGED/NOT_PROMOTED` recibió 2 cotizaciones
+DEMO completas (`bid < ask`, calidad `VALID`) y las ingirió en PAPER; no hubo
+señales porque el arranque quedó en calentamiento/`partial_bucket`, por lo que
+el resultado correcto fue `fills=0`, no un fill inventado. Receipt:
+`../runtime/market-evidence/ctrader-watch-live-paper-canary-v27-20260915.json`
+(SHA-256 `dce8d1bae3df40f4e6d583989172aae85c27f23576fa590de81e88ab15d1870d`).
+
+El adaptador también expone `fetch_tick_data()` para
+`ProtoOAGetTickDataReq/Res`: BID y ASK se solicitan por separado, se
+reconstruyen sus timestamps y precios acumulativos y se limita la ventana a
+siete días. El resultado conserva páginas/receipts, pero no fabrica un BBO
+uniendo dos solicitudes. La canaria de lectura observó 386 ticks BID y 386 ASK,
+una página por lado, completas y sin incidencias, en
+`../runtime/market-evidence/ctrader-tick-data-read-only-canary-20260915.json`
+(SHA-256 `c3abd241781c2f6742b9610f9e0d90a61f0f7187c11a1198f7d12f106f45053f`).
+
 ### Evolución H0–H6 local — 2026-09-13
 
 La [matriz de implementación y aceptación](demo_reliability_plan.md) describe

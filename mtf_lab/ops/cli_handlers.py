@@ -107,6 +107,20 @@ def cmd_research(args: argparse.Namespace) -> int:
     return _emit(CommandResult.json(payload, code=code, stderr=code != 0))
 
 
+def cmd_market_data(args: argparse.Namespace) -> int:
+    from .market_data_service import market_data_command
+
+    code, payload = market_data_command(args)
+    return _emit(CommandResult.json(payload, code=code, stderr=code != 0))
+
+
+def cmd_market_research(args: argparse.Namespace) -> int:
+    from .market_research import market_research_command
+
+    code, payload = market_research_command(args)
+    return _emit(CommandResult.json(payload, code=code, stderr=code != 0))
+
+
 def cmd_ctrader_supervise(args: argparse.Namespace) -> int:
     from .supervision import CommandService
 
@@ -117,8 +131,16 @@ def cmd_ui(args: argparse.Namespace) -> int:
     from .application_services import _config_for, _db_for
     from .ui import serve
 
-    config = _config_for(args)
-    db = _db_for(args, config)
+    snapshot = getattr(args, "snapshot", None)
+    # Snapshot mode deliberately avoids configuration/database resolution.
+    # The already-running writer owns publication; the UI only reads JSON.
+    if snapshot is not None:
+        if getattr(args, "db", None) is not None:
+            raise ValueError("--snapshot y --db son incompatibles")
+        db = None
+    else:
+        config = _config_for(args)
+        db = _db_for(args, config)
     print(f"UI local: http://{args.host}:{args.port}/ (sólo lectura)", flush=True)
     serve(
         db,
@@ -127,6 +149,7 @@ def cmd_ui(args: argparse.Namespace) -> int:
         session_id=args.session,
         duration=args.duration,
         supervisor_state=getattr(args, "supervisor_state", None),
+        snapshot_path=snapshot,
     )
     return 0
 
@@ -141,6 +164,8 @@ __all__ = [
     "cmd_watch",
     "cmd_cfd_paper",
     "cmd_research",
+    "cmd_market_data",
+    "cmd_market_research",
     "cmd_ctrader_supervise",
     "cmd_ui",
 ]

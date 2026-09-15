@@ -1581,6 +1581,186 @@ class CfdPaperService:
             raise ConfigError(f"la sesión {session_id} no contiene envelopes de captura durables")
 
     @staticmethod
+    def _instrument_spec_from_mapping(raw: Any) -> Any:
+        """Build an instrument spec only from explicit, durable observations."""
+
+        from ..data.ctrader import CTraderInstrumentSpec
+
+        if not isinstance(raw, Mapping):
+            raise ValueError("instrument_spec debe ser un mapping")
+        symbol = raw.get("symbol")
+        if symbol is None or not str(symbol).strip():
+            raise ValueError("instrument_spec.symbol es obligatorio")
+        fields = ("symbol_id", "digits", "pip_position", "price_scale")
+        if any(field not in raw or isinstance(raw[field], bool) for field in fields):
+            raise ValueError("instrument_spec requiere symbol_id/digits/pip_position/price_scale")
+        return CTraderInstrumentSpec(
+            symbol=str(symbol).strip().upper().replace("-", "/"),
+            symbol_id=int(raw["symbol_id"]),
+            digits=int(raw["digits"]),
+            pip_position=int(raw["pip_position"]),
+            price_scale=int(raw["price_scale"]),
+        )
+
+    @staticmethod
+    def _session_capture_preflight(  # noqa: C901 - one guarded resume boundary
+        store: SQLiteStore, session_id: str
+    ) -> tuple[Mapping[str, Any], Mapping[str, Any] | None, Any | None] | CommandResult:
+        """Inspect a durable session before constructing a new PAPER analysis.
+
+        Historical pages carry the observed cTrader instrument specification in
+        ``capture_provenance.instrument_spec``.  A fixture TOML intentionally
+        has no broker ``symbol_id`` and must never replace that observation
+        with its fallback.  Missing or conflicting evidence is rejected before
+        ``CTraderPipeline`` can create another analysis identity.
+        """
+
+        from ..data.capture import MessageClass
+        from .ctrader_history_export import CAPTURE_KIND
+
+        session = store.get_session(session_id)
+        if session is None:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "SESSION_NOT_FOUND",
+                    "network_performed": False,
+                    "session_id": session_id,
+                    "next_action": "Use un session_id existente; no se creó una sesión ni un análisis PAPER.",
+                },
+                code=2,
+                stderr=True,
+            )
+
+        found = False
+        historical = False
+        trendbar_pages = 0
+        observed_raw: Mapping[str, Any] | None = None
+        observed_spec: Any | None = None
+        end_payload: Mapping[str, Any] | None = None
+        for row in store.iter_capture_envelopes(session_id):
+            found = True
+            payload = row.get("payload")
+            if not isinstance(payload, Mapping) or payload.get("capture_kind") != CAPTURE_KIND:
+                continue
+            historical = True
+            message_class = str(row.get("message_class", ""))
+            if message_class == MessageClass.END.value:
+                end_payload = payload
+                continue
+            if message_class != MessageClass.TRENDBAR.value:
+                continue
+            trendbar_pages += 1
+            provenance = payload.get("capture_provenance")
+            raw = provenance.get("instrument_spec") if isinstance(provenance, Mapping) else None
+            if not isinstance(raw, Mapping):
+                return CommandResult.json(
+                    {
+                        "ok": False,
+                        "state": "SESSION_CAPTURE_SPEC_REQUIRED",
+                        "network_performed": False,
+                        "session_id": session_id,
+                        "capture_kind": CAPTURE_KIND,
+                        "next_action": "La captura histórica durable no conserva instrument_spec observado; no se creó otro análisis.",
+                    },
+                    code=2,
+                    stderr=True,
+                )
+            try:
+                candidate = CfdPaperService._instrument_spec_from_mapping(raw)
+            except (TypeError, ValueError) as exc:
+                return CommandResult.json(
+                    {
+                        "ok": False,
+                        "state": "SESSION_CAPTURE_SPEC_INVALID",
+                        "network_performed": False,
+                        "session_id": session_id,
+                        "capture_kind": CAPTURE_KIND,
+                        "error": type(exc).__name__,
+                        "next_action": "La especificación durable no es utilizable; repita discovery/catálogo.",
+                    },
+                    code=2,
+                    stderr=True,
+                )
+            if observed_spec is None:
+                observed_spec = candidate
+                observed_raw = dict(raw)
+            elif candidate != observed_spec:
+                return CommandResult.json(
+                    {
+                        "ok": False,
+                        "state": "SESSION_CAPTURE_SPEC_CONFLICT",
+                        "network_performed": False,
+                        "session_id": session_id,
+                        "capture_kind": CAPTURE_KIND,
+                        "next_action": "Las páginas durables contienen especificaciones distintas; no se reanudó el análisis.",
+                    },
+                    code=2,
+                    stderr=True,
+                )
+
+        if not found:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "SESSION_CAPTURE_REQUIRED",
+                    "network_performed": False,
+                    "session_id": session_id,
+                    "next_action": "La sesión no contiene envelopes de captura durables; no se creó un análisis PAPER.",
+                },
+                code=2,
+                stderr=True,
+            )
+        if not historical:
+            # Synthetic/spot sessions retain the existing configured-spec
+            # behavior; only historical cTrader pages need broker identity.
+            return session, None, None
+        if trendbar_pages == 0:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "SESSION_CAPTURE_REQUIRED",
+                    "network_performed": False,
+                    "session_id": session_id,
+                    "capture_kind": CAPTURE_KIND,
+                    "next_action": "La captura histórica no contiene páginas trendbar; no se creó un análisis PAPER.",
+                },
+                code=2,
+                stderr=True,
+            )
+        if observed_spec is None or observed_raw is None:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "SESSION_CAPTURE_SPEC_REQUIRED",
+                    "network_performed": False,
+                    "session_id": session_id,
+                    "capture_kind": CAPTURE_KIND,
+                    "next_action": "La captura histórica durable no conserva instrument_spec observado; no se creó otro análisis.",
+                },
+                code=2,
+                stderr=True,
+            )
+        metadata: dict[str, Any] = {
+            "capture_kind": CAPTURE_KIND,
+            "instrument_spec": observed_raw,
+        }
+        if end_payload is not None:
+            for key in (
+                "capture_order",
+                "capture_status",
+                "complete",
+                "has_more",
+                "issues",
+                "history_complete",
+                "continuity",
+                "bounded_selection_verified",
+            ):
+                if key in end_payload:
+                    metadata[key] = end_payload[key]
+        return session, metadata, observed_spec
+
+    @staticmethod
     def _historical_capture_preflight(
         config: EffectiveConfig, args: argparse.Namespace
     ) -> tuple[Mapping[str, Any] | None, Any | None, Path | None] | CommandResult:
@@ -1703,7 +1883,7 @@ class CfdPaperService:
             )
         return metadata, observed_spec, input_path
 
-    def run(self, args: argparse.Namespace) -> CommandResult:
+    def run(self, args: argparse.Namespace) -> CommandResult:  # noqa: C901 - compose one guarded PAPER command
         from ..data.ctrader import CTraderInstrumentSpec
         from .ctrader_pipeline import CTraderPipeline, synthetic_ctrader_capture
 
@@ -1717,36 +1897,178 @@ class CfdPaperService:
             config = _override_config(config, price_base=str(requested_price_base), mode="REPLAY")
         config, analysis_basis = self._pipeline_config(config)
         capture_source = "local_file" if input_path is not None else "synthetic_fixture"
-        symbol_id = (
-            int(observed_spec.symbol_id)
-            if observed_spec is not None
-            else _int_or_default(config.ctrader.get("symbol_id"), 99)
-        )
-        spec = observed_spec or CTraderInstrumentSpec(
-            symbol=config.instrument,
-            symbol_id=symbol_id,
-            digits=int(config.ctrader.get("digits", 5)),
-            pip_position=int(config.ctrader.get("pip_position", 4)),
-            price_scale=int(config.ctrader.get("price_scale", 100_000)),
-        )
         db = _db_for(args, config)
         db.parent.mkdir(parents=True, exist_ok=True)
         with SQLiteStore(db) as store:
+            session_metadata: Mapping[str, Any] | None = None
+            session_record: Mapping[str, Any] = {}
+            session_id = getattr(args, "session", None)
+            if input_path is None and session_id:
+                session_preflight = self._session_capture_preflight(store, str(session_id))
+                if isinstance(session_preflight, CommandResult):
+                    return session_preflight
+                session_record, session_metadata, session_spec = session_preflight
+                if session_spec is not None:
+                    observed_spec = session_spec
+                    historical_metadata = session_metadata
+                    from .ctrader_history_export import CAPTURE_KIND, CAPTURE_ORDER
+
+                    if str(config.price_base).strip().lower() != "native":
+                        return CommandResult.json(
+                            {
+                                "ok": False,
+                                "state": "HISTORICAL_NATIVE_REQUIRED",
+                                "network_performed": False,
+                                "session_id": session_id,
+                                "capture_kind": CAPTURE_KIND,
+                                "next_action": "Reanude con la misma configuración native; trendbars históricos no contienen bid/ask.",
+                            },
+                            code=2,
+                            stderr=True,
+                        )
+                    if (
+                        not isinstance(session_metadata, Mapping)
+                        or str(session_metadata.get("capture_order", "")) != CAPTURE_ORDER
+                        or str(getattr(args, "order", "as_observed")) != CAPTURE_ORDER
+                    ):
+                        return CommandResult.json(
+                            {
+                                "ok": False,
+                                "state": "HISTORICAL_ORDER_REQUIRED",
+                                "network_performed": False,
+                                "session_id": session_id,
+                                "capture_kind": CAPTURE_KIND,
+                                "next_action": "Reanude con --order market_time_corrected; no se fingió recepción cronológica.",
+                            },
+                            code=2,
+                            stderr=True,
+                        )
+                    if (
+                        str(session_metadata.get("capture_status", "PARTIAL")) != "COMPLETE"
+                        or session_metadata.get("complete") is not True
+                        or session_metadata.get("has_more") is True
+                        or session_metadata.get("issues")
+                    ):
+                        return CommandResult.json(
+                            {
+                                "ok": False,
+                                "state": "PARTIAL_HISTORY_CAPTURE",
+                                "network_performed": False,
+                                "session_id": session_id,
+                                "capture_kind": CAPTURE_KIND,
+                                "complete": session_metadata.get("complete", False),
+                                "has_more": session_metadata.get("has_more"),
+                                "issues": list(session_metadata.get("issues", ())),
+                                "next_action": "No se reanuda una captura histórica parcial; repita la consulta y exportación.",
+                            },
+                            code=2,
+                            stderr=True,
+                        )
+                    configured_symbol = str(config.instrument).strip().upper().replace("-", "/")
+                    configured_cfd_symbol = (
+                        str(config.cfd.get("instrument", config.instrument)).strip().upper().replace("-", "/")
+                    )
+                    if observed_spec.symbol != configured_symbol or observed_spec.symbol != configured_cfd_symbol:
+                        return CommandResult.json(
+                            {
+                                "ok": False,
+                                "state": "CAPTURE_SPEC_MISMATCH",
+                                "network_performed": False,
+                                "session_id": session_id,
+                                "observed_symbol": observed_spec.symbol,
+                                "configured_symbol": configured_symbol,
+                                "next_action": "Use una configuración cuyo instrumento y CFD coincidan con la captura.",
+                            },
+                            code=2,
+                            stderr=True,
+                        )
             if input_path is not None:
                 capture_input: CTraderCapture | Iterable[Any] = self._capture_input(input_path)
-            elif getattr(args, "session", None):
+            elif session_id:
                 capture_source = "sqlite_capture_envelopes"
-                capture_input = self._durable_input(store, str(args.session))
+                capture_input = self._durable_input(store, str(session_id))
             else:
+                symbol_id = (
+                    int(observed_spec.symbol_id)
+                    if observed_spec is not None
+                    else _int_or_default(config.ctrader.get("symbol_id"), 99)
+                )
                 capture_input = synthetic_ctrader_capture(
                     start=datetime(2026, 1, 1, tzinfo=UTC),
                     symbol_id=symbol_id,
                     count=int(getattr(args, "count", 190)),
                     mode="REPLAY",
                 )
+            symbol_id = (
+                int(observed_spec.symbol_id)
+                if observed_spec is not None
+                else _int_or_default(config.ctrader.get("symbol_id"), 99)
+            )
+            spec = observed_spec or CTraderInstrumentSpec(
+                symbol=config.instrument,
+                symbol_id=symbol_id,
+                digits=int(config.ctrader.get("digits", 5)),
+                pip_position=int(config.ctrader.get("pip_position", 4)),
+                price_scale=int(config.ctrader.get("price_scale", 100_000)),
+            )
             pipeline = CTraderPipeline(
                 store, config, spec=spec, mode="REPLAY", max_candles=getattr(args, "max_candles", 256)
             )
+            if session_id and session_metadata is not None:
+                stored_config_hash = str(session_record.get("config_hash", ""))
+                expected_config_hash = payload_hash(pipeline.session_config())
+                if not stored_config_hash or stored_config_hash != expected_config_hash:
+                    return CommandResult.json(
+                        {
+                            "ok": False,
+                            "state": "SESSION_CONFIG_IDENTITY_MISMATCH",
+                            "network_performed": False,
+                            "session_id": session_id,
+                            "next_action": "Reanude con la misma configuración y variante; no se creó otro análisis PAPER.",
+                        },
+                        code=2,
+                        stderr=True,
+                    )
+                try:
+                    from ..data.capture import CaptureIndex
+                    from .ctrader_capture import capture_envelopes, capture_identity
+
+                    with CaptureIndex(
+                        capture_envelopes(self._durable_input(store, str(session_id))),
+                        mode=cast(
+                            Literal["as_observed", "market_time_corrected"], str(getattr(args, "order", "as_observed"))
+                        ),
+                    ) as index:
+                        expected_dataset_ref = capture_identity(
+                            index.capture_hash,
+                            spec,
+                            analysis_basis if analysis_basis in {"bid", "ask", "mid"} else "mid",
+                        )
+                except (TypeError, ValueError, OSError) as exc:
+                    return CommandResult.json(
+                        {
+                            "ok": False,
+                            "state": "SESSION_CAPTURE_INVALID",
+                            "network_performed": False,
+                            "session_id": session_id,
+                            "error": type(exc).__name__,
+                            "next_action": "La captura durable no puede reconstruirse con su contrato; no se creó otro análisis.",
+                        },
+                        code=2,
+                        stderr=True,
+                    )
+                if str(session_record.get("dataset_ref", "")) != expected_dataset_ref:
+                    return CommandResult.json(
+                        {
+                            "ok": False,
+                            "state": "SESSION_DATASET_IDENTITY_MISMATCH",
+                            "network_performed": False,
+                            "session_id": session_id,
+                            "next_action": "La identidad de la captura durable no coincide; no se creó otro análisis PAPER.",
+                        },
+                        code=2,
+                        stderr=True,
+                    )
             result = pipeline.run(
                 capture_input,
                 session_id=getattr(args, "session", None),

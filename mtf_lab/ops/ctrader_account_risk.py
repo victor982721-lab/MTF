@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -48,6 +49,8 @@ RECONCILE_REQ = 2124
 RECONCILE_RES = 2125
 DEAL_LIST_REQ = 2133
 DEAL_LIST_RES = 2134
+CASH_FLOW_HISTORY_LIST_REQ = 2143
+CASH_FLOW_HISTORY_LIST_RES = 2144
 UNREALIZED_PNL_REQ = 2187
 UNREALIZED_PNL_RES = 2188
 
@@ -70,6 +73,9 @@ _RISK_STATE_SCOPE = "OBSERVED_SINCE_ARM"
 _RISK_STATE_MAX_BYTES = 8192
 _RISK_JOURNAL_MAX_BYTES = _RISK_STATE_MAX_BYTES * 128
 _RISK_LIFECYCLE_EVENTS = frozenset({"ACTIVATED", "DEACTIVATED", "PAUSED", "RESUMED"})
+_DAY_ANCHOR_STATE_VERSION = 1
+_DAY_ANCHOR_STATE_SCOPE = "UTC_DAY_EQUITY_ANCHOR"
+_DAY_ANCHOR_MAX_BYTES = 16 * 1024
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -88,6 +94,29 @@ class _HighWaterState:
     endpoint: str
     peak_equity: Decimal
     armed_at: datetime
+    updated_at: datetime
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _DailyAnchorState:
+    """Persisted, cash-flow-adjusted equity anchor for one UTC day."""
+
+    account_id: str
+    environment: str
+    endpoint: str
+    connection_generation: str
+    day_start: datetime
+    anchor_equity: Decimal
+    anchor_cashflow_total: Decimal
+    cashflow_total: Decimal
+    cashflow_digests: tuple[tuple[str, str], ...]
+    cashflow_fingerprint: str
+    anchor_verified: bool
+    anchor_basis: str
+    anchor_reference_at: datetime | None
+    anchor_mark_age_seconds: Decimal | None
+    last_equity: Decimal
+    anchored_at: datetime
     updated_at: datetime
 
 
@@ -128,7 +157,7 @@ class _HighWaterStore:
         peak = self._state.peak_equity if self._state is not None else None
         if not data_ready or equity is None or observed_at is None:
             return self._result(None, peak)
-        if self._status not in {"UNARMED", "READY"}:
+        if self._status not in {"UNARMED", "READY", "UNKNOWN"}:
             return self._result(None, None)
         try:
             with decimal_context():
@@ -308,6 +337,546 @@ class _HighWaterStore:
                     os.unlink(temporary)
 
 
+class _DailyEquityAnchorStore:
+    """Persist the equity baseline and observed cash-flow history per UTC day.
+
+    The store is deliberately separate from ``_HighWaterStore`` so the older
+    high-water file remains byte/schema compatible.  A missing or corrupt
+    anchor is never interpreted as a fresh day.  Only an explicitly permitted
+    first arm may create the initial state; a restart on the same UTC day
+    reloads the existing anchor and cannot reset the budget.
+    """
+
+    def __init__(
+        self,
+        state_path: str | Path | None,
+        journal_path: str | Path | None,
+        *,
+        allow_new_baseline: bool,
+    ) -> None:
+        self.path = _private_state_path(state_path) if state_path is not None else None
+        self.journal_path = Path(journal_path).expanduser() if journal_path is not None else None
+        if self.journal_path is not None:
+            _validate_private_path(self.journal_path, allow_missing=True)
+        self.allow_new_baseline = bool(allow_new_baseline)
+        self._identity_key: tuple[str, str, str] | None = None
+        self._state: _DailyAnchorState | None = None
+        self._status = "UNAVAILABLE" if self.path is None else "UNARMED"
+        self._reason: str | None = None
+        self._rearm_requested = False
+        self._baseline_allowed = False
+
+    @property
+    def available(self) -> bool:
+        return self.path is not None
+
+    def observe(
+        self,
+        identity: _SessionIdentity,
+        day_start: datetime,
+        equity: Decimal | None,
+        cashflow_total: Decimal | None,
+        cashflow_digests: Sequence[tuple[str, str]],
+        cashflow_fingerprint: str | None,
+        observed_at: datetime | None,
+        max_age_seconds: float,
+        *,
+        data_ready: bool,
+    ) -> dict[str, Any]:
+        self._ensure(identity)
+        state = self._state
+        if not data_ready or equity is None or cashflow_total is None or cashflow_fingerprint is None:
+            return self._result(state, None, None)
+        if observed_at is None:
+            return self._result(state, None, "day_anchor_timestamp_unobserved")
+        if self._status not in {"UNARMED", "READY", "UNKNOWN"}:
+            return self._result(state, None, self._reason)
+        if state is None and self._status == "UNARMED" and not self._baseline_allowed:
+            return self._result(state, None, self._reason or "day_anchor_baseline_required")
+        try:
+            with decimal_context():
+                current_digests = tuple(sorted((str(key), str(value)) for key, value in cashflow_digests))
+                next_state, invalid_reason = self._next_state(
+                    state,
+                    identity=identity,
+                    day_start=day_start,
+                    equity=equity,
+                    cashflow_total=cashflow_total,
+                    cashflow_digests=current_digests,
+                    cashflow_fingerprint=cashflow_fingerprint,
+                    observed_at=observed_at,
+                    max_age_seconds=max_age_seconds,
+                )
+                if invalid_reason is not None:
+                    self._status = "INVALID"
+                    self._reason = invalid_reason
+                    return self._result(state, None, invalid_reason)
+                assert next_state is not None
+                if self.path is not None and next_state != state:
+                    self._write(next_state)
+                self._state = next_state
+                self._status = "READY" if next_state.anchor_verified else "UNKNOWN"
+                self._reason = None if next_state.anchor_verified else "day_anchor_start_unobserved"
+                if not next_state.anchor_verified:
+                    return self._result(next_state, None, self._reason)
+                daily_change = (equity - next_state.anchor_equity) - (cashflow_total - next_state.anchor_cashflow_total)
+                daily_loss = max(Decimal("0"), -daily_change)
+        except Exception as exc:
+            self._status = "INVALID"
+            self._reason = f"day_anchor_persist_failed:{type(exc).__name__}"
+            return self._result(self._state, None, self._reason)
+        return self._result(next_state, daily_change, None, daily_loss=daily_loss)
+
+    @staticmethod
+    def _next_state(
+        state: _DailyAnchorState | None,
+        *,
+        identity: _SessionIdentity,
+        day_start: datetime,
+        equity: Decimal,
+        cashflow_total: Decimal,
+        cashflow_digests: tuple[tuple[str, str], ...],
+        cashflow_fingerprint: str,
+        observed_at: datetime,
+        max_age_seconds: float,
+    ) -> tuple[_DailyAnchorState | None, str | None]:
+        if state is None:
+            return (
+                _DailyAnchorState(
+                    identity.account_id,
+                    identity.environment,
+                    identity.endpoint,
+                    identity.generation,
+                    day_start,
+                    equity,
+                    cashflow_total,
+                    cashflow_total,
+                    cashflow_digests,
+                    cashflow_fingerprint,
+                    observed_at == day_start,
+                    "EXACT_UTC_DAY_START" if observed_at == day_start else "INITIAL_MARK_UNVERIFIED",
+                    None,
+                    None,
+                    equity,
+                    observed_at,
+                    observed_at,
+                ),
+                None,
+            )
+        if identity.generation != state.connection_generation:
+            return None, "day_anchor_generation_changed"
+        if day_start < state.day_start:
+            return None, "day_anchor_epoch_regressed"
+        if day_start == state.day_start:
+            return _DailyEquityAnchorStore._same_day_state(
+                state,
+                cashflow_total=cashflow_total,
+                equity=equity,
+                cashflow_digests=cashflow_digests,
+                cashflow_fingerprint=cashflow_fingerprint,
+                observed_at=observed_at,
+            )
+        if (day_start.date() - state.day_start.date()).days > 1:
+            return None, "day_anchor_missing"
+        return _DailyEquityAnchorStore._boundary_state(
+            state,
+            identity=identity,
+            day_start=day_start,
+            equity=equity,
+            cashflow_total=cashflow_total,
+            cashflow_digests=cashflow_digests,
+            cashflow_fingerprint=cashflow_fingerprint,
+            observed_at=observed_at,
+            max_age_seconds=max_age_seconds,
+        )
+
+    @staticmethod
+    def _same_day_state(
+        state: _DailyAnchorState,
+        *,
+        cashflow_total: Decimal,
+        equity: Decimal,
+        cashflow_digests: tuple[tuple[str, str], ...],
+        cashflow_fingerprint: str,
+        observed_at: datetime,
+    ) -> tuple[_DailyAnchorState | None, str | None]:
+        prior_digests = dict(state.cashflow_digests)
+        current_digest_map = dict(cashflow_digests)
+        if any(
+            key not in current_digest_map or current_digest_map[key] != digest for key, digest in prior_digests.items()
+        ):
+            return None, "cashflow_history_regressed"
+        return (
+            dataclasses.replace(
+                state,
+                last_equity=equity,
+                cashflow_total=cashflow_total,
+                cashflow_digests=cashflow_digests,
+                cashflow_fingerprint=cashflow_fingerprint,
+                updated_at=observed_at,
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _boundary_state(
+        state: _DailyAnchorState,
+        *,
+        identity: _SessionIdentity,
+        day_start: datetime,
+        equity: Decimal,
+        cashflow_total: Decimal,
+        cashflow_digests: tuple[tuple[str, str], ...],
+        cashflow_fingerprint: str,
+        observed_at: datetime,
+        max_age_seconds: float,
+    ) -> tuple[_DailyAnchorState | None, str | None]:
+        boundary_age = (day_start - state.updated_at).total_seconds()
+        observation_gap = (observed_at - state.updated_at).total_seconds()
+        usable_reference = (
+            state.updated_at <= day_start
+            and observed_at >= day_start
+            and 0 <= boundary_age <= max_age_seconds
+            and 0 <= observation_gap <= max_age_seconds
+        )
+        if observed_at == day_start:
+            anchor_equity = equity
+            anchor_cashflow_total = cashflow_total
+            verified = True
+            basis = "EXACT_UTC_DAY_START"
+            reference_at = observed_at
+            mark_age = Decimal("0")
+        elif usable_reference:
+            anchor_equity = state.last_equity
+            anchor_cashflow_total = Decimal("0")
+            verified = True
+            basis = "LAST_KNOWN_MARK_AT_UTC_BOUNDARY"
+            reference_at = state.updated_at
+            mark_age = Decimal(str(boundary_age))
+        else:
+            anchor_equity = equity
+            anchor_cashflow_total = cashflow_total
+            verified = False
+            basis = "BOUNDARY_MARK_TOO_OLD"
+            reference_at = state.updated_at
+            mark_age = Decimal(str(max(0.0, boundary_age)))
+        return (
+            _DailyAnchorState(
+                identity.account_id,
+                identity.environment,
+                identity.endpoint,
+                identity.generation,
+                day_start,
+                anchor_equity,
+                anchor_cashflow_total,
+                cashflow_total,
+                cashflow_digests,
+                cashflow_fingerprint,
+                verified,
+                basis,
+                reference_at,
+                mark_age,
+                equity,
+                observed_at,
+                observed_at,
+            ),
+            None,
+        )
+
+    def rearm_after_human(self, *, confirm: bool = False) -> dict[str, Any]:
+        """Request a new UTC-day anchor only after explicit human confirmation."""
+
+        if confirm is not True:
+            raise AccountRiskObservationError("rearm_after_human requiere confirm=True")
+        if self.path is None:
+            raise AccountRiskObservationError("rearm_after_human requiere state_path persistente")
+        empty, reason = self._journal_empty()
+        if not empty:
+            raise AccountRiskObservationError(reason or "no se puede rearmar con intents existentes")
+        self._rearm_requested = True
+        self._identity_key = None
+        self._state = None
+        self._status = "UNARMED"
+        self._reason = "day_anchor_rearm_after_human"
+        return {"rearm_requested": True, "state": self._status, "reason": self._reason}
+
+    def _ensure(self, identity: _SessionIdentity) -> None:
+        key = (identity.account_id, identity.environment, identity.endpoint)
+        if self._identity_key == key and not self._rearm_requested:
+            return
+        self._identity_key = key
+        if self.path is None:
+            self._status = "UNAVAILABLE"
+            self._reason = "day_anchor_state_unavailable"
+            self._state = None
+            return
+        if self._rearm_requested:
+            self._status = "UNARMED"
+            self._reason = None
+            self._state = None
+            self._rearm_requested = False
+            self._baseline_allowed = True
+            return
+        try:
+            state = self._read()
+        except FileNotFoundError:
+            empty, reason = self._journal_empty()
+            if not empty:
+                self._status, self._reason, self._state = "INVALID", reason, None
+            elif self.allow_new_baseline:
+                self._status, self._reason, self._state = "UNARMED", None, None
+                self._baseline_allowed = True
+            else:
+                self._status, self._reason, self._state = "UNARMED", "day_anchor_baseline_required", None
+                self._baseline_allowed = False
+            return
+        except AccountRiskObservationError as exc:
+            # Presence of a corrupt state is not a first run, even if the
+            # lifecycle journal contains no intents.  Human rearm is separate.
+            self._status, self._reason, self._state = "INVALID", str(exc), None
+            return
+        expected = (identity.account_id, identity.environment, identity.endpoint)
+        actual = (state.account_id, state.environment, state.endpoint)
+        if actual != expected:
+            self._status = "INVALID"
+            self._reason = "day_anchor_identity_mismatch"
+            self._state = None
+            return
+        self._state = state
+        self._status = "READY" if state.anchor_verified else "UNKNOWN"
+        self._reason = None if state.anchor_verified else "day_anchor_start_unobserved"
+        self._baseline_allowed = False
+
+    def _result(
+        self,
+        state: _DailyAnchorState | None,
+        daily_change: Decimal | None,
+        reason: str | None,
+        *,
+        daily_loss: Decimal | None = None,
+    ) -> dict[str, Any]:
+        selected_reason = reason or self._reason
+        return {
+            "daily_pnl": daily_change,
+            "daily_loss": daily_loss
+            if daily_loss is not None
+            else (max(Decimal("0"), -daily_change) if daily_change is not None else None),
+            "anchor_equity": state.anchor_equity if state is not None else None,
+            "anchor_cashflow_total": state.anchor_cashflow_total if state is not None else None,
+            "cashflow_total": state.cashflow_total if state is not None else None,
+            "cashflow_ids": tuple(key for key, _digest in state.cashflow_digests) if state is not None else (),
+            "cashflow_fingerprint": state.cashflow_fingerprint if state is not None else None,
+            "anchor_verified": state.anchor_verified if state is not None else False,
+            "anchor_basis": state.anchor_basis if state is not None else None,
+            "anchor_reference_at": state.anchor_reference_at if state is not None else None,
+            "anchor_mark_age_seconds": state.anchor_mark_age_seconds if state is not None else None,
+            "day_start": state.day_start if state is not None else None,
+            "anchor_observed_at": state.anchored_at if state is not None else None,
+            "state": self._status,
+            "complete": self._status == "READY" and state is not None,
+            "reason": selected_reason,
+        }
+
+    def _journal_empty(self) -> tuple[bool, str | None]:
+        if self.journal_path is None:
+            return False, "risk_journal_unobserved"
+        try:
+            st = _private_lstat(self.journal_path, allow_missing=True)
+        except AccountRiskObservationError as exc:
+            return False, str(exc)
+        if st is None:
+            return False, "risk_journal_missing"
+        try:
+            _validate_private_file_stat(st)
+        except AccountRiskObservationError as exc:
+            return False, str(exc)
+        if st.st_size > _RISK_JOURNAL_MAX_BYTES:
+            return False, "risk_journal_too_large"
+        if st.st_size == 0:
+            return True, None
+        try:
+            raw = _read_private_bytes(self.journal_path, limit=_RISK_JOURNAL_MAX_BYTES)
+        except AccountRiskObservationError:
+            return False, "risk_journal_corrupt"
+        return _journal_content_empty(raw)
+
+    def _read(self) -> _DailyAnchorState:
+        if self.path is None:
+            raise FileNotFoundError
+        raw = _read_private_bytes(self.path, limit=_DAY_ANCHOR_MAX_BYTES)
+        value = self._read_mapping(raw)
+        account_id, environment, endpoint = _state_identity({"identity": value["identity"]})
+        anchor_equity, anchor_cashflow_total, cashflow_total, last_equity = self._read_amounts(value)
+        digests = self._read_cashflow_digests(value)
+        fingerprint = value["cashflow_fingerprint"]
+        if not isinstance(fingerprint, str) or not fingerprint:
+            raise AccountRiskObservationError("day_anchor_cashflow_fingerprint_invalid")
+        anchor_verified = value["anchor_verified"]
+        if not isinstance(anchor_verified, bool):
+            raise AccountRiskObservationError("day_anchor_verification_invalid")
+        anchor_basis = value["anchor_basis"]
+        if not isinstance(anchor_basis, str) or not anchor_basis:
+            raise AccountRiskObservationError("day_anchor_basis_invalid")
+        connection_generation = value["connection_generation"]
+        if not isinstance(connection_generation, str) or not connection_generation:
+            raise AccountRiskObservationError("day_anchor_generation_invalid")
+        anchor_mark_age_raw = value["anchor_mark_age_seconds"]
+        anchor_mark_age = Decimal(str(anchor_mark_age_raw)) if anchor_mark_age_raw is not None else None
+        if anchor_mark_age is not None and (not anchor_mark_age.is_finite() or anchor_mark_age < 0):
+            raise AccountRiskObservationError("day_anchor_mark_age_invalid")
+        day_start, anchored_at, updated_at, anchor_reference_at = self._read_times(value)
+        return _DailyAnchorState(
+            account_id,
+            environment,
+            endpoint,
+            connection_generation,
+            day_start,
+            anchor_equity,
+            anchor_cashflow_total,
+            cashflow_total,
+            digests,
+            fingerprint,
+            anchor_verified,
+            anchor_basis,
+            anchor_reference_at,
+            anchor_mark_age,
+            last_equity,
+            anchored_at,
+            updated_at,
+        )
+
+    @staticmethod
+    def _read_mapping(raw: bytes) -> Mapping[str, Any]:
+        try:
+            value = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AccountRiskObservationError("day_anchor_corrupt_json") from exc
+        if not isinstance(value, Mapping):
+            raise AccountRiskObservationError("day_anchor_corrupt_shape")
+        required = {
+            "version",
+            "scope",
+            "identity",
+            "connection_generation",
+            "day_start",
+            "anchor_equity",
+            "anchor_cashflow_total",
+            "cashflow_total",
+            "cashflow_digests",
+            "cashflow_fingerprint",
+            "anchor_verified",
+            "anchor_basis",
+            "anchor_reference_at",
+            "anchor_mark_age_seconds",
+            "last_equity",
+            "anchored_at",
+            "updated_at",
+        }
+        if set(value) != required:
+            raise AccountRiskObservationError("day_anchor_corrupt_fields")
+        if value.get("version") != _DAY_ANCHOR_STATE_VERSION or value.get("scope") != _DAY_ANCHOR_STATE_SCOPE:
+            raise AccountRiskObservationError("day_anchor_version_or_scope_invalid")
+        identity = value.get("identity")
+        if not isinstance(identity, Mapping) or set(identity) != {"account_id", "environment", "endpoint"}:
+            raise AccountRiskObservationError("day_anchor_identity_invalid")
+        return value
+
+    @staticmethod
+    def _read_amounts(value: Mapping[str, Any]) -> tuple[Decimal, Decimal, Decimal, Decimal]:
+        try:
+            anchor_equity = Decimal(str(value["anchor_equity"]))
+            anchor_cashflow_total = Decimal(str(value["anchor_cashflow_total"]))
+            cashflow_total = Decimal(str(value["cashflow_total"]))
+            last_equity = Decimal(str(value["last_equity"]))
+        except (AccountRiskObservationError, TypeError, ValueError, ArithmeticError) as exc:
+            raise AccountRiskObservationError("day_anchor_numeric_or_time_invalid") from exc
+        if (
+            not anchor_equity.is_finite()
+            or not anchor_cashflow_total.is_finite()
+            or not cashflow_total.is_finite()
+            or not last_equity.is_finite()
+            or anchor_equity < 0
+            or last_equity < 0
+        ):
+            raise AccountRiskObservationError("day_anchor_numeric_invalid")
+        return anchor_equity, anchor_cashflow_total, cashflow_total, last_equity
+
+    @staticmethod
+    def _read_cashflow_digests(value: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+        raw_digests = value["cashflow_digests"]
+        if not isinstance(raw_digests, list):
+            raise AccountRiskObservationError("day_anchor_cashflows_invalid")
+        digests: list[tuple[str, str]] = []
+        for item in raw_digests:
+            if not isinstance(item, list) or len(item) != 2 or not all(isinstance(part, str) for part in item):
+                raise AccountRiskObservationError("day_anchor_cashflows_invalid")
+            digests.append((item[0], item[1]))
+        if tuple(sorted(digests)) != tuple(digests) or len({key for key, _digest in digests}) != len(digests):
+            raise AccountRiskObservationError("day_anchor_cashflows_invalid")
+        return tuple(digests)
+
+    @staticmethod
+    def _read_times(value: Mapping[str, Any]) -> tuple[datetime, datetime, datetime, datetime | None]:
+        day_start = _utc(value["day_start"], "day_anchor.day_start")
+        reference_raw = value["anchor_reference_at"]
+        anchor_reference_at = (
+            _utc(reference_raw, "day_anchor.anchor_reference_at") if reference_raw is not None else None
+        )
+        anchored_at = _utc(value["anchored_at"], "day_anchor.anchored_at")
+        updated_at = _utc(value["updated_at"], "day_anchor.updated_at")
+        if updated_at < anchored_at or day_start.date() != anchored_at.date():
+            raise AccountRiskObservationError("day_anchor_time_order_invalid")
+        if anchor_reference_at is not None and anchor_reference_at > anchored_at:
+            raise AccountRiskObservationError("day_anchor_reference_time_invalid")
+        return day_start, anchored_at, updated_at, anchor_reference_at
+
+    def _write(self, state: _DailyAnchorState) -> None:
+        if self.path is None:
+            return
+        payload = {
+            "version": _DAY_ANCHOR_STATE_VERSION,
+            "scope": _DAY_ANCHOR_STATE_SCOPE,
+            "identity": {
+                "account_id": state.account_id,
+                "environment": state.environment,
+                "endpoint": state.endpoint,
+            },
+            "connection_generation": state.connection_generation,
+            "day_start": _iso(state.day_start),
+            "anchor_equity": _text(state.anchor_equity),
+            "anchor_cashflow_total": _text(state.anchor_cashflow_total),
+            "cashflow_total": _text(state.cashflow_total),
+            "cashflow_digests": [[key, digest] for key, digest in state.cashflow_digests],
+            "cashflow_fingerprint": state.cashflow_fingerprint,
+            "anchor_verified": state.anchor_verified,
+            "anchor_basis": state.anchor_basis,
+            "anchor_reference_at": _iso(state.anchor_reference_at),
+            "anchor_mark_age_seconds": _text(state.anchor_mark_age_seconds),
+            "last_equity": _text(state.last_equity),
+            "anchored_at": _iso(state.anchored_at),
+            "updated_at": _iso(state.updated_at),
+        }
+        encoded = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > _DAY_ANCHOR_MAX_BYTES:
+            raise AccountRiskObservationError("day_anchor_too_large")
+        parent = self.path.parent
+        fd, temporary = tempfile.mkstemp(prefix=".account-day-anchor-", dir=parent)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb", closefd=True) as stream:
+                stream.write(encoded)
+                stream.flush()
+                os.fdatasync(stream.fileno())
+            os.replace(temporary, self.path)
+            _sync_directory(parent)
+            _validate_private_file(self.path)
+            temporary = ""
+        finally:
+            if temporary:
+                with contextlib.suppress(FileNotFoundError):
+                    os.unlink(temporary)
+
+
 def _journal_content_empty(raw: bytes) -> tuple[bool, str | None]:
     try:
         records = [json.loads(line) for line in raw.decode("utf-8").splitlines() if line.strip()]
@@ -408,6 +977,21 @@ class AccountRiskSnapshot(Mapping[str, Any]):
     risk_state: str = "UNAVAILABLE"
     risk_state_complete: bool = False
     risk_state_reason: str | None = None
+    daily_anchor_equity: str | None = None
+    daily_anchor_cashflow_total: str | None = None
+    daily_cashflow_total: str | None = None
+    daily_anchor_day: str | None = None
+    daily_anchor_observed_at: datetime | None = None
+    daily_anchor_basis: str | None = None
+    daily_anchor_reference_at: datetime | None = None
+    daily_anchor_mark_age_seconds: str | None = None
+    daily_anchor_verified: bool = False
+    daily_loss: str | None = None
+    daily_loss_state: str = "UNAVAILABLE"
+    daily_loss_reason: str | None = None
+    cashflows: tuple[Mapping[str, Any], ...] = ()
+    cashflows_complete: bool = False
+    cashflow_fingerprint: str | None = None
 
     @property
     def generation(self) -> str | None:
@@ -435,11 +1019,31 @@ class AccountRiskSnapshot(Mapping[str, Any]):
             "realized_daily_pnl": decimal_or_none(self.realized_daily_pnl) if usable else None,
             "unrealized_daily_pnl": decimal_or_none(self.unrealized_daily_pnl) if usable else None,
             "daily_pnl": decimal_or_none(self.daily_pnl) if usable else None,
+            "daily_loss": decimal_or_none(self.daily_loss) if usable else None,
+            "daily_anchor_equity": decimal_or_none(self.daily_anchor_equity) if usable else None,
+            "daily_anchor_cashflow_total": decimal_or_none(self.daily_anchor_cashflow_total) if usable else None,
+            "daily_cashflow_total": decimal_or_none(self.daily_cashflow_total) if usable else None,
+            "daily_anchor_day": self.daily_anchor_day,
+            "daily_anchor_observed_at": self.daily_anchor_observed_at,
+            "daily_anchor_basis": self.daily_anchor_basis,
+            "daily_anchor_reference_at": self.daily_anchor_reference_at,
+            "daily_anchor_mark_age_seconds": decimal_or_none(self.daily_anchor_mark_age_seconds) if usable else None,
+            "daily_anchor_verified": self.daily_anchor_verified if usable else False,
+            "daily_loss_state": self.daily_loss_state if usable else "UNKNOWN",
+            "daily_loss_reason": self.daily_loss_reason if usable else "risk_snapshot_incomplete",
+            "cashflows_complete": self.cashflows_complete if usable else False,
+            "cashflow_fingerprint": self.cashflow_fingerprint if usable else None,
             "drawdown": decimal_or_none(self.drawdown) if usable else None,
+            "high_water_equity": decimal_or_none(self.high_water_equity) if usable else None,
             # A zero used margin is an observed state, but the mathematical
             # ratio is intentionally left unknown.  The executor may consume
             # used_margin plus margin_state in a later compatibility extension.
             "used_margin": decimal_or_none(self.used_margin) if usable else None,
+            # ProtoOATrader does not expose free/required margin in this
+            # observer contract.  Keep both values explicitly unknown rather
+            # than deriving them from equity or used_margin.
+            "margin_available": None,
+            "margin_required": None,
             "margin_level": decimal_or_none(self.margin_level) if usable else None,
             "observed_at": self.observed_at,
             "connection_generation": self.connection_generation,
@@ -469,6 +1073,21 @@ class AccountRiskSnapshot(Mapping[str, Any]):
             "unrealized_pnl": self.unrealized_daily_pnl,
             "unrealized_gross_pnl": self.unrealized_gross_pnl,
             "daily_pnl": self.daily_pnl,
+            "daily_loss": self.daily_loss,
+            "daily_anchor_equity": self.daily_anchor_equity,
+            "daily_anchor_cashflow_total": self.daily_anchor_cashflow_total,
+            "daily_cashflow_total": self.daily_cashflow_total,
+            "daily_anchor_day": self.daily_anchor_day,
+            "daily_anchor_observed_at": _iso(self.daily_anchor_observed_at),
+            "daily_anchor_basis": self.daily_anchor_basis,
+            "daily_anchor_reference_at": _iso(self.daily_anchor_reference_at),
+            "daily_anchor_mark_age_seconds": self.daily_anchor_mark_age_seconds,
+            "daily_anchor_verified": self.daily_anchor_verified,
+            "daily_loss_state": self.daily_loss_state,
+            "daily_loss_reason": self.daily_loss_reason,
+            "cashflows": [dict(item) for item in self.cashflows],
+            "cashflows_complete": self.cashflows_complete,
+            "cashflow_fingerprint": self.cashflow_fingerprint,
             "positions": [dict(item) for item in self.positions],
             "freshness": self.freshness_state,
             "freshness_state": self.freshness_state,
@@ -528,6 +1147,7 @@ class AccountRiskObserver:
         state_path: str | Path | None = None,
         journal_path: str | Path | None = None,
         allow_new_baseline: bool = False,
+        require_cashflows: bool = False,
     ) -> None:
         client = getattr(provider, "client", None)
         if client is None or not callable(getattr(client, "request_message", None)):
@@ -541,6 +1161,9 @@ class AccountRiskObserver:
         self.max_age_seconds = _positive_float(max_age_seconds, "max_age_seconds")
         self.max_pages = _positive_int(max_pages, "max_pages")
         self.max_rows = _positive_int(max_rows, "max_rows")
+        if not isinstance(require_cashflows, bool):
+            raise ValueError("require_cashflows debe ser booleano")
+        self.require_cashflows = require_cashflows
         self._cache_key: tuple[str, str] | None = None
         self._cache_invalidated_reason: str | None = None
         self.last_observation: AccountRiskSnapshot | None = None
@@ -551,6 +1174,21 @@ class AccountRiskObserver:
             journal_path,
             allow_new_baseline=allow_new_baseline,
         )
+        anchor_path = None
+        if state_path is not None:
+            state_value = Path(state_path).expanduser()
+            anchor_path = state_value.with_name(f"{state_value.stem}.day-anchor{state_value.suffix}")
+        self._daily_anchor = _DailyEquityAnchorStore(
+            anchor_path,
+            journal_path,
+            allow_new_baseline=allow_new_baseline,
+        )
+
+    @property
+    def daily_anchor_path(self) -> Path | None:
+        """Private path of the persisted UTC-day anchor, when configured."""
+
+        return self._daily_anchor.path
 
     def observe(self, *, now: datetime | None = None) -> AccountRiskSnapshot:
         """Query trader, positions, unrealized PnL, and bounded daily deals."""
@@ -643,6 +1281,21 @@ class AccountRiskObserver:
         deals = self._deals(identity.account_id, day_start, current, trader_digits)
         responses.extend(deals["responses"])
         component_reasons.extend(deals["reasons"])
+        cashflows = (
+            self._cashflows(identity.account_id, day_start, current, trader_digits)
+            if self.require_cashflows
+            else {
+                "responses": [],
+                "records": (),
+                "complete": True,
+                "net": None,
+                "fingerprint": None,
+                "digests": (),
+                "reasons": [],
+            }
+        )
+        responses.extend(cashflows["responses"])
+        component_reasons.extend(cashflows["reasons"])
         final_identity = self._session_identity()
         if final_identity != identity:
             component_reasons.append("connection_generation_changed")
@@ -656,6 +1309,8 @@ class AccountRiskObserver:
             "positions_complete": positions_complete,
             "unrealized": unrealized,
             "deals": deals,
+            "cashflows": cashflows,
+            "cashflows_required": self.require_cashflows,
             "reasons": component_reasons,
         }
 
@@ -673,6 +1328,7 @@ class AccountRiskObserver:
         positions = cast(list[dict[str, Any]], components["positions"])
         unrealized = cast(Mapping[str, Any], components["unrealized"])
         deals = cast(Mapping[str, Any], components["deals"])
+        cashflows = cast(Mapping[str, Any], components["cashflows"])
         balance_value = cast(Decimal | None, components["balance"])
         unrealized_value = cast(Decimal | None, unrealized["net"] if unrealized["complete"] else None)
         gross_unrealized_value = cast(Decimal | None, unrealized["gross"] if unrealized["complete"] else None)
@@ -703,16 +1359,58 @@ class AccountRiskObserver:
             reasons.append(str(high_water["reason"]))
         drawdown = cast(Decimal | None, high_water["drawdown"])
         peak_equity = cast(Decimal | None, high_water["high_water_equity"])
+        daily_anchor = (
+            self._daily_anchor.observe(
+                identity,
+                day_start,
+                equity_value,
+                cast(Decimal | None, cashflows.get("net")),
+                cast(Sequence[tuple[str, str]], cashflows.get("digests", ())),
+                cast(str | None, cashflows.get("fingerprint")),
+                observed_at,
+                self.max_age_seconds,
+                data_ready=fresh and complete and equity_value is not None and cashflows.get("complete") is True,
+            )
+            if self.require_cashflows
+            else {
+                "daily_pnl": None,
+                "daily_loss": None,
+                "anchor_equity": None,
+                "anchor_cashflow_total": None,
+                "cashflow_total": None,
+                "day_start": None,
+                "anchor_observed_at": None,
+                "anchor_basis": None,
+                "anchor_reference_at": None,
+                "anchor_mark_age_seconds": None,
+                "anchor_verified": False,
+                "state": "NOT_REQUIRED",
+                "complete": True,
+                "reason": None,
+                "cashflow_fingerprint": None,
+            }
+        )
+        if self.require_cashflows:
+            if daily_anchor["reason"] is not None:
+                reasons.append(str(daily_anchor["reason"]))
+            if daily_anchor["complete"] is not True:
+                complete = False
         if not fresh or not complete:
             usable_realized = None
             usable_daily = None
+            usable_daily_loss = None
         else:
             usable_realized = cast(Decimal | None, deals["net"])
-            usable_daily = (
-                usable_realized + unrealized_value
-                if usable_realized is not None and unrealized_value is not None
-                else None
-            )
+            if self.require_cashflows:
+                usable_daily = cast(Decimal | None, daily_anchor.get("daily_pnl"))
+                usable_daily_loss = cast(Decimal | None, daily_anchor.get("daily_loss"))
+            else:
+                usable_daily = (
+                    usable_realized + unrealized_value
+                    if usable_realized is not None and unrealized_value is not None
+                    else None
+                )
+                usable_daily_loss = None
         freshness_state = "FRESH" if fresh else ("STALE" if any("stale" in item for item in reasons) else "UNKNOWN")
         reported_balance = balance_value if fresh else None
         reported_equity = equity_value if fresh else None
@@ -760,6 +1458,21 @@ class AccountRiskObserver:
             str(high_water["state"]),
             bool(high_water["complete"]),
             cast(str | None, high_water["reason"]),
+            _text(cast(Decimal | None, daily_anchor.get("anchor_equity"))),
+            _text(cast(Decimal | None, daily_anchor.get("anchor_cashflow_total"))),
+            _text(cast(Decimal | None, daily_anchor.get("cashflow_total"))),
+            _iso(cast(datetime | None, daily_anchor.get("day_start"))),
+            cast(datetime | None, daily_anchor.get("anchor_observed_at")),
+            cast(str | None, daily_anchor.get("anchor_basis")),
+            cast(datetime | None, daily_anchor.get("anchor_reference_at")),
+            _text(cast(Decimal | None, daily_anchor.get("anchor_mark_age_seconds"))),
+            bool(daily_anchor.get("anchor_verified", False)),
+            _text(usable_daily_loss),
+            str(daily_anchor.get("state", "UNAVAILABLE")),
+            cast(str | None, daily_anchor.get("reason")),
+            tuple(cast(Mapping[str, Any], item) for item in cashflows.get("records", ())),
+            bool(cashflows.get("complete", False)) if self.require_cashflows else False,
+            cast(str | None, daily_anchor.get("cashflow_fingerprint")),
         )
 
     def _margin_level(self, used_margin: Decimal | None, equity: Decimal | None, reasons: list[str]) -> Decimal | None:
@@ -794,11 +1507,15 @@ class AccountRiskObserver:
             "equity_negative",
             "response_generation_unobserved",
         }
+        cashflows_complete = (
+            not components.get("cashflows_required", False) or components["cashflows"]["complete"] is True
+        )
         return bool(
             components["positions_complete"]
             and components["unrealized"]["complete"]
             and components["deals"]["complete"]
             and components["deals"]["fees_complete"]
+            and cashflows_complete
             and not any(reason in blocked for reason in reasons)
             and "response_timestamp_unobserved" not in reasons
         )
@@ -825,6 +1542,22 @@ class AccountRiskObserver:
             kwargs.pop("used_margin", None)
         elif "margin_state" in parameters:
             kwargs["margin_state"] = snapshot.margin_state
+        for name in (
+            "daily_loss",
+            "daily_anchor_equity",
+            "daily_anchor_cashflow_total",
+            "daily_cashflow_total",
+            "daily_anchor_day",
+            "daily_anchor_observed_at",
+            "daily_anchor_verified",
+            "daily_loss_state",
+            "daily_loss_reason",
+            "cashflows_complete",
+            "cashflow_fingerprint",
+            "high_water_equity",
+        ):
+            if name not in parameters:
+                kwargs.pop(name, None)
         executor_status = update(**kwargs)
         projection = snapshot.to_dict()
         projection["observation"] = dict(projection)
@@ -834,7 +1567,9 @@ class AccountRiskObserver:
     def rearm_after_human(self, *, confirm: bool = False) -> dict[str, Any]:
         """Explicitly request a new high-water baseline; never called implicitly."""
 
-        return self._high_water.rearm_after_human(confirm=confirm)
+        daily = self._daily_anchor.rearm_after_human(confirm=confirm)
+        high_water = self._high_water.rearm_after_human(confirm=confirm)
+        return {**high_water, "daily_anchor": daily}
 
     # Alias used by composition roots that phrase the operation as observe.
     observe_and_update = update_executor
@@ -1054,6 +1789,117 @@ class AccountRiskObserver:
             "reasons": reasons,
         }
 
+    def _cashflows(
+        self, account_id: str, day_start: datetime, now: datetime, trader_digits: int | None
+    ) -> dict[str, Any]:
+        """Read and verify the bounded UTC-day deposit/withdrawal history."""
+
+        response = self._request_cashflow_history(account_id, day_start, now)
+        reasons: list[str] = []
+        payload = response.payload
+        if isinstance(payload, Mapping) and "depositWithdraw" not in payload and "deposit_withdraw" not in payload:
+            return {
+                "responses": [response],
+                "records": (),
+                "complete": False,
+                "net": None,
+                "fingerprint": None,
+                "digests": (),
+                "reasons": ["cashflow_list_incomplete"],
+            }
+        records: list[dict[str, Any]] = []
+        digests: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        net = Decimal("0")
+        for raw in read_repeated(payload, "depositWithdraw", "deposit_withdraw"):
+            cashflow_id = _required_text(raw, "balanceHistoryId", "balance_history_id")
+            if cashflow_id is not None and cashflow_id in seen:
+                reasons.append("duplicate_cashflow_id")
+                continue
+            if cashflow_id is not None:
+                seen.add(cashflow_id)
+            record, digest, signed_delta, record_reasons = self._cashflow_record(
+                raw,
+                cashflow_id=cashflow_id,
+                day_start=day_start,
+                now=now,
+                trader_digits=trader_digits,
+            )
+            reasons.extend(record_reasons)
+            if record is None or digest is None or signed_delta is None or cashflow_id is None:
+                continue
+            records.append(record)
+            digests.append((cashflow_id, digest))
+            with decimal_context():
+                net += signed_delta
+        complete = not reasons
+        fingerprint = None
+        if complete:
+            encoded = json.dumps(
+                sorted(records, key=lambda item: str(item["cashflow_id"])),
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            fingerprint = hashlib.sha256(encoded).hexdigest()
+        return {
+            "responses": [response],
+            "records": tuple(records),
+            "complete": complete,
+            "net": net if complete else None,
+            "fingerprint": fingerprint,
+            "digests": tuple(sorted(digests)),
+            "reasons": reasons,
+        }
+
+    @staticmethod
+    def _cashflow_record(
+        raw: Any,
+        *,
+        cashflow_id: str | None,
+        day_start: datetime,
+        now: datetime,
+        trader_digits: int | None,
+    ) -> tuple[dict[str, Any] | None, str | None, Decimal | None, list[str]]:
+        reasons: list[str] = []
+        delta = _required_integer(raw, "delta", reasons)
+        timestamp_ms = _required_integer(raw, "changeBalanceTimestamp", reasons)
+        operation = enum_name(
+            raw,
+            "operationType",
+            read_field(raw, "operationType", "operation_type", default=None),
+        )
+        operation = str(operation or "").strip().upper()
+        if not operation or operation in {"UNKNOWN", "0"}:
+            reasons.append("cashflow_operation_unobserved")
+        if delta is None or timestamp_ms is None:
+            return None, None, None, reasons
+        timestamp = _cashflow_timestamp(timestamp_ms, day_start, now, reasons)
+        if timestamp is None:
+            return None, None, None, reasons
+        digits = _optional_money_digits(raw, "moneyDigits") or trader_digits
+        if digits is None:
+            reasons.append("cashflow_money_digits_unobserved")
+            return None, None, None, reasons
+        balance = _scaled_optional(raw, "balance", digits)
+        if balance is None:
+            reasons.append("cashflow_balance_unobserved")
+            return None, None, None, reasons
+        signed_delta = _cashflow_signed_delta(operation, delta, digits, reasons)
+        if signed_delta is None:
+            return None, None, None, reasons
+        record = {
+            "cashflow_id": cashflow_id,
+            "operation_type": operation,
+            "delta": _text(signed_delta),
+            "balance": _text(balance),
+            "timestamp": _iso(timestamp),
+        }
+        digest = hashlib.sha256(
+            json.dumps(record, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return record, digest, signed_delta, reasons
+
     def _deal_page(
         self,
         response: _Response,
@@ -1120,6 +1966,39 @@ class AccountRiskObserver:
             "structure_complete": not any(not item.startswith("realized_") for item in reasons),
             "reasons": reasons,
         }
+
+    def _request_cashflow_history(self, account_id: str, day_start: datetime, now: datetime) -> _Response:
+        factory = getattr(self.proto, "ProtoOACashFlowHistoryListReq", None)
+        if factory is None and isinstance(self.proto, Mapping):
+            factory = self.proto.get("ProtoOACashFlowHistoryListReq")
+        if not callable(factory):
+            raise AccountRiskProtocolError("codec oficial carece de ProtoOACashFlowHistoryListReq")
+        try:
+            message = factory(
+                ctidTraderAccountId=int(account_id),
+                fromTimestamp=_timestamp_ms(day_start),
+                toTimestamp=_timestamp_ms(now),
+            )
+        except Exception as exc:
+            raise AccountRiskProtocolError("no se pudo construir ProtoOACashFlowHistoryListReq") from exc
+        self._request_counter += 1
+        request_id = f"account-risk:{self._request_nonce}:{self._request_counter:06d}"
+        try:
+            wire = self.client.request_message(message, client_msg_id=request_id, timeout_seconds=self.max_age_seconds)
+        except Exception as exc:
+            raise AccountRiskObservationError("falló ProtoOACashFlowHistoryListReq") from exc
+        if (
+            not isinstance(wire, WireMessage)
+            or wire.client_msg_id != request_id
+            or wire.payload_type_id != CASH_FLOW_HISTORY_LIST_RES
+        ):
+            raise AccountRiskProtocolError("respuesta inválida o no correlacionada en ProtoOACashFlowHistoryListReq")
+        response_account = read_field(wire.payload, "ctidTraderAccountId", "ctid_trader_account_id", default=None)
+        if response_account is None or str(response_account) != account_id:
+            raise AccountRiskProtocolError("ProtoOACashFlowHistoryListRes no coincide con account_id")
+        observed_at = wire.available_at or wire.received_at
+        generation = None if wire.connection_generation is None else str(wire.connection_generation).strip() or None
+        return _Response(wire.payload, CASH_FLOW_HISTORY_LIST_RES, generation, observed_at, wire.client_msg_id)
 
     def _request_deal_page(self, account_id: str, from_ms: int, to_ms: int, page_number: int) -> _Response:
         factory = getattr(self.proto, "ProtoOADealListReq", None)
@@ -1256,6 +2135,7 @@ def update_executor_risk(provider: Any, executor: Any, **kwargs: Any) -> dict[st
                 "state_path",
                 "journal_path",
                 "allow_new_baseline",
+                "require_cashflows",
             }
         },
     ).update_executor(executor, now=kwargs.get("now"))
@@ -1555,6 +2435,27 @@ def _ms_iso(value: Any) -> str | None:
         return _iso(datetime.fromtimestamp(int(value) / 1000, UTC))
     except (TypeError, ValueError, OverflowError, OSError):
         return None
+
+
+def _cashflow_timestamp(timestamp_ms: int, day_start: datetime, now: datetime, reasons: list[str]) -> datetime | None:
+    try:
+        timestamp = datetime.fromtimestamp(timestamp_ms / 1000, UTC)
+    except (OverflowError, OSError, ValueError):
+        reasons.append("cashflow_timestamp_invalid")
+        return None
+    if timestamp < day_start or timestamp > now:
+        reasons.append("cashflow_timestamp_out_of_bounds")
+    return timestamp
+
+
+def _cashflow_signed_delta(operation: str, delta: int, digits: int, reasons: list[str]) -> Decimal | None:
+    amount = abs(_scale_integer(delta, digits))
+    if "WITHDRAW" in operation:
+        return -amount
+    if "DEPOSIT" in operation:
+        return amount
+    reasons.append("cashflow_operation_unobserved")
+    return None
 
 
 def _text(value: Decimal | None) -> str | None:

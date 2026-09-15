@@ -87,6 +87,11 @@ from .ctrader_executor import (
     Side,
     verify_demo_account,
 )
+from .ctrader_history_export import (
+    BoundedHistorySelection,
+    HistoryCaptureError,
+    select_bounded_history_window,
+)
 from .persistence import SQLiteStore
 from .reporting import ReportBuilder
 from .simulation import (
@@ -124,6 +129,9 @@ __all__ = [
     "ForexCFDSimulator",
     "ForexCFDTrade",
     "known_fixture_eurusd_long",
+    "BoundedHistorySelection",
+    "HistoryCaptureError",
+    "select_bounded_history_window",
     "run_ctrader_fixture",
     "CTraderDemoTransport",
     "CTraderOfficialDemoTransport",

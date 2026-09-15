@@ -16,6 +16,7 @@ from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import Enum, StrEnum
+from types import MappingProxyType
 from typing import Any
 
 from .canonical import fingerprint as _strict_fingerprint
@@ -36,6 +37,19 @@ from .numeric import (
     quantize_decimal,
     seconds_decimal,
 )
+from .risk_exit import (
+    EXIT_NONE,
+    EXIT_STOP_LOSS,
+    EXIT_TAKE_PROFIT,
+    EXIT_TIME,
+    EXIT_UNKNOWN,
+    EntryPlan,
+    ExitDecision,
+    RiskExitPolicy,
+    evaluate_exit,
+    plan_entry,
+)
+from .risk_exit import serialize as serialize_risk_exit
 
 D0 = Decimal("0")
 D1 = Decimal("1")
@@ -43,6 +57,16 @@ CFD_SNAPSHOT_VERSION = 3
 CFD_PRODUCT = "FOREX_CFD_LOCAL_PAPER"
 CFD_ECONOMICS_LEGACY_VERSION = "cfd-economics-v1"
 CFD_ECONOMICS_VERSION = "cfd-economics-v2"
+RISK_BAR_CLOCK_BASIS = "UTC_TIMEFRAME_BOUNDARIES_NO_OHLC_IMPUTATION"
+_RISK_TIMEFRAME_SECONDS = {
+    "M1": 60,
+    "M5": 300,
+    "M15": 900,
+    "M30": 1800,
+    "H1": 3600,
+    "H4": 14_400,
+    "D1": 86_400,
+}
 ECONOMICS_VERSION = CFD_ECONOMICS_VERSION
 LEGACY_ECONOMICS_VERSION = CFD_ECONOMICS_LEGACY_VERSION
 _SUPPORTED_ECONOMICS_VERSIONS = frozenset({CFD_ECONOMICS_LEGACY_VERSION, CFD_ECONOMICS_VERSION})
@@ -537,9 +561,13 @@ def _quote_times(quote: CFDQuote, metadata: Mapping[str, Any] | None = None) -> 
             if value is None:
                 continue
             side_time = _utc(value, name=f"{side}_{kind}")
-            if side_time < market:
-                raise CFDSimulationError(f"{side}_{kind} no puede preceder market_time")
-            available = max(available, side_time)
+            # A merged BBO may retain the other side from an older envelope.
+            # Its receipt/availability timestamp is valid evidence for that
+            # side even when the new envelope's market time is later.  Never
+            # move the envelope backwards; only a future side observation can
+            # promote the quote's effective availability.
+            if side_time >= market:
+                available = max(available, side_time)
     if available < market:
         raise CFDSimulationError("available_at no puede preceder market_time")
     return market, available
@@ -1231,6 +1259,14 @@ class CFDConfig:
     commission_known: bool = True
     max_active_trades: int = 4096
     economics_version: str = CFD_ECONOMICS_VERSION
+    # RiskExit is opt-in.  Leaving it None preserves the pre-policy config
+    # hash and legacy horizon/economics behaviour byte-for-byte.
+    risk_exit_policy: RiskExitPolicy | Mapping[str, Any] | None = None
+    risk_exit_contract_spec: Mapping[str, Any] | None = None
+    risk_exit_calendar: Mapping[str, Any] | None = None
+    risk_exit_mode: str = "DEMO_GATED"
+    risk_trigger_timeframe: str | None = None
+    risk_bar_clock_basis: str = RISK_BAR_CLOCK_BASIS
 
     def __post_init__(self) -> None:
         values = _normalise_config_values(self)
@@ -1275,7 +1311,7 @@ class CFDConfig:
         return _digest(self.to_dict())
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "instrument": self.instrument,
             "units": str(self.units),
             "pip_size": str(self.pip_size),
@@ -1306,6 +1342,21 @@ class CFDConfig:
             "max_active_trades": self.max_active_trades,
             "economics_version": self.economics_version,
         }
+        if self.risk_exit_policy is not None:
+            policy = (
+                self.risk_exit_policy
+                if isinstance(self.risk_exit_policy, RiskExitPolicy)
+                else RiskExitPolicy.from_mapping(self.risk_exit_policy)
+            )
+            result["risk_exit_policy"] = policy.serialize()
+            if self.risk_exit_contract_spec is not None:
+                result["risk_exit_contract_spec"] = _jsonable(self.risk_exit_contract_spec)
+            if self.risk_exit_calendar is not None:
+                result["risk_exit_calendar"] = _jsonable(self.risk_exit_calendar)
+            result["risk_exit_mode"] = self.risk_exit_mode
+            result["risk_trigger_timeframe"] = self.risk_trigger_timeframe
+            result["risk_bar_clock_basis"] = self.risk_bar_clock_basis
+        return result
 
 
 def _normalise_config_values(config: CFDConfig) -> dict[str, Any]:
@@ -1321,7 +1372,44 @@ def _normalise_config_values(config: CFDConfig) -> dict[str, Any]:
     values.update(_normalise_config_latencies(config))
     values.update(_normalise_config_costs(config))
     values.update(_normalise_config_retention(config))
+    if config.risk_exit_policy is not None:
+        values["risk_exit_policy"] = (
+            config.risk_exit_policy
+            if isinstance(config.risk_exit_policy, RiskExitPolicy)
+            else RiskExitPolicy.from_mapping(config.risk_exit_policy)
+        )
+        for name in ("risk_exit_contract_spec", "risk_exit_calendar"):
+            raw = getattr(config, name)
+            if raw is not None:
+                if not isinstance(raw, Mapping):
+                    raise CFDSimulationError(f"{name} debe ser mapping")
+                values[name] = dict(raw)
+        values["risk_exit_mode"] = _normalise_risk_exit_mode(config.risk_exit_mode)
+        values["risk_trigger_timeframe"] = _normalise_risk_trigger_timeframe(config.risk_trigger_timeframe)
+        if config.risk_bar_clock_basis != RISK_BAR_CLOCK_BASIS:
+            raise CFDSimulationError("risk_bar_clock_basis no soportado")
+        values["risk_bar_clock_basis"] = RISK_BAR_CLOCK_BASIS
+    elif str(config.risk_exit_mode).strip().upper() != "DEMO_GATED":
+        raise CFDSimulationError("risk_exit_mode requiere risk_exit_policy")
     return values
+
+
+def _normalise_risk_exit_mode(value: Any) -> str:
+    raw = str(value or "DEMO_GATED").strip().upper().replace("-", "_")
+    if raw in {"DIAGNOSTIC", "VIRTUAL_DIAGNOSTICS"}:
+        raw = "VIRTUAL_DIAGNOSTIC"
+    if raw not in {"DEMO_GATED", "VIRTUAL_DIAGNOSTIC"}:
+        raise CFDSimulationError(f"risk_exit_mode no soportado: {value!r}")
+    return raw
+
+
+def _normalise_risk_trigger_timeframe(value: Any) -> str | None:
+    if value is None:
+        return None
+    raw = str(value).strip().upper()
+    if raw not in _RISK_TIMEFRAME_SECONDS:
+        raise CFDSimulationError(f"risk_trigger_timeframe no soportado: {value!r}")
+    return raw
 
 
 def _normalise_horizons(raw: Iterable[Any]) -> tuple[Decimal, ...]:
@@ -1494,6 +1582,39 @@ class CFDTrade:
     entry_reference_price: Decimal | None = None
     close_reference_price: Decimal | None = None
     reference_gross_pnl_quote: Decimal | None = None
+    # RiskExit is opt-in.  These fields stay absent from legacy serializations
+    # unless a policy actually planned/observed the trade.
+    risk_exit_plan: Mapping[str, Any] | None = None
+    risk_exit_decision: Mapping[str, Any] | None = None
+    risk_atr: Decimal | None = None
+    # The denominator is frozen from the actual filled quantity and the
+    # planned monetary risk per unit.  It is intentionally separate from the
+    # account risk budget, which is a portfolio admission limit.
+    risk_initial_risk: Decimal | None = None
+    risk_initial_quantity: Decimal | None = None
+    risk_initial_risk_per_unit: Decimal | None = None
+    risk_mfe_price: Decimal | None = None
+    risk_mae_price: Decimal | None = None
+    risk_mfe_r: Decimal | None = None
+    risk_mae_r: Decimal | None = None
+    risk_net_r: Decimal | None = None
+    risk_gross_r: Decimal | None = None
+    # Kept as a stored compatibility spelling.  It is always equal to
+    # risk_net_r after normalization; it never stores MFE.
+    risk_r_multiple: Decimal | None = None
+    risk_bars_held: int = 0
+    risk_last_price: Decimal | None = None
+    risk_favorable_price: Decimal | None = None
+    risk_adverse_price: Decimal | None = None
+    risk_exit_due_at: datetime | None = None
+    risk_trigger_bar_count: int | None = None
+    risk_entry_bar_count: int | None = None
+    risk_bar_clock_basis: str | None = None
+    risk_trigger_timeframe: str | None = None
+    risk_exit_triggered_at: datetime | None = None
+    risk_exit_requested_latency: Decimal | None = None
+    risk_exit_trigger_price: Decimal | None = None
+    risk_bar_clock_invalid: bool = False
 
     def __post_init__(self) -> None:
         values = _normalise_trade_values(self)
@@ -1517,6 +1638,52 @@ class CFDTrade:
     @property
     def effective_fill_at(self) -> datetime | None:
         return self.entry_available_at
+
+    @property
+    def mfe_price(self) -> Decimal | None:
+        """Maximum favorable excursion retained by the risk-managed trade."""
+        return self.risk_mfe_price
+
+    @property
+    def mae_price(self) -> Decimal | None:
+        """Maximum adverse excursion retained by the risk-managed trade."""
+        return self.risk_mae_price
+
+    @property
+    def initial_risk(self) -> Decimal | None:
+        """Frozen monetary R denominator used for economic R metrics."""
+
+        return self.risk_initial_risk
+
+    @property
+    def mfe_r(self) -> Decimal | None:
+        """Maximum favorable excursion in price-risk R."""
+
+        return self.risk_mfe_r
+
+    @property
+    def mae_r(self) -> Decimal | None:
+        """Maximum adverse excursion in price-risk R."""
+
+        return self.risk_mae_r
+
+    @property
+    def net_r(self) -> Decimal | None:
+        """Settled net ledger PnL divided by frozen initial monetary R."""
+
+        return self.risk_net_r
+
+    @property
+    def gross_r(self) -> Decimal | None:
+        """Gross account PnL divided by frozen initial monetary R."""
+
+        return self.risk_gross_r
+
+    @property
+    def r_multiple(self) -> Decimal | None:
+        """Canonical economic R; never a favorable-excursion measurement."""
+
+        return self.risk_net_r
 
     @property
     def economic_result(self) -> CFDEconomicResult:
@@ -1546,7 +1713,7 @@ class CFDTrade:
         def dec(value: Decimal | None) -> str | None:
             return str(value) if value is not None else None
 
-        return {
+        result = {
             "product": self.product,
             "trade_id": self.trade_id,
             "identity": self.identity,
@@ -1595,17 +1762,179 @@ class CFDTrade:
             "reference_gross_pnl_quote": dec(self.reference_gross_pnl_quote),
             "economic_result": self.economic_result.to_dict(),
         }
+        if self.risk_exit_plan is not None or self.risk_atr is not None:
+            result["risk_exit_plan"] = _jsonable(self.risk_exit_plan)
+            result["risk_exit_decision"] = _jsonable(self.risk_exit_decision)
+            result["risk_atr"] = dec(self.risk_atr)
+            result["risk_initial_risk"] = dec(self.risk_initial_risk)
+            result["risk_initial_quantity"] = dec(self.risk_initial_quantity)
+            result["risk_initial_risk_per_unit"] = dec(self.risk_initial_risk_per_unit)
+            result["risk_mfe_price"] = dec(self.risk_mfe_price)
+            result["risk_mae_price"] = dec(self.risk_mae_price)
+            result["risk_mfe_r"] = dec(self.risk_mfe_r)
+            result["risk_mae_r"] = dec(self.risk_mae_r)
+            result["risk_net_r"] = dec(self.risk_net_r)
+            result["risk_gross_r"] = dec(self.risk_gross_r)
+            result["risk_r_multiple"] = dec(self.risk_r_multiple)
+            result["risk_bars_held"] = self.risk_bars_held
+            result["risk_last_price"] = dec(self.risk_last_price)
+            result["risk_favorable_price"] = dec(self.risk_favorable_price)
+            result["risk_adverse_price"] = dec(self.risk_adverse_price)
+            result["risk_exit_due_at"] = _iso(self.risk_exit_due_at)
+            result["risk_trigger_bar_count"] = self.risk_trigger_bar_count
+            result["risk_entry_bar_count"] = self.risk_entry_bar_count
+            result["risk_bar_clock_basis"] = self.risk_bar_clock_basis
+            result["risk_trigger_timeframe"] = self.risk_trigger_timeframe
+            result["risk_exit_triggered_at"] = _iso(self.risk_exit_triggered_at)
+            result["risk_exit_requested_latency"] = dec(self.risk_exit_requested_latency)
+            result["risk_exit_trigger_price"] = dec(self.risk_exit_trigger_price)
+            result["risk_bar_clock_invalid"] = self.risk_bar_clock_invalid
+            # Short aliases make the report-facing contract discoverable while
+            # keeping the canonical names above stable for restore.
+            result["mfe_price"] = dec(self.risk_mfe_price)
+            result["mae_price"] = dec(self.risk_mae_price)
+            result["initial_risk"] = dec(self.risk_initial_risk)
+            result["mfe_r"] = dec(self.risk_mfe_r)
+            result["mae_r"] = dec(self.risk_mae_r)
+            result["net_r"] = dec(self.risk_net_r)
+            result["gross_r"] = dec(self.risk_gross_r)
+            result["r_multiple"] = dec(self.risk_net_r)
+            if isinstance(self.risk_exit_plan, Mapping):
+                result["stop_price"] = self.risk_exit_plan.get("initial_stop")
+                result["take_profit_price"] = self.risk_exit_plan.get("take_profit")
+        return result
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> CFDTrade:
+        # Public aliases are accepted for report/checkpoint round-trips.  A
+        # pre-v2 snapshot's r_multiple was MFE-R, so migrate it to the
+        # explicitly named excursion field rather than treating it as net R.
+        data_in = dict(value)
+        aliases = {
+            "initial_risk": "risk_initial_risk",
+            "mfe_r": "risk_mfe_r",
+            "mae_r": "risk_mae_r",
+            "net_r": "risk_net_r",
+            "gross_r": "risk_gross_r",
+        }
+        for alias, target in aliases.items():
+            if target not in data_in and alias in data_in:
+                data_in[target] = data_in[alias]
+        if (
+            "risk_r_multiple" in data_in
+            and "risk_mfe_r" not in data_in
+            and "risk_net_r" not in data_in
+            and "net_r" not in value
+        ):
+            data_in["risk_mfe_r"] = data_in.pop("risk_r_multiple")
+        elif (
+            "r_multiple" in data_in
+            and "risk_mfe_r" not in data_in
+            and "risk_net_r" not in data_in
+            and "net_r" not in value
+        ):
+            data_in["risk_mfe_r"] = data_in["r_multiple"]
         allowed = {item.name for item in fields(cls)}
-        data = {key: item for key, item in value.items() if key in allowed}
+        data = {key: item for key, item in data_in.items() if key in allowed}
         data.pop("product", None) if data.get("product") is None else None
         data.setdefault("product", CFD_PRODUCT)
         return cls(**data)
 
 
+def _normalise_initial_risk(trade: CFDTrade) -> dict[str, Decimal | None]:
+    risk_plan = trade.risk_exit_plan if isinstance(trade.risk_exit_plan, Mapping) else None
+    initial_quantity = _optional_decimal(trade.risk_initial_quantity, "risk_initial_quantity")
+    initial_per_unit = _optional_decimal(trade.risk_initial_risk_per_unit, "risk_initial_risk_per_unit")
+    initial_risk = _optional_decimal(trade.risk_initial_risk, "risk_initial_risk")
+    if risk_plan is not None:
+        if initial_quantity is None:
+            # units is the actual filled amount and therefore wins over a
+            # requested/planned quantity when a provider ever reports a
+            # partial fill.
+            initial_quantity = _optional_decimal(trade.units, "risk_initial_quantity")
+        if initial_quantity is None and risk_plan.get("quantity") is not None:
+            initial_quantity = _optional_decimal(risk_plan.get("quantity"), "risk_initial_quantity")
+        if initial_per_unit is None and risk_plan.get("risk_per_unit") is not None:
+            initial_per_unit = _optional_decimal(risk_plan.get("risk_per_unit"), "risk_initial_risk_per_unit")
+        if initial_risk is None:
+            # Prefer the explicit filled quantity contract.  The plan's
+            # risk_amount is retained only as a compatibility fallback for
+            # snapshots produced before the denominator fields existed.
+            if initial_quantity is not None and initial_per_unit is not None:
+                with decimal_context():
+                    initial_risk = initial_quantity * initial_per_unit
+            elif risk_plan.get("risk_amount") is not None:
+                initial_risk = _optional_decimal(risk_plan.get("risk_amount"), "risk_initial_risk")
+    return {
+        "risk_initial_risk": initial_risk,
+        "risk_initial_quantity": initial_quantity,
+        "risk_initial_risk_per_unit": initial_per_unit,
+    }
+
+
+def _normalise_excursion_r(trade: CFDTrade) -> dict[str, Decimal | None]:
+    decision = trade.risk_exit_decision if isinstance(trade.risk_exit_decision, Mapping) else None
+    mfe_r = _optional_decimal(trade.risk_mfe_r, "risk_mfe_r")
+    mae_r = _optional_decimal(trade.risk_mae_r, "risk_mae_r")
+    if decision is not None:
+        if mfe_r is None:
+            mfe_r = _optional_decimal(decision.get("mfe_r", decision.get("r_multiple")), "risk_mfe_r")
+        if mae_r is None:
+            mae_r = _optional_decimal(decision.get("mae_r"), "risk_mae_r")
+    return {"risk_mfe_r": mfe_r, "risk_mae_r": mae_r}
+
+
+def _normalise_economic_r(trade: CFDTrade) -> dict[str, Decimal | None]:
+    net_r = _optional_decimal(trade.risk_net_r, "risk_net_r")
+    gross_r = _optional_decimal(trade.risk_gross_r, "risk_gross_r")
+    stored_r = _optional_decimal(trade.risk_r_multiple, "risk_r_multiple")
+    state = trade.state if isinstance(trade.state, TradeState) else TradeState(str(trade.state).upper())
+    if state is TradeState.CLOSED:
+        initial = _normalise_initial_risk(trade)["risk_initial_risk"]
+        ledger_net = _optional_decimal(trade.net_pnl, "net_pnl")
+        ledger_gross = _optional_decimal(trade.gross_pnl_account, "gross_pnl_account")
+        if initial is not None and initial > D0:
+            with decimal_context():
+                derived_net = ledger_net / initial if ledger_net is not None else None
+                derived_gross = ledger_gross / initial if ledger_gross is not None else None
+        else:
+            derived_net = None
+            derived_gross = None
+        # A closed trade's economic R is recomputed from its settled ledger;
+        # an inconsistent persisted value is a corrupt snapshot, not a
+        # reason to trust the opaque value.
+        if net_r is not None and net_r != derived_net:
+            raise CFDSimulationError("risk_net_r no coincide con el ledger cerrado")
+        if gross_r is not None and gross_r != derived_gross:
+            raise CFDSimulationError("risk_gross_r no coincide con el ledger cerrado")
+        if stored_r is not None and stored_r != derived_net:
+            raise CFDSimulationError("risk_r_multiple no coincide con el ledger cerrado")
+        net_r = derived_net
+        gross_r = derived_gross
+    elif net_r is None and stored_r is not None:
+        # Direct construction with the new compatibility field uses the
+        # canonical economic meaning.  Legacy mappings are migrated in
+        # from_mapping before reaching this function.
+        net_r = stored_r
+    if stored_r is not None and net_r is not None and stored_r != net_r:
+        raise CFDSimulationError("risk_r_multiple debe coincidir con risk_net_r")
+    return {
+        "risk_net_r": net_r,
+        "risk_gross_r": gross_r,
+        "risk_r_multiple": net_r,
+    }
+
+
+def _normalise_risk_metrics(trade: CFDTrade) -> dict[str, Decimal | None]:
+    return {
+        **_normalise_initial_risk(trade),
+        **_normalise_excursion_r(trade),
+        **_normalise_economic_r(trade),
+    }
+
+
 def _normalise_trade_values(trade: CFDTrade) -> dict[str, Any]:
+    risk_values = _normalise_risk_metrics(trade)
     values: dict[str, Any] = {
         "trade_id": _id(trade.trade_id, name="trade_id"),
         "signal_id": _id(trade.signal_id, name="signal_id"),
@@ -1620,6 +1949,22 @@ def _normalise_trade_values(trade: CFDTrade) -> dict[str, Any]:
         "lineage": dict(trade.lineage or {}),
         "product": trade.product,
         "economics_version": _normalise_economics_version(trade.economics_version),
+        "risk_exit_plan": MappingProxyType(dict(trade.risk_exit_plan))
+        if isinstance(trade.risk_exit_plan, Mapping)
+        else None,
+        "risk_exit_decision": MappingProxyType(dict(trade.risk_exit_decision))
+        if isinstance(trade.risk_exit_decision, Mapping)
+        else None,
+        "risk_bars_held": _risk_integer(trade.risk_bars_held, name="risk_bars_held"),
+        "risk_trigger_bar_count": _optional_risk_integer(trade.risk_trigger_bar_count, name="risk_trigger_bar_count"),
+        "risk_entry_bar_count": _optional_risk_integer(trade.risk_entry_bar_count, name="risk_entry_bar_count"),
+        "risk_bar_clock_basis": (
+            str(trade.risk_bar_clock_basis).strip() if trade.risk_bar_clock_basis is not None else None
+        ),
+        "risk_trigger_timeframe": _normalise_risk_trigger_timeframe(trade.risk_trigger_timeframe),
+        "risk_exit_triggered_at": _optional_time(trade.risk_exit_triggered_at, "risk_exit_triggered_at"),
+        "risk_bar_clock_invalid": _strict_risk_bool(trade.risk_bar_clock_invalid, "risk_bar_clock_invalid"),
+        **risk_values,
     }
     values.update(
         {
@@ -1658,9 +2003,18 @@ def _normalise_trade_values(trade: CFDTrade) -> dict[str, Any]:
                 "costs_account",
                 "net_pnl",
                 "conversion_rate",
+                "risk_atr",
+                "risk_mfe_price",
+                "risk_mae_price",
+                "risk_last_price",
+                "risk_favorable_price",
+                "risk_adverse_price",
+                "risk_exit_requested_latency",
+                "risk_exit_trigger_price",
             )
         }
     )
+    values["risk_exit_due_at"] = _optional_time(trade.risk_exit_due_at, "risk_exit_due_at")
     return values
 
 
@@ -1670,6 +2024,47 @@ def _optional_time(value: Any, name: str) -> datetime | None:
 
 def _optional_decimal(value: Any, name: str) -> Decimal | None:
     return decimal(value, name=name) if value is not None else None
+
+
+def _risk_integer(value: Any, *, name: str) -> int:
+    if isinstance(value, bool):
+        raise CFDSimulationError(f"{name} debe ser entero")
+    if isinstance(value, Decimal) and value != value.to_integral_value():
+        raise CFDSimulationError(f"{name} debe ser entero")
+    if isinstance(value, float) and not value.is_integer():
+        raise CFDSimulationError(f"{name} debe ser entero")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CFDSimulationError(f"{name} debe ser entero") from exc
+    if result < 0:
+        raise CFDSimulationError(f"{name} debe ser >= 0")
+    return result
+
+
+def _optional_risk_integer(value: Any, *, name: str) -> int | None:
+    return None if value is None else _risk_integer(value, name=name)
+
+
+def _strict_risk_bool(value: Any, name: str) -> bool:
+    if not isinstance(value, bool):
+        raise CFDSimulationError(f"{name} debe ser booleano")
+    return value
+
+
+def _validate_risk_trade_metrics(trade: CFDTrade) -> None:
+    if trade.risk_initial_risk is not None and trade.risk_initial_risk <= D0:
+        raise CFDSimulationError("risk_initial_risk debe ser positivo")
+    if trade.risk_initial_quantity is not None and trade.risk_initial_quantity <= D0:
+        raise CFDSimulationError("risk_initial_quantity debe ser positivo")
+    if trade.risk_initial_risk_per_unit is not None and trade.risk_initial_risk_per_unit <= D0:
+        raise CFDSimulationError("risk_initial_risk_per_unit debe ser positivo")
+    for name in ("risk_mfe_r", "risk_mae_r"):
+        value = getattr(trade, name)
+        if value is not None and value < D0:
+            raise CFDSimulationError(f"{name} no puede ser negativo")
+    if trade.risk_r_multiple != trade.risk_net_r:
+        raise CFDSimulationError("risk_r_multiple debe ser el net_r canónico")
 
 
 def _validate_trade(trade: CFDTrade) -> None:
@@ -1682,6 +2077,19 @@ def _validate_trade(trade: CFDTrade) -> None:
         raise CFDSimulationError("price_precision inválido en trade")
     if trade.product != CFD_PRODUCT:
         raise CFDSimulationError("product de CFD no soportado")
+    if trade.risk_exit_plan is not None and not isinstance(trade.risk_exit_plan, Mapping):
+        raise CFDSimulationError("risk_exit_plan inválido")
+    if trade.risk_exit_decision is not None and not isinstance(trade.risk_exit_decision, Mapping):
+        raise CFDSimulationError("risk_exit_decision inválida")
+    if trade.risk_bar_clock_basis is not None and trade.risk_bar_clock_basis != RISK_BAR_CLOCK_BASIS:
+        raise CFDSimulationError("risk_bar_clock_basis inválido")
+    if (
+        trade.risk_entry_bar_count is not None
+        and trade.risk_trigger_bar_count is not None
+        and trade.risk_trigger_bar_count < trade.risk_entry_bar_count
+    ):
+        raise CFDSimulationError("risk_trigger_bar_count no puede retroceder antes de entry")
+    _validate_risk_trade_metrics(trade)
 
 
 def _quote_costs(trade: CFDTrade) -> Decimal | None:
@@ -1759,7 +2167,13 @@ class _QuoteBook:
             return previous
         values, reasons = _book_side_values(previous, quote, updated)
         self.last_reasons = reasons
-        merged = _merge_book_quote(previous, quote, values, updated, reasons)
+        try:
+            merged = _merge_book_quote(previous, quote, values, updated, reasons)
+        except (CFDSimulationError, ValueError):
+            # A malformed merged envelope is an invalid quote, not evidence
+            # that bid crossed ask.  Keep the prior book and fail closed.
+            self.last_reasons = (QuoteReason.INVALID_QUALITY,)
+            return None
         if merged is None:
             self.last_reasons = (*self.last_reasons, QuoteReason.CROSSED)
             return None
@@ -1867,8 +2281,13 @@ def _merge_book_quote(
             is_snapshot=quote.is_snapshot,
             disconnected=quote.disconnected,
         )
-    except CFDSimulationError:
-        return None
+    except CFDSimulationError as exc:
+        # Only the explicit cross invariant means the candidate BBO must be
+        # discarded as CROSSED.  Timestamp/metadata errors must not be
+        # relabelled as a market cross or silently erase a usable side.
+        if exc.code == "CROSSED_QUOTE":
+            return None
+        raise
 
 
 def _build_trade(config: CFDConfig, trade_id: str, signal: CFDSignal, horizon: Decimal) -> CFDTrade:
@@ -1903,7 +2322,28 @@ def _build_trade(config: CFDConfig, trade_id: str, signal: CFDSignal, horizon: D
             "economics_version": config.economics_version,
         },
         economics_version=config.economics_version,
+        risk_atr=_signal_risk_atr(signal) if config.risk_exit_policy is not None else None,
     )
+
+
+def _signal_risk_atr(signal: CFDSignal) -> Decimal | None:
+    """Read only an ATR already attached to the immutable signal evidence."""
+
+    metadata = signal.metadata if isinstance(signal.metadata, Mapping) else {}
+    candidates: list[Any] = [metadata.get(key) for key in ("risk_atr", "atr", "atr_value")]
+    for nested_key in ("indicators", "indicator_values", "features"):
+        nested = metadata.get(nested_key)
+        if isinstance(nested, Mapping):
+            candidates.extend(nested.get(key) for key in ("risk_atr", "atr", "atr_value"))
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            value = decimal(candidate, name="signal ATR", positive=True)
+        except CFDSimulationError:
+            return None
+        return value
+    return None
 
 
 def _reject_invalid_signal(trade: CFDTrade, signal: CFDSignal, instrument: str) -> CFDTrade:
@@ -1951,6 +2391,42 @@ def _quote_fillable(
     return config.max_spread is None or (quote.spread is not None and quote.spread <= config.max_spread)
 
 
+def _risk_entry_quote_usable(quote: CFDQuote, watermark: datetime, config: CFDConfig) -> bool:
+    """Require one coherent, current BBO for a risk-managed entry.
+
+    Liquidations intentionally use only their executable side, but entry
+    sizing must not combine a fresh leg with a retained/stale opposite leg.
+    The quote book may legitimately retain one side from an earlier packet;
+    strict leg assessments provide the timestamp, availability and generation
+    gates, so an independently fresh retained leg remains usable.
+    """
+
+    if quote.bid is None or quote.ask is None or quote.spread is None:
+        return False
+    if not quote.operable_for(
+        QuoteSide.BID,
+        at=watermark,
+        max_age_seconds=config.max_quote_age_seconds,
+        expected_session=quote.session_generation,
+        connected=not quote.disconnected,
+    ) or not quote.operable_for(
+        QuoteSide.ASK,
+        at=watermark,
+        max_age_seconds=config.max_quote_age_seconds,
+        expected_session=quote.session_generation,
+        connected=not quote.disconnected,
+    ):
+        return False
+    metadata = quote.metadata if isinstance(quote.metadata, Mapping) else {}
+    for left, right in (
+        ("bid_session_generation", "ask_session_generation"),
+        ("bid_connection_generation", "ask_connection_generation"),
+    ):
+        if (left in metadata or right in metadata) and metadata.get(left) != metadata.get(right):
+            return False
+    return True
+
+
 def _entry_price(
     raw: Decimal,
     direction: Direction,
@@ -1960,6 +2436,320 @@ def _entry_price(
     with decimal_context():
         slipped = raw + slippage_price if direction is Direction.LONG else raw - slippage_price
     return quantize(slipped)
+
+
+def _risk_metadata_bool(quote: CFDQuote, key: str) -> bool:
+    metadata = quote.metadata if isinstance(quote.metadata, Mapping) else {}
+    raw = metadata.get(f"risk_{key}", metadata.get(key))
+    if raw is None:
+        return False
+    try:
+        return _bool(raw, name=f"risk metadata {key}")
+    except CFDSimulationError:
+        return False
+
+
+def _risk_server_side(spec: Mapping[str, Any] | None) -> bool:
+    if not isinstance(spec, Mapping):
+        return False
+    return any(spec.get(key) is True for key in ("server_side_stops", "server_stop_loss", "server_stops"))
+
+
+def _risk_extrema(trade: CFDTrade, current: Decimal) -> tuple[Decimal, Decimal]:
+    favorable = trade.risk_favorable_price or trade.entry_price or current
+    adverse = trade.risk_adverse_price or trade.entry_price or current
+    if trade.direction is Direction.LONG:
+        return max(favorable, current), min(adverse, current)
+    return min(favorable, current), max(adverse, current)
+
+
+def _risk_mfe(direction: Direction, entry: Decimal, favorable: Decimal) -> Decimal:
+    with decimal_context():
+        return max(D0, favorable - entry if direction is Direction.LONG else entry - favorable)
+
+
+def _risk_mae(direction: Direction, entry: Decimal, adverse: Decimal) -> Decimal:
+    with decimal_context():
+        return max(D0, entry - adverse if direction is Direction.LONG else adverse - entry)
+
+
+def _risk_initial_risk_for_fill(plan: EntryPlan, filled_quantity: Decimal) -> Decimal | None:
+    """Freeze the monetary R denominator from the actual filled quantity."""
+
+    if plan.risk_per_unit is None or filled_quantity <= D0:
+        return None
+    with decimal_context():
+        return filled_quantity * plan.risk_per_unit
+
+
+def _risk_mfe_r(trade: CFDTrade, favorable: Decimal) -> Decimal | None:
+    if trade.entry_price is None or not isinstance(trade.risk_exit_plan, Mapping):
+        return None
+    stop = trade.risk_exit_plan.get("initial_stop")
+    if stop is None:
+        return None
+    try:
+        distance = abs(decimal(stop, name="risk initial stop") - trade.entry_price)
+    except CFDSimulationError:
+        return None
+    if distance <= D0:
+        return None
+    with decimal_context():
+        return _risk_mfe(trade.direction, trade.entry_price, favorable) / distance
+
+
+def _risk_mae_r(trade: CFDTrade, adverse: Decimal) -> Decimal | None:
+    if trade.entry_price is None or not isinstance(trade.risk_exit_plan, Mapping):
+        return None
+    stop = trade.risk_exit_plan.get("initial_stop")
+    if stop is None:
+        return None
+    try:
+        distance = abs(decimal(stop, name="risk initial stop") - trade.entry_price)
+    except CFDSimulationError:
+        return None
+    if distance <= D0:
+        return None
+    with decimal_context():
+        return _risk_mae(trade.direction, trade.entry_price, adverse) / distance
+
+
+def _risk_close_metrics(
+    trade: CFDTrade, *, net_pnl: Decimal | None, gross_pnl_account: Decimal | None
+) -> dict[str, Any]:
+    """Derive economic R from the settled ledger and frozen entry R only."""
+
+    denominator = trade.risk_initial_risk
+    if denominator is None or denominator <= D0:
+        return {"risk_net_r": None, "risk_gross_r": None, "risk_r_multiple": None}
+    with decimal_context():
+        net_r = net_pnl / denominator if net_pnl is not None else None
+        gross_r = gross_pnl_account / denominator if gross_pnl_account is not None else None
+    return {"risk_net_r": net_r, "risk_gross_r": gross_r, "risk_r_multiple": net_r}
+
+
+def _risk_bar_ordinal(quote: CFDQuote, config: CFDConfig) -> int | None:
+    timeframe = config.risk_trigger_timeframe
+    if timeframe is None:
+        return None
+    seconds = _RISK_TIMEFRAME_SECONDS[timeframe]
+    instant = quote.market_time.astimezone(UTC)
+    micros = (instant.date() - datetime(1970, 1, 1, tzinfo=UTC).date()).days * 86_400_000_000
+    micros += instant.hour * 3_600_000_000 + instant.minute * 60_000_000
+    micros += instant.second * 1_000_000 + instant.microsecond
+    return micros // (seconds * 1_000_000)
+
+
+def _risk_bar_metadata_consistent(quote: CFDQuote, config: CFDConfig, ordinal: int | None) -> bool:
+    metadata = quote.metadata if isinstance(quote.metadata, Mapping) else {}
+    if metadata.get("risk_bar_clock_basis") not in (None, config.risk_bar_clock_basis):
+        return False
+    if metadata.get("risk_trigger_timeframe", metadata.get("trigger_timeframe")) not in (
+        None,
+        config.risk_trigger_timeframe,
+    ):
+        return False
+    supplied = metadata.get("risk_trigger_bar_count", metadata.get("trigger_bar_count"))
+    if supplied is None or ordinal is None:
+        return True
+    try:
+        return _risk_integer(supplied, name="risk_trigger_bar_count") == ordinal
+    except CFDSimulationError:
+        return False
+
+
+def _risk_bar_observation(trade: CFDTrade, quote: CFDQuote, config: CFDConfig) -> tuple[int, int | None, bool]:
+    ordinal = _risk_bar_ordinal(quote, config)
+    if trade.risk_bar_clock_invalid:
+        return trade.risk_bars_held, ordinal, False
+    if ordinal is None or trade.risk_entry_bar_count is None:
+        return trade.risk_bars_held, ordinal, False
+    if trade.risk_trigger_bar_count is not None and ordinal < trade.risk_trigger_bar_count:
+        return trade.risk_bars_held, ordinal, False
+    if ordinal < trade.risk_entry_bar_count:
+        return trade.risk_bars_held, ordinal, False
+    if not _risk_bar_metadata_consistent(quote, config, ordinal):
+        return trade.risk_bars_held, ordinal, False
+    with decimal_context():
+        held = ordinal - trade.risk_entry_bar_count
+    return held, ordinal, True
+
+
+def _risk_gap(plan: EntryPlan, previous: Decimal | None, current: Decimal) -> bool:
+    if previous is None or plan.initial_stop is None or plan.take_profit is None:
+        return False
+    if plan.direction == Direction.LONG.value:
+        return (previous > plan.initial_stop > current) or (previous < plan.take_profit < current)
+    return (previous < plan.initial_stop < current) or (previous > plan.take_profit > current)
+
+
+def _risk_pending_action(value: Mapping[str, Any] | None) -> str | None:
+    if not isinstance(value, Mapping):
+        return None
+    action = str(value.get("action", "")).strip().upper()
+    return action if action in {EXIT_STOP_LOSS, EXIT_TAKE_PROFIT, EXIT_TIME} else None
+
+
+_RISK_DIAGNOSTIC_HARD_BLOCKERS = frozenset(
+    {
+        "MAX_DAILY_LOSS",
+        "MAX_DRAWDOWN",
+        "MAX_POSITIONS",
+        "MAX_INTENTS",
+        "QUANTITY_BELOW_MIN",
+        "RISK_BUDGET_WOULD_BE_EXCEEDED",
+        "RISK_SIZING_UNKNOWN",
+        "STOP_DISTANCE_BELOW_MINIMUM",
+        "MARGIN_INSUFFICIENT",
+        "MARGIN_STATE_INVALID",
+        "CONTRACT_QUANTITY_MAX_INVALID",
+        "RISK_STATE_INVALID",
+        "EQUITY_STATE_INVALID",
+        "EQUITY_STATE_MISMATCH",
+        "EQUITY_STATE_SOURCE_MISMATCH",
+        "EQUITY_BASIS_MISMATCH",
+        "HIGH_WATER_INVALID",
+        "DRAWDOWN_INCONSISTENT",
+        "MARKET_CLOSED",
+        "STOP_EXECUTABLE_SIDE_INVALID",
+        "STOP_EXECUTABLE_SIDE_UNKNOWN",
+        "STOP_DISTANCE_BELOW_MINIMUM_EXECUTABLE",
+    }
+)
+
+
+def _risk_diagnostic_fillable(plan: EntryPlan) -> bool:
+    """Allow only calculable PAPER diagnostics, never a hard-risk bypass."""
+
+    if plan.mode != "VIRTUAL_DIAGNOSTIC" or plan.quantity is None:
+        return False
+    return not any(
+        reason in _RISK_DIAGNOSTIC_HARD_BLOCKERS or reason.startswith("ENTRY_PRE_") or reason.startswith("atr no es")
+        for reason in plan.reasons
+    )
+
+
+def _risk_deferred_update(
+    trade: CFDTrade,
+    raw: Decimal,
+    favorable: Decimal,
+    adverse: Decimal,
+    bars: int,
+    trigger_count: int | None,
+) -> CFDTrade:
+    assert trade.entry_price is not None
+    return replace(
+        trade,
+        risk_last_price=raw,
+        risk_favorable_price=favorable,
+        risk_adverse_price=adverse,
+        risk_mfe_price=_risk_mfe(trade.direction, trade.entry_price, favorable),
+        risk_mae_price=_risk_mae(trade.direction, trade.entry_price, adverse),
+        risk_mfe_r=_risk_mfe_r(trade, favorable),
+        risk_mae_r=_risk_mae_r(trade, adverse),
+        risk_bars_held=bars,
+        risk_trigger_bar_count=trigger_count,
+    )
+
+
+def _replace_risk_metrics(trade: CFDTrade, common: Mapping[str, Any], *, due_at: datetime | None) -> CFDTrade:
+    return replace(
+        trade,
+        risk_exit_decision=common.get("risk_exit_decision"),
+        risk_last_price=common.get("risk_last_price"),
+        risk_favorable_price=common.get("risk_favorable_price"),
+        risk_adverse_price=common.get("risk_adverse_price"),
+        risk_mfe_price=common.get("risk_mfe_price"),
+        risk_mae_price=common.get("risk_mae_price"),
+        risk_mfe_r=common.get("risk_mfe_r", trade.risk_mfe_r),
+        risk_mae_r=common.get("risk_mae_r", trade.risk_mae_r),
+        risk_net_r=common.get("risk_net_r", trade.risk_net_r),
+        risk_gross_r=common.get("risk_gross_r", trade.risk_gross_r),
+        risk_r_multiple=common.get("risk_r_multiple", trade.risk_r_multiple),
+        risk_bars_held=common.get("risk_bars_held", trade.risk_bars_held),
+        risk_exit_due_at=due_at,
+        risk_trigger_bar_count=common.get("risk_trigger_bar_count", trade.risk_trigger_bar_count),
+        risk_exit_triggered_at=common.get("risk_exit_triggered_at", trade.risk_exit_triggered_at),
+        risk_exit_requested_latency=common.get("risk_exit_requested_latency", trade.risk_exit_requested_latency),
+        risk_exit_trigger_price=common.get("risk_exit_trigger_price", trade.risk_exit_trigger_price),
+        risk_bar_clock_invalid=common.get("risk_bar_clock_invalid", trade.risk_bar_clock_invalid),
+    )
+
+
+def _risk_override_pending(
+    decision: ExitDecision,
+    previous: Mapping[str, Any] | None,
+    due_at: datetime | None,
+    observed_at: datetime,
+    raw: Decimal,
+    bars: int,
+    policy_hash: str,
+) -> ExitDecision:
+    if due_at is None or observed_at < due_at:
+        return decision
+    action = _risk_pending_action(previous)
+    if action is None or decision.action not in {EXIT_NONE, EXIT_UNKNOWN}:
+        return decision
+    reason = str(previous.get("reason", action)) if isinstance(previous, Mapping) else action
+    trigger = (
+        _optional_time(previous.get("triggered_at"), "risk_exit_triggered_at")
+        if isinstance(previous, Mapping)
+        else None
+    )
+    requested = (
+        _optional_decimal(previous.get("requested_latency_seconds"), "requested_latency_seconds")
+        if isinstance(previous, Mapping)
+        else None
+    )
+    planned = (
+        _optional_decimal(previous.get("planned_trigger_price"), "planned_trigger_price")
+        if isinstance(previous, Mapping)
+        else decision.planned_trigger_price
+    )
+    latency = requested if requested is not None else decision.latency_seconds
+    return ExitDecision(
+        action,
+        reason,
+        raw,
+        planned,
+        observed_at,
+        latency,
+        bool(previous.get("server_side", False)) if isinstance(previous, Mapping) else False,
+        bool(previous.get("gap", False)) if isinstance(previous, Mapping) else False,
+        bars,
+        decision.holding_seconds,
+        decision.mfe_price,
+        decision.mae_price,
+        decision.mfe_r,
+        decision.mae_r,
+        policy_hash,
+        trigger,
+        requested,
+        None,
+    )
+
+
+def _bar_clock_unknown_decision(decision: ExitDecision, policy_hash: str, bars: int) -> ExitDecision:
+    return ExitDecision(
+        EXIT_UNKNOWN,
+        "RISK_BAR_CLOCK_UNKNOWN",
+        None,
+        None,
+        decision.observed_at,
+        D0,
+        False,
+        False,
+        bars,
+        decision.holding_seconds,
+        decision.mfe_price,
+        decision.mae_price,
+        decision.mfe_r,
+        decision.mae_r,
+        policy_hash,
+        None,
+        None,
+        None,
+    )
 
 
 def _validate_advance_clock(
@@ -2036,6 +2826,7 @@ class CFDSimulator:
         self._connected = True
         self._session_generation: int | str | None = None
         self._session_baseline_required = False
+        self._reset_risk_state()
         self._counters: dict[str, int] = {
             "signals_submitted": 0,
             "trades_submitted": 0,
@@ -2099,6 +2890,87 @@ class CFDSimulator:
     def session_generation(self) -> int | str | None:
         return self._session_generation
 
+    @property
+    def risk_state(self) -> Mapping[str, Any] | None:
+        """Current persisted risk budget, or ``None`` for legacy mode."""
+
+        return self._risk_state_dict() if self._risk_enabled() else None
+
+    def _risk_enabled(self) -> bool:
+        return isinstance(self.config.risk_exit_policy, RiskExitPolicy)
+
+    def _reset_risk_state(self) -> None:
+        policy = self.config.risk_exit_policy
+        if isinstance(policy, RiskExitPolicy):
+            self._risk_equity: Decimal = policy.initial_equity
+            self._risk_realized: Decimal = D0
+            self._risk_realized_gross: Decimal = D0
+            self._risk_net_known = True
+            self._risk_floating: Decimal = D0
+            self._risk_floating_gross: Decimal = D0
+            self._risk_peak_equity: Decimal = policy.initial_equity
+            self._risk_margin_available: Decimal | None = policy.initial_equity
+            self._risk_day_anchor_equity: Decimal | None = None
+            self._risk_day: str | None = None
+        else:
+            self._risk_equity = D0
+            self._risk_realized = D0
+            self._risk_realized_gross = D0
+            self._risk_net_known = True
+            self._risk_floating = D0
+            self._risk_floating_gross = D0
+            self._risk_peak_equity = D0
+            self._risk_margin_available = None
+            self._risk_day_anchor_equity = None
+            self._risk_day = None
+
+    def _risk_state_dict(self) -> dict[str, Any]:
+        policy = self.config.risk_exit_policy
+        if not isinstance(policy, RiskExitPolicy):
+            return {}
+        daily = D0
+        if self._risk_day_anchor_equity is not None:
+            with decimal_context():
+                daily = self._risk_equity - self._risk_day_anchor_equity
+        with decimal_context():
+            drawdown = max(D0, self._risk_peak_equity - self._risk_equity)
+        return {
+            "version": "risk-exit-state-v1",
+            "policy_hash": policy.policy_hash,
+            "equity": str(self._risk_equity),
+            "equity_source": policy.equity_basis,
+            "realized_pnl": str(self._risk_realized) if self._risk_net_known else None,
+            "realized_net_pnl": str(self._risk_realized) if self._risk_net_known else None,
+            "realized_gross_pnl": str(self._risk_realized_gross),
+            "realized_gross_currency": policy.account_currency,
+            "net_pnl_known": self._risk_net_known,
+            "floating_pnl": str(self._risk_floating) if self._risk_net_known else None,
+            "floating_gross_pnl": str(self._risk_floating_gross),
+            "daily_pnl": str(daily),
+            "daily_anchor_equity": str(self._risk_day_anchor_equity)
+            if self._risk_day_anchor_equity is not None
+            else None,
+            "day": self._risk_day,
+            "high_water_equity": str(self._risk_peak_equity),
+            "drawdown": str(drawdown),
+            "costs_known": self._risk_costs_known(),
+            "bar_clock_known": self.config.risk_trigger_timeframe is not None,
+            "risk_bar_clock_basis": self.config.risk_bar_clock_basis,
+            "risk_trigger_timeframe": self.config.risk_trigger_timeframe,
+            "margin_available": str(self._risk_margin_available) if self._risk_margin_available is not None else None,
+        }
+
+    def _risk_costs_known(self) -> bool:
+        return bool(
+            self.config.commission_known
+            and (not self.config.financing_required or self.config.financing_rate_per_second is not None)
+            and (
+                self.config.quote_currency is None
+                or self.config.quote_currency == self.config.account_currency
+                or self.config.conversion_rate is not None
+            )
+        )
+
     def reset(self) -> None:
         self._trades.clear()
         self._terminal_order.clear()
@@ -2113,6 +2985,7 @@ class CFDSimulator:
         self._connected = True
         self._session_generation = None
         self._session_baseline_required = False
+        self._reset_risk_state()
         for key in self._counters:
             self._counters[key] = 0
 
@@ -2240,6 +3113,13 @@ class CFDSimulator:
                 code="ARCHIVE_REQUIRED",
             )
         needed = sum(self._existing_trade(signal, horizon) is None for horizon in self.config.horizons_seconds)
+        if self._risk_enabled() and needed:
+            pending = any(not item.is_terminal for item in self._trades.values())
+            if pending:
+                raise CFDSimulationError(
+                    "RiskExit permite una sola intención pendiente o posición activa",
+                    code="RISK_INTENT_LIMIT",
+                )
         if self._active_count() + needed > self.config.max_active_trades:
             self._counters["capacity_rejections"] += 1
             raise CFDSimulationError(
@@ -2435,16 +3315,202 @@ class CFDSimulator:
         self._event({"event": "quote_blocked", "quote_id": observed.identity, "reason": reasons})
         return True
 
+    def _risk_calendar(self, quote: CFDQuote) -> Mapping[str, Any] | None:
+        base = self.config.risk_exit_calendar
+        metadata = quote.metadata if isinstance(quote.metadata, Mapping) else {}
+        overlay = metadata.get("risk_calendar", metadata.get("calendar"))
+        if base is None and not isinstance(overlay, Mapping):
+            return None
+        result = dict(base or {})
+        if isinstance(overlay, Mapping):
+            result.update(overlay)
+        return result
+
+    def _risk_contract_spec(self, quote: CFDQuote | None = None) -> Mapping[str, Any] | None:
+        base = self.config.risk_exit_contract_spec
+        result = dict(base or {})
+        if quote is not None and isinstance(quote.metadata, Mapping):
+            overlay = quote.metadata.get("risk_contract_spec", quote.metadata.get("contract_spec"))
+            if isinstance(overlay, Mapping):
+                result.update(overlay)
+        # Only non-zero, explicitly configured values are projected into the
+        # generic cost contract.  Missing zero components remain UNKNOWN;
+        # callers must declare an explicit zero in the contract/fixture.
+        if self.config.commission_known:
+            if self.config.commission_fixed != D0:
+                result.setdefault("expected_commission_fixed", self.config.commission_fixed)
+            if self.config.commission_per_unit != D0:
+                result.setdefault("expected_commission_per_unit", self.config.commission_per_unit)
+        if self.config.slippage_pips != D0:
+            result.setdefault("expected_exit_slippage_pips", self.config.slippage_pips)
+        if any(
+            key in result
+            for key in (
+                "expected_cost_fixed",
+                "expected_commission_fixed",
+                "expected_cost_per_unit",
+                "expected_commission_per_unit",
+                "expected_exit_slippage_per_unit",
+                "expected_exit_slippage_pips",
+            )
+        ):
+            result.setdefault("expected_cost_currency", self.config.account_currency)
+            result.setdefault("expected_cost_source", "CFDConfig/contract_spec explicit cost inputs")
+        return result
+
+    def _risk_mark_to_market(self, quote: CFDQuote) -> None:
+        if not self._risk_enabled():
+            return
+        net_floating, gross_floating, net_complete, gross_complete = self._risk_mark_values(quote)
+        policy = self.config.risk_exit_policy
+        assert isinstance(policy, RiskExitPolicy)
+        diagnostic = self.config.risk_exit_mode == "VIRTUAL_DIAGNOSTIC"
+        if diagnostic:
+            if not gross_complete:
+                return
+            floating = gross_floating
+            equity_delta = self._risk_realized_gross + gross_floating
+        else:
+            if not net_complete:
+                return
+            floating = net_floating
+            equity_delta = self._risk_realized + net_floating
+        with decimal_context():
+            self._risk_floating = floating
+            self._risk_floating_gross = gross_floating
+            self._risk_equity = policy.initial_equity + equity_delta
+            self._risk_peak_equity = max(self._risk_peak_equity, self._risk_equity)
+        day = quote.available_ts.date().isoformat()
+        if self._risk_day is None:
+            self._risk_day = day
+            self._risk_day_anchor_equity = self._risk_equity
+        elif self._risk_day != day:
+            # A new observed day starts from the marked equity, including any
+            # open exposure.  The anchor is persisted and never reset by a
+            # process restart.
+            self._risk_day = day
+            self._risk_day_anchor_equity = self._risk_equity
+
+    def _risk_mark_values(self, quote: CFDQuote) -> tuple[Decimal, Decimal, bool, bool]:
+        net_floating = D0
+        gross_floating = D0
+        net_complete = True
+        gross_complete = True
+        for trade in self._trades.values():
+            if trade.state is not TradeState.FILLED or trade.risk_exit_plan is None:
+                continue
+            raw = quote.bid if trade.direction is Direction.LONG else quote.ask
+            if raw is None or not _quote_fillable(
+                quote,
+                QuoteSide.BID if trade.direction is Direction.LONG else QuoteSide.ASK,
+                quote.available_ts,
+                self.config,
+                self._session_generation,
+                self._connected,
+            ):
+                net_complete = False
+                gross_complete = False
+                continue
+            values = self._close_values(trade, quote, raw)
+            net = values["net"]
+            gross = values["gross_account"]
+            if gross is None and self.config.quote_currency == self.config.account_currency:
+                gross = values["gross"]
+            if gross is None:
+                gross_complete = False
+            else:
+                with decimal_context():
+                    gross_floating += gross
+            if net is None:
+                net_complete = False
+            else:
+                with decimal_context():
+                    net_floating += net
+        return net_floating, gross_floating, net_complete, gross_complete
+
+    def _risk_state_for_entry(self, current_trade_id: str) -> dict[str, Any]:
+        state = dict(self._risk_state_dict())
+        positions = 0
+        intents = 0
+        before_current = True
+        for item in self._trades.values():
+            if item.trade_id == current_trade_id:
+                before_current = False
+                continue
+            if not before_current or item.is_terminal:
+                continue
+            intents += 1
+            if item.state is TradeState.FILLED and item.risk_exit_plan is not None:
+                positions += 1
+        state["positions"] = positions
+        state["intents"] = intents
+        return state
+
+    def _risk_record_close(self, trade: CFDTrade) -> None:
+        if not self._risk_enabled() or trade.risk_exit_plan is None:
+            return
+        gross = trade.gross_pnl_account
+        if gross is None and self.config.quote_currency == self.config.account_currency:
+            gross = trade.gross_pnl_quote
+        with decimal_context():
+            if gross is not None:
+                self._risk_realized_gross += gross
+            if trade.net_pnl is None:
+                self._risk_net_known = False
+            else:
+                self._risk_realized += trade.net_pnl
+
+    def _risk_entry_plan(self, trade: CFDTrade, quote: CFDQuote, price: Decimal) -> EntryPlan:
+        policy = self.config.risk_exit_policy
+        assert isinstance(policy, RiskExitPolicy)
+        risk_state = self._risk_state_for_entry(trade.trade_id)
+        # A one-sided quote may fill a legacy entry, but it cannot establish
+        # the spread/cost evidence required by RiskExit.
+        risk_state["costs_known"] = bool(risk_state.get("costs_known") and quote.spread is not None)
+        spec = self._risk_contract_spec(quote)
+        if isinstance(spec, Mapping):
+            # PAPER owns an explicit virtual balance.  A DEMO bridge supplies
+            # observed available margin in its own risk_state instead.
+            available = (
+                spec.get("margin_available")
+                if spec.get("margin_available") is not None
+                else self._risk_margin_available
+                if self._risk_margin_available is not None
+                else self._risk_equity
+            )
+            risk_state.setdefault("margin_available", available)
+        return plan_entry(
+            policy,
+            direction=trade.direction.value,
+            entry_price=price,
+            atr=trade.risk_atr,
+            equity=self._risk_equity,
+            available_at=quote.available_ts,
+            contract_spec=self._risk_contract_spec(quote),
+            calendar_state=self._risk_calendar(quote),
+            risk_state=risk_state,
+            requested_quantity=trade.units,
+            # This simulator owns only the explicit virtual PAPER balance;
+            # OBSERVED_DEMO must be supplied by a separate server composition.
+            equity_source="VIRTUAL_PAPER_ONLY",
+            mode=self.config.risk_exit_mode,
+            executable_bid=quote.bid,
+            executable_ask=quote.ask,
+        )
+
     def _apply_quote_to_trades(self, quote: CFDQuote, watermark: datetime) -> list[CFDTrade]:
+        self._risk_mark_to_market(quote)
         changed: list[CFDTrade] = []
         for trade in tuple(self._trades.values()):
             changed.extend(self._apply_quote_to_trade(trade, quote, watermark))
+        self._risk_mark_to_market(quote)
         return changed
 
     def _apply_quote_to_trade(self, trade: CFDTrade, quote: CFDQuote, watermark: datetime) -> list[CFDTrade]:
         if trade.state not in {TradeState.PENDING, TradeState.FILLED} or trade.instrument != quote.instrument:
             return []
         changed: list[CFDTrade] = []
+        filled_now = False
         if trade.state is TradeState.PENDING:
             selected = self._entry_fill(trade, quote, watermark)
             if selected is not None:
@@ -2460,11 +3526,31 @@ class CFDSimulator:
                     }
                 )
                 trade = selected
-        if trade.state is TradeState.FILLED:
+                filled_now = True
+        if trade.state is TradeState.FILLED and not filled_now:
+            risk_selected = self._risk_exit_fill(trade, quote, watermark)
+            if risk_selected is not None:
+                self._transition(risk_selected, previous=trade)
+                changed.append(risk_selected)
+                if risk_selected.state is TradeState.CLOSED:
+                    self._risk_record_close(risk_selected)
+                    self._event(
+                        {
+                            "event": "closed",
+                            "trade_id": risk_selected.trade_id,
+                            "quote_id": quote.identity,
+                            "at": _iso(risk_selected.close_available_at),
+                            "reason": risk_selected.reason,
+                            "risk_exit": risk_selected.risk_exit_decision,
+                        }
+                    )
+                    return changed
+                trade = risk_selected
             selected = self._close_fill(trade, quote, watermark)
             if selected is not None:
                 self._transition(selected, previous=trade)
                 changed.append(selected)
+                self._risk_record_close(selected)
                 self._event(
                     {
                         "event": "closed" if selected.state is TradeState.CLOSED else "unknown",
@@ -2527,14 +3613,42 @@ class CFDSimulator:
         raw = quote.ask if trade.direction is Direction.LONG else quote.bid
         if raw is None:
             return None
+        if self._risk_enabled() and not _risk_entry_quote_usable(quote, watermark, self.config):
+            return None
+        entry_bar_count = _risk_bar_ordinal(quote, self.config) if self._risk_enabled() else None
+        if self._risk_enabled() and not _risk_bar_metadata_consistent(quote, self.config, entry_bar_count):
+            return None
         price = _entry_price(raw, trade.direction, self.config.slippage_price, self._quantize)
         reference_price = self._quantize(raw) if trade.economics_version == CFD_ECONOMICS_VERSION else None
+        risk_plan: EntryPlan | None = None
+        units = trade.units
+        if self._risk_enabled():
+            risk_plan = self._risk_entry_plan(trade, quote, price)
+            diagnostic = risk_plan.mode == "VIRTUAL_DIAGNOSTIC"
+            if not risk_plan.allowed and not (diagnostic and _risk_diagnostic_fillable(risk_plan)):
+                return replace(
+                    trade,
+                    state=TradeState.REJECTED,
+                    reason="RISK_EXIT_BLOCKED:" + ",".join(risk_plan.reasons),
+                    quality=QuoteQuality.UNKNOWN.value,
+                    risk_exit_plan=serialize_risk_exit(risk_plan),
+                )
+            if risk_plan.quantity is None:
+                return replace(
+                    trade,
+                    state=TradeState.REJECTED,
+                    reason="RISK_EXIT_BLOCKED:QUANTITY_UNKNOWN",
+                    quality=QuoteQuality.UNKNOWN.value,
+                    risk_exit_plan=serialize_risk_exit(risk_plan),
+                )
+            units = risk_plan.quantity
         close_target = max(quote.available_ts, target) + _timedelta_seconds(
             trade.horizon_seconds + self.config.close_latency_seconds
         )
-        return replace(
+        selected = replace(
             trade,
             state=TradeState.FILLED,
+            units=units,
             entry_market_at=quote.market_time,
             entry_available_at=quote.available_ts,
             entry_quote_id=quote.identity,
@@ -2545,8 +3659,171 @@ class CFDSimulator:
             quality=quote.quality,
             lineage={**dict(trade.lineage or {}), "entry_quote_id": quote.identity, "entry_source": quote.source},
         )
+        if risk_plan is not None:
+            selected = replace(
+                selected,
+                risk_exit_plan=serialize_risk_exit(risk_plan),
+                risk_last_price=raw,
+                risk_favorable_price=price,
+                risk_adverse_price=price,
+                risk_mfe_price=D0,
+                risk_mae_price=D0,
+                risk_initial_risk=_risk_initial_risk_for_fill(risk_plan, units),
+                risk_initial_quantity=units,
+                risk_initial_risk_per_unit=risk_plan.risk_per_unit,
+                risk_mfe_r=D0,
+                risk_mae_r=D0,
+                risk_net_r=None,
+                risk_gross_r=None,
+                risk_r_multiple=None,
+                risk_bars_held=0,
+                risk_trigger_bar_count=entry_bar_count,
+                risk_entry_bar_count=entry_bar_count,
+                risk_bar_clock_basis=self.config.risk_bar_clock_basis,
+                risk_trigger_timeframe=self.config.risk_trigger_timeframe,
+            )
+        return selected
+
+    def _risk_exit_fill(self, trade: CFDTrade, quote: CFDQuote, watermark: datetime) -> CFDTrade | None:
+        if not self._risk_enabled() or trade.risk_exit_plan is None or not _trade_has_entry(trade):
+            return None
+        required = QuoteSide.BID if trade.direction is Direction.LONG else QuoteSide.ASK
+        if not _quote_fillable(quote, required, watermark, self.config, self._session_generation, self._connected):
+            return None
+        raw = quote.bid if trade.direction is Direction.LONG else quote.ask
+        if raw is None or trade.entry_price is None or trade.entry_available_at is None:
+            return None
+        policy = self.config.risk_exit_policy
+        assert isinstance(policy, RiskExitPolicy)
+        plan = EntryPlan.from_mapping(trade.risk_exit_plan)
+        favorable, adverse = _risk_extrema(trade, raw)
+        bars, trigger_count, bar_clock_ok = _risk_bar_observation(trade, quote, self.config)
+        gap = _risk_gap(plan, trade.risk_last_price, raw) or _risk_metadata_bool(quote, "gap")
+        server_side = _risk_server_side(self._risk_contract_spec(quote))
+        previous_decision = trade.risk_exit_decision
+        previous_due = trade.risk_exit_due_at
+        if previous_due is not None and quote.available_ts < previous_due:
+            return _risk_deferred_update(
+                trade,
+                raw,
+                favorable,
+                adverse,
+                bars,
+                trigger_count if bar_clock_ok else trade.risk_trigger_bar_count,
+            )
+        decision = evaluate_exit(
+            policy,
+            plan,
+            current_price=raw,
+            executable_price=raw,
+            observed_at=quote.available_ts,
+            entry_at=trade.entry_available_at,
+            bars_held=bars,
+            calendar_state=self._risk_calendar(quote),
+            gap=gap,
+            favorable_price=favorable,
+            adverse_price=adverse,
+            server_side_stop=server_side,
+        )
+        decision = _risk_override_pending(
+            decision, previous_decision, previous_due, quote.available_ts, raw, bars, policy.policy_hash
+        )
+        if not bar_clock_ok and decision.action in {EXIT_NONE, EXIT_TIME}:
+            decision = _bar_clock_unknown_decision(decision, policy.policy_hash, bars)
+        common = dict(
+            risk_exit_decision=serialize_risk_exit(decision),
+            risk_last_price=raw,
+            risk_favorable_price=favorable,
+            risk_adverse_price=adverse,
+            risk_mfe_price=decision.mfe_price,
+            risk_mae_price=decision.mae_price,
+            risk_mfe_r=decision.mfe_r,
+            risk_mae_r=decision.mae_r,
+            risk_bars_held=bars,
+            risk_trigger_bar_count=trigger_count
+            if bar_clock_ok and trigger_count is not None
+            else trade.risk_trigger_bar_count,
+            risk_exit_triggered_at=decision.triggered_at,
+            risk_exit_requested_latency=decision.requested_latency_seconds,
+            risk_exit_trigger_price=decision.planned_trigger_price,
+            risk_bar_clock_invalid=trade.risk_bar_clock_invalid or (trigger_count is not None and not bar_clock_ok),
+        )
+        if decision.action == EXIT_UNKNOWN:
+            self._event(
+                {
+                    "event": "risk_exit_unknown",
+                    "trade_id": trade.trade_id,
+                    "quote_id": quote.identity,
+                    "reason": decision.reason,
+                }
+            )
+            return _replace_risk_metrics(trade, common, due_at=previous_due)
+        if decision.action == EXIT_NONE:
+            return _replace_risk_metrics(trade, common, due_at=None)
+        if previous_due is not None and quote.available_ts >= previous_due:
+            return self._close_from_risk_decision(trade, quote, raw, decision, common)
+        if decision.latency_seconds > D0:
+            due = quote.available_ts + _timedelta_seconds(decision.latency_seconds)
+            return _replace_risk_metrics(trade, common, due_at=due)
+        return self._close_from_risk_decision(trade, quote, raw, decision, common)
+
+    def _close_from_risk_decision(
+        self,
+        trade: CFDTrade,
+        quote: CFDQuote,
+        raw: Decimal,
+        decision: ExitDecision,
+        common: Mapping[str, Any],
+    ) -> CFDTrade:
+        values = self._close_values(trade, quote, raw)
+        decision_data = dict(serialize_risk_exit(decision))
+        decision_data["filled_at"] = _iso(quote.available_ts)
+        risked = _replace_risk_metrics(
+            trade,
+            {**dict(common), "risk_exit_decision": decision_data},
+            due_at=None,
+        )
+        risk_metrics = _risk_close_metrics(
+            risked,
+            net_pnl=values["net"],
+            gross_pnl_account=values["gross_account"],
+        )
+        return replace(
+            risked,
+            **risk_metrics,
+            state=TradeState.CLOSED,
+            close_market_at=quote.market_time,
+            close_available_at=quote.available_ts,
+            close_quote_id=quote.identity,
+            close_price=values["price"],
+            close_reference_price=values["reference_close"],
+            reference_gross_pnl_quote=values["reference_gross"],
+            pips=values["pips"],
+            gross_pnl_quote=values["gross"],
+            commission_quote=values["commission"],
+            slippage_quote=values["slippage"],
+            financing_quote=values["financing"],
+            gross_pnl_account=values["gross_account"],
+            costs_account=values["costs_account"],
+            net_pnl=values["net"],
+            conversion_rate=self.config.conversion_rate,
+            quality=QuoteQuality.UNKNOWN.value if values["unknown_reason"] else quote.quality,
+            reason=values["unknown_reason"] or decision.reason,
+            lineage={
+                **dict(risked.lineage or {}),
+                "close_quote_id": quote.identity,
+                "close_source": quote.source,
+                "risk_exit": serialize_risk_exit(decision),
+            },
+        )
 
     def _close_fill(self, trade: CFDTrade, quote: CFDQuote, watermark: datetime) -> CFDTrade | None:
+        # A risk-managed position is governed by its immutable plan.  The
+        # legacy horizon remains available for policy-free simulations only;
+        # otherwise it could close a position before the declared 5-bar/72h
+        # policy window and hide a missing executable risk exit.
+        if self._risk_enabled() and trade.risk_exit_plan is not None:
+            return None
         if not _close_target_is_eligible(trade, quote, self.config.max_quote_age_seconds):
             return None
         required = QuoteSide.BID if trade.direction is Direction.LONG else QuoteSide.ASK
@@ -2703,13 +3980,17 @@ class CFDSimulator:
         financing_missing: bool,
         commission_missing: bool,
     ) -> tuple[Decimal | None, Decimal | None, Decimal | None, str | None]:
+        # Gross account PnL is an independent ledger fact.  Missing costs
+        # must make only net/costs UNKNOWN; they must not erase a calculable
+        # gross amount used by diagnostic gross-R reporting.
+        gross_account, conversion_reason = self._gross_account(gross_quote)
         if costs_quote is None:
-            gross_account, conversion_reason = self._gross_account(gross_quote)
             reason = "COMMISSION_UNKNOWN" if commission_missing else conversion_reason
             return gross_account, None, None, reason
+        if commission_missing or financing_missing:
+            reason = "COMMISSION_UNKNOWN" if commission_missing else "FINANCING_RATE_MISSING"
+            return gross_account, None, None, reason
         gross_account, costs_account, net, reason = self._accounting(gross_quote, costs_quote, financing_missing)
-        if commission_missing:
-            return gross_account, None, None, "COMMISSION_UNKNOWN"
         return gross_account, costs_account, net, reason
 
     def _gross_account(self, gross_quote: Decimal) -> tuple[Decimal | None, str | None]:
@@ -2908,6 +4189,8 @@ class CFDSimulator:
                 "max_active": self.config.max_active_trades,
             },
         }
+        if self._risk_enabled():
+            state["risk_exit_state"] = self._risk_state_dict()
         state["snapshot_hash"] = _digest(state)
         return state
 
@@ -2919,6 +4202,7 @@ class CFDSimulator:
         restored_config = _validate_snapshot(snapshot, config)
         self.config = restored_config
         self._clear_restore_state()
+        self._restore_risk_state(snapshot)
         self._restore_trades(snapshot)
         self._restore_history(snapshot)
         self._restore_book_and_clock(snapshot)
@@ -2932,6 +4216,53 @@ class CFDSimulator:
         self._events = deque(maxlen=self.config.event_retention)
         self._seen_quotes.clear()
         self._quote_order.clear()
+
+    def _restore_risk_state(self, snapshot: Mapping[str, Any]) -> None:
+        if not self._risk_enabled():
+            self._reset_risk_state()
+            return
+        raw = snapshot.get("risk_exit_state")
+        if not isinstance(raw, Mapping):
+            raise CFDSimulationError("snapshot RiskExit sin estado de cartera; no se reinicia presupuesto")
+        policy = self.config.risk_exit_policy
+        assert isinstance(policy, RiskExitPolicy)
+        if raw.get("policy_hash") != policy.policy_hash:
+            raise CFDSimulationError("snapshot RiskExit usa una política distinta")
+        source = str(raw.get("equity_source", "")).strip().upper()
+        if source != policy.equity_basis:
+            raise CFDSimulationError("snapshot RiskExit usa una fuente de equity distinta")
+        for key in ("equity", "high_water_equity"):
+            value = raw.get(key)
+            if value is None:
+                raise CFDSimulationError(f"snapshot RiskExit sin {key}")
+            setattr(
+                self,
+                f"_risk_{'realized' if key == 'realized_pnl' else 'floating' if key == 'floating_pnl' else 'peak_equity' if key == 'high_water_equity' else 'equity'}",
+                decimal(value, name=key),
+            )
+        realized_net = raw.get("realized_net_pnl", raw.get("realized_pnl"))
+        self._risk_realized = decimal(realized_net, name="realized_net_pnl") if realized_net is not None else D0
+        realized_gross = raw.get("realized_gross_pnl", realized_net)
+        self._risk_realized_gross = (
+            decimal(realized_gross, name="realized_gross_pnl") if realized_gross is not None else D0
+        )
+        net_known = raw.get("net_pnl_known", realized_net is not None)
+        self._risk_net_known = _strict_risk_bool(net_known, "net_pnl_known")
+        floating_net = raw.get("floating_pnl")
+        self._risk_floating = decimal(floating_net, name="floating_pnl") if floating_net is not None else D0
+        floating_gross = raw.get("floating_gross_pnl", floating_net)
+        self._risk_floating_gross = (
+            decimal(floating_gross, name="floating_gross_pnl") if floating_gross is not None else D0
+        )
+        anchor = raw.get("daily_anchor_equity")
+        self._risk_day_anchor_equity = (
+            decimal(anchor, name="daily_anchor_equity", positive=True) if anchor is not None else None
+        )
+        margin = raw.get("margin_available")
+        self._risk_margin_available = (
+            decimal(margin, name="margin_available", minimum=D0) if margin is not None else None
+        )
+        self._risk_day = str(raw.get("day")) if raw.get("day") is not None else None
 
     def _restore_trades(self, snapshot: Mapping[str, Any]) -> None:
         economics_version = _snapshot_economics_version(snapshot)

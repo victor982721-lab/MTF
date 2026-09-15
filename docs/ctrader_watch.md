@@ -4,9 +4,14 @@
 
 `ctrader watch` une el proveedor cTrader existente, su cola de mensajes y
 normalizador con `RuntimeCoordinator`, M1/M5/M15, indicadores, señales y
-persistencia. Es **sólo lectura**: no construye un ejecutor ni envía órdenes.
-La prueba offline utiliza ese mismo cliente/proveedor con un transporte
-controlado; no sustituye al runner por uno de demostración.
+persistencia. Además, por defecto entrega las señales y los `SpotEvent`
+normalizados a un único producto local `FOREX_CFD_LOCAL_PAPER`; esto no
+construye un ejecutor, no usa una cuenta y no envía órdenes. El sink PAPER sólo
+acepta una pareja bid/ask explícita, ordenada y de calidad `VALID`; bid==ask,
+quotes cruzados, ausencia de una pierna, snapshot o actualización parcial se
+conservan como evidencia bloqueada y nunca producen un fill. La prueba offline
+utiliza ese mismo cliente/proveedor con un transporte controlado; no sustituye
+al runner por uno de demostración.
 
 La aplicación externa sigue pendiente de Spotware y OAuth, según el
 [estado de integración](ctrader_integration_status.md). Esta mejora local no
@@ -28,10 +33,13 @@ pero `--fixture` identifica la sesión como `SYNTHETIC`, el origen como
   --db runtime/ctrader-watch/fixture.sqlite3
 ```
 
-El JSON incluye `session_id`, `analysis_id`, hashes semánticos, contadores,
-procedencia, motivo de parada, `clean_stop` y estado del checkpoint. La base
-de salida debe indicarse explícitamente y los archivos nuevos son privados
-(`0600`); no se elige una base productiva por defecto.
+El JSON incluye `session_id`, `analysis_id`, `paper_analysis_id`, hashes
+semánticos, contadores, procedencia, motivo de parada, `clean_stop`, estado del
+checkpoint y la proyección `paper` (trades/fills y bloqueos). Las filas
+`cfd_trades` son el registro durable del producto local; sus estados no son
+fills DEMO observados. La base de salida debe indicarse explícitamente y los
+archivos nuevos son privados (`0600`); no se elige una base productiva por
+defecto.
 
 Para reanudar, usa el `session_id` del primer resultado y la misma base y
 configuración:
@@ -68,8 +76,9 @@ conserva los hashes semánticos aunque cambien los identificadores de sesión.
   conectarse de nuevo no demuestra continuidad. Sin esa evidencia el análisis
   permanece bloqueado. La CLI no inventa un backfill de mercado.
 - El CLI observa spots `mid`, `bid` o `ask`; no interpola trendbars nativas.
-  El [flujo histórico nativo](../README.md) sigue separado y no fabrica bid/ask
-  ni fills.
+  Un `SpotEvent` válido puede producir un fill **PAPER local** determinista y
+  su cierre posterior; el [flujo histórico nativo](../README.md) sigue
+  separado y no fabrica bid/ask ni fills.
 
 `--network` es una ruta distinta, explícita, para una futura sesión DEMO ya
 autorizada. Reutiliza la preparación y verificación fresca de `ctrader query`

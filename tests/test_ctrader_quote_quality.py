@@ -148,6 +148,33 @@ class CTraderQuoteQualityTests(unittest.TestCase):
         self.assertIn(QuoteQualityReason.CROSSED.value, event.metadata["quality_reasons"])
         self.assertFalse(event.metadata["quote_usable"])
 
+    def test_equal_quote_is_crossed_too_without_relabeling_prices(self) -> None:
+        result = normalize_spot_event(
+            {"symbolId": 99, "timestamp": int(UTC_BASE.timestamp() * 1000), "bid": 110000, "ask": 110000},
+            spec=CTraderInstrumentSpec(symbol_id=99),
+            received_at=UTC_BASE,
+        )
+        self.assertEqual(len(result.quote_events), 1)
+        event = result.quote_events[0]
+        self.assertEqual((event.bid, event.ask), (1.1, 1.1))
+        self.assertEqual(event.metadata["quality_state"], QuoteQualityState.INVALID.value)
+        self.assertIn(QuoteQualityReason.CROSSED.value, event.metadata["quality_reasons"])
+        self.assertFalse(event.metadata["quote_usable"])
+
+    def test_future_source_timestamp_is_rejected_without_clamping(self) -> None:
+        with self.assertRaises(ValueError):
+            normalize_spot_event(
+                {
+                    "symbolId": 99,
+                    "timestamp": int((UTC_BASE + timedelta(seconds=1)).timestamp() * 1000),
+                    "bid": 110000,
+                    "ask": 110000,
+                },
+                spec=CTraderInstrumentSpec(symbol_id=99),
+                received_at=UTC_BASE,
+                available_at=UTC_BASE,
+            )
+
     def test_partial_quote_basis_does_not_fabricate_missing_leg(self) -> None:
         result = normalize_spot_event(
             {"symbolId": 99, "timestamp": int(UTC_BASE.timestamp() * 1000), "bid": 110000},

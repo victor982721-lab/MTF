@@ -62,6 +62,34 @@ def _database_path(value: Any) -> Path:
     return path
 
 
+def _safe_spot_diagnostic(exc: BaseException) -> dict[str, Any] | None:
+    """Expose only the bounded market diagnostic attached by the adapter."""
+
+    value = getattr(exc, "diagnostic", None)
+    if not isinstance(value, Mapping):
+        return None
+    allowed = (
+        "event_time",
+        "timestamp_original",
+        "timestamp_unit",
+        "received_at",
+        "available_at",
+        "bid_raw",
+        "ask_raw",
+        "price_scale",
+        "digits",
+        "fields_present",
+        "updated_sides",
+        "partial_update",
+        "bid_ask_relation",
+        "received_minus_event_seconds",
+        "available_minus_event_seconds",
+        "timing_status",
+        "timing_attribution",
+    )
+    return {key: value[key] for key in allowed if key in value}
+
+
 def _validate_args(args: argparse.Namespace, config: EffectiveConfig) -> CTraderWatchOptions:
     from .ctrader_watch import CTraderWatchOptions
 
@@ -220,17 +248,17 @@ class CTraderWatchCliService:
         except KeyboardInterrupt:
             return CommandResult.json({"ok": False, "state": "INTERRUPTED"}, code=130, stderr=True)
         except Exception as exc:
-            return CommandResult.json(
-                {
-                    "ok": False,
-                    "state": "WATCH_FAILED",
-                    "error": _safe_error_code(exc),
-                    "network_attempted": bool(network_context is not None and network_context.network_performed),
-                    "execution_enabled": False,
-                },
-                code=2,
-                stderr=True,
-            )
+            payload: dict[str, Any] = {
+                "ok": False,
+                "state": "WATCH_FAILED",
+                "error": _safe_error_code(exc),
+                "network_attempted": bool(network_context is not None and network_context.network_performed),
+                "execution_enabled": False,
+            }
+            diagnostic = _safe_spot_diagnostic(exc)
+            if diagnostic is not None:
+                payload["spot_diagnostic"] = diagnostic
+            return CommandResult.json(payload, code=2, stderr=True)
 
     def _fixture(
         self, args: argparse.Namespace, config: EffectiveConfig, options: CTraderWatchOptions

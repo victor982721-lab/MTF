@@ -21,6 +21,9 @@ from typing import Any, cast
 from ..core import (
     Candle,
     CandleAggregator,
+    DecisionKind,
+    Evaluation,
+    IndicatorConfig,
     IndicatorPoint,
     IndicatorSeries,
     MarketEvent,
@@ -34,7 +37,9 @@ from ..core import (
     parse_timeframe,
 )
 from ..core.aggregation import _Bucket, interval_start
-from ..core.quality import merge_quality
+from ..core.canonical import fingerprint
+from ..core.historical_calendar import HistoricalQuoteCalendar
+from ..core.quality import DataQuality, merge_quality
 from .consumers import (
     BinarySimulationConsumer,
     SignalConsumer,
@@ -99,6 +104,47 @@ def _strategy_timeframe_names(strategy: StrategyConfig) -> tuple[str, str, str]:
         _timeframe_name(strategy.preparation_timeframe),
         _timeframe_name(strategy.trigger_timeframe),
     )
+
+
+def _normalise_market_candidate(value: str | None) -> str:
+    if value is None or not str(value).strip():
+        return "trend_pullback_v1"
+    candidate = str(value).strip()
+    if candidate == "trend_pullback_v1":
+        return candidate
+    from ..core.market_profiles import market_profile
+
+    profile = market_profile(candidate)
+    return profile.candidate_id
+
+
+def _processor_config_hash(processor: Any) -> str:
+    base = config_hash(
+        processor.strategy_config,
+        processor.simulation_config,
+        processor.timeframes,
+        processor.mode,
+        processor.price_base,
+    )
+    extra = _processor_extra_config(processor)
+    return fingerprint({"base": base, **extra}) if extra else base
+
+
+def _processor_extra_config(processor: Any) -> dict[str, Any]:
+    extra: dict[str, Any] = {}
+    if processor.market_candidate_id != "trend_pullback_v1":
+        extra["market_candidate_id"] = processor.market_candidate_id
+    if processor.quote_coverage_mode != "strict":
+        extra["quote_coverage_mode"] = processor.quote_coverage_mode
+        extra["max_quote_gap_seconds"] = processor.max_quote_gap_seconds
+    if processor.historical_calendar is not None:
+        extra["historical_calendar"] = processor.historical_calendar.to_dict()
+    return extra
+
+
+def _checkpoint_historical_calendar(snapshot: Mapping[str, Any]) -> HistoricalQuoteCalendar | None:
+    raw = snapshot.get("historical_calendar")
+    return HistoricalQuoteCalendar.from_mapping(raw) if raw is not None else None
 
 
 def _container(max_candles: int | None) -> deque[Any] | list[Any]:
@@ -177,6 +223,673 @@ class ReplayResult:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class PrecomputedFrame:
+    """One causal candle and its already-computed indicator point.
+
+    A frame is produced by :class:`SharedDataPlane` and consumed by one or
+    more independent strategy processors.  The point is never recalculated by
+    the consumer; compatibility and availability are checked at the public
+    processor seam before the strategy sees it.
+    """
+
+    candle: Candle
+    indicator_point: IndicatorPoint
+
+
+@dataclass(frozen=True, slots=True)
+class DataPlaneResult:
+    """Bounded output of one shared data-plane ingestion step."""
+
+    accepted: bool
+    event: MarketEvent | None = None
+    frames: tuple[PrecomputedFrame, ...] = ()
+    issues: tuple[RuntimeIssue, ...] = ()
+    cached: bool = False
+    last_event_time: datetime | None = None
+    last_event_id: str | None = None
+    last_available_at: datetime | None = None
+
+    @property
+    def candles(self) -> tuple[Candle, ...]:
+        return tuple(frame.candle for frame in self.frames)
+
+    @property
+    def indicator_points(self) -> tuple[IndicatorPoint, ...]:
+        return tuple(frame.indicator_point for frame in self.frames)
+
+
+class SharedDataPlane:
+    """Single causal aggregation/indicator plane shared by strategies.
+
+    The plane owns one ``CandleAggregator`` and one
+    ``IncrementalIndicatorEngine`` per canonical data key.  Strategy
+    processors attach to it and retain only their own detector, episode,
+    signal, consumer and reporting state.  Quotes therefore cross the
+    aggregation/indicator boundary once, while strategies receive immutable
+    ``PrecomputedFrame`` values through :meth:`IncrementalProcessor.feed_precomputed`.
+    """
+
+    CHECKPOINT_VERSION = 1
+
+    def __init__(
+        self,
+        *,
+        timeframes: Iterable[Timeframe | str],
+        indicator_config: IndicatorConfig | Mapping[str, Any] | None = None,
+        mode: OperationMode | str = OperationMode.REPLAY,
+        instrument: str | None = None,
+        source: str = "runtime",
+        price_base: PriceBase | str = PriceBase.TRADED,
+        max_candles: int | None = None,
+        coverage_mode: str = "strict",
+        max_quote_gap_seconds: float | None = None,
+        historical_calendar: HistoricalQuoteCalendar | None = None,
+    ) -> None:
+        self.mode = mode_from(mode)
+        self.instrument = instrument.strip() if instrument else None
+        self.source = str(source).strip() or "runtime"
+        self.price_base = price_base if isinstance(price_base, PriceBase) else PriceBase(str(price_base).lower())
+        selected = tuple(parse_timeframe(item) for item in timeframes)
+        if not selected or len({item.name for item in selected}) != len(selected):
+            raise ValueError("data plane requiere temporalidades únicas")
+        self.timeframes = selected
+        self.indicator_config = (
+            indicator_config
+            if isinstance(indicator_config, IndicatorConfig)
+            else IndicatorConfig.from_mapping(indicator_config)
+        )
+        if max_candles is not None and (
+            isinstance(max_candles, bool) or not isinstance(max_candles, int) or max_candles <= 0
+        ):
+            raise ValueError("max_candles debe ser entero positivo")
+        self.max_candles = max_candles
+        self.quote_coverage_mode = str(coverage_mode)
+        self.max_quote_gap_seconds = max_quote_gap_seconds
+        self.historical_calendar = historical_calendar
+        self.aggregators: dict[str, CandleAggregator] = {
+            timeframe.name: CandleAggregator(
+                timeframe,
+                instrument=self.instrument,
+                price_base=self.price_base,
+                source=f"{self.source}:aggregated",
+                mode=self.mode,
+                max_seen_event_ids=max_candles,
+                max_issues=max_candles,
+                coverage_mode=self.quote_coverage_mode,
+                max_quote_gap_seconds=max_quote_gap_seconds,
+                historical_calendar=historical_calendar,
+            )
+            for timeframe in self.timeframes
+        }
+        from ..core.indicators import IncrementalIndicatorEngine
+
+        self.indicator_engines: dict[str, Any] = {
+            timeframe.name: IncrementalIndicatorEngine(
+                self.indicator_config,
+                max_points=max_candles,
+                historical_calendar=historical_calendar,
+            )
+            for timeframe in self.timeframes
+        }
+        self.candles: dict[str, deque[Candle] | list[Candle]] = {
+            timeframe.name: _container(max_candles) for timeframe in self.timeframes
+        }
+        self.indicator_points: dict[str, deque[IndicatorPoint] | list[IndicatorPoint]] = {
+            timeframe.name: _container(max_candles) for timeframe in self.timeframes
+        }
+        self._seen_event_ids: set[str] = set()
+        self._seen_event_order: deque[str] = deque()
+        self._events: dict[str, MarketEvent] = {}
+        self._last_event_time: datetime | None = None
+        self._last_event_id: str | None = None
+        self._last_available_at: datetime | None = None
+        self.events_processed = 0
+        self.candles_processed = 0
+        self.indicator_updates: dict[str, int] = {timeframe.name: 0 for timeframe in self.timeframes}
+        self._last_result: DataPlaneResult | None = None
+
+    @property
+    def key(self) -> tuple[str | None, str, str, str, tuple[str, ...], str]:
+        return (
+            self.instrument,
+            self.mode.value,
+            self.price_base.value,
+            self.quote_coverage_mode,
+            tuple(item.name for item in self.timeframes),
+            self.indicator_config_hash,
+        )
+
+    @property
+    def indicator_config_hash(self) -> str:
+        return fingerprint(
+            {
+                "ema_fast": self.indicator_config.ema_fast,
+                "ema_slow": self.indicator_config.ema_slow,
+                "rsi_period": self.indicator_config.rsi_period,
+                "atr_period": self.indicator_config.atr_period,
+                "wilder": self.indicator_config.wilder,
+            }
+        )
+
+    @property
+    def config_hash(self) -> str:
+        return fingerprint(self._config_material())
+
+    @property
+    def last_event_time(self) -> datetime | None:
+        return self._last_event_time
+
+    @property
+    def last_event_id(self) -> str | None:
+        return self._last_event_id
+
+    @property
+    def last_available_at(self) -> datetime | None:
+        return self._last_available_at
+
+    @property
+    def status(self) -> dict[str, Any]:
+        result = {
+            "config_hash": self.config_hash,
+            "key": self.key,
+            "mode": self.mode.value,
+            "instrument": self.instrument,
+            "price_base": self.price_base.value,
+            "coverage_mode": self.quote_coverage_mode,
+            "max_quote_gap_seconds": self.max_quote_gap_seconds,
+            "timeframes": [item.name for item in self.timeframes],
+            "aggregators": len(self.aggregators),
+            "indicator_engines": len(self.indicator_engines),
+            "events_processed": self.events_processed,
+            "candles_processed": self.candles_processed,
+            "indicator_updates": dict(self.indicator_updates),
+            "last_event_time": iso(self.last_event_time),
+            "last_event_id": self.last_event_id,
+            "last_available_at": iso(self.last_available_at),
+            "candles": {name: len(values) for name, values in self.candles.items()},
+            "indicator_points": {name: len(values) for name, values in self.indicator_points.items()},
+        }
+        return result
+
+    def _config_material(self) -> dict[str, Any]:
+        return {
+            "checkpoint_version": self.CHECKPOINT_VERSION,
+            "mode": self.mode.value,
+            "instrument": self.instrument,
+            "source": self.source,
+            "price_base": self.price_base.value,
+            "timeframes": [item.name for item in self.timeframes],
+            "indicator_config": {
+                "ema_fast": self.indicator_config.ema_fast,
+                "ema_slow": self.indicator_config.ema_slow,
+                "rsi_period": self.indicator_config.rsi_period,
+                "atr_period": self.indicator_config.atr_period,
+                "wilder": self.indicator_config.wilder,
+            },
+            "max_candles": self.max_candles,
+            "coverage_mode": self.quote_coverage_mode,
+            "max_quote_gap_seconds": self.max_quote_gap_seconds,
+            "historical_calendar": self.historical_calendar.to_dict() if self.historical_calendar is not None else None,
+        }
+
+    def _issue(self, code: str, message: str, record: Any | None = None) -> RuntimeIssue:
+        return RuntimeIssue(code, message, _attr_time(record), _attr_id(record))
+
+    def _remember_event(self, event: MarketEvent) -> None:
+        event_id = _event_identity(event)
+        self._seen_event_ids.add(event_id)
+        self._seen_event_order.append(event_id)
+        self._events[event_id] = event
+        if self.max_candles is not None:
+            limit = max(self.max_candles, self.max_candles * len(self.timeframes))
+            while len(self._seen_event_order) > limit:
+                old_id = self._seen_event_order.popleft()
+                self._seen_event_ids.discard(old_id)
+                self._events.pop(old_id, None)
+        self.events_processed += 1
+        self._last_event_id = event_id
+        self._last_event_time = event.event_time
+        self._last_available_at = event.effective_available_at
+
+    def _append_frame(self, candle: Candle, point: IndicatorPoint) -> None:
+        candles = self.candles[candle.timeframe_name]
+        points = self.indicator_points[candle.timeframe_name]
+        if self.max_candles is not None and len(candles) >= self.max_candles:
+            candles.popleft() if isinstance(candles, deque) else candles.pop(0)
+            points.popleft() if isinstance(points, deque) else points.pop(0)
+        candles.append(candle)
+        points.append(point)
+        self.candles_processed += 1
+        self.indicator_updates[candle.timeframe_name] = self.indicator_updates.get(candle.timeframe_name, 0) + 1
+
+    def _feed_core_event(self, event: MarketEvent) -> DataPlaneResult:
+        if self.instrument is None:
+            self.instrument = event.instrument
+            for aggregator in self.aggregators.values():
+                aggregator.instrument = event.instrument
+        if event.instrument != self.instrument:
+            issue = self._issue(
+                "instrument_mismatch", f"Se esperaba {self.instrument}, llegó {event.instrument}", event
+            )
+            return DataPlaneResult(
+                False,
+                event=event,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        if event.mode is not self.mode:
+            issue = self._issue("mode_mismatch", f"Se esperaba {self.mode.value}, llegó {event.mode.value}", event)
+            return DataPlaneResult(
+                False,
+                event=event,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        event_id = _event_identity(event)
+        if event_id in self._seen_event_ids:
+            if (
+                self._last_result is not None
+                and self._last_result.event is not None
+                and _event_identity(self._last_result.event) == event_id
+            ):
+                return replace(self._last_result, cached=True)
+            issue = self._issue("duplicate_event", f"Evento repetido: {event_id}", event)
+            return DataPlaneResult(
+                False,
+                event=event,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        if self._last_event_time is not None and event.event_time < self._last_event_time:
+            issue = self._issue("out_of_order_event", f"Evento fuera de orden: {event.event_time.isoformat()}", event)
+            return DataPlaneResult(
+                False,
+                event=event,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        self._remember_event(event)
+        frames: list[PrecomputedFrame] = []
+        issues: list[RuntimeIssue] = []
+        accepted = True
+        for timeframe in sorted(self.timeframes, key=lambda item: item.seconds, reverse=True):
+            result = self.aggregators[timeframe.name].add(event)
+            accepted = accepted and result.accepted
+            issues.extend(
+                RuntimeIssue(item.code, item.message, item.timestamp, item.record_id) for item in result.issues
+            )
+            for candle in result.emitted:
+                point = self.indicator_engines[timeframe.name].update(candle)
+                self._append_frame(candle, point)
+                frames.append(PrecomputedFrame(candle, point))
+        output = DataPlaneResult(
+            accepted,
+            event=event,
+            frames=tuple(frames),
+            issues=tuple(issues),
+            last_event_time=self.last_event_time,
+            last_event_id=self.last_event_id,
+            last_available_at=self.last_available_at,
+        )
+        self._last_result = output
+        return output
+
+    def feed_event(self, record: Any) -> DataPlaneResult:
+        """Validate and ingest one event exactly once across all strategies."""
+
+        try:
+            event = to_core_event(record, mode=self.mode)
+        except Exception as exc:
+            issue = self._issue("event_invalid", str(exc), record)
+            return DataPlaneResult(
+                False,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        return self._feed_core_event(event)
+
+    def feed_candle(self, record: Any) -> DataPlaneResult:
+        """Ingest one native candle and compute its indicator once.
+
+        Native higher-timeframe candles are accepted independently.  Event
+        streams should use :meth:`feed_event`, which owns all aggregation.
+        No ticks or OHLC values are fabricated for a missing timeframe.
+        """
+
+        try:
+            candle = to_core_candle(record, mode=self.mode)
+        except Exception as exc:
+            issue = self._issue("candle_invalid", str(exc), record)
+            return DataPlaneResult(
+                False,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        if self.instrument is None:
+            self.instrument = candle.instrument
+        if candle.instrument != self.instrument:
+            issue = self._issue(
+                "instrument_mismatch", f"Se esperaba {self.instrument}, llegó {candle.instrument}", candle
+            )
+            return DataPlaneResult(
+                False,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        if candle.timeframe_name not in self.candles:
+            issue = self._issue(
+                "timeframe_not_configured", f"Temporalidad no configurada: {candle.timeframe_name}", candle
+            )
+            return DataPlaneResult(
+                False,
+                issues=(issue,),
+                last_event_time=self.last_event_time,
+                last_event_id=self.last_event_id,
+                last_available_at=self.last_available_at,
+            )
+        point = self.indicator_engines[candle.timeframe_name].update(candle)
+        self._append_frame(candle, point)
+        self.candles_processed += 0
+        available = candle.available_at or candle.end
+        self._last_event_id = candle.candle_id
+        self._last_event_time = candle.end
+        self._last_available_at = available
+        output = DataPlaneResult(
+            True,
+            frames=(PrecomputedFrame(candle, point),),
+            last_event_time=self.last_event_time,
+            last_event_id=self.last_event_id,
+            last_available_at=self.last_available_at,
+        )
+        self._last_result = output
+        return output
+
+    def latest_indicator_point(
+        self, timeframe: Timeframe | str | int, *, at: datetime | None = None
+    ) -> IndicatorPoint | None:
+        name = _timeframe_name(timeframe)
+        points = self.indicator_points.get(name, ())
+        if not points:
+            return None
+        if at is None:
+            return points[-1]
+        watermark = utc(at)
+        if watermark is None:
+            return None
+        return next(
+            (
+                point
+                for point in reversed(points)
+                if (available := point_available(point)) is not None and available <= watermark
+            ),
+            None,
+        )
+
+    def _aggregator_checkpoint(self, aggregator: CandleAggregator) -> dict[str, Any]:
+        # The bounded accumulator seam is deliberately opt-in.  The strict
+        # aggregator still owns its event list and its checkpoint contract;
+        # calling ``export_bucket_state`` for it is an error by design.
+        bucket_state: dict[str, Any] | None = None
+        if getattr(aggregator, "coverage_mode", "strict") == "continuous_quotes":
+            export = getattr(aggregator, "export_bucket_state", None)
+            if callable(export):
+                exported = export()
+                bucket_state = cast(dict[str, Any] | None, exported)
+        if bucket_state is None:
+            bucket = getattr(aggregator, "_bucket", None)
+            bucket_state = {
+                "version": 1,
+                "start": iso(bucket.start) if bucket is not None else None,
+                "end": iso(bucket.end) if bucket is not None else None,
+                "events": [event_dict(event) for event in bucket.events] if bucket is not None else [],
+                "partial": bucket.partial if bucket is not None else None,
+            }
+        return {
+            "bucket": bucket_state,
+            "closed_through": iso(getattr(aggregator, "_closed_through", None)),
+            "seen_event_ids": sorted(getattr(aggregator, "_seen_event_ids", set())),
+            "seen_event_order": list(getattr(aggregator, "_seen_event_order", ())),
+            "last_event_time": iso(getattr(aggregator, "_last_event_time", None)),
+        }
+
+    def checkpoint(self) -> dict[str, Any]:
+        """Serialize the shared plane once, without strategy/consumer state."""
+
+        return {
+            "checkpoint_version": self.CHECKPOINT_VERSION,
+            "config_hash": self.config_hash,
+            **self._config_material(),
+            "seen_event_ids": sorted(self._seen_event_ids),
+            "seen_event_order": list(self._seen_event_order),
+            "events": [event_dict(event) for event in self._events.values()],
+            "last_event_time": iso(self.last_event_time),
+            "last_event_id": self.last_event_id,
+            "last_available_at": iso(self.last_available_at),
+            "events_processed": self.events_processed,
+            "candles_processed": self.candles_processed,
+            "indicator_updates": dict(self.indicator_updates),
+            "aggregators": {
+                name: self._aggregator_checkpoint(aggregator) for name, aggregator in self.aggregators.items()
+            },
+            "candles": {name: [candle_dict(candle) for candle in values] for name, values in self.candles.items()},
+            "indicator_points": {
+                name: [_indicator_point_dict(point) for point in values]
+                for name, values in self.indicator_points.items()
+            },
+            "indicator_engines": {name: _engine_state(engine) for name, engine in self.indicator_engines.items()},
+        }
+
+    snapshot = checkpoint
+
+    @classmethod
+    def from_checkpoint(cls, snapshot: Mapping[str, Any] | str) -> SharedDataPlane:
+        if isinstance(snapshot, str):
+            snapshot = json.loads(snapshot)
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("data-plane checkpoint debe ser mapping o JSON")
+        if int(snapshot.get("checkpoint_version", 0)) != cls.CHECKPOINT_VERSION:
+            raise ValueError("versión de data-plane checkpoint no soportada")
+        plane = cls._from_checkpoint_config(snapshot)
+        if snapshot.get("config_hash") != plane.config_hash:
+            raise ValueError("config_hash del data plane no coincide")
+        plane._restore_checkpoint_state(snapshot)
+        return plane
+
+    @classmethod
+    def _from_checkpoint_config(cls, snapshot: Mapping[str, Any]) -> SharedDataPlane:
+        calendar_raw = snapshot.get("historical_calendar")
+        calendar = HistoricalQuoteCalendar.from_mapping(calendar_raw) if isinstance(calendar_raw, Mapping) else None
+        return cls(
+            timeframes=tuple(str(item) for item in snapshot.get("timeframes", ())),
+            indicator_config=snapshot.get("indicator_config")
+            if isinstance(snapshot.get("indicator_config"), Mapping)
+            else None,
+            mode=snapshot.get("mode", "REPLAY"),
+            instrument=snapshot.get("instrument"),
+            source=snapshot.get("source", "runtime"),
+            price_base=snapshot.get("price_base", "traded"),
+            max_candles=snapshot.get("max_candles"),
+            coverage_mode=snapshot.get("coverage_mode", "strict"),
+            max_quote_gap_seconds=snapshot.get("max_quote_gap_seconds"),
+            historical_calendar=calendar,
+        )
+
+    def _restore_checkpoint_state(self, snapshot: Mapping[str, Any]) -> None:
+        self._seen_event_ids = {str(item) for item in snapshot.get("seen_event_ids", ())}
+        self._seen_event_order = deque(str(item) for item in snapshot.get("seen_event_order", self._seen_event_ids))
+        self._last_event_time = utc(snapshot.get("last_event_time"))
+        self._last_event_id = str(snapshot["last_event_id"]) if snapshot.get("last_event_id") is not None else None
+        self._last_available_at = utc(snapshot.get("last_available_at"))
+        self.events_processed = int(snapshot.get("events_processed", len(self._events)))
+        self.candles_processed = int(snapshot.get("candles_processed", 0))
+        self.indicator_updates = {
+            str(key): int(value) for key, value in dict(snapshot.get("indicator_updates", {})).items()
+        }
+        self._restore_checkpoint_events(snapshot)
+        self._restore_checkpoint_candles(snapshot)
+        self._restore_checkpoint_indicator_points(snapshot)
+        self._restore_checkpoint_engines(snapshot)
+        self._restore_checkpoint_aggregators(snapshot)
+
+    def _restore_checkpoint_events(self, snapshot: Mapping[str, Any]) -> None:
+        for raw in snapshot.get("events", ()):
+            event = event_from_dict(raw)
+            if event.event_id is not None:
+                self._events[event.event_id] = event
+
+    def _restore_checkpoint_candles(self, snapshot: Mapping[str, Any]) -> None:
+        for name, rows in dict(snapshot.get("candles", {})).items():
+            if name not in self.candles:
+                continue
+            for raw in rows:
+                self.candles[name].append(candle_from_dict(raw))
+
+    def _restore_checkpoint_indicator_points(self, snapshot: Mapping[str, Any]) -> None:
+        for name, rows in dict(snapshot.get("indicator_points", {})).items():
+            if name not in self.indicator_points:
+                continue
+            for raw in rows:
+                self.indicator_points[name].append(_indicator_point_from_dict(raw))
+
+    def _restore_checkpoint_engines(self, snapshot: Mapping[str, Any]) -> None:
+        for name, raw in dict(snapshot.get("indicator_engines", {})).items():
+            if name in self.indicator_engines and isinstance(raw, Mapping):
+                _restore_engine_state(self.indicator_engines[name], raw)
+
+    def _restore_checkpoint_aggregators(self, snapshot: Mapping[str, Any]) -> None:
+        for name, raw in dict(snapshot.get("aggregators", {})).items():
+            if name not in self.aggregators or not isinstance(raw, Mapping):
+                continue
+            _restore_shared_aggregator(self.aggregators[name], raw)
+
+    restore = from_checkpoint
+
+
+def _resolve_processor_data_plane(
+    *,
+    timeframes: tuple[Timeframe, ...],
+    mode: OperationMode,
+    price_base: PriceBase,
+    instrument: str | None,
+    strategy_config: StrategyConfig,
+    data_plane: SharedDataPlane | None,
+    quote_coverage_mode: str,
+    max_quote_gap_seconds: float | None,
+    historical_calendar: HistoricalQuoteCalendar | None,
+) -> tuple[str | None, str, float | None, HistoricalQuoteCalendar | None]:
+    """Validate a shared plane and resolve its data-owned settings."""
+
+    if data_plane is None:
+        return instrument, quote_coverage_mode, max_quote_gap_seconds, historical_calendar
+    plane_timeframes = {item.name for item in data_plane.timeframes}
+    missing = [item.name for item in timeframes if item.name not in plane_timeframes]
+    if missing:
+        raise ValueError(f"data_plane no contiene temporalidades: {missing}")
+    if data_plane.mode is not mode or data_plane.price_base is not price_base:
+        raise ValueError("data_plane no coincide en mode/price_base")
+    if strategy_config.indicators != data_plane.indicator_config:
+        raise ValueError("data_plane no coincide en indicator_config")
+    if instrument is not None and data_plane.instrument is not None and instrument != data_plane.instrument:
+        raise ValueError("data_plane no coincide en instrument")
+    if quote_coverage_mode != "strict" and quote_coverage_mode != data_plane.quote_coverage_mode:
+        raise ValueError("data_plane no coincide en quote_coverage_mode")
+    if max_quote_gap_seconds is not None and max_quote_gap_seconds != data_plane.max_quote_gap_seconds:
+        raise ValueError("data_plane no coincide en max_quote_gap_seconds")
+    plane_calendar = data_plane.historical_calendar.to_dict() if data_plane.historical_calendar is not None else None
+    if historical_calendar is not None and historical_calendar.to_dict() != plane_calendar:
+        raise ValueError("data_plane no coincide en historical_calendar")
+    return (
+        instrument if instrument is not None else data_plane.instrument,
+        data_plane.quote_coverage_mode,
+        data_plane.max_quote_gap_seconds,
+        data_plane.historical_calendar,
+    )
+
+
+def _new_processor_data_components(
+    *,
+    data_plane: SharedDataPlane | None,
+    timeframes: tuple[Timeframe, ...],
+    mode: OperationMode,
+    instrument: str | None,
+    source: str,
+    price_base: PriceBase,
+    max_candles: int | None,
+    quote_coverage_mode: str,
+    max_quote_gap_seconds: float | None,
+    historical_calendar: HistoricalQuoteCalendar | None,
+    indicator_config: IndicatorConfig,
+) -> tuple[dict[str, CandleAggregator], dict[str, Any]]:
+    """Build data-owned components, sharing them when a plane is supplied."""
+
+    if data_plane is not None:
+        return (
+            {tf.name: data_plane.aggregators[tf.name] for tf in timeframes},
+            {tf.name: data_plane.indicator_engines[tf.name] for tf in timeframes},
+        )
+    aggregators = {
+        tf.name: CandleAggregator(
+            tf,
+            instrument=instrument,
+            price_base=price_base,
+            source=f"{source}:aggregated",
+            mode=mode,
+            max_seen_event_ids=max_candles,
+            max_issues=max_candles,
+            coverage_mode=quote_coverage_mode,
+            max_quote_gap_seconds=max_quote_gap_seconds,
+            historical_calendar=historical_calendar,
+        )
+        for tf in timeframes
+    }
+    from ..core.indicators import IncrementalIndicatorEngine
+
+    engines = {
+        tf.name: IncrementalIndicatorEngine(
+            indicator_config,
+            max_points=max_candles,
+            historical_calendar=historical_calendar,
+        )
+        for tf in timeframes
+    }
+    return aggregators, engines
+
+
+def _market_strategy_for_candidate(candidate_id: str) -> Any | None:
+    if candidate_id == "trend_pullback_v1" or not candidate_id.startswith("dc_"):
+        return None
+    from ..core.market_profiles import market_profile
+    from ..core.strategy_extensions import Donchian20Config, Donchian20M5Strategy, Donchian20Strategy
+
+    target = market_profile(candidate_id).trigger_timeframe
+    return Donchian20M5Strategy() if target == "M5" else Donchian20Strategy(Donchian20Config(timeframe=target))
+
+
+def _resolve_signal_consumer(
+    consumer: SignalConsumer | None,
+    simulation_config: SimulationConfig,
+) -> SignalConsumer:
+    selected = consumer if consumer is not None else BinarySimulationConsumer(simulation_config)
+    if not isinstance(selected, SignalConsumer):
+        raise TypeError("signal_consumer no cumple el contrato SignalConsumer")
+    return selected
+
+
 class IncrementalProcessor:
     """Motor incremental y reanudable para eventos y velas nativas."""
 
@@ -195,6 +908,11 @@ class IncrementalProcessor:
         price_base: PriceBase | str = PriceBase.TRADED,
         max_candles: int | None = None,
         signal_consumer: SignalConsumer | None = None,
+        market_candidate_id: str | None = None,
+        data_plane: SharedDataPlane | None = None,
+        quote_coverage_mode: str = "strict",
+        max_quote_gap_seconds: float | None = None,
+        historical_calendar: HistoricalQuoteCalendar | None = None,
     ) -> None:
         self.mode = mode_from(mode)
         self.instrument = instrument.strip() if instrument else None
@@ -212,43 +930,56 @@ class IncrementalProcessor:
             strategy_cfg = replace(strategy_cfg, mode=self.mode)
         self.strategy_config = strategy_cfg
         self.strategy = TrendPullbackStrategy(strategy_cfg)
+        self.market_candidate_id = _normalise_market_candidate(market_candidate_id)
+        if data_plane is not None and not isinstance(data_plane, SharedDataPlane):
+            raise TypeError("data_plane debe ser SharedDataPlane")
+        self.instrument, quote_coverage_mode, max_quote_gap_seconds, historical_calendar = (
+            _resolve_processor_data_plane(
+                timeframes=self.timeframes,
+                mode=self.mode,
+                price_base=self.price_base,
+                instrument=self.instrument,
+                strategy_config=strategy_cfg,
+                data_plane=data_plane,
+                quote_coverage_mode=quote_coverage_mode,
+                max_quote_gap_seconds=max_quote_gap_seconds,
+                historical_calendar=historical_calendar,
+            )
+        )
+        self.quote_coverage_mode = quote_coverage_mode
+        self.max_quote_gap_seconds = max_quote_gap_seconds
+        self.historical_calendar = historical_calendar
+        self.data_plane = data_plane
+        self._market_strategy = _market_strategy_for_candidate(self.market_candidate_id)
         self.simulation_config = (
             simulation if isinstance(simulation, SimulationConfig) else SimulationConfig.from_mapping(simulation)
         )
-        if signal_consumer is None:
-            signal_consumer = BinarySimulationConsumer(self.simulation_config)
-        if not isinstance(signal_consumer, SignalConsumer):
-            raise TypeError("signal_consumer no cumple el contrato SignalConsumer")
-        self.signal_consumer = signal_consumer
-        # Kept as a compatibility view for existing binary callers.  Non-binary
-        # consumers intentionally expose no book object.
-        self._simulation_book = getattr(signal_consumer, "book", None)
-        self._consumer_pending: tuple[PendingSimulation, ...] = ()
-        self._consumer_events: deque[SignalConsumerEvent] = deque(maxlen=max(256, max_candles or 4096))
-        self._consumer_event_count = 0
-        self._transition_consumer_events: list[SignalConsumerEvent] = []
-        self.max_candles = max_candles
+        self.signal_consumer = _resolve_signal_consumer(signal_consumer, self.simulation_config)
+        self.max_candles = (
+            max_candles if max_candles is not None else data_plane.max_candles if data_plane is not None else None
+        )
         if max_candles is not None and (isinstance(max_candles, bool) or max_candles <= 0):
             raise ValueError("max_candles debe ser positivo")
-        self.aggregators: dict[str, CandleAggregator] = {
-            tf.name: CandleAggregator(
-                tf,
-                instrument=self.instrument,
-                price_base=self.price_base,
-                source=f"{self.source}:aggregated",
-                mode=self.mode,
-                max_seen_event_ids=max_candles,
-                max_issues=max_candles,
-            )
-            for tf in self.timeframes
-        }
-        self.indicator_engines: dict[str, Any] = {}
-        for tf in self.timeframes:
-            from ..core.indicators import IncrementalIndicatorEngine
-
-            self.indicator_engines[tf.name] = IncrementalIndicatorEngine(
-                strategy_cfg.indicators, max_points=max_candles
-            )
+        # Kept as a compatibility view for existing binary callers.  Non-binary
+        # consumers intentionally expose no book object.
+        self._simulation_book = getattr(self.signal_consumer, "book", None)
+        self._consumer_pending: tuple[PendingSimulation, ...] = ()
+        self._consumer_events: deque[SignalConsumerEvent] = deque(maxlen=max(256, self.max_candles or 4096))
+        self._consumer_event_count = 0
+        self._transition_consumer_events: list[SignalConsumerEvent] = []
+        self.aggregators, self.indicator_engines = _new_processor_data_components(
+            data_plane=data_plane,
+            timeframes=self.timeframes,
+            mode=self.mode,
+            instrument=self.instrument,
+            source=self.source,
+            price_base=self.price_base,
+            max_candles=self.max_candles,
+            quote_coverage_mode=self.quote_coverage_mode,
+            max_quote_gap_seconds=self.max_quote_gap_seconds,
+            historical_calendar=self.historical_calendar,
+            indicator_config=strategy_cfg.indicators,
+        )
 
         self.candles: dict[str, Any] = {tf.name: _container(self.max_candles) for tf in self.timeframes}
         self.indicator_points: dict[str, Any] = {tf.name: _container(self.max_candles) for tf in self.timeframes}
@@ -295,6 +1026,360 @@ class IncrementalProcessor:
     @property
     def pending_simulations(self) -> tuple[PendingSimulation, ...]:
         return self._consumer_pending
+
+    def latest_indicator_point(
+        self,
+        timeframe: Timeframe | str | int,
+        *,
+        at: datetime | None = None,
+    ) -> IndicatorPoint | None:
+        """Return the latest already-computed point at or before ``at``.
+
+        Historical runners and read-only observers use this seam to consume
+        the processor's existing ATR/EMA/RSI state without touching private
+        indicator-engine attributes or recalculating a valid prefix.
+        """
+
+        name = _timeframe_name(timeframe)
+        points = cast(Sequence[IndicatorPoint], self.indicator_points.get(name, ()))
+        if not points:
+            return None
+        if at is None:
+            return points[-1]
+        watermark = utc(at)
+        if watermark is None:
+            return None
+        return next(
+            (
+                point
+                for point in reversed(points)
+                if (availability := point_available(point)) is not None and availability <= watermark
+            ),
+            None,
+        )
+
+    def _validate_data_plane(self, data_plane: SharedDataPlane) -> None:
+        if data_plane.mode is not self.mode or data_plane.price_base is not self.price_base:
+            raise ValueError("data_plane no coincide en mode/price_base")
+        if self.strategy_config.indicators != data_plane.indicator_config:
+            raise ValueError("data_plane no coincide en indicator_config")
+        if (
+            self.instrument is not None
+            and data_plane.instrument is not None
+            and self.instrument != data_plane.instrument
+        ):
+            raise ValueError("data_plane no coincide en instrument")
+        missing = [item.name for item in self.timeframes if item.name not in data_plane.candles]
+        if missing:
+            raise ValueError(f"data_plane no contiene temporalidades: {missing}")
+
+    def attach_data_plane(self, data_plane: SharedDataPlane) -> None:
+        """Attach this strategy state to an already-built shared plane.
+
+        Existing frames are copied as bounded references, not recalculated.
+        The strategy keeps its own mutable detector/episode/signal state while
+        indicator engines remain owned by ``data_plane``.
+        """
+
+        if not isinstance(data_plane, SharedDataPlane):
+            raise TypeError("data_plane debe ser SharedDataPlane")
+        self._validate_data_plane(data_plane)
+        self.data_plane = data_plane
+        self.instrument = self.instrument or data_plane.instrument
+        self.quote_coverage_mode = data_plane.quote_coverage_mode
+        self.max_quote_gap_seconds = data_plane.max_quote_gap_seconds
+        self.historical_calendar = data_plane.historical_calendar
+        self.aggregators = {tf.name: data_plane.aggregators[tf.name] for tf in self.timeframes}
+        self.indicator_engines = {tf.name: data_plane.indicator_engines[tf.name] for tf in self.timeframes}
+        for name in self.candles:
+            self.candles[name].clear()
+            self.indicator_points[name].clear()
+            self._logical_candle_keys[name].clear()
+            self._candle_by_key[name].clear()
+            self._processed_candle_starts[name].clear()
+            self._point_index_by_start[name].clear()
+            self._point_base_index[name] = 0
+            for candle, point in zip(
+                data_plane.candles.get(name, ()), data_plane.indicator_points.get(name, ()), strict=True
+            ):
+                self._append_precomputed_frame(candle, point, watermark=data_plane.last_available_at)
+        self._seen_event_ids = set(data_plane._seen_event_ids)
+        self._events = dict(data_plane._events)
+        self.last_event_time = data_plane.last_event_time
+        self.last_event_id = data_plane.last_event_id
+        self.last_available_at = data_plane.last_available_at
+        self.events_processed = data_plane.events_processed
+        self.candles_processed = sum(len(values) for values in self.candles.values())
+        self.indicator_updates = {name: data_plane.indicator_updates.get(name, 0) for name in self.timeframes_by_name}
+
+    @property
+    def timeframes_by_name(self) -> tuple[str, ...]:
+        return tuple(item.name for item in self.timeframes)
+
+    def _precomputed_issue(self, code: str, message: str, candle: Candle | None = None) -> RuntimeIssue:
+        return self._issue(code, message, record=candle)
+
+    def _precomputed_identity_issue(self, frame: PrecomputedFrame) -> RuntimeIssue | None:
+        candle = frame.candle
+        name = candle.timeframe_name
+        if name not in self.candles:
+            return self._precomputed_issue("timeframe_not_configured", f"Temporalidad no configurada: {name}", candle)
+        if candle.mode is not self.mode:
+            return self._precomputed_issue(
+                "mode_mismatch", f"Se esperaba modo {self.mode.value}, llegó {candle.mode.value}", candle
+            )
+        if self.instrument is not None and candle.instrument != self.instrument:
+            return self._precomputed_issue(
+                "instrument_mismatch", f"Se esperaba {self.instrument}, llegó {candle.instrument}", candle
+            )
+        if candle.price_base is not self.price_base:
+            return self._precomputed_issue(
+                "price_base_mismatch", f"Se esperaba {self.price_base.value}, llegó {candle.price_base.value}", candle
+            )
+        return None
+
+    def _precomputed_point_issue(self, frame: PrecomputedFrame) -> RuntimeIssue | None:
+        candle, point = frame.candle, frame.indicator_point
+        if not isinstance(point, IndicatorPoint):
+            return self._precomputed_issue("indicator_point_invalid", "indicator_point debe ser IndicatorPoint", candle)
+        if point.start != candle.start or point.end != candle.end:
+            return self._precomputed_issue(
+                "indicator_point_incompatible", "IndicatorPoint no coincide temporalmente con Candle", candle
+            )
+        if point.candle_id not in (None, candle.candle_id):
+            return self._precomputed_issue(
+                "indicator_point_incompatible", "IndicatorPoint no coincide en candle_id", candle
+            )
+        if point.closed != candle.closed:
+            return self._precomputed_issue(
+                "indicator_point_incompatible", "IndicatorPoint no coincide en closed", candle
+            )
+        return None
+
+    def _precomputed_availability_issue(
+        self, frame: PrecomputedFrame, *, watermark: datetime | None
+    ) -> RuntimeIssue | None:
+        point_at = point_available(frame.indicator_point)
+        limit = utc(watermark) if watermark is not None else utc(frame.candle.available_at or frame.candle.end)
+        if point_at is None or limit is None or point_at > limit:
+            return self._precomputed_issue(
+                "indicator_point_future", "IndicatorPoint posterior al watermark de entrada", frame.candle
+            )
+        return None
+
+    def _precomputed_order_issue(self, frame: PrecomputedFrame) -> RuntimeIssue | None:
+        candle = frame.candle
+        name = candle.timeframe_name
+        logical = self._logical_key(candle)
+        if logical in self._candle_by_key[name]:
+            return self._precomputed_issue(
+                "duplicate_candle", f"Candle precomputada repetida: {candle.candle_id}", candle
+            )
+        if self.candles[name] and candle.start <= self.candles[name][-1].start:
+            return self._precomputed_issue(
+                "out_of_order_candle", f"Candle precomputada fuera de orden: {candle.start.isoformat()}", candle
+            )
+        return None
+
+    def _append_precomputed_frame(
+        self,
+        candle: Candle,
+        point: IndicatorPoint,
+        *,
+        watermark: datetime | None,
+    ) -> None:
+        name = candle.timeframe_name
+        logical = self._logical_key(candle)
+        self._logical_candle_keys[name].add(logical)
+        self._add_candle_id(candle.candle_id)
+        (self._derived_candle_keys if self._is_derived(candle) else self._native_candle_keys).add(logical)
+        self._append_bounded(name, candle, point)
+        self._processed_candle_starts[name].add(candle.start)
+        self._point_index_by_start[name][candle.start] = (
+            self._point_base_index[name] + len(self.indicator_points[name]) - 1
+        )
+        self.indicator_updates[name] = self.indicator_updates.get(name, 0) + 1
+        self.candles_processed += 1
+        if watermark is not None:
+            self.last_available_at = (
+                watermark if self.last_available_at is None else max(self.last_available_at, watermark)
+            )
+
+    def _validate_precomputed_frame(
+        self,
+        frame: PrecomputedFrame,
+        *,
+        watermark: datetime | None,
+    ) -> RuntimeIssue | None:
+        issue = self._precomputed_identity_issue(frame)
+        if issue is not None:
+            return issue
+        issue = self._precomputed_point_issue(frame)
+        if issue is not None:
+            return issue
+        issue = self._precomputed_availability_issue(frame, watermark=watermark)
+        if issue is not None:
+            return issue
+        issue = self._precomputed_order_issue(frame)
+        if issue is not None:
+            return issue
+        return None
+
+    def _resolve_precomputed_input(
+        self,
+        value: DataPlaneResult | PrecomputedFrame | Candle | Iterable[PrecomputedFrame],
+        indicator_point: IndicatorPoint | None,
+        event: MarketEvent | None,
+        watermark: datetime | None,
+    ) -> tuple[
+        DataPlaneResult | None,
+        MarketEvent | None,
+        tuple[PrecomputedFrame, ...],
+        datetime | None,
+        ProcessResult | None,
+    ]:
+        source_result: DataPlaneResult | None = value if isinstance(value, DataPlaneResult) else None
+        source_event = source_result.event if source_result is not None else event
+        if source_result is not None:
+            if not source_result.accepted:
+                return (
+                    source_result,
+                    source_event,
+                    (),
+                    watermark,
+                    ProcessResult(
+                        False, events=(source_event,) if source_event is not None else (), issues=source_result.issues
+                    ),
+                )
+            return source_result, source_event, source_result.frames, watermark or source_result.last_available_at, None
+        if isinstance(value, PrecomputedFrame):
+            return None, source_event, (value,), watermark, None
+        if isinstance(value, Candle):
+            if indicator_point is None:
+                issue = self._precomputed_issue(
+                    "indicator_point_required", "Candle precomputada requiere IndicatorPoint", value
+                )
+                return None, source_event, (), watermark, ProcessResult(False, issues=(issue,))
+            return None, source_event, (PrecomputedFrame(value, indicator_point),), watermark, None
+        return None, source_event, tuple(cast(Iterable[PrecomputedFrame], value)), watermark, None
+
+    def _remember_precomputed_event(self, source_event: MarketEvent | None) -> ProcessResult | None:
+        if source_event is None:
+            return None
+        if source_event.mode is not self.mode:
+            issue = self._issue(
+                "mode_mismatch",
+                f"Se esperaba modo {self.mode.value}, llegó {source_event.mode.value}",
+                record=source_event,
+            )
+            return ProcessResult(False, events=(source_event,), issues=(issue,))
+        if self.instrument is None:
+            self.instrument = source_event.instrument
+        if source_event.instrument != self.instrument:
+            issue = self._issue(
+                "instrument_mismatch",
+                f"Se esperaba {self.instrument}, llegó {source_event.instrument}",
+                record=source_event,
+            )
+            return ProcessResult(False, events=(source_event,), issues=(issue,))
+        event_id = _event_identity(source_event)
+        if event_id in self._seen_event_ids:
+            issue = self._issue("duplicate_event", f"Evento repetido: {event_id}", record=source_event)
+            return ProcessResult(False, events=(source_event,), issues=(issue,))
+        self._remember_event(source_event)
+        return None
+
+    def _accept_precomputed_frames(
+        self,
+        frames: tuple[PrecomputedFrame, ...],
+        *,
+        source_result: DataPlaneResult | None,
+        watermark: datetime | None,
+    ) -> tuple[list[Candle], list[RuntimeIssue], bool]:
+        emitted: list[Candle] = []
+        issues: list[RuntimeIssue] = list(source_result.issues) if source_result is not None else []
+        trigger_closed = False
+        trigger_timeframe = self._trigger_timeframe_name()
+        for frame in frames:
+            if frame.candle.timeframe_name not in self.candles and source_result is not None:
+                # A shared plane can contain frames not required by this
+                # strategy profile; they remain owned by the plane.
+                continue
+            issue = self._validate_precomputed_frame(frame, watermark=watermark)
+            if issue is not None:
+                issues.append(issue)
+                continue
+            self._append_precomputed_frame(frame.candle, frame.indicator_point, watermark=watermark)
+            emitted.append(frame.candle)
+            quality_issue: RuntimeIssue | None = None
+            if not frame.candle.quality.usable:
+                quality_issue = self._issue(
+                    "quality_blocked",
+                    f"Calidad no admisible en {frame.candle.timeframe_name}: {frame.candle.quality.status}",
+                    record=frame.candle,
+                )
+                issues.append(quality_issue)
+            if quality_issue is None and frame.candle.timeframe_name == trigger_timeframe and frame.candle.closed:
+                trigger_closed = True
+        return emitted, issues, trigger_closed
+
+    def feed_precomputed(
+        self,
+        value: DataPlaneResult | PrecomputedFrame | Candle | Iterable[PrecomputedFrame],
+        indicator_point: IndicatorPoint | None = None,
+        *,
+        event: MarketEvent | None = None,
+        watermark: datetime | None = None,
+        evaluate_strategy: bool = True,
+    ) -> ProcessResult:
+        """Consume validated candle/indicator frames without recalculation.
+
+        ``DataPlaneResult`` is the normal multi-strategy path.  A single
+        ``Candle`` plus ``IndicatorPoint`` is also accepted for provider
+        adapters and tests.  A frame whose timestamp, identity or availability
+        is incompatible is rejected before strategy state changes.
+        """
+
+        self._begin_transition()
+        source_result, source_event, frames, watermark, early = self._resolve_precomputed_input(
+            value, indicator_point, event, watermark
+        )
+        if early is not None:
+            return early
+        early = self._remember_precomputed_event(source_event)
+        if early is not None:
+            return early
+        emitted, issues, trigger_closed = self._accept_precomputed_frames(
+            frames, source_result=source_result, watermark=watermark
+        )
+        evaluations: tuple[Any, ...] = ()
+        signals: tuple[Signal, ...] = ()
+        blocked = any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in issues)
+        if evaluate_strategy and trigger_closed and not blocked:
+            evaluations, signals = self._evaluate_strategy()
+        observation_allowed = source_result.accepted if source_result is not None else True
+        completed = list(self._observe_event(source_event)) if source_event is not None and observation_allowed else []
+        return ProcessResult(
+            bool(source_result.accepted if source_result is not None else True)
+            and not any(
+                issue.code
+                in {
+                    "indicator_point_invalid",
+                    "indicator_point_incompatible",
+                    "indicator_point_future",
+                    "timeframe_not_configured",
+                }
+                for issue in issues
+            ),
+            events=(source_event,) if source_event is not None else (),
+            candles=tuple(emitted),
+            evaluations=evaluations,
+            signals=signals,
+            simulations=tuple(completed),
+            pending_simulations=self.pending_simulations,
+            issues=tuple(issues),
+            consumer_events=tuple(self._transition_consumer_events),
+        )
 
     @property
     def consumer_events(self) -> tuple[SignalConsumerEvent, ...]:
@@ -345,11 +1430,12 @@ class IncrementalProcessor:
 
     @property
     def status(self) -> dict[str, Any]:
-        return {
+        result = {
             "mode": self.mode.value,
             "instrument": self.instrument,
             "source": self.source,
             "price_base": self.price_base.value,
+            "market_candidate_id": self.market_candidate_id,
             "consumer_type": self.signal_consumer.consumer_type,
             "consumer_product": getattr(self.signal_consumer, "product", self.signal_consumer.consumer_type),
             "consumer_event_count": self._consumer_event_count,
@@ -372,6 +1458,9 @@ class IncrementalProcessor:
             "last_strategy_window_sizes": dict(self.last_strategy_window_sizes),
             "indicator_updates": dict(self.indicator_updates),
         }
+        if self.data_plane is not None:
+            result["shared_data_plane"] = self.data_plane.status
+        return result
 
     def _warmup_pending(self, timeframe: str) -> int:
         points = self.indicator_points.get(timeframe, ())
@@ -413,7 +1502,9 @@ class IncrementalProcessor:
         """Rebuild only after a late native replacement, never per event."""
         from ..core.indicators import IncrementalIndicatorEngine
 
-        engine = IncrementalIndicatorEngine(self.strategy_config.indicators, max_points=self.max_candles)
+        engine = IncrementalIndicatorEngine(
+            self.strategy_config.indicators, max_points=self.max_candles, historical_calendar=self.historical_calendar
+        )
         points = []
         for candle in self.candles[name]:
             points.append(engine.update(candle))
@@ -647,10 +1738,17 @@ class IncrementalProcessor:
     def _evaluate_trigger(
         self, candle: Candle, timeframe: str, evaluate_strategy: bool
     ) -> tuple[tuple[Any, ...], tuple[Signal, ...]]:
-        trigger_timeframe = _timeframe_name(self.strategy_config.trigger_timeframe)
+        trigger_timeframe = self._trigger_timeframe_name()
         if evaluate_strategy and timeframe == trigger_timeframe and candle.closed:
             return self._evaluate_strategy()
         return (), ()
+
+    def _trigger_timeframe_name(self) -> str:
+        if self.market_candidate_id != "trend_pullback_v1":
+            from ..core.market_profiles import market_profile
+
+            return market_profile(self.market_candidate_id).trigger_timeframe
+        return _timeframe_name(self.strategy_config.trigger_timeframe)
 
     def _append_new_candle(
         self,
@@ -880,7 +1978,9 @@ class IncrementalProcessor:
             }
 
     def _evaluate_strategy(self) -> tuple[tuple[Any, ...], tuple[Signal, ...]]:
-        trigger_timeframe = _timeframe_name(self.strategy_config.trigger_timeframe)
+        if self._market_strategy is not None:
+            return self._evaluate_market_strategy()
+        trigger_timeframe = self._trigger_timeframe_name()
         trigger_points = self.indicator_points.get(trigger_timeframe, ())
         if not trigger_points:
             return (), ()
@@ -902,6 +2002,80 @@ class IncrementalProcessor:
         self._update_strategy_context(result)
         self._prune_episodes()
         return new_evaluations, new_signals
+
+    def _evaluate_market_strategy(self) -> tuple[tuple[Any, ...], tuple[Signal, ...]]:
+        """Evaluate an opt-in non-baseline strategy over bounded closed bars.
+
+        The processor still owns aggregation and indicator updates.  The
+        selected strategy receives only its target timeframe's bounded bars;
+        its output is converted into the canonical ``Evaluation``/``Signal``
+        types so checkpoints, consumers and callers retain one public seam.
+        """
+
+        from ..core.market_profiles import market_profile
+
+        profile = market_profile(self.market_candidate_id)
+        target = profile.trigger_timeframe
+        bars = tuple(self.candles.get(target, ()))
+        if not bars:
+            return (), ()
+        strategy = self._market_strategy
+        if strategy is None:
+            raise ValueError("la estrategia de mercado seleccionada no está construida")
+        output = strategy.evaluate_causal({target: bars})
+        raw_explanations = tuple(getattr(output, "explanations", ()))
+        evaluations: list[Evaluation] = []
+        for explanation in raw_explanations[-1:]:
+            decision_text = str(getattr(explanation, "decision", "blocked")).lower()
+            try:
+                decision = DecisionKind(decision_text)
+            except ValueError:
+                decision = DecisionKind.BLOCKED
+            evaluations.append(
+                Evaluation(
+                    timestamp=explanation.timestamp,
+                    available_at=explanation.available_at,
+                    instrument=str(explanation.values.get("instrument", self.instrument or "unknown")),
+                    stage="donchian",
+                    decision=decision,
+                    direction=explanation.direction,
+                    conditions=(),
+                    values=dict(explanation.values),
+                    reasons=tuple(explanation.reasons),
+                    episode_id=None,
+                    mode=self.mode,
+                    quality=DataQuality.good(),
+                )
+            )
+        core_signals = tuple(self._market_signal_to_core(signal) for signal in output.signals)
+        result = StrategyResult(tuple(evaluations), core_signals, ())
+        new_evaluations = self._record_strategy_evaluations(result)
+        new_signals = self._record_strategy_signals(result)
+        self.strategy_evaluations += 1
+        return new_evaluations, new_signals
+
+    def _market_signal_to_core(self, signal: Any) -> Signal:
+        return Signal(
+            signal_id=str(signal.signal_id),
+            instrument=str(signal.instrument),
+            direction=str(signal.direction),
+            detected_at=signal.detected_at,
+            context_start=signal.trigger_start,
+            preparation_start=signal.trigger_start,
+            trigger_start=signal.trigger_start,
+            trigger_end=signal.trigger_end,
+            episode_id=f"{self.market_candidate_id}:{signal.signal_id}",
+            values=dict(getattr(signal, "values", {})),
+            mode=self.mode,
+            quality=DataQuality.good(),
+        )
+
+    def process_market_profile(self) -> tuple[tuple[Any, ...], tuple[Signal, ...]]:
+        """Evaluate the selected opt-in market profile on current bars."""
+
+        if self._market_strategy is None:
+            raise ValueError("processor no tiene un market_candidate_id challenger")
+        return self._evaluate_market_strategy()
 
     def register_signal(self, signal: Signal) -> tuple[PendingSimulation, ...]:
         """Registra una señal ya validada y crea sus horizontes virtuales."""
@@ -1058,7 +2232,7 @@ class IncrementalProcessor:
         emitted: list[Candle] = []
         issues: list[RuntimeIssue] = []
         seen_issue_keys: set[tuple[str, str, str | None]] = set()
-        trigger_timeframe = _timeframe_name(self.strategy_config.trigger_timeframe)
+        trigger_timeframe = self._trigger_timeframe_name()
         # Contexto primero (M15 > M5 > M1) cuando varias temporalidades
         # cierran al recibir un evento de frontera.
         for timeframe in sorted(self.timeframes, key=lambda item: item.seconds, reverse=True):
@@ -1082,6 +2256,13 @@ class IncrementalProcessor:
         it still warms aggregators, indicators and the observation book but does
         not emit historical decisions or signals.
         """
+
+        if self.data_plane is not None:
+            return self.feed_precomputed(
+                self.data_plane.feed_event(record),
+                evaluate_strategy=evaluate_strategy,
+            )
+
         self._begin_transition()
         try:
             event = to_core_event(record, mode=self.mode)
@@ -1123,6 +2304,13 @@ class IncrementalProcessor:
         ``evaluate_strategy=False`` is reserved for bootstrap/recovery history:
         it warms indicators and continuity but cannot emit historical signals.
         """
+
+        if self.data_plane is not None:
+            return self.feed_precomputed(
+                self.data_plane.feed_candle(record),
+                evaluate_strategy=evaluate_strategy,
+            )
+
         self._begin_transition()
 
         try:
@@ -1158,7 +2346,7 @@ class IncrementalProcessor:
         # been installed. This is the same order used by event aggregation.
         if (
             evaluate_strategy
-            and candle.timeframe_name == _timeframe_name(self.strategy_config.trigger_timeframe)
+            and candle.timeframe_name == self._trigger_timeframe_name()
             and candle.closed
             and not any(issue.code in _BLOCKING_RUNTIME_ISSUES for issue in all_issues)
         ):
@@ -1280,27 +2468,9 @@ class IncrementalProcessor:
             tuple(issues),
         )
 
-    def checkpoint(self) -> dict[str, Any]:
-        """Return a JSON-compatible snapshot; no pickle or live objects."""
-
-        aggregator_state: dict[str, Any] = {}
-        for name, aggregator in self.aggregators.items():
-            bucket = getattr(aggregator, "_bucket", None)
-            aggregator_state[name] = {
-                "closed_through": iso(getattr(aggregator, "_closed_through", None)),
-                "seen_event_ids": sorted(getattr(aggregator, "_seen_event_ids", set())),
-                "seen_event_order": list(getattr(aggregator, "_seen_event_order", ())),
-                "last_event_time": iso(getattr(aggregator, "_last_event_time", None)),
-                "bucket": {
-                    "start": iso(bucket.start),
-                    "end": iso(bucket.end),
-                    "events": [event_dict(event) for event in bucket.events],
-                }
-                if bucket is not None
-                else None,
-            }
+    def _strategy_checkpoint_data(self) -> dict[str, Any]:
         context_timeframe, preparation_timeframe, trigger_timeframe = _strategy_timeframe_names(self.strategy_config)
-        strategy_data = {
+        return {
             "name": self.strategy_config.name,
             "context_timeframe": context_timeframe,
             "preparation_timeframe": preparation_timeframe,
@@ -1322,6 +2492,10 @@ class IncrementalProcessor:
                 "wilder": self.strategy_config.indicators.wilder,
             },
         }
+
+    def _strategy_checkpoint_payload(self) -> dict[str, Any]:
+        """Serialize only mutable strategy/consumer state for a shared plane."""
+
         completed_ids = (
             list(self._simulation_book.completed_order)
             if self._simulation_book is not None
@@ -1330,9 +2504,92 @@ class IncrementalProcessor:
         observations = self._simulation_book.observations if self._simulation_book is not None else ()
         return {
             "checkpoint_version": self.CHECKPOINT_VERSION,
-            "config_hash": config_hash(
-                self.strategy_config, self.simulation_config, self.timeframes, self.mode, self.price_base
-            ),
+            "checkpoint_scope": "strategy",
+            "config_hash": _processor_config_hash(self),
+            "data_plane_config_hash": self.data_plane.config_hash if self.data_plane is not None else None,
+            **_processor_extra_config(self),
+            "mode": self.mode.value,
+            "instrument": self.instrument,
+            "source": self.source,
+            "price_base": self.price_base.value,
+            "consumer_type": self.signal_consumer.consumer_type,
+            "consumer_product": getattr(self.signal_consumer, "product", self.signal_consumer.consumer_type),
+            "timeframes": [tf.name for tf in self.timeframes],
+            "strategy": self._strategy_checkpoint_data(),
+            "simulation": self.simulation_config.to_dict(),
+            "market_candidate_id": self.market_candidate_id,
+            "max_candles": self.max_candles,
+            "evaluations": [evaluation_dict(item) for item in self.evaluations],
+            "signals": [signal_dict(item) for item in self.signals],
+            "decision_id_order": list(self._decision_order),
+            "signal_id_order": list(self._signal_order),
+            "episodes": [_episode_dict(item) for item in self.episodes.values()],
+            "context": {**self.context, "timestamp": iso(self.context.get("timestamp"))} if self.context else None,
+            "pending_simulations": [item.to_dict() for item in self.pending_simulations],
+            "completed_simulations": [item.to_dict() for item in self.completed_simulations],
+            "completed_simulation_ids": completed_ids,
+            "simulation_observations": [item.to_dict() for item in observations],
+            "consumer": self.consumer_checkpoint,
+            "consumer_events": [event.to_dict() for event in self._consumer_events],
+            "consumer_event_count": self._consumer_event_count,
+            "last_event_time": iso(self.last_event_time),
+            "last_event_id": self.last_event_id,
+            "last_available_at": iso(self.last_available_at),
+            "events_processed": self.events_processed,
+            "candles_processed": self.candles_processed,
+            "strategy_evaluations": self.strategy_evaluations,
+            "strategy_skipped": self.strategy_skipped,
+            "strategy_dirty": self._strategy_dirty,
+            "last_strategy_window_sizes": dict(self.last_strategy_window_sizes),
+            "indicator_updates": dict(self.indicator_updates),
+            "issues": [issue.to_dict() for issue in self.issues],
+        }
+
+    def strategy_checkpoint(self) -> dict[str, Any]:
+        """Return the strategy-only state when the data plane is shared."""
+
+        if self.data_plane is None:
+            raise ValueError("strategy_checkpoint requiere un SharedDataPlane")
+        return self._strategy_checkpoint_payload()
+
+    def checkpoint(self, *, include_data_plane: bool = True) -> dict[str, Any]:
+        """Return a JSON-compatible snapshot; no pickle or live objects."""
+
+        if self.data_plane is not None:
+            payload = self._strategy_checkpoint_payload()
+            if include_data_plane:
+                payload["data_plane"] = self.data_plane.checkpoint()
+            return payload
+
+        aggregator_state: dict[str, Any] = {}
+        for name, aggregator in self.aggregators.items():
+            bucket = getattr(aggregator, "_bucket", None)
+            aggregator_state[name] = {
+                "closed_through": iso(getattr(aggregator, "_closed_through", None)),
+                "seen_event_ids": sorted(getattr(aggregator, "_seen_event_ids", set())),
+                "seen_event_order": list(getattr(aggregator, "_seen_event_order", ())),
+                "last_event_time": iso(getattr(aggregator, "_last_event_time", None)),
+                "bucket": {
+                    "start": iso(bucket.start),
+                    "end": iso(bucket.end),
+                    "events": [event_dict(event) for event in bucket.events],
+                }
+                if bucket is not None
+                else None,
+            }
+            if bucket is not None and self.quote_coverage_mode != "strict":
+                aggregator_state[name]["bucket"]["partial"] = bucket.partial
+        strategy_data = self._strategy_checkpoint_data()
+        completed_ids = (
+            list(self._simulation_book.completed_order)
+            if self._simulation_book is not None
+            else [item.simulation_id for item in self.completed_simulations]
+        )
+        observations = self._simulation_book.observations if self._simulation_book is not None else ()
+        return {
+            "checkpoint_version": self.CHECKPOINT_VERSION,
+            "config_hash": _processor_config_hash(self),
+            **_processor_extra_config(self),
             "mode": self.mode.value,
             "instrument": self.instrument,
             "source": self.source,
@@ -1394,6 +2651,49 @@ class IncrementalProcessor:
     snapshot_json = checkpoint_json
 
     @classmethod
+    def from_strategy_checkpoint(
+        cls,
+        snapshot: Mapping[str, Any] | str,
+        *,
+        data_plane: SharedDataPlane,
+        allow_config_mismatch: bool = False,
+        signal_consumer: SignalConsumer | None = None,
+    ) -> IncrementalProcessor:
+        """Restore one strategy state onto an existing shared data plane."""
+
+        if isinstance(snapshot, str):
+            snapshot = json.loads(snapshot)
+        if not isinstance(snapshot, Mapping):
+            raise TypeError("strategy checkpoint debe ser mapping o JSON")
+        if snapshot.get("checkpoint_scope") != "strategy":
+            raise ValueError("checkpoint no contiene scope strategy")
+        if snapshot.get("data_plane_config_hash") not in (None, data_plane.config_hash):
+            raise ValueError("data_plane_config_hash no coincide")
+        strategy_raw = dict(snapshot.get("strategy", {}))
+        simulation_raw = dict(snapshot.get("simulation", {}))
+        consumer_raw = snapshot.get("consumer")
+        selected_consumer = _checkpoint_consumer(signal_consumer, consumer_raw, simulation_raw)
+        processor = cls(
+            strategy=strategy_raw,
+            simulation=simulation_raw,
+            timeframes=snapshot.get("timeframes", ()),
+            mode=snapshot.get("mode", "REPLAY"),
+            instrument=snapshot.get("instrument"),
+            source=snapshot.get("source", "runtime"),
+            price_base=snapshot.get("price_base", "traded"),
+            max_candles=snapshot.get("max_candles"),
+            signal_consumer=selected_consumer,
+            market_candidate_id=snapshot.get("market_candidate_id"),
+            data_plane=data_plane,
+        )
+        expected_hash = _processor_config_hash(processor)
+        if not allow_config_mismatch and snapshot.get("config_hash") != expected_hash:
+            raise ValueError("config_hash del strategy checkpoint no coincide")
+        processor.attach_data_plane(data_plane)
+        _restore_strategy_state(processor, snapshot)
+        return processor
+
+    @classmethod
     def from_checkpoint(
         cls,
         snapshot: Mapping[str, Any] | str,
@@ -1407,6 +2707,15 @@ class IncrementalProcessor:
             raise TypeError("snapshot debe ser mapping o JSON")
         if int(snapshot.get("checkpoint_version", 0)) != cls.CHECKPOINT_VERSION:
             raise ValueError("versión de checkpoint no soportada")
+        data_plane_raw = snapshot.get("data_plane")
+        if isinstance(data_plane_raw, Mapping):
+            data_plane = SharedDataPlane.from_checkpoint(data_plane_raw)
+            return cls.from_strategy_checkpoint(
+                snapshot,
+                data_plane=data_plane,
+                allow_config_mismatch=allow_config_mismatch,
+                signal_consumer=signal_consumer,
+            )
         strategy_raw = dict(snapshot.get("strategy", {}))
         simulation_raw = dict(snapshot.get("simulation", {}))
         consumer_raw = snapshot.get("consumer")
@@ -1425,14 +2734,12 @@ class IncrementalProcessor:
             price_base=snapshot.get("price_base", "traded"),
             max_candles=snapshot.get("max_candles"),
             signal_consumer=signal_consumer,
+            market_candidate_id=snapshot.get("market_candidate_id"),
+            quote_coverage_mode=snapshot.get("quote_coverage_mode", "strict"),
+            max_quote_gap_seconds=snapshot.get("max_quote_gap_seconds"),
+            historical_calendar=_checkpoint_historical_calendar(snapshot),
         )
-        expected_hash = config_hash(
-            processor.strategy_config,
-            processor.simulation_config,
-            processor.timeframes,
-            processor.mode,
-            processor.price_base,
-        )
+        expected_hash = _processor_config_hash(processor)
         if not allow_config_mismatch and snapshot.get("config_hash") != expected_hash:
             raise ValueError("config_hash del checkpoint no coincide")
         _restore_capture_history(processor, snapshot)
@@ -1646,6 +2953,37 @@ def _restore_aggregator(
         aggregator._last_order_key = max(aggregator._event_order_key(event) for event in bucket_events)
 
 
+def _restore_shared_aggregator(aggregator: Any, raw: Mapping[str, Any]) -> None:
+    """Restore the shared bucket through B's public seam when available."""
+
+    bucket_raw = raw.get("bucket")
+    # ``CandleAggregator`` intentionally raises when the continuous-only
+    # seam is called for strict coverage.  Preserve the strict legacy event
+    # list and bucket bytes; only continuous quotes use the bounded public
+    # state importer.
+    restore = getattr(aggregator, "restore_bucket_state", None)
+    if getattr(aggregator, "coverage_mode", "strict") != "continuous_quotes" or not callable(restore):
+        _restore_aggregator(aggregator, raw)
+        return
+    restore(bucket_raw)
+    aggregator._closed_through = utc(raw.get("closed_through"))
+    aggregator._seen_event_ids = set(str(item) for item in raw.get("seen_event_ids", ()))
+    aggregator._seen_event_order.clear()
+    order = [str(item) for item in raw.get("seen_event_order", raw.get("seen_event_ids", ()))]
+    for event_id in order:
+        if event_id in aggregator._seen_event_ids:
+            aggregator._seen_event_order.append(event_id)
+    aggregator._last_event_time = utc(raw.get("last_event_time"))
+
+
+def _restore_strategy_state(processor: IncrementalProcessor, snapshot: Mapping[str, Any]) -> None:
+    """Restore strategy/consumer fields after the shared plane is attached."""
+
+    _restore_detector_state(processor, snapshot)
+    _restore_checkpoint_consumer(processor, snapshot.get("consumer"), snapshot)
+    _restore_issues(processor, snapshot)
+
+
 def _restore_legacy_binary_book(
     processor: IncrementalProcessor,
     snapshot: Mapping[str, Any],
@@ -1694,7 +3032,10 @@ def _bucket_from_dict(raw: Mapping[str, Any], events: Sequence[MarketEvent]) -> 
     end = utc(raw.get("end"))
     if start is None or end is None:
         raise ValueError("bucket de checkpoint sin start/end")
-    return _Bucket(start, end, list(events))
+    partial = raw.get("partial")
+    if partial is not None and not isinstance(partial, bool):
+        raise ValueError("bucket.partial debe ser booleano")
+    return _Bucket(start, end, list(events), partial=partial)
 
 
 def _attr_id(record: Any) -> str | None:

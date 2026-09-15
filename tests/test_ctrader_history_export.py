@@ -27,6 +27,7 @@ from mtf_lab.ops.persistence import SQLiteStore
 
 BASE = datetime(2026, 1, 1, tzinfo=UTC)
 BAR_BASE_MINUTES = int(BASE.timestamp() // 60)
+FIXTURE_ACCOUNT_ID = "fixture-demo-account"
 
 
 def raw_bar(timestamp_minutes: int) -> dict[str, int]:
@@ -136,7 +137,7 @@ class CTraderHistoryExportTests(unittest.TestCase):
                 spec=spec,
                 catalog=catalog,
                 environment="DEMO",
-                account_id="314000",
+                account_id=FIXTURE_ACCOUNT_ID,
                 endpoint="demo.ctraderapi.com:5035",
                 permission_scope=0,
                 discovery={
@@ -144,7 +145,7 @@ class CTraderHistoryExportTests(unittest.TestCase):
                     "accessToken": marker,
                     "clientSecret": marker,
                     "authorization": {"unexpected": marker},
-                    "records": [{"account_id": 314000, "environment": "DEMO", "token": marker}],
+                    "records": [{"account_id": FIXTURE_ACCOUNT_ID, "environment": "DEMO", "token": marker}],
                 },
             )
             self.assertNotIn(marker, target.read_text())
@@ -152,7 +153,7 @@ class CTraderHistoryExportTests(unittest.TestCase):
             first = json.loads(target.read_text().splitlines()[0])
             provenance = first["payload"]["capture_provenance"]
             self.assertEqual(provenance["discovery"]["permissionScope"], 0)
-            self.assertEqual(provenance["discovery"]["records"][0]["account_id"], 314000)
+            self.assertEqual(provenance["discovery"]["records"][0]["account_id"], FIXTURE_ACCOUNT_ID)
             self.assertEqual(provenance["request"]["payload"], {"symbolId": 314})
 
     def test_recent_then_old_pages_export_corrected_replay_with_observed_receipts(self) -> None:
@@ -165,12 +166,12 @@ class CTraderHistoryExportTests(unittest.TestCase):
                 spec=spec,
                 catalog=catalog,
                 environment="DEMO",
-                account_id="314000",
+                account_id=FIXTURE_ACCOUNT_ID,
                 endpoint="demo.ctraderapi.com:5035",
                 permission_scope="SCOPE_VIEW",
                 discovery={
                     "permissionScope": "SCOPE_VIEW",
-                    "records": [{"account_id": "314000", "environment": "DEMO"}],
+                    "records": [{"account_id": FIXTURE_ACCOUNT_ID, "environment": "DEMO"}],
                 },
             )
             self.assertEqual(result["capture_kind"], CAPTURE_KIND)
@@ -190,7 +191,7 @@ class CTraderHistoryExportTests(unittest.TestCase):
             self.assertEqual(envelopes[0].availability_policy, "historical_event_time")
             provenance = envelopes[0].payload["capture_provenance"]
             self.assertEqual(provenance["environment"], "DEMO")
-            self.assertEqual(provenance["account_id"], "314000")
+            self.assertEqual(provenance["account_id"], FIXTURE_ACCOUNT_ID)
             self.assertEqual(provenance["permission_scope"], "SCOPE_VIEW")
             self.assertEqual(provenance["discovery"]["records"][0]["environment"], "DEMO")
             self.assertEqual(provenance["instrument_spec"]["symbol_id"], 314)
@@ -229,7 +230,7 @@ class CTraderHistoryExportTests(unittest.TestCase):
                 spec=spec,
                 catalog=catalog,
                 environment="DEMO",
-                account_id="314000",
+                account_id=FIXTURE_ACCOUNT_ID,
                 endpoint="demo.ctraderapi.com:5035",
                 permission_scope="SCOPE_VIEW",
             )
@@ -258,7 +259,7 @@ class CTraderHistoryExportTests(unittest.TestCase):
                     spec=spec,
                     catalog=catalog,
                     environment="DEMO",
-                    account_id="314000",
+                    account_id=FIXTURE_ACCOUNT_ID,
                     endpoint="demo.ctraderapi.com:5035",
                     permission_scope="SCOPE_VIEW",
                 )
@@ -272,7 +273,7 @@ class CTraderHistoryExportTests(unittest.TestCase):
                 spec=spec,
                 catalog=catalog,
                 environment="REAL",
-                account_id="314000",
+                account_id=FIXTURE_ACCOUNT_ID,
                 endpoint="live.ctraderapi.com:5035",
                 permission_scope="SCOPE_TRADE",
             )

@@ -78,6 +78,53 @@ def _coverage_from_dict(raw: Mapping[str, Any]) -> CaptureCoverage:
     )
 
 
+def _bounded_selection_marker(envelope: CaptureEnvelope) -> bool | None:
+    """Read the optional marker emitted by bounded history export."""
+
+    payload = envelope.payload
+    if payload.get("bounded_selection_verified") is True:
+        return True
+    if payload.get("bounded_selection_verified") is False:
+        return False
+    marker = payload.get("bounded_selection")
+    if isinstance(marker, Mapping):
+        return True
+    provenance = payload.get("capture_provenance")
+    if isinstance(provenance, Mapping) and isinstance(provenance.get("bounded_selection_verified"), bool):
+        return bool(provenance["bounded_selection_verified"])
+    return None
+
+
+def _bounded_selection_verified_in_stream(envelopes: Iterable[CaptureEnvelope]) -> bool:
+    """Verify the additive bounded marker across a capture stream.
+
+    Trendbar pages are required to be marked.  An absent END marker is allowed
+    for the first V22 export; an explicit END contradiction is not.
+    """
+
+    pages: list[CaptureEnvelope] = []
+    ends: list[CaptureEnvelope] = []
+    for envelope in envelopes:
+        if envelope.message_class is MessageClass.TRENDBAR:
+            pages.append(envelope)
+        elif envelope.message_class is MessageClass.END:
+            ends.append(envelope)
+    return (
+        bool(pages)
+        and all(_bounded_selection_marker(item) is True for item in pages)
+        and not any(_bounded_selection_marker(item) is False for item in ends)
+    )
+
+
+def _bounded_end_is_complete(payload: Mapping[str, Any]) -> bool:
+    return (
+        payload.get("complete") is True
+        and payload.get("history_complete") is True
+        and payload.get("has_more") is False
+        and not payload.get("issues")
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class CTraderPipelineResult:
     capture: CTraderCapture
@@ -235,7 +282,34 @@ class CTraderPipeline:
             identity = capture_identity(index.capture_hash, self.spec, quote_basis)
             last = index.last_envelope
             coverage = _coverage_from_dict(last.payload) if last and last.message_class is MessageClass.END else None
-            session = self.open_session(dataset_id=identity, session_id=session_id, coverage=coverage, order=order)
+            bounded_selection_verified = _bounded_selection_verified_in_stream(index)
+            if (
+                coverage is not None
+                and coverage.continuity == "UNKNOWN"
+                and bounded_selection_verified
+                and last is not None
+                and _bounded_end_is_complete(last.payload)
+            ):
+                # The original bounded V22 END lacked the additive marker and
+                # repeated UNKNOWN continuity.  Its pages still carry the
+                # selector's gap-checked marker, so recover the derived
+                # continuity before replay rather than mutating the capture.
+                coverage = replace(coverage, continuity="CONTINUOUS")
+            marker = bounded_selection_verified if last is not None and last.message_class is MessageClass.END else None
+            provenance = {
+                "provider": "ctrader-open-api",
+                "instrument": self.spec.symbol,
+                "mode": self.mode,
+                "order": order,
+                **({"bounded_selection_verified": marker} if marker is not None else {}),
+            }
+            session = self.open_session(
+                dataset_id=identity,
+                session_id=session_id,
+                coverage=coverage,
+                provenance=provenance,
+                order=order,
+            )
             session.ingest_many(index.iter_after(session.cursor), chunk_size=chunk_size)
             return session.finish(capture_complete=capture_complete, finish_session=finish_session)
 
@@ -306,6 +380,8 @@ class CTraderPaperSession:
                 "order": order,
             }
         )
+        declared_bounded = self.provenance.get("bounded_selection_verified")
+        self._bounded_selection_verified: bool | None = declared_bounded if isinstance(declared_bounded, bool) else None
         self.cursor: tuple[str, int] | None = None
         self.max_ingest_sequence = -1
         self.logical_time = datetime(1970, 1, 1, tzinfo=UTC)
@@ -461,8 +537,39 @@ class CTraderPaperSession:
             continuity="UNKNOWN", reconciliation="PENDING", blocked_reasons=("reconciliation_required",)
         )
 
-    def _observe_coverage(self, envelope: CaptureEnvelope) -> None:
-        instant = envelope.available_at
+    def _observe_coverage(self, envelope: CaptureEnvelope) -> None:  # noqa: C901 - bounded marker gate
+        if envelope.message_class is MessageClass.TRENDBAR:
+            marker = _bounded_selection_marker(envelope)
+            # Every bounded trendbar page must carry the selector marker.  An
+            # unmarked page makes the whole stream unverified; mixing marked
+            # and unmarked pages is rejected rather than changing axes midway.
+            marked = marker is True
+            if self._bounded_selection_verified is None:
+                self._bounded_selection_verified = marked
+                self.provenance["bounded_selection_verified"] = marked
+            elif self._bounded_selection_verified != marked:
+                raise CTraderPipelineError("bounded historical coverage marker is inconsistent")
+        elif envelope.message_class is MessageClass.END:
+            marker = _bounded_selection_marker(envelope)
+            # The END marker was added after the first bounded V22 capture;
+            # absence is tolerated there because all trendbar pages still
+            # carry the selector marker.  An explicit contradiction is not.
+            if marker is not None:
+                if self._bounded_selection_verified is None:
+                    self._bounded_selection_verified = marker
+                    self.provenance["bounded_selection_verified"] = marker
+                elif self._bounded_selection_verified != marker:
+                    raise CTraderPipelineError("bounded historical coverage marker is inconsistent")
+        # ``available_at`` is the causal watermark for normal observation.  A
+        # market-time-corrected historical replay has a separate reconstructed
+        # watermark and must express coverage in its market-time axis instead.
+        instant = (
+            envelope.event_time
+            if self.order == "market_time_corrected" and self._bounded_selection_verified
+            else envelope.available_at
+        )
+        if instant is None:
+            raise CTraderPipelineError("coverage observation lacks its replay time")
         first = self.coverage.observed_start is None
         self.coverage = replace(
             self.coverage,
@@ -475,6 +582,20 @@ class CTraderPaperSession:
         if envelope.message_class is MessageClass.END:
             self.end_seen = True
             continuity = envelope.payload.get("continuity", self.coverage.continuity)
+            # Backward-compatible read of the first bounded V22 export: its
+            # pages prove selector-based gap checking, but its END envelope
+            # predates the explicit bounded/continuity fields.  Do not infer
+            # this for a newer export that explicitly says UNKNOWN.
+            if (
+                continuity == "UNKNOWN"
+                and self._bounded_selection_verified is True
+                and "bounded_selection_verified" not in envelope.payload
+                and envelope.payload.get("complete") is True
+                and envelope.payload.get("history_complete") is True
+                and envelope.payload.get("has_more") is False
+                and not envelope.payload.get("issues")
+            ):
+                continuity = "CONTINUOUS"
             if continuity not in {"UNKNOWN", "CONTINUOUS", "DISCONTINUOUS"}:
                 raise CTraderPipelineError("unknown end-of-dataset continuity state")
             self.coverage = replace(
@@ -832,7 +953,13 @@ class CTraderPaperSession:
             0,
             0,
         )
-        paper = CFDReplayResult(self.simulator.trades, self.simulator.events, self.finished and self.coverage.complete)
+        paper_finished = self.finished and self.simulator.finished
+        paper = CFDReplayResult(
+            self.simulator.trades,
+            self.simulator.events,
+            capture_complete=paper_finished and self.coverage.complete,
+            finished=paper_finished,
+        )
         signals = tuple(self._signals)
         return CTraderPipelineResult(
             self.capture_summary(),

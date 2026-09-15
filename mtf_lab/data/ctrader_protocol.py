@@ -61,6 +61,8 @@ PAYLOAD: dict[str, int] = {
     "PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_RES": 2165,
     "PROTO_OA_GET_TRENDBARS_REQ": 2137,
     "PROTO_OA_GET_TRENDBARS_RES": 2138,
+    "PROTO_OA_GET_TICKDATA_REQ": 2145,
+    "PROTO_OA_GET_TICKDATA_RES": 2146,
     "PROTO_OA_ERROR_RES": 2142,
     "PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ": 2149,
     "PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RES": 2150,
@@ -90,6 +92,8 @@ WIRE_CLASS_NAMES = {
     "PROTO_OA_SUBSCRIBE_SPOTS_REQ": "ProtoOASubscribeSpotsReq",
     "PROTO_OA_SUBSCRIBE_LIVE_TRENDBAR_REQ": "ProtoOASubscribeLiveTrendbarReq",
     "PROTO_OA_GET_TRENDBARS_REQ": "ProtoOAGetTrendbarsReq",
+    "PROTO_OA_GET_TICKDATA_REQ": "ProtoOAGetTickDataReq",
+    "PROTO_OA_GET_TICKDATA_RES": "ProtoOAGetTickDataRes",
     "PROTO_HEARTBEAT_EVENT": "ProtoHeartbeatEvent",
 }
 
@@ -105,6 +109,8 @@ MESSAGE_PAYLOAD_TYPES = {
     "ProtoOASubscribeSpotsReq": 2127,
     "ProtoOASubscribeLiveTrendbarReq": 2135,
     "ProtoOAGetTrendbarsReq": 2137,
+    "ProtoOAGetTickDataReq": 2145,
+    "ProtoOAGetTickDataRes": 2146,
     "ProtoOANewOrderReq": 2106,
     "ProtoOAClosePositionReq": 2111,
     "ProtoOAReconcileReq": 2124,

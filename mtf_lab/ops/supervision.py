@@ -1171,10 +1171,14 @@ class _SupervisedWatchRunner(CTraderWatchRunner):
         self._progress_callback()
 
     def _process_record(self, record: Any, raw_synthetic: bool) -> bool:
-        before = len(self.coordinator.signals)
         accepted = super()._process_record(record, raw_synthetic)
         self._record_callback(record)
-        for signal in self.coordinator.signals[before:]:
+        signals = self.last_record_signals
+        if signals:
+            # Publish this record's causal ATR/bar clock before the entry
+            # callback, not only after the enclosing provider message.
+            self._status_callback(self.coordinator)
+        for signal in signals:
             self._signal_callback(signal)
         return accepted
 
@@ -2016,6 +2020,12 @@ class CTraderSupervisor:
 
     def _observe_runtime_status(self, coordinator: Any) -> None:
         status = coordinator.status()
+        observer = getattr(self.context.callbacks, "observe_runtime", None)
+        publisher = getattr(coordinator, "market_profile_snapshot", None)
+        if callable(observer) and callable(publisher):
+            snapshot = publisher()
+            if snapshot is not None:
+                observer(snapshot)
         connection = str(getattr(status, "connection", "UNKNOWN")).upper()
         self._runtime_connection_state = connection
         if connection in {"DISCONNECTED", "ERROR"}:

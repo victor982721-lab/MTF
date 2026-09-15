@@ -10,7 +10,9 @@ from typing import Any, Protocol
 class ExecutorPort(Protocol):
     """Genuine DEMO executor seam; OMS and journal stay outside H5."""
 
-    def manage(self) -> Any: ...
+    def observe_runtime(self, snapshot: Any) -> Any: ...
+
+    def manage(self, quote: Any | None = None) -> Any: ...
 
     def reconcile(self) -> Any: ...
 
@@ -39,6 +41,7 @@ class ExecutionCallbacks:
     reduce: Callable[..., Any] | None = None
     risk: Any | None = None
     quote_resolver: Callable[[Any], Any] | None = None
+    observe_runtime: Callable[[Any], Any] | None = None
 
 
 __all__ = ["ExecutionCallbacks", "ExecutorPort", "RiskPort"]

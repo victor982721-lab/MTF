@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
 
 Handler = Callable[[argparse.Namespace], int]
 
@@ -39,6 +40,8 @@ def _default_handlers() -> dict[str, Handler]:
         cmd_demo,
         cmd_doctor,
         cmd_import,
+        cmd_market_data,
+        cmd_market_research,
         cmd_replay,
         cmd_report,
         cmd_research,
@@ -50,6 +53,8 @@ def _default_handlers() -> dict[str, Handler]:
         "doctor": cmd_doctor,
         "demo": cmd_demo,
         "import": cmd_import,
+        "market_data": cmd_market_data,
+        "market_research": cmd_market_research,
         "replay": cmd_replay,
         "backtest": cmd_backtest,
         "report": cmd_report,
@@ -93,6 +98,69 @@ def _add_input_options(parser: argparse.ArgumentParser, *, optional: bool = Fals
     parser.add_argument("--allow-out-of-order", action="store_true")
     parser.add_argument("--allow-duplicates", action="store_true")
     parser.add_argument("--db", type=Path)
+
+
+def _add_campaign_commands(parent: Any, handler: Handler) -> None:
+    """Keep the historical campaign distinct from the legacy research runner."""
+    from ..core.market_profiles import candidate_ids
+    from .historical_assumptions import PEPPERSTONE_PUBLIC_CALENDAR_MODEL_ID, VIRTUAL_EURUSD_10K_MODEL_ID
+
+    campaign = parent.add_parser("campaign", help="protocolo de mercado: preregistro, ejecución e informes")
+    actions = campaign.add_subparsers(dest="market_research_action", required=True)
+    init = actions.add_parser("init", help="crea protocolo y registro privados; no lee cotizaciones")
+    init.add_argument("--protocol", type=Path, required=True)
+    init.add_argument("--registry", type=Path, required=True)
+    init.set_defaults(func=handler)
+    for name in ("register", "run"):
+        action = actions.add_parser(name, help="registra identidades antes de cualquier resultado")
+        action.add_argument("--protocol", type=Path, required=True)
+        action.add_argument("--registry", type=Path, required=True)
+        action.add_argument("--dataset-manifest", type=Path, required=True)
+        action.add_argument(
+            "--stage", choices=["pilot-week", "pilot-month", "development", "walk-forward", "holdout"], required=True
+        )
+        action.add_argument("--candidates", choices=candidate_ids(), nargs="+")
+        action.add_argument(
+            "--runtime-identity", type=Path, help="JSON de runtime/código verificados; no cambia permisos"
+        )
+        action.add_argument("--cost-identity", type=Path, help="JSON de costes/procedencia; desconocidos no son cero")
+        calendar_identity = action.add_mutually_exclusive_group()
+        calendar_identity.add_argument(
+            "--calendar-hash", default="UNKNOWN", help="identidad de calendario; no acredita vigencia por sí sola"
+        )
+        calendar_identity.add_argument(
+            "--calendar-identity", type=Path, help="JSON de calendario/vigencia; un hash aislado no acredita cobertura"
+        )
+        action.add_argument(
+            "--assumptions-model",
+            choices=[VIRTUAL_EURUSD_10K_MODEL_ID],
+            help="modelo virtual explícito; no acredita contrato, costes ni elegibilidad DEMO",
+        )
+        action.add_argument(
+            "--calendar-model",
+            choices=[PEPPERSTONE_PUBLIC_CALENDAR_MODEL_ID],
+            help="retroproyección pública modelada; no acredita festivos ni horario histórico de la cuenta",
+        )
+        action.add_argument("--contract-spec", type=Path, help="JSON de especificación y procedencia; no abre cuentas")
+        action.add_argument(
+            "--calendar-state", type=Path, help="JSON de estado del calendario; desconocido no es abierto"
+        )
+        action.add_argument("--scenarios", choices=["base", "adverse", "extreme"], nargs="+", default=["base"])
+        if name == "run":
+            action.add_argument("--output-dir", type=Path, required=True)
+            action.add_argument("--start", help="inicio ISO-8601 con zona, inclusivo")
+            action.add_argument("--end", help="fin ISO-8601 con zona, exclusivo")
+        action.set_defaults(func=handler)
+    for name in ("report", "validate"):
+        action = actions.add_parser(name, help="proyecta o valida evidencia existente sin ejecutar estrategias")
+        action.add_argument("manifest", type=Path)
+        action.add_argument("--protocol", type=Path)
+        if name == "report":
+            action.add_argument("--output-dir", type=Path, required=True)
+        else:
+            action.add_argument("--dataset-manifest", type=Path)
+            action.add_argument("--registry", type=Path)
+        action.set_defaults(func=handler)
 
 
 def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.ArgumentParser:
@@ -147,8 +215,49 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     p.add_argument("--boundary", help="timestamp UTC de frontera cronológica")
     p.set_defaults(func=callbacks["backtest"])
 
+    p = subs.add_parser("market-data", help="adquisición explícita y validación de ticks históricos auditables")
+    market_data = p.add_subparsers(dest="market_data_action", required=True)
+    q = market_data.add_parser(
+        "acquire", help="adquisición gratuita HistData de un mes de desarrollo; requiere --terms-accepted"
+    )
+    q.add_argument("--provider", choices=["histdata"], default="histdata")
+    q.add_argument("--instrument", choices=["EURUSD", "EUR/USD"], default="EURUSD")
+    q.add_argument(
+        "--month",
+        choices=[f"{year}-{month:02d}" for year in range(2016, 2020) for month in range(1, 13)],
+        default="2016-03",
+        help="mes UTC de desarrollo permitido (2016-01..2019-12)",
+    )
+    q.add_argument("--data-root", type=Path, default=Path.home() / ".local/share/mtf-lab/market-data")
+    q.add_argument("--terms-accepted", action="store_true", help="condiciones de acceso/uso resueltas previamente")
+    q.add_argument("--timeout", type=float, default=120.0)
+    q.set_defaults(func=callbacks["market_data"])
+    q = market_data.add_parser("validate", help="verifica hashes, formato y cobertura sin descargar")
+    q.add_argument("manifest", type=Path)
+    q.add_argument("--start", help="inicio de ventana UTC inclusivo, con zona")
+    q.add_argument("--end", help="fin de ventana UTC exclusivo, con zona")
+    q.set_defaults(func=callbacks["market_data"])
+    q = market_data.add_parser("describe", help="estructura descriptiva en desarrollo; no abre holdout")
+    q.add_argument("manifest", type=Path)
+    q.add_argument("--start", required=True, help="inicio ISO-8601 inclusivo con zona, 2016–2019")
+    q.add_argument("--end", required=True, help="fin ISO-8601 exclusivo con zona, hasta 2020-01-01")
+    q.add_argument("--output-dir", type=Path, help="HTML/JSON nuevo autocontenido; no sobrescribe informes")
+    q.add_argument(
+        "--registry",
+        type=Path,
+        help="registro global opcional de la corrida descriptiva; se crea sólo tras validar la ventana",
+    )
+    q.add_argument(
+        "--weekly-calendar",
+        choices=["strict", "modeled-fx"],
+        default="strict",
+        help="modelo semanal explícito; no acredita calendario ni festivos de cuenta",
+    )
+    q.set_defaults(func=callbacks["market_data"])
+
     p = subs.add_parser("research", help="investigación CFD explícita; no reutiliza payout binario")
     research = p.add_subparsers(dest="research_action", required=True)
+    _add_campaign_commands(research, callbacks["market_research"])
     q = research.add_parser("run", help="registra todos los intentos y evalúa un replay local causal")
     source = q.add_mutually_exclusive_group(required=True)
     source.add_argument("--fixture", action="store_true", help="datos sintéticos; sin evidencia de mercado")
@@ -208,7 +317,13 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     p.add_argument(
         "--supervisor-state", type=Path, help="snapshot privado del supervisor; readiness requiere identidad viva"
     )
-    p.add_argument("--db", type=Path)
+    ui_source = p.add_mutually_exclusive_group()
+    ui_source.add_argument("--db", type=Path)
+    ui_source.add_argument(
+        "--snapshot",
+        type=Path,
+        help="JSON privado publicado por el escritor; no abre SQLite durante corridas cercadas",
+    )
     p.add_argument("--config", type=Path)
     p.add_argument("--session")
     p.add_argument("--host", default="127.0.0.1")

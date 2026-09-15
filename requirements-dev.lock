@@ -15,3 +15,4 @@ pyright==1.1.414
 ruff==0.16.7
 setuptools==84.0.0
 typing-extensions==4.16.0
+types-protobuf==7.35.1.20260906

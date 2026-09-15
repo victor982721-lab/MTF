@@ -75,7 +75,16 @@ class CTraderRequestCancelled(CTraderError):
 
 
 class CTraderDataError(CTraderError, ValueError):
-    """Payload o dato de mercado incompatible con el contrato."""
+    """Payload o dato de mercado incompatible con el contrato.
+
+    ``diagnostic`` is optional, bounded, and secret-free.  Data adapters use
+    it when a raw market observation must be rejected without losing the
+    timing/field-presence evidence needed to audit the source.
+    """
+
+    def __init__(self, message: str, *, diagnostic: object | None = None) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(message)
 
 
 class DependencyState(StrEnum):

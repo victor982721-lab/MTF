@@ -25,6 +25,7 @@ from datetime import datetime
 from typing import Any, cast, overload
 
 from .canonical import fingerprint
+from .historical_calendar import HistoricalQuoteCalendar
 from .models import Candle, Timeframe, normalize_utc, parse_timeframe
 from .quality import DataQuality, QualityFlag, QualityIssue
 
@@ -244,6 +245,7 @@ class IndicatorEngineConfigIdentity:
     wilder: bool
     max_points: int | None
     max_issues: int | None
+    historical_calendar: HistoricalQuoteCalendar | None = None
 
     def __post_init__(self) -> None:
         for name in ("ema_fast", "ema_slow", "rsi_period", "atr_period"):
@@ -254,9 +256,11 @@ class IndicatorEngineConfigIdentity:
             value = getattr(self, name)
             if value is not None:
                 object.__setattr__(self, name, _snapshot_period(value, name))
+        if self.historical_calendar is not None and not isinstance(self.historical_calendar, HistoricalQuoteCalendar):
+            raise TypeError("historical_calendar debe ser HistoricalQuoteCalendar")
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "ema_fast": self.ema_fast,
             "ema_slow": self.ema_slow,
             "rsi_period": self.rsi_period,
@@ -265,6 +269,9 @@ class IndicatorEngineConfigIdentity:
             "max_points": self.max_points,
             "max_issues": self.max_issues,
         }
+        if self.historical_calendar is not None:
+            result["historical_calendar"] = self.historical_calendar.to_dict()
+        return result
 
     @property
     def fingerprint(self) -> str:
@@ -274,11 +281,20 @@ class IndicatorEngineConfigIdentity:
     def from_mapping(cls, value: Mapping[str, Any]) -> IndicatorEngineConfigIdentity:
         if not isinstance(value, Mapping):
             raise TypeError("config_identity debe ser un mapping")
-        allowed = {"ema_fast", "ema_slow", "rsi_period", "atr_period", "wilder", "max_points", "max_issues"}
+        allowed = {
+            "ema_fast",
+            "ema_slow",
+            "rsi_period",
+            "atr_period",
+            "wilder",
+            "max_points",
+            "max_issues",
+            "historical_calendar",
+        }
         unknown = set(value) - allowed
         if unknown:
             raise ValueError(f"Claves desconocidas en config_identity: {sorted(unknown)}")
-        required = allowed - {"max_points", "max_issues"}
+        required = allowed - {"max_points", "max_issues", "historical_calendar"}
         missing = required - set(value)
         if missing:
             raise ValueError(f"Faltan campos en config_identity: {sorted(missing)}")
@@ -290,6 +306,9 @@ class IndicatorEngineConfigIdentity:
             wilder=value["wilder"],
             max_points=value.get("max_points"),
             max_issues=value.get("max_issues"),
+            historical_calendar=HistoricalQuoteCalendar.from_mapping(value["historical_calendar"])
+            if value.get("historical_calendar") is not None
+            else None,
         )
 
 
@@ -706,8 +725,12 @@ class IncrementalIndicatorEngine:
         *,
         max_points: int | None = None,
         max_issues: int | None = None,
+        historical_calendar: HistoricalQuoteCalendar | None = None,
     ) -> None:
         self.config = config if isinstance(config, IndicatorConfig) else IndicatorConfig.from_mapping(config)
+        if historical_calendar is not None and not isinstance(historical_calendar, HistoricalQuoteCalendar):
+            raise TypeError("historical_calendar debe ser HistoricalQuoteCalendar")
+        self.historical_calendar = historical_calendar
         if max_points is not None and (isinstance(max_points, bool) or int(max_points) <= 0):
             raise ValueError("max_points debe ser entero positivo")
         if max_issues is not None and (isinstance(max_issues, bool) or int(max_issues) <= 0):
@@ -743,6 +766,7 @@ class IncrementalIndicatorEngine:
             wilder=self.config.wilder,
             max_points=self.max_points,
             max_issues=self.max_issues,
+            historical_calendar=self.historical_calendar,
         )
 
     @property
@@ -938,7 +962,7 @@ class IncrementalIndicatorEngine:
             return point
 
         # La continuidad se comprueba antes de alimentar el siguiente cálculo.
-        if self._previous_end is not None and start != self._previous_end:
+        if self._previous_end is not None and start != self._previous_end and not self._scheduled_gap(start):
             quality = quality.with_flags(QualityFlag.GAP, reason=f"intervalo_no_contiguo:{self._previous_end}->{start}")
             issue = QualityIssue(
                 "gap", "Intervalos no contiguos; se reinicia calentamiento", record_id=candle_id, timestamp=start
@@ -973,6 +997,20 @@ class IncrementalIndicatorEngine:
         self._index += 1
         self._previous_end = end
         return point
+
+    def _scheduled_gap(self, start: datetime) -> bool:
+        if self._previous_end is None or self.historical_calendar is None or start < self._previous_end:
+            return False
+        if not self.historical_calendar.covers_closed(self._previous_end, start):
+            return False
+        self._issues.append(
+            QualityIssue(
+                "modeled_scheduled_closure",
+                f"Continuidad numérica bajo calendario modelado {self.historical_calendar.calendar_hash}; no cuenta verificada",
+                timestamp=start,
+            )
+        )
+        return True
 
 
 def compute_indicators(

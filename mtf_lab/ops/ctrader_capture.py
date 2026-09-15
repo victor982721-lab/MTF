@@ -30,7 +30,10 @@ from ..data.ctrader import (
     CTraderProvider,
     DeterministicTransport,
     WireMessage,
+    normalize_trendbar,
 )
+from ..data.ctrader_errors import CTraderDataError
+from ..data.ctrader_protocol import TREND_PERIODS, read_field, read_repeated
 from ..data.models import Bar, Event
 
 NORMALIZATION_VERSION = 2
@@ -188,12 +191,128 @@ def _metadata(record: Event | Bar, envelope: CaptureEnvelope, mode: str) -> dict
             },
         }
     )
-    if envelope.availability_policy != "observed":
+    # Historical replay keeps the original response receipt separately from
+    # the market-time watermark used for corrected ordering.  A non-observed
+    # policy therefore does not, by itself, mean that the receipt is unknown:
+    # an exported historical page has ``historical_event_time`` plus a real
+    # ``received_at``.  Only an explicitly unknown policy or a missing receipt
+    # is insufficient evidence for quality purposes.
+    if envelope.availability_policy == "unknown" or envelope.received_at is None:
         flags = set(result.get("quality_flags", ()))
         flags.add("insufficient")
         result["quality_flags"] = sorted(flags)
         result["quality_reasons"] = [*result.get("quality_reasons", ()), "original_receipt_unknown"]
     return result
+
+
+def _bounded_selection_marker(envelope: CaptureEnvelope) -> bool:
+    """Return the exporter marker for a gap-checked bounded history page."""
+
+    payload = envelope.payload
+    if payload.get("bounded_selection_verified") is True:
+        return True
+    marker = payload.get("bounded_selection")
+    if isinstance(marker, Mapping):
+        return True
+    provenance = payload.get("capture_provenance")
+    return isinstance(provenance, Mapping) and provenance.get("bounded_selection_verified") is True
+
+
+def _bounded_selection_marked(envelopes: tuple[CaptureEnvelope, ...]) -> bool:
+    pages = tuple(item for item in envelopes if item.message_class is MessageClass.TRENDBAR)
+    ends = tuple(item for item in envelopes if item.message_class is MessageClass.END)
+    # Older bounded exports marked every trendbar page but predated the END
+    # marker.  Accept that additive shape while rejecting an explicit false
+    # marker on an END envelope.
+    return (
+        bool(pages)
+        and all(_bounded_selection_marker(item) for item in pages)
+        and not any(
+            not _bounded_selection_marker(item) for item in ends if "bounded_selection_verified" in item.payload
+        )
+    )
+
+
+def _period_key(value: Any) -> tuple[str, Any] | None:
+    """Return a comparable protocol period identity without selecting one."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return ("invalid", value)
+    if isinstance(value, int):
+        return ("code", value)
+    text = str(value).strip().upper()
+    return ("code", TREND_PERIODS[text]) if text in TREND_PERIODS else ("raw", text)
+
+
+def _historical_provenance(
+    payload: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], Mapping[str, Any], list[str]]:
+    issues: list[str] = []
+    raw_provenance = read_field(payload, "capture_provenance", default=None)
+    provenance: Mapping[str, Any] = raw_provenance if isinstance(raw_provenance, Mapping) else {}
+    if raw_provenance is not None and not isinstance(raw_provenance, Mapping):
+        issues.append("historical capture_provenance must be a mapping")
+    raw_period_context = provenance.get("period_context")
+    period_context: Mapping[str, Any] = raw_period_context if isinstance(raw_period_context, Mapping) else {}
+    if raw_period_context is not None and not isinstance(raw_period_context, Mapping):
+        issues.append("historical capture_provenance.period_context must be a mapping")
+    return provenance, period_context, issues
+
+
+def _historical_requested_period(provenance: Mapping[str, Any], period_context: Mapping[str, Any]) -> Any | None:
+    for source in (provenance, period_context):
+        value = source.get("requested_period")
+        if value is not None:
+            return value
+    request = provenance.get("request")
+    if not isinstance(request, Mapping):
+        return None
+    request_payload = request.get("payload")
+    return read_field(request_payload, "period", default=None) if isinstance(request_payload, Mapping) else None
+
+
+def _historical_response_period(
+    payload: Mapping[str, Any], provenance: Mapping[str, Any], period_context: Mapping[str, Any]
+) -> tuple[Any | None, Any | None]:
+    provenance_response = provenance.get("response_period")
+    if provenance_response is None:
+        provenance_response = period_context.get("response_period")
+    page_response = read_field(payload, "period", default=None)
+    return (provenance_response if provenance_response is not None else page_response), provenance_response
+
+
+def _period_discrepancy(left_name: str, left: Any, right_name: str, right: Any) -> str | None:
+    if left is None or right is None or _period_key(left) == _period_key(right):
+        return None
+    return f"trendbar period discrepancy: {left_name}={left!r}, {right_name}={right!r}"
+
+
+def _historical_period_context(payload: Mapping[str, Any]) -> tuple[Any | None, Any | None, tuple[str, ...]]:
+    """Read explicit request/response period evidence from a history page.
+
+    ``ProtoOATrendbar.period`` is optional.  The page response and the capture
+    provenance are therefore separate evidence sources; if both are present,
+    they must agree before any child is normalized.  No timeframe is selected
+    here: ``normalize_trendbar`` remains the single protocol resolver.
+    """
+
+    provenance, period_context, issues = _historical_provenance(payload)
+    requested_period = _historical_requested_period(provenance, period_context)
+    response_period, provenance_response = _historical_response_period(payload, provenance, period_context)
+    page_response = read_field(payload, "period", default=None)
+    for item in (
+        _period_discrepancy("requested", requested_period, "response", response_period),
+        _period_discrepancy("provenance_response", provenance_response, "page_response", page_response),
+    ):
+        if item is not None:
+            issues.append(item)
+    return requested_period, response_period, tuple(issues)
+
+
+def _historical_trendbars(payload: Mapping[str, Any]) -> tuple[Any, ...]:
+    return read_repeated(payload, "trendbar", "trendbars")
 
 
 class CausalNormalizer:
@@ -235,19 +354,41 @@ class CausalNormalizer:
             self.provider.reset_discontinuity()
         if envelope.message_class is MessageClass.TRENDBAR:
             # A historical GetTrendbars response is deliberately kept out of
-            # the SpotEvent/quote path.  The provider already owns the native
-            # relative-OHLC decoder; use it only for its embedded trendbars
-            # and discard any accidental quote legs rather than inventing
-            # bid/ask evidence from history.
-            result = self.provider.normalize_spot(
-                envelope.payload,
-                received_at=envelope.received_at,
-                available_at=envelope.available_at,
+            # the SpotEvent/quote path.  ProtoOATrendbar.period is optional,
+            # so preserve the response/request context from the historical
+            # page instead of asking the provider's live SpotEvent decoder to
+            # guess it (or silently dropping periodless children).
+            requested_period, response_period, context_issues = _historical_period_context(envelope.payload)
+            historical_bars: list[Bar] = []
+            issues = list(context_issues)
+            if not context_issues:
+                for index, raw_bar in enumerate(_historical_trendbars(envelope.payload)):
+                    try:
+                        bar = normalize_trendbar(
+                            raw_bar,
+                            spec=self.spec,
+                            received_at=envelope.received_at,
+                            available_at=envelope.available_at,
+                            requested_period=requested_period,
+                            response_period=response_period,
+                            request_id=f"history-{envelope.observation_id}-bar-{index}",
+                            mode=self.mode,
+                            availability_policy=envelope.availability_policy,
+                        )
+                    except CTraderDataError as exc:
+                        issues.append(f"trendbar[{index}]:{exc}")
+                        continue
+                    historical_bars.append(self._bar(bar, envelope))
+            normalized_bars = tuple(historical_bars)
+            return CTraderNormalizationResult(
+                records=normalized_bars,
+                quote_events=(),
+                bars=normalized_bars,
+                issues=tuple(dict.fromkeys(issues)),
                 snapshot=False,
-                sequence=envelope.ingest_sequence,
+                symbol_id=self.spec.symbol_id,
+                quote_quality=None,
             )
-            bars = tuple(self._bar(item, envelope) for item in result.bars)
-            return replace(result, records=bars, quote_events=(), bars=bars, quote_quality=None)
         if envelope.message_class not in {MessageClass.SPOT, MessageClass.REVISION}:
             return CTraderNormalizationResult((), (), ())
         payload_time = parse_instant(envelope.payload.get("timestamp"), unit="ms")
@@ -261,8 +402,8 @@ class CausalNormalizer:
             sequence=envelope.ingest_sequence,
         )
         quotes = tuple(self._event(item, envelope) for item in result.quote_events)
-        bars = tuple(self._bar(item, envelope) for item in result.bars)
-        return replace(result, records=(*quotes, *bars), quote_events=quotes, bars=bars)
+        spot_bars = tuple(self._bar(item, envelope) for item in result.bars)
+        return replace(result, records=(*quotes, *spot_bars), quote_events=quotes, bars=spot_bars)
 
     def _event(self, event: Event, envelope: CaptureEnvelope) -> Event:
         return replace(
@@ -307,8 +448,23 @@ def capture_identity(envelope_hash: str, spec: CTraderInstrumentSpec, quote_basi
     )
 
 
-def observed_coverage(envelopes: tuple[CaptureEnvelope, ...], coverage: CaptureCoverage | None) -> CaptureCoverage:
-    instants = [item.available_at for item in envelopes if item.available_at is not None]
+def observed_coverage(
+    envelopes: tuple[CaptureEnvelope, ...],
+    coverage: CaptureCoverage | None,
+    *,
+    order: CaptureOrder = "as_observed",
+) -> CaptureCoverage:
+    if order not in {"as_observed", "market_time_corrected"}:
+        raise CaptureContractError(f"unsupported coverage order: {order}")
+    # Coverage intervals are expressed in the same time domain as the replay
+    # contract.  Corrected historical replay is ordered by market ``event_time``
+    # while ``available_at`` remains a reconstructed availability watermark.
+    corrected_bounded = order == "market_time_corrected" and _bounded_selection_marked(envelopes)
+    instants: list[datetime] = []
+    for item in envelopes:
+        instant = item.event_time if corrected_bounded else item.available_at
+        if instant is not None:
+            instants.append(instant)
     requested = coverage or CaptureCoverage()
     return replace(
         requested,
@@ -350,10 +506,11 @@ def normalize_ctrader_capture(
         issues.extend(result.issues)
         snapshots += int(result.snapshot)
     digest = capture_identity(capture_fingerprint(envelopes, mode=order), spec, quote_basis)
-    observed = observed_coverage(envelopes, coverage)
+    observed = observed_coverage(envelopes, coverage, order=order)
     synthetic = any(
         bool(item.payload.get("synthetic_fixture", item.payload.get("synthetic", False))) for item in envelopes
     )
+    bounded_selection_verified = _bounded_selection_marked(envelopes)
     provenance = {
         "provider": "ctrader-open-api",
         "instrument": spec.symbol,
@@ -369,6 +526,7 @@ def normalize_ctrader_capture(
         "resolutions": sorted({item.resolution for item in bars}),
         "coverage_start": instant_text(observed.observed_start) if observed.observed_start else None,
         "coverage_end": instant_text(observed.observed_end) if observed.observed_end else None,
+        "bounded_selection_verified": bounded_selection_verified,
     }
     return CTraderCapture(
         tuple(

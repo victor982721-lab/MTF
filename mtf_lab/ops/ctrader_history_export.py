@@ -13,13 +13,15 @@ import os
 import tempfile
 from collections.abc import Mapping, Sequence
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from ..core.canonical import canonical_json
 from ..data.capture import CAPTURE_VERSION, CaptureEnvelope, MessageClass, parse_instant
-from ..data.ctrader import CTraderInstrumentSpec, normalize_trendbar
+from ..data.ctrader import CTraderHistoryResult, CTraderInstrumentSpec, normalize_trendbar
+from ..data.ctrader_protocol import TREND_PERIODS
 
 CAPTURE_KIND = "historical_trendbars"
 CAPTURE_ORDER = "market_time_corrected"
@@ -32,6 +34,44 @@ class HistoryCaptureError(ValueError):
         super().__init__(message)
         self.state = str(state)
         self.issues = tuple(str(item) for item in issues)
+
+
+@dataclass(frozen=True, slots=True)
+class BoundedHistorySelection:
+    """A new, explicitly bounded view of a paginated native history.
+
+    ``CTraderHistoryResult.has_more`` describes the original server response.
+    A server may report older pages even after the requested lower boundary is
+    reached.  This object keeps that fact in ``source_has_more`` while the
+    derived history contains only bars in the declared half-open window.  It
+    is never a relabeling of the source result.
+    """
+
+    history: CTraderHistoryResult
+    requested_start: datetime
+    requested_end: datetime
+    source_pages: int
+    source_has_more: bool
+    source_complete: bool
+    source_issues: tuple[str, ...]
+    raw_bars: int
+    selected_bars: int
+    gaps: tuple[Mapping[str, Any], ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requested_start": _iso(self.requested_start),
+            "requested_end": _iso(self.requested_end),
+            "source_pages": self.source_pages,
+            "source_has_more": self.source_has_more,
+            "source_complete": self.source_complete,
+            "source_issues": list(self.source_issues),
+            "raw_bars": self.raw_bars,
+            "selected_bars": self.selected_bars,
+            "gaps": [_jsonable(item) for item in self.gaps],
+            "bounded_complete": self.history.complete,
+            "bounded_has_more": self.history.has_more,
+        }
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -160,12 +200,228 @@ def _raw_trendbars(page: Mapping[str, Any]) -> tuple[Mapping[str, Any], ...]:
     return tuple(item for item in raw if isinstance(item, Mapping))
 
 
+def _bounded_raw_page(page: Mapping[str, Any], *, start: datetime, end: datetime) -> tuple[dict[str, Any] | None, int]:
+    """Keep raw trendbars whose native interval starts in ``[start, end)``."""
+
+    key = "trendbar" if "trendbar" in page else "trendbars"
+    raw = _raw_trendbars(page)
+    selected: list[Mapping[str, Any]] = []
+    for index, item in enumerate(raw):
+        raw_timestamp = item.get("utcTimestampInMinutes", item.get("utc_timestamp_in_minutes"))
+        if raw_timestamp is None:
+            raise HistoryCaptureError(
+                "trendbar sin utcTimestampInMinutes en la selección acotada",
+                issues=(f"bounded_bar_{index}:timestamp_missing",),
+            )
+        try:
+            item_start = datetime.fromtimestamp(int(raw_timestamp) * 60, UTC)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise HistoryCaptureError(
+                "trendbar con timestamp inválido en la selección acotada",
+                issues=(f"bounded_bar_{index}:timestamp_invalid",),
+            ) from exc
+        if start <= item_start < end:
+            selected.append(item)
+    if not selected:
+        return None, 0
+    bounded = dict(page)
+    bounded[key] = selected
+    bounded["bounded_selection"] = {
+        "requested_start": _iso(start),
+        "requested_end": _iso(end),
+        "source_has_more": bool(page.get("hasMore", page.get("has_more", False))),
+    }
+    return bounded, len(selected)
+
+
+def _bounded_selection_verified(history: Any) -> bool:
+    """Recognize the selector's explicit, gap-checked derived history.
+
+    ``CTraderHistoryResult.complete`` only describes pagination/normalization;
+    it is not by itself a continuity proof.  The bounded selector marks every
+    retained raw page and its metadata, so the exporter can carry that proof
+    without relabeling an ordinary complete server response.
+    """
+
+    raw_pages = tuple(getattr(history, "raw_pages", ()))
+    page_metadata = tuple(getattr(history, "page_metadata", ()))
+    if not raw_pages or len(raw_pages) != len(page_metadata):
+        return False
+    return all(
+        isinstance(page, Mapping)
+        and isinstance(page.get("bounded_selection"), Mapping)
+        and isinstance(metadata, Mapping)
+        and metadata.get("bounded_selection") is True
+        for page, metadata in zip(raw_pages, page_metadata, strict=True)
+    )
+
+
+def select_bounded_history_window(  # noqa: C901 - one guarded bounded-selection boundary
+    history: Any,
+    *,
+    start: datetime,
+    end: datetime,
+) -> BoundedHistorySelection:
+    """Derive a complete, gap-checked window without weakening source facts.
+
+    The source history remains unchanged.  Only native bars whose interval
+    starts in the explicit half-open window are copied into a new result.  A
+    source ``has_more`` flag is retained as ``source_has_more`` and does not
+    become a false claim about the bounded range.
+    """
+
+    if not isinstance(start, datetime) or not isinstance(end, datetime):
+        raise HistoryCaptureError("la ventana histórica requiere datetimes")
+    start = start.astimezone(UTC) if start.tzinfo is not None else start
+    end = end.astimezone(UTC) if end.tzinfo is not None else end
+    if start.tzinfo is None or end.tzinfo is None or start >= end:
+        raise HistoryCaptureError("la ventana histórica debe ser UTC y half-open no vacía")
+    raw_bars = tuple(getattr(history, "bars", ()))
+    if not raw_bars:
+        raise HistoryCaptureError("histórico sin barras para seleccionar")
+    selected_bars = tuple(
+        bar
+        for bar in sorted(raw_bars, key=lambda item: item.interval_start)
+        if bar.interval_start >= start and bar.interval_start < end and bar.interval_end <= end
+    )
+    if not selected_bars:
+        raise HistoryCaptureError("la ventana no contiene barras nativas")
+    resolution = int(selected_bars[0].resolution_seconds)
+    if resolution <= 0 or any(int(bar.resolution_seconds) != resolution for bar in selected_bars):
+        raise HistoryCaptureError("la ventana mezcla resoluciones nativas")
+    gaps: list[Mapping[str, Any]] = []
+    cursor = start
+    for bar in selected_bars:
+        if bar.interval_start != cursor:
+            missing = max(0, int((bar.interval_start - cursor).total_seconds() // resolution))
+            gaps.append(
+                {
+                    "from": _iso(cursor),
+                    "to": _iso(bar.interval_start),
+                    "missing_bars": missing,
+                }
+            )
+        cursor = bar.interval_end
+    if cursor != end:
+        gaps.append({"from": _iso(cursor), "to": _iso(end), "missing_bars": 0})
+
+    raw_pages = tuple(getattr(history, "raw_pages", ()))
+    page_metadata = tuple(getattr(history, "page_metadata", ()))
+    source_issues = tuple(str(item) for item in getattr(history, "issues", ()))
+    if source_issues:
+        raise HistoryCaptureError(
+            "el histórico de origen contiene incidencias; no se selecciona como completo",
+            issues=source_issues,
+        )
+    if not raw_pages or len(raw_pages) != len(page_metadata):
+        raise HistoryCaptureError(
+            "histórico sin páginas/metadata para selección acotada", issues=("raw_pages_missing",)
+        )
+    bounded_pages: list[Mapping[str, Any]] = []
+    bounded_metadata: list[Mapping[str, Any]] = []
+    bounded_raw_count = 0
+    for page, metadata in zip(raw_pages, page_metadata, strict=True):
+        if not isinstance(page, Mapping) or not isinstance(metadata, Mapping):
+            raise HistoryCaptureError("página/metadata inválida en selección acotada")
+        bounded_page, count = _bounded_raw_page(page, start=start, end=end)
+        if bounded_page is None:
+            continue
+        bounded_pages.append(bounded_page)
+        bounded_metadata.append({**metadata, "bounded_selection": True})
+        bounded_raw_count += count
+    if bounded_raw_count != len(selected_bars):
+        raise HistoryCaptureError(
+            "las barras normalizadas no coinciden con los trendbars crudos acotados",
+            issues=(f"bounded_raw_bars={bounded_raw_count}", f"bounded_normalized_bars={len(selected_bars)}"),
+        )
+    if gaps:
+        raise HistoryCaptureError(
+            "la ventana histórica contiene gaps; no se declara completa",
+            issues=tuple(f"gap:{_jsonable(item)}" for item in gaps),
+        )
+    bounded_result = CTraderHistoryResult(
+        bars=selected_bars,
+        timeframe=str(getattr(history, "timeframe", "")),
+        pages=len(bounded_pages),
+        complete=True,
+        has_more=False,
+        issues=(),
+        raw_pages=tuple(bounded_pages),
+        page_metadata=tuple(bounded_metadata),
+    )
+    return BoundedHistorySelection(
+        history=bounded_result,
+        requested_start=start,
+        requested_end=end,
+        source_pages=int(getattr(history, "pages", len(raw_pages))),
+        source_has_more=bool(getattr(history, "has_more", False)),
+        source_complete=bool(getattr(history, "complete", False)),
+        source_issues=source_issues,
+        raw_bars=bounded_raw_count,
+        selected_bars=len(selected_bars),
+        gaps=tuple(gaps),
+    )
+
+
+def _period_code(value: Any, *, source: str) -> int:
+    """Validate a request/response period through the protocol's known map."""
+
+    if isinstance(value, bool):
+        raise HistoryCaptureError(f"{source} period inválido: {value!r}")
+    if isinstance(value, int):
+        if value in TREND_PERIODS.values():
+            return value
+        raise HistoryCaptureError(f"{source} period code no soportado: {value}")
+    text = str(value).strip().upper()
+    if text in TREND_PERIODS:
+        return TREND_PERIODS[text]
+    raise HistoryCaptureError(f"{source} period no soportado: {value!r}")
+
+
+def _period_from_request(metadata: Mapping[str, Any]) -> Any | None:
+    request = metadata.get("request")
+    if not isinstance(request, Mapping):
+        return None
+    payload = request.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    return payload.get("period")
+
+
+def _page_period_context(
+    raw_page: Mapping[str, Any],
+    metadata: Mapping[str, Any],
+    *,
+    requested_period: int,
+    page_index: int,
+) -> tuple[int, int | None]:
+    """Resolve and cross-check one page's request/response period context."""
+
+    request_period_raw = _period_from_request(metadata)
+    page_requested_period = requested_period
+    if request_period_raw is not None:
+        page_requested_period = _period_code(request_period_raw, source=f"page_{page_index}:request")
+        if page_requested_period != requested_period:
+            issue = f"page_{page_index}:period discrepancy: history={requested_period}, request={page_requested_period}"
+            raise HistoryCaptureError("periodo solicitado inconsistente", issues=(issue,))
+    response_period_raw = raw_page.get("period")
+    response_period = (
+        None if response_period_raw is None else _period_code(response_period_raw, source=f"page_{page_index}:response")
+    )
+    if response_period is not None and response_period != page_requested_period:
+        issue = f"page_{page_index}:period discrepancy: requested={page_requested_period}, response={response_period}"
+        raise HistoryCaptureError("respuesta histórica con periodo discrepante", issues=(issue,))
+    return page_requested_period, response_period
+
+
 def _page_window(
     raw_page: Mapping[str, Any],
     *,
     spec: CTraderInstrumentSpec,
     received_at: datetime,
     page_index: int,
+    requested_period: int,
+    response_period: int | None,
 ) -> tuple[datetime, datetime, int, tuple[str, ...]]:
     bars = _raw_trendbars(raw_page)
     if not bars:
@@ -184,11 +440,13 @@ def _page_window(
                 spec=spec,
                 received_at=received_at,
                 available_at=received_at,
+                requested_period=requested_period,
+                response_period=response_period,
                 request_id=f"history-page-{page_index}-bar-{bar_index}",
                 mode="REPLAY",
             )
         except Exception as exc:
-            issues.append(f"page_{page_index}:bar_{bar_index}:{type(exc).__name__}")
+            issues.append(f"page_{page_index}:bar_{bar_index}:{type(exc).__name__}:{exc}")
             continue
         valid += 1
         starts.append(normalized.interval_start)
@@ -217,6 +475,29 @@ def _history_status(
     return ("COMPLETE" if complete else "PARTIAL"), complete, unique
 
 
+def _history_continuity(history: Any, *, complete: bool) -> str:
+    """Return continuity only when the native intervals prove adjacency.
+
+    Pagination completeness is not interval continuity: a server can return a
+    complete response set with missing native bars.  Keep that distinction
+    explicit so a direct historical export cannot turn ``complete=True`` into
+    a false continuity claim.  The bounded-window selector already enforces
+    this same adjacency contract; this check also protects unbounded exports.
+    """
+
+    if not complete or not _bounded_selection_verified(history):
+        return "UNKNOWN"
+    bars = sorted(tuple(getattr(history, "bars", ())), key=lambda item: item.interval_start)
+    if not bars:
+        return "UNKNOWN"
+    previous_end = bars[0].interval_end
+    for bar in bars[1:]:
+        if bar.interval_start != previous_end:
+            return "UNKNOWN"
+        previous_end = bar.interval_end
+    return "CONTINUOUS"
+
+
 def _build_page_envelopes(
     raw_pages: Sequence[Mapping[str, Any]],
     page_metadata: Sequence[Mapping[str, Any]],
@@ -224,6 +505,7 @@ def _build_page_envelopes(
     spec: CTraderInstrumentSpec,
     common_provenance: Mapping[str, Any],
     timeframe: str,
+    requested_period: int,
 ) -> tuple[list[CaptureEnvelope], list[tuple[datetime, datetime]], int, int, list[str]]:
     envelopes: list[CaptureEnvelope] = []
     page_windows: list[tuple[datetime, datetime]] = []
@@ -245,10 +527,21 @@ def _build_page_envelopes(
                 "página histórica sin evidencia de recepción/disponibilidad",
                 issues=(f"page_{page_index}:receipt_missing",),
             )
+        page_requested_period, response_period = _page_period_context(
+            raw_page,
+            metadata,
+            requested_period=requested_period,
+            page_index=page_index,
+        )
         page_bars = _raw_trendbars(raw_page)
         raw_bar_count += len(page_bars)
         start, end, valid_count, local_issues = _page_window(
-            raw_page, spec=spec, received_at=received_at, page_index=page_index
+            raw_page,
+            spec=spec,
+            received_at=received_at,
+            page_index=page_index,
+            requested_period=page_requested_period,
+            response_period=response_period,
         )
         valid_bar_count += valid_count
         page_issues.extend(local_issues)
@@ -261,6 +554,13 @@ def _build_page_envelopes(
             **dict(common_provenance),
             "response_type": metadata.get("response_type", "PROTO_OA_GET_TRENDBARS_RES"),
             "timeframe": timeframe,
+            "requested_period": page_requested_period,
+            "response_period": response_period,
+            "period_context": {
+                "requested_period": page_requested_period,
+                "response_period": response_period,
+                "child_period_optional": True,
+            },
             "original_page_order": page_index,
             "source_ingest_sequence": metadata.get("ingest_sequence"),
             "request": _safe_history_request(metadata.get("request")),
@@ -315,6 +615,12 @@ def export_history_capture(
         raise HistoryCaptureError(
             "el conteo de páginas no coincide con el payload histórico", issues=("page_count_mismatch",)
         )
+    timeframe_value = getattr(history, "timeframe", None)
+    if timeframe_value is None or not str(timeframe_value).strip():
+        raise HistoryCaptureError("histórico sin timeframe solicitado", issues=("timeframe_missing",))
+    timeframe = str(timeframe_value).strip().upper()
+    requested_period = _period_code(timeframe, source="history")
+    bounded_selection_verified = _bounded_selection_verified(history)
     observed_catalog = _safe_catalog(catalog)
     observed_discovery = _safe_discovery(discovery or {})
     observed_spec = _jsonable(spec.to_dict())
@@ -326,13 +632,15 @@ def export_history_capture(
         "discovery": observed_discovery,
         "instrument_spec": observed_spec,
         "catalog": observed_catalog,
+        "bounded_selection_verified": bounded_selection_verified,
     }
     envelopes, page_windows, raw_bar_count, valid_bar_count, page_issues = _build_page_envelopes(
         raw_pages,
         page_metadata,
         spec=spec,
         common_provenance=common_provenance,
-        timeframe=str(getattr(history, "timeframe", "M1")),
+        timeframe=timeframe,
+        requested_period=requested_period,
     )
     status, complete, issues = _history_status(
         history,
@@ -340,6 +648,7 @@ def export_history_capture(
         valid_bar_count=valid_bar_count,
         issues=page_issues,
     )
+    continuity = _history_continuity(history, complete=complete)
     if not envelopes or not valid_bar_count:
         raise HistoryCaptureError("captura histórica vacía o sin barras válidas", issues=issues, state="PARTIAL")
     market_start = min(item[0] for item in page_windows)
@@ -364,7 +673,7 @@ def export_history_capture(
             message_class=MessageClass.END,
             payload={
                 "state": "END",
-                "continuity": "UNKNOWN",
+                "continuity": continuity,
                 "capture_kind": CAPTURE_KIND,
                 "capture_order": CAPTURE_ORDER,
                 "capture_status": status,
@@ -372,6 +681,9 @@ def export_history_capture(
                 "has_more": bool(getattr(history, "has_more", False)),
                 "issues": list(issues),
                 "history_complete": bool(getattr(history, "complete", False)),
+                "bounded_selection_verified": bounded_selection_verified,
+                "timeframe": timeframe,
+                "requested_period": requested_period,
                 "native_bars": valid_bar_count,
                 "requested_start": _iso(market_start),
                 "requested_end": _iso(market_end),
@@ -388,12 +700,16 @@ def export_history_capture(
         "capture_order": CAPTURE_ORDER,
         "capture_status": status,
         "complete": complete,
+        "continuity": continuity,
+        "bounded_selection_verified": bounded_selection_verified,
         "has_more": bool(getattr(history, "has_more", False)),
         "issues": list(issues),
         "environment": "DEMO",
         "account_id": str(account_id),
         "endpoint": str(endpoint),
         "permission_scope": permission_scope,
+        "timeframe": timeframe,
+        "requested_period": requested_period,
         "discovery": observed_discovery,
         "instrument_spec": observed_spec,
         "catalog": observed_catalog,
@@ -456,16 +772,27 @@ def inspect_historical_capture(path: str | Path) -> dict[str, Any] | None:
     if isinstance(last, Mapping) and last.get("message_class") == MessageClass.END.value:
         end_payload = last.get("payload")
         if isinstance(end_payload, Mapping):
-            for key in ("capture_status", "complete", "has_more", "issues", "native_bars", "capture_order"):
+            for key in (
+                "capture_status",
+                "complete",
+                "has_more",
+                "issues",
+                "native_bars",
+                "capture_order",
+                "continuity",
+                "bounded_selection_verified",
+            ):
                 if key in end_payload:
                     result[key] = end_payload[key]
     return result
 
 
 __all__ = [
+    "BoundedHistorySelection",
     "CAPTURE_KIND",
     "CAPTURE_ORDER",
     "HistoryCaptureError",
     "export_history_capture",
     "inspect_historical_capture",
+    "select_bounded_history_window",
 ]

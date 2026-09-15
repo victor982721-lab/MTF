@@ -21,6 +21,7 @@ import hashlib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -128,6 +129,13 @@ def build_demo_execution_binding(
     if symbol != expected_symbol:
         raise DemoCompositionError("provider y configuración DEMO no observan el mismo instrumento")
     volume_grid = _observed_volume_grid(provider, clock_fn())
+    risk_binding = _risk_binding_kwargs(
+        provider,
+        raw_execution,
+        clock_fn(),
+        volume_grid,
+        connection_generation=observation.connection_generation,
+    )
 
     account = DemoAccount(
         account_id,
@@ -159,6 +167,7 @@ def build_demo_execution_binding(
             clock=clock_fn,
             server_observation=observation,
             fixture_mode=False,
+            **risk_binding,
         )
         # Recovery is registration-only: it hydrates durable identities and
         # never resubmits.  With --no-resume, an existing journal remains a
@@ -178,6 +187,7 @@ def build_demo_execution_binding(
             state_path=journal_path.with_suffix(".risk.json"),
             journal_path=journal_path,
             allow_new_baseline=not bool(intent_store.intents),
+            require_cashflows=True,
         )
         callbacks = _callbacks_for(executor, provider, observation, risk_observer=observer)
         return DemoExecutionBinding(gateway, observation, transport, executor, intent_store, callbacks, observer)
@@ -302,6 +312,183 @@ def _policy_from_config(raw: Mapping[str, Any], symbol: str) -> ExecutionPolicy:
     return ExecutionPolicy(required_scopes=frozenset({"trading"}), **values)
 
 
+def _risk_binding_kwargs(
+    provider: Any,
+    raw_execution: Mapping[str, Any],
+    observed_at: datetime,
+    volume_grid: VolumeGrid,
+    *,
+    connection_generation: Any = None,
+) -> dict[str, Any]:
+    candidate_id = raw_execution.get("market_candidate_id")
+    if candidate_id is None:
+        return {
+            "risk_exit_policy": None,
+            "risk_contract_spec": None,
+            "risk_calendar": None,
+            "market_candidate_id": None,
+        }
+    candidate_text = str(candidate_id).strip()
+    if not candidate_text:
+        raise RiskLimitRejected("market_candidate_id no puede estar vacío")
+    risk_exit_policy = raw_execution.get("risk_exit_policy")
+    risk_calendar = raw_execution.get("risk_calendar")
+    if not isinstance(risk_exit_policy, Mapping):
+        raise RiskLimitRejected("market_candidate_id requiere una política RiskExit efectiva")
+    if not isinstance(risk_calendar, Mapping):
+        raise RiskLimitRejected("market_candidate_id requiere un calendario RiskExit explícito")
+    contract_spec = dict(_observed_risk_contract_spec(provider, observed_at, volume_grid))
+    if connection_generation is not None and str(connection_generation).strip():
+        contract_spec["connection_generation"] = str(connection_generation).strip()
+    return {
+        "risk_exit_policy": risk_exit_policy,
+        "risk_contract_spec": contract_spec,
+        "risk_calendar": risk_calendar,
+        "market_candidate_id": candidate_text,
+    }
+
+
+def _catalog_raw_full_symbol(provider: Any) -> Mapping[str, Any] | None:
+    catalog = getattr(provider, "catalog", None)
+    selected = getattr(catalog, "selected", None)
+    metadata = getattr(selected, "metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    raw_full = metadata.get("fullSymbol", metadata)
+    return raw_full if isinstance(raw_full, Mapping) else None
+
+
+def _explicit_catalog_field(
+    provider: Any,
+    compact_full: Mapping[str, Any],
+    names: tuple[str, ...],
+) -> Any:
+    for name in names:
+        if name in compact_full:
+            return compact_full[name]
+    raw_full = _catalog_raw_full_symbol(provider)
+    if raw_full is not None:
+        for name in names:
+            if name in raw_full:
+                return raw_full[name]
+    return None
+
+
+def _positive_decimal_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return str(parsed) if parsed.is_finite() and parsed > 0 else None
+
+
+def _nonnegative_decimal_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    return str(parsed) if parsed.is_finite() and parsed >= 0 else None
+
+
+def _observed_cost_fields(provider: Any, full: Mapping[str, Any]) -> dict[str, Any]:
+    cost_source = _explicit_catalog_field(
+        provider,
+        full,
+        ("expected_cost_source", "cost_estimate_source", "cost_source"),
+    )
+    cost_currency = _explicit_catalog_field(
+        provider,
+        full,
+        ("expected_cost_currency", "cost_currency", "commission_currency"),
+    )
+    cost_identity = (
+        isinstance(cost_source, str)
+        and bool(cost_source.strip())
+        and isinstance(cost_currency, str)
+        and bool(cost_currency.strip())
+    )
+    result: dict[str, Any] = {}
+    if cost_identity:
+        result["expected_cost_source"] = cost_source.strip()
+        result["expected_cost_currency"] = cost_currency.strip().upper()
+    for target, cost_names in (
+        ("expected_cost_fixed", ("expected_cost_fixed", "expected_commission_fixed")),
+        ("expected_cost_per_unit", ("expected_cost_per_unit", "expected_commission_per_unit")),
+        ("expected_exit_slippage_per_unit", ("expected_exit_slippage_per_unit",)),
+        ("expected_exit_slippage_pips", ("expected_exit_slippage_pips",)),
+    ):
+        normalized = (
+            _nonnegative_decimal_text(_explicit_catalog_field(provider, full, cost_names)) if cost_identity else None
+        )
+        if normalized is not None:
+            result[target] = normalized
+    expected_costs_known = _explicit_catalog_field(
+        provider,
+        full,
+        ("expected_costs_known", "risk_envelope_known"),
+    )
+    if isinstance(expected_costs_known, bool):
+        result["expected_costs_known"] = expected_costs_known
+    return result
+
+
+def _observed_risk_contract_spec(provider: Any, observed_at: datetime, volume_grid: VolumeGrid) -> Mapping[str, Any]:
+    """Project only economics explicitly present in the selected catalog.
+
+    cTrader's digits, pip position and lot-size metadata are not silently
+    converted into a monetary unit value.  A missing unit value, pip size or
+    fee declaration therefore remains visible to ``RiskExit`` and blocks an
+    external entry instead of becoming a broker-default guess.
+    """
+
+    try:
+        from .market_schedule import catalog_provenance
+
+        provenance = catalog_provenance(provider, observed_at)
+    except (AttributeError, TypeError, ValueError):
+        return {"known": False}
+    if not isinstance(provenance, Mapping) or provenance.get("catalog_identity_valid") is not True:
+        return {"known": False}
+    full = provenance.get("full_symbol")
+    if not isinstance(full, Mapping):
+        return {"known": False}
+
+    result: dict[str, Any] = {
+        "known": True,
+        "quantity_min": str(Decimal(volume_grid.min_volume) / Decimal(volume_grid.volume_scale)),
+        "quantity_step": str(Decimal(volume_grid.step_volume) / Decimal(volume_grid.volume_scale)),
+        "quantity_max": str(Decimal(volume_grid.max_volume) / Decimal(volume_grid.volume_scale)),
+    }
+    for target, value_names in (
+        ("pip_size", ("pip_size", "pipSize")),
+        ("unit_value", ("unit_value", "unitValue")),
+        (
+            "minimum_stop_distance",
+            ("minimum_stop_distance", "min_stop_distance", "minimumStopDistance", "minStopDistance"),
+        ),
+        ("margin_per_unit", ("margin_per_unit", "marginPerUnit")),
+    ):
+        normalized = _positive_decimal_text(_explicit_catalog_field(provider, full, value_names))
+        if normalized is not None:
+            result[target] = normalized
+    for target, flag_names in (
+        (
+            "fees_known",
+            ("fees_known", "feesKnown", "commission_known", "commissionKnown", "costs_known", "costsKnown"),
+        ),
+        ("spread_known", ("spread_known", "spreadKnown")),
+    ):
+        value = _explicit_catalog_field(provider, full, flag_names)
+        if isinstance(value, bool):
+            result[target] = value
+    result.update(_observed_cost_fields(provider, full))
+    return result
+
+
 def _observed_volume_grid(provider: Any, observed_at: datetime) -> VolumeGrid:
     try:
         from .market_schedule import catalog_provenance
@@ -337,6 +524,51 @@ def _journal_path(
     return root / "execution-intents" / f"{key}.jsonl"
 
 
+def _refresh_observed_risk(observer: AccountRiskObserver | None, executor: CTraderDemoExecutor) -> None:
+    if observer is None:
+        return
+    try:
+        observer.update_executor(executor)
+    except Exception as exc:
+        raise RiskLimitRejected(f"la observación de riesgo DEMO no es utilizable: {type(exc).__name__}") from exc
+
+
+def _management_quote(
+    executor: CTraderDemoExecutor,
+    provider: Any,
+    observation: ServerAccountObservation,
+) -> Quote | None:
+    if not bool(getattr(executor, "risk_exit_enabled", False)):
+        return None
+    try:
+        # The quote book is already held by this provider.  This read does not
+        # refresh a session or issue a market request.
+        return _quote_from_provider(provider, observation, {})
+    except (RiskLimitRejected, TypeError, ValueError):
+        # Missing/stale BBO is an UNKNOWN exit input; do not invent a close
+        # price or fall back to the legacy holding deadline.
+        return None
+
+
+def _manage_callbacks(
+    executor: CTraderDemoExecutor,
+    provider: Any,
+    observation: ServerAccountObservation,
+) -> tuple[OrderResult, ...]:
+    quote = _management_quote(executor, provider, observation)
+    if bool(getattr(executor, "risk_exit_enabled", False)):
+        return tuple(executor.manage(quote))
+    return tuple(executor.manage())
+
+
+def _observe_runtime_callback(executor: Any, snapshot: Any) -> Mapping[str, Any]:
+    observe = getattr(executor, "observe_runtime", None)
+    if not callable(observe):
+        return {"runtime_state": "UNKNOWN", "reasons": ["runtime_observer_unavailable"]}
+    result = observe(snapshot)
+    return result if isinstance(result, Mapping) else {"runtime_state": "UNKNOWN"}
+
+
 def _callbacks_for(
     executor: CTraderDemoExecutor,
     provider: Any,
@@ -356,15 +588,15 @@ def _callbacks_for(
         # REAL account. The account context comes only from this bound seam.
         data["data_mode"] = data.get("data_mode", data.get("mode", "LIVE"))
         data["account_environment"] = observation.environment
+        _refresh_observed_risk(risk_observer, executor)
         return executor.submit_signal(data, selected_quote)
 
     def manage() -> tuple[OrderResult, ...]:
-        if risk_observer is not None:
-            risk_observer.update_executor(executor)
+        _refresh_observed_risk(risk_observer, executor)
         # Account metrics never substitute for the execution journal's own
         # typed, account-scoped position/ownership reconciliation.
         executor.reconcile_positions()
-        return tuple(executor.manage())
+        return _manage_callbacks(executor, provider, observation)
 
     def reconcile() -> Mapping[str, Any]:
         managed = manage()
@@ -386,12 +618,16 @@ def _callbacks_for(
         del _reason
         return executor.reduce_exposure()
 
+    def observe_runtime(snapshot: Any) -> Mapping[str, Any]:
+        return _observe_runtime_callback(executor, snapshot)
+
     return ExecutionCallbacks(
         executor=executor,
         on_signal=on_signal,
         manage=manage,
         reconcile=reconcile,
         reduce=reduce,
+        observe_runtime=observe_runtime,
     )
 
 
@@ -441,9 +677,28 @@ def _book_legs(raw_snapshot: Any, symbol_id: Any) -> tuple[Mapping[str, Any], Ma
     ask = book.get("ask")
     if not isinstance(bid, Mapping) or not isinstance(ask, Mapping):
         raise RiskLimitRejected("no se observó una pareja bid/ask completa")
+    _validate_book_pair(bid, ask)
+    return bid, ask
+
+
+def _validate_book_pair(bid: Mapping[str, Any], ask: Mapping[str, Any]) -> None:
     if bid.get("timestamp_missing") is True or ask.get("timestamp_missing") is True:
         raise RiskLimitRejected("la cotización DEMO carece de timestamp de origen")
-    return bid, ask
+    for side, leg in (("bid", bid), ("ask", ask)):
+        state = leg.get("state")
+        if state is not None and str(state).strip().upper() != "VALID":
+            raise RiskLimitRejected(f"la pierna {side} no tiene calidad VALID observada")
+        if leg.get("reasons", ()):
+            raise RiskLimitRejected(f"la pierna {side} conserva razones de calidad bloqueantes")
+    try:
+        bid_price = _decimal_value(bid.get("price"), "bid", positive=True)
+        ask_price = _decimal_value(ask.get("price"), "ask", positive=True)
+    except (TypeError, ValueError) as exc:
+        raise RiskLimitRejected("la pareja bid/ask observada es inválida") from exc
+    # Equality is not an executable zero-spread quote.  Treat it as the same
+    # crossed class as bid > ask; never repair or reorder provider prices.
+    if bid_price >= ask_price:
+        raise RiskLimitRejected("la pareja bid/ask observada está cruzada")
 
 
 def _book_timing(

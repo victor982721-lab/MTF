@@ -18,6 +18,8 @@ from typing import Any
 
 from ..configuration import EffectiveConfig
 from ..core import Candle, MarketEvent, OperationMode, QualityFlag, Timeframe, parse_timeframe
+from ..core.aggregation import BAR_CLOCK_BASIS, bar_clock_ordinal
+from ..core.market_profiles import market_profile
 from ..core.reference import m1_reference_signals
 from ..ops.persistence import SQLiteStore, payload_hash
 from .consumers import SignalConsumer
@@ -411,6 +413,7 @@ class RuntimeCoordinator:
                 price_base=("traded" if config.price_base == "close" else config.price_base),
                 max_candles=max_candles,
                 signal_consumer=signal_consumer,
+                market_candidate_id=config.execution.get("market_candidate_id"),
             )
 
     @property
@@ -424,6 +427,39 @@ class RuntimeCoordinator:
         """Detector signals retained by the processor."""
 
         return tuple(self.processor.signals)
+
+    def market_profile_snapshot(self) -> dict[str, Any] | None:
+        """Publish bounded, already-computed strategy context without SQL/I/O.
+
+        A bar-clock ordinal is not a count of samples, sessions, or observed
+        OHLC bars. It lets the executor identify overdue exits after a quote
+        outage without manufacturing the missing market trajectory.
+        """
+        candidate_id = self.config.execution.get("market_candidate_id")
+        if candidate_id is None:
+            return None
+        profile = market_profile(str(candidate_id))
+        available = self.processor.last_available_at
+        point = self.processor.latest_indicator_point(profile.trigger_timeframe, at=available)
+        market_time = self.processor.last_event_time
+        if market_time is None and point is not None and isinstance(point.end, datetime):
+            market_time = point.end
+        return {
+            "market_candidate_id": profile.candidate_id,
+            "trigger_timeframe": profile.trigger_timeframe,
+            "trigger_bar_count": bar_clock_ordinal(market_time, profile.trigger_timeframe) if market_time else None,
+            "risk_bar_clock_basis": BAR_CLOCK_BASIS,
+            "latest_trigger_start": _jsonable(point.start) if point is not None else None,
+            "latest_trigger_end": _jsonable(point.end) if point is not None else None,
+            "latest_trigger_available_at": _jsonable(point.available_at) if point is not None else None,
+            "atr": str(point.atr) if point is not None and point.atr is not None and point.quality.valid else None,
+            "last_market": _jsonable(market_time),
+            "last_available": _jsonable(available),
+            "data_mode": self.mode.value,
+            "indicator_updates": self.processor.indicator_updates.get(profile.trigger_timeframe, 0),
+            "source": self.processor.source,
+            "read_only_memory_projection": True,
+        }
 
     def _analysis_fields(self, *, variant: str | None = None) -> dict[str, Any]:
         return {

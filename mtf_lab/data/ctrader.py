@@ -15,6 +15,7 @@ presence helpers for other adapters.
 """
 
 from .ctrader_config import CTraderConfig, normalize_symbol_name
+from .ctrader_diagnostics import CTraderSpotDiagnostic, build_spot_diagnostic
 from .ctrader_errors import (
     AuthState,
     ConnectionState,
@@ -40,11 +41,14 @@ from .ctrader_market import (
     CTraderProvider,
     CTraderSessionWindow,
     CTraderSymbol,
+    CTraderTick,
+    CTraderTickDataResult,
     QuoteLegQuality,
     QuoteQuality,
     QuoteQualityReason,
     QuoteQualityState,
     SymbolCatalog,
+    TickQuoteType,
     _as_sequence,  # noqa: F401 - retained as a compatibility module attribute
     _mapping,  # noqa: F401 - retained as a compatibility module attribute
     _timestamp_ms,  # noqa: F401 - retained as a compatibility module attribute
@@ -141,9 +145,12 @@ __all__ = [
     "CTraderRequestCancelled",
     "CTraderRequestTimeout",
     "CTraderSessionWindow",
+    "CTraderSpotDiagnostic",
     "CTraderSession",
     "CTraderStatus",
     "CTraderSymbol",
+    "CTraderTick",
+    "CTraderTickDataResult",
     "CTraderTransport",
     "CTraderTransportError",
     "ConnectionState",
@@ -172,9 +179,11 @@ __all__ = [
     "TREND_PERIODS",
     "TREND_PERIOD_NAMES",
     "TcpTlsTransport",
+    "TickQuoteType",
     "WIRE_CLASS_NAMES",
     "WallClock",
     "WireMessage",
+    "build_spot_diagnostic",
     "canonical_json",
     "capture_envelope",
     "dependency_report",

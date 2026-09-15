@@ -186,7 +186,12 @@ def _static_checks(
                 "--explicit-package-bases",
                 "--no-incremental",
                 "--python-executable",
-                str(runtime_python),
+                # Mypy resolves installed package stubs through this
+                # interpreter.  Keep that lookup in the development
+                # environment: the runtime intentionally contains only
+                # execution dependencies and therefore must not be used as
+                # the typing environment for generated protobuf stubs.
+                str(dev_python),
                 "--cache-dir",
                 str(temporary_root / "mypy-cache"),
                 "--show-error-codes",
@@ -324,6 +329,7 @@ def _coverage_checks(
     temporary_root: Path,
     timeout: float,
     threshold: float,
+    build_python: Path | None = None,
 ) -> dict[str, Any]:
     coverage_data = temporary_root / "coverage" / ".coverage"
     coverage_json = temporary_root / "coverage" / "coverage.json"
@@ -391,7 +397,7 @@ def _coverage_checks(
         timeout=timeout,
         coverage_file=coverage_data,
         coverage_site=coverage_site,
-        build_python=dev_python,
+        build_python=build_python or dev_python,
     )
     json_receipt = _run_check(
         "coverage_json",
@@ -492,7 +498,16 @@ def run(
         environment["MTF_UI_JS_DEV"] = "1"
         if node_path is not None:
             environment["MTF_NODE_BIN"] = str(node_path)
-        environment["MTF_LAB_BUILD_PYTHON"] = str(dev_path)
+        # The V2 dev wrapper is suitable for tooling but its nested virtualenv
+        # inherits a base that intentionally omits ``ensurepip``.  Wheel
+        # delivery needs a local build interpreter that can create that nested
+        # environment; prefer the canonical project dev venv when present and
+        # retain the explicit dev path as a fail-closed fallback for clones
+        # without it.  This does not change the runtime or static-tool roles.
+        build_path = root_path / ".venv-dev" / "bin" / "python"
+        if not build_path.is_file() or not os.access(build_path, os.X_OK):
+            build_path = dev_path
+        environment["MTF_LAB_BUILD_PYTHON"] = str(build_path)
         before = delivery.source_manifest(root_path)
         git = delivery.git_snapshot(root_path)
         scope = discover_quality_scope(root_path)
@@ -522,6 +537,7 @@ def run(
                 temporary_root=temporary_root,
                 timeout=timeout,
                 threshold=coverage_threshold,
+                build_python=build_path,
             )
         )
         after = delivery.source_manifest(root_path)
@@ -555,6 +571,7 @@ def run(
             "environment": {
                 "runtime_python": str(runtime_path),
                 "dev_python": str(dev_path),
+                "build_python": str(build_path),
                 "node": str(node_path) if node_path is not None else None,
                 "isolated_state_dir": environment.get("MTF_LAB_STATE_DIR"),
             },

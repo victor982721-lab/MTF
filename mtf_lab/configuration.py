@@ -13,13 +13,15 @@ import os
 import tomllib
 from collections.abc import Mapping
 from copy import deepcopy
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field, fields, replace
+from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
 from .core import IndicatorConfig, StrategyConfig, Timeframe, parse_timeframe
 from .core.canonical import canonical_json, canonical_value
+from .core.market_profiles import MarketProfile, market_profile
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _BUNDLED_CONFIG_ROOT = Path(__file__).resolve().parent / "resources" / "config"
@@ -294,6 +296,9 @@ _SECTION_KEYS: dict[str, set[str]] = {
         "max_relative_take_profit",
         "max_slippage_points",
         "max_holding_seconds",
+        "market_candidate_id",
+        "risk_exit_policy",
+        "risk_calendar",
     },
     "cfd": {
         "economics_version",
@@ -357,6 +362,164 @@ def _read_toml(path: str | Path | None) -> tuple[Path, Mapping[str, Any]]:
 
 def _read_sections(raw: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     return {name: _section(raw, name, allowed) for name, allowed in _SECTION_KEYS.items()}
+
+
+def _market_profile_for_execution(execution: Mapping[str, Any]) -> MarketProfile | None:
+    """Resolve the one canonical market profile selected by the TOML.
+
+    The profile registry is the owner of candidate identity and its causal
+    temporalities.  In particular, a Donchian candidate may intentionally
+    have one timeframe; it must not be expanded to the legacy three-timeframe
+    detector merely because the latter is the older configuration shape.
+    """
+
+    candidate_id = execution.get("market_candidate_id")
+    if candidate_id is None:
+        return None
+    if not isinstance(candidate_id, str) or not candidate_id.strip():
+        raise ConfigError("market_candidate_id debe ser texto no vacío")
+    try:
+        return market_profile(candidate_id)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+
+
+def _calendar_is_modelled(calendar: Mapping[str, Any]) -> bool:
+    """Return whether a calendar is a model/template rather than observed."""
+
+    for key in ("basis", "calendar_basis", "model", "model_id", "calendar_model_id"):
+        value = calendar.get(key)
+        if value is not None and str(value).strip():
+            text = str(value).strip().upper()
+            if key in {"model", "model_id", "calendar_model_id"} or text.startswith(("MODEL", "MODELED")):
+                return True
+    return False
+
+
+def _validate_market_calendar(execution: Mapping[str, Any], calendar: Mapping[str, Any]) -> None:
+    """Keep unknown/modelled calendars in the diagnostic lane only.
+
+    The loader does not invent a calendar or turn an unobserved template into
+    broker evidence.  A candidate can therefore be loaded with an unknown or
+    modelled calendar while execution remains disabled; attempting to enable
+    the DEMO execution gate with either state is rejected instead of silently
+    overriding the user's TOML.
+    """
+
+    if execution.get("enabled") is not True:
+        return
+    if calendar.get("known") is not True:
+        raise ConfigError("execution.risk_calendar desconocido no puede habilitar DEMO")
+    if _calendar_is_modelled(calendar):
+        raise ConfigError("execution.risk_calendar modelado no puede habilitar DEMO")
+
+
+def _market_risk_policy(execution: Mapping[str, Any], profile: MarketProfile | None = None) -> dict[str, Any] | None:
+    """Validate the new opt-in without changing legacy configuration hashes."""
+    from .core.risk_exit import RiskExitPolicy
+
+    if profile is None:
+        profile = _market_profile_for_execution(execution)
+    if profile is None:
+        if "risk_exit_policy" in execution or "risk_calendar" in execution:
+            raise ConfigError("execution.risk_exit_policy/risk_calendar requieren market_candidate_id")
+        return None
+    raw = execution.get("risk_exit_policy", {})
+    if not isinstance(raw, Mapping):
+        raise ConfigError("market_candidate_id debe ser texto y risk_exit_policy una tabla")
+    try:
+        policy = RiskExitPolicy.from_mapping(raw)
+        _validate_market_risk_limits(policy)
+        projected = profile.policy_for(policy)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(str(exc)) from exc
+    if "holding_profile" in raw and policy.holding_profile != profile.holding_profile:
+        raise ConfigError("risk_exit_policy.holding_profile no coincide con el candidato")
+    _validate_market_risk_limits(projected)
+    calendar = execution.get("risk_calendar", {})
+    if not isinstance(calendar, Mapping):
+        raise ConfigError("execution.risk_calendar debe ser una tabla con procedencia")
+    _validate_market_calendar(execution, calendar)
+    # Loading a document is not evidence that its calendar or costs are known;
+    # those gates are assessed against the observed runtime by the executor.
+    return projected.to_dict()
+
+
+def _validate_market_risk_limits(policy: Any) -> None:
+    expected = {
+        "stop_atr_multiple": Decimal("1.5"),
+        "take_profit_atr_multiple": Decimal("3"),
+        "max_positions": 1,
+        "max_intents": 1,
+        "intraday_max_bars": 5,
+        "intraday_max_minutes": Decimal("30"),
+        "multiday_max_hours": Decimal("72"),
+        "multiday_preclose_minutes": Decimal("60"),
+    }
+    for name, value in expected.items():
+        if getattr(policy, name) != value:
+            raise ConfigError(f"risk_exit_policy.{name} difiere de la política congelada")
+    for name, ceiling in (
+        ("planned_risk_fraction", Decimal("0.0025")),
+        ("max_daily_loss_fraction", Decimal("0.01")),
+        ("max_drawdown_fraction", Decimal("0.05")),
+    ):
+        if getattr(policy, name) > ceiling:
+            raise ConfigError(f"risk_exit_policy.{name} excede el máximo acordado")
+
+
+def _market_strategy_identity(
+    strategy: StrategyConfig,
+    execution: Mapping[str, Any],
+    *,
+    symbol: str,
+    price_base: str,
+    timeframes: tuple[Timeframe, ...],
+    profile: MarketProfile | None = None,
+) -> tuple[StrategyConfig, set[str] | None]:
+    """Bind the opt-in profile to the detector that will actually run."""
+    if profile is None:
+        profile = _market_profile_for_execution(execution)
+    if profile is None:
+        return strategy, None
+
+    if symbol.upper().replace("/", "").replace("-", "") != "EURUSD" or price_base != "mid":
+        raise ConfigError("la campaña inicial requiere EUR/USD con análisis mid")
+    if strategy.indicators != IndicatorConfig():
+        raise ConfigError("la campaña inicial conserva EMA20/50, RSI14 y ATR14")
+    configured_timeframes = {timeframe.name for timeframe in timeframes}
+    missing_timeframes = sorted(set(profile.timeframes) - configured_timeframes)
+    if missing_timeframes:
+        raise ConfigError(
+            f"market_candidate_id={profile.candidate_id} requiere temporalidades presentes: {missing_timeframes}"
+        )
+    if str(strategy.name).strip() not in {"trend_pullback_v1", profile.candidate_id}:
+        raise ConfigError("strategy.name no coincide con market_candidate_id")
+    if not profile.is_donchian:
+        _validate_market_trend_profile(strategy, profile.timeframes)
+    return replace(strategy, name=profile.candidate_id), set(profile.timeframes)
+
+
+def _validate_market_trend_profile(strategy: StrategyConfig, timeframes: tuple[str, ...]) -> None:
+    actual = tuple(
+        parse_timeframe(value).name
+        for value in (
+            strategy.context_timeframe,
+            strategy.preparation_timeframe,
+            strategy.trigger_timeframe,
+        )
+    )
+    if actual != timeframes:
+        raise ConfigError("strategy temporalidades no coinciden con market_candidate_id")
+    if (
+        strategy.context_lookback != 3
+        or strategy.preparation_lookback != 3
+        or strategy.max_distance_atr != 0.5
+        or strategy.rsi_threshold != 50
+        or strategy.preparation_ttl_bars != 3
+        or any(strategy.optional_filters.values())
+    ):
+        raise ConfigError("los umbrales iniciales y TTL de la campaña están congelados")
 
 
 def _provider_and_ui(sections: Mapping[str, Mapping[str, Any]]) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -461,7 +624,12 @@ def _resolve_indicators(ind_section: Mapping[str, Any], strategy_section: Mappin
 
 
 def _resolve_strategy(
-    section: Mapping[str, Any], indicators: IndicatorConfig, mode: str, timeframes: tuple[Timeframe, ...]
+    section: Mapping[str, Any],
+    indicators: IndicatorConfig,
+    mode: str,
+    timeframes: tuple[Timeframe, ...],
+    *,
+    market_profile: MarketProfile | None = None,
 ) -> StrategyConfig:
     strategy_data = dict(section)
     strategy_data.pop("indicators", None)
@@ -474,19 +642,30 @@ def _resolve_strategy(
         "atr_period": indicators.atr_period,
     }
     strategy_data["mode"] = mode
-    if not any(
+    has_explicit_timeframes = any(
         key in strategy_data
         for key in ("context_timeframe", "preparation_timeframe", "trigger_timeframe", "setup_timeframe", "timeframes")
-    ):
-        if len(timeframes) < 3:
-            raise ConfigError("se requieren al menos tres temporalidades para trend_pullback_v1")
-        strategy_data.update(
-            {
-                "trigger_timeframe": timeframes[0],
-                "preparation_timeframe": timeframes[1],
-                "context_timeframe": timeframes[2],
-            }
-        )
+    )
+    if not has_explicit_timeframes:
+        # ``StrategyConfig`` is still the compatibility envelope consumed by
+        # legacy callers.  The selected Donchian profile is single-timeframe
+        # and is carried separately by ``market_candidate_id``; do not derive
+        # three market timeframes from the one configured timeframe.
+        is_single_timeframe_market_profile = market_profile is not None and market_profile.is_donchian
+        if not is_single_timeframe_market_profile:
+            if len(timeframes) < 3:
+                raise ConfigError("se requieren al menos tres temporalidades para trend_pullback_v1")
+            timeframe_iter = iter(timeframes)
+            trigger_timeframe = next(timeframe_iter)
+            preparation_timeframe = next(timeframe_iter)
+            context_timeframe = next(timeframe_iter)
+            strategy_data.update(
+                {
+                    "trigger_timeframe": trigger_timeframe,
+                    "preparation_timeframe": preparation_timeframe,
+                    "context_timeframe": context_timeframe,
+                }
+            )
     _validate_optional_filters(strategy_data.get("optional_filters", {}))
     try:
         return StrategyConfig.from_mapping(strategy_data)
@@ -807,6 +986,10 @@ def normalize_simulation_mapping(config: EffectiveConfig | Mapping[str, Any] | N
 def load_config(path: str | Path | None = None) -> EffectiveConfig:
     target, raw = _read_toml(path)
     sections = _read_sections(raw)
+    market_profile = _market_profile_for_execution(sections["execution"])
+    market_policy = _market_risk_policy(sections["execution"], market_profile)
+    if market_policy is not None:
+        sections["execution"]["risk_exit_policy"] = market_policy
     project = sections["project"]
     data_section = sections["data"]
     mode = _resolve_mode(project, data_section)
@@ -814,7 +997,15 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
     symbol, price_base = _resolve_instrument(sections["instrument"], data_section)
     timeframes, closed_only = _resolve_timeframes(sections["timeframes"])
     indicators = _resolve_indicators(sections["indicators"], sections["strategy"])
-    strategy = _resolve_strategy(sections["strategy"], indicators, mode, timeframes)
+    strategy = _resolve_strategy(sections["strategy"], indicators, mode, timeframes, market_profile=market_profile)
+    strategy, market_timeframes = _market_strategy_identity(
+        strategy,
+        sections["execution"],
+        symbol=symbol,
+        price_base=price_base,
+        timeframes=timeframes,
+        profile=market_profile,
+    )
     simulation = _resolve_simulation(sections["simulation"])
     quality = QualityConfig(**sections["quality"])
     required_strategy_tfs = {
@@ -822,7 +1013,7 @@ def load_config(path: str | Path | None = None) -> EffectiveConfig:
         parse_timeframe(strategy.preparation_timeframe).name,
         parse_timeframe(strategy.trigger_timeframe).name,
     }
-    if not required_strategy_tfs.issubset({tf.name for tf in timeframes}):
+    if not (market_timeframes or required_strategy_tfs).issubset({tf.name for tf in timeframes}):
         raise ConfigError("strategy requiere temporalidades presentes en timeframes.values")
     project_name, version, db, logs, data_effective = _resolve_storage_data(
         project,

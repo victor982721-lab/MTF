@@ -712,7 +712,7 @@ class BaselineStrategyAdapter:
 
 @dataclass(frozen=True, slots=True)
 class Donchian20Config:
-    """Configuración fija del challenger Donchian M5."""
+    """Configuración del canal Donchian de 20 barras en un único timeframe."""
 
     lookback: int = 20
     timeframe: Timeframe | str = "M5"
@@ -724,8 +724,6 @@ class Donchian20Config:
         if self.lookback != 20:
             raise ValueError("Donchian20Config exige lookback=20")
         object.__setattr__(self, "timeframe", parse_timeframe(self.timeframe))
-        if parse_timeframe(self.timeframe).name != "M5":
-            raise ValueError("Donchian20Config exige timeframe=M5")
         if not isinstance(self.mode, OperationMode):
             object.__setattr__(self, "mode", OperationMode(str(self.mode).upper()))
         sessions = tuple(str(item).upper() for item in self.allowed_sessions)
@@ -918,8 +916,18 @@ def _donchian_signal(
     )
 
 
-class Donchian20M5Strategy:
-    """Challenger de ruptura causal del canal Donchian de veinte barras M5."""
+def _donchian_variant_name(timeframe: Timeframe | str) -> str:
+    name = parse_timeframe(timeframe).name.lower()
+    return f"donchian20_{name}_v1"
+
+
+class Donchian20Strategy:
+    """Challenger de ruptura causal de veinte barras en un único timeframe.
+
+    The M5 implementation remains available as ``Donchian20M5Strategy``;
+    this general form only changes the configured bar duration and reuses the
+    same previous-closed-bars rule, availability checks and checkpoint shape.
+    """
 
     VERSION = "donchian20_m5_v1"
 
@@ -927,15 +935,19 @@ class Donchian20M5Strategy:
         self,
         config: Donchian20Config | None = None,
         *,
+        timeframe: Timeframe | str | None = None,
         mode: OperationMode | str | None = None,
         allowed_sessions: Sequence[str] = (),
         volatility_threshold: VolatilityRegimeThreshold | None = None,
     ) -> None:
-        if config is not None and (mode is not None or allowed_sessions or volatility_threshold is not None):
+        if config is not None and (
+            timeframe is not None or mode is not None or allowed_sessions or volatility_threshold is not None
+        ):
             raise ValueError("config no puede combinarse con overrides del challenger")
         if config is None:
             selected_mode = OperationMode.REPLAY if mode is None else mode
             config = Donchian20Config(
+                timeframe=timeframe or "M5",
                 mode=selected_mode
                 if isinstance(selected_mode, OperationMode)
                 else OperationMode(str(selected_mode).upper()),
@@ -943,17 +955,18 @@ class Donchian20M5Strategy:
                 volatility_threshold=volatility_threshold,
             )
         self.config = config
-        self.name = self.VERSION
+        self.name = _donchian_variant_name(config.timeframe)
 
     @property
     def config_identity(self) -> str:
         return _strategy_identity(self.config)
 
     def warmup_requirements(self) -> WarmupRequirements:
+        timeframe = parse_timeframe(self.config.timeframe).name
         return WarmupRequirements(
             self.name,
-            {"M5": self.config.lookback},
-            ("canal Donchian usa sólo las 20 barras M5 previas",),
+            {timeframe: self.config.lookback},
+            (f"canal Donchian usa sólo las 20 barras {timeframe} previas",),
         )
 
     def warmup(self) -> WarmupRequirements:
@@ -1036,7 +1049,7 @@ class Donchian20M5Strategy:
             return StrategyOutput(self.name, (), ())
         expected_timeframe = parse_timeframe(self.config.timeframe)
         if any(bar.timeframe != expected_timeframe for bar in bars):
-            raise ValueError("Donchian20M5Strategy sólo acepta barras M5")
+            raise ValueError(f"{self.name} sólo acepta barras {expected_timeframe.name}")
         previous_end: datetime | None = None
         for bar in bars:
             if previous_end is not None and bar.start < previous_end:
@@ -1072,7 +1085,32 @@ class Donchian20M5Strategy:
         if value.config_identity != self.config_identity:
             raise ValueError("config_identity de estrategia no coincide")
         if value.state:
-            raise ValueError("Donchian20M5Strategy no admite estado adicional")
+            raise ValueError(f"{self.name} no admite estado adicional")
+
+
+class Donchian20M5Strategy(Donchian20Strategy):
+    """Compatibility wrapper preserving the original strict M5 challenger."""
+
+    VERSION = "donchian20_m5_v1"
+
+    def __init__(
+        self,
+        config: Donchian20Config | None = None,
+        *,
+        mode: OperationMode | str | None = None,
+        allowed_sessions: Sequence[str] = (),
+        volatility_threshold: VolatilityRegimeThreshold | None = None,
+    ) -> None:
+        super().__init__(
+            config,
+            timeframe=None,
+            mode=mode,
+            allowed_sessions=allowed_sessions,
+            volatility_threshold=volatility_threshold,
+        )
+        if parse_timeframe(self.config.timeframe).name != "M5":
+            raise ValueError("Donchian20M5Strategy exige timeframe=M5")
+        self.name = self.VERSION
 
 
 # Nombres alternativos legibles para integradores que prefieren el orden de
@@ -1080,8 +1118,7 @@ class Donchian20M5Strategy:
 BaselineStrategy = BaselineStrategyAdapter
 BaselineAdapter = BaselineStrategyAdapter
 Donchian20BarsM5Strategy = Donchian20M5Strategy
-Donchian20Strategy = Donchian20M5Strategy
-DonchianStrategy = Donchian20M5Strategy
+DonchianStrategy = Donchian20Strategy
 SignalExplanation = StrategyExplanation
 StrategyEvaluation = StrategyExplanation
 ResearchSignal = StrategySignal

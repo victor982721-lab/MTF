@@ -21,7 +21,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -29,13 +30,17 @@ from typing import Any, Protocol, cast
 
 from ..configuration import EffectiveConfig
 from ..core.canonical import canonical_json, fingerprint
+from ..core.cfd_simulation import CFD_PRODUCT, CFDConfig, CFDSimulationError, CFDSimulator, CFDTrade
 from ..data.ctrader_market import CTraderProvider
 from ..data.ctrader_protocol import PAYLOAD, WireMessage
 from ..data.models import Bar, Event
 from ..runtime import RuntimeCoordinator, runtime_simulation_config
+from .ctrader_paper_adapters import signal_to_cfd_signal, spot_event_to_cfd_quote
 from .persistence import IdempotencyConflict, SQLiteStore, payload_hash
 
 WATCH_CHECKPOINT_VERSION = 1
+PAPER_WATCH_CHECKPOINT_VERSION = 1
+PAPER_WATCH_VARIANT = "ctrader_watch_cfd_paper"
 _CONTROL_PAYLOADS = frozenset(
     PAYLOAD[name]
     for name in (
@@ -116,6 +121,13 @@ class CTraderWatchContext:
     monotonic: Callable[[], float] | None = None
     close_provider: bool = True
     on_initialized: Callable[[str, str], None] | None = None
+    # The PAPER product is local-only and has no transport side effects.  It
+    # is enabled by default so the cTrader observation route exercises the
+    # complete SpotEvent -> signal -> bid/ask fill path rather than silently
+    # stopping at the detector.  Callers may supply an explicit CFD mapping
+    # when the profile does not contain a ``[cfd]`` section.
+    paper_enabled: bool = True
+    paper_config: CFDConfig | Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +156,8 @@ class CTraderWatchResult:
     resumed: bool
     status: Mapping[str, Any]
     provenance: Mapping[str, Any]
+    paper_analysis_id: str | None = None
+    paper: Mapping[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -170,6 +184,8 @@ class CTraderWatchResult:
             "resumed": self.resumed,
             "status": dict(self.status),
             "provenance": dict(self.provenance),
+            "paper_analysis_id": self.paper_analysis_id,
+            "paper": dict(self.paper),
         }
 
 
@@ -465,6 +481,222 @@ def _stop_is_set(value: StopSignal | None) -> bool:
     return bool(value is not None and value.is_set())
 
 
+class _WatchPaper:
+    """Small local PAPER sink for one cTrader watch session.
+
+    The watch already owns the only provider reader and the only
+    ``RuntimeCoordinator``.  This sink therefore consumes detector deltas and
+    normalized ``Event`` objects; it never creates another reader, indicator
+    engine, strategy, socket, OAuth client, or broker order path.
+    """
+
+    def __init__(
+        self,
+        *,
+        store: SQLiteStore,
+        session_id: str,
+        config: EffectiveConfig,
+        paper_config: CFDConfig | Mapping[str, Any] | None,
+        semantic_identity: str,
+        runtime_analysis_id: str,
+    ) -> None:
+        raw_config: CFDConfig | Mapping[str, Any]
+        if paper_config is None:
+            values = dict(config.cfd)
+            values.setdefault("instrument", config.instrument)
+            raw_config = values
+        elif isinstance(paper_config, CFDConfig):
+            raw_config = paper_config
+        else:
+            values = dict(paper_config)
+            values.setdefault("instrument", config.instrument)
+            raw_config = values
+        try:
+            self.config = raw_config if isinstance(raw_config, CFDConfig) else CFDConfig.from_mapping(raw_config)
+        except (CFDSimulationError, TypeError, ValueError) as exc:
+            raise CTraderWatchError(f"configuración CFD PAPER inválida: {exc}") from exc
+        expected = str(config.instrument).strip().upper().replace("-", "/")
+        if self.config.instrument != expected:
+            raise CTraderWatchError("configuración CFD PAPER usa otro instrumento")
+        self.store = store
+        self.session_id = session_id
+        self.application_config_hash = config.config_hash
+        self.analysis_id = store.create_analysis(
+            session_id,
+            dataset_hash=f"ctrader-watch:{semantic_identity}",
+            config_hash=self.config.config_hash,
+            variant=PAPER_WATCH_VARIANT,
+            contract_hash=self.config.config_hash,
+            partition="paper",
+            code_version=config.version,
+            identity_extra={
+                "paper_watch_version": PAPER_WATCH_CHECKPOINT_VERSION,
+                "runtime_analysis_id": runtime_analysis_id,
+                "semantic_identity": semantic_identity,
+            },
+        )
+        self._issues: deque[str] = deque(maxlen=256)
+        self._resumed = False
+        self.simulator = CFDSimulator(self.config, terminal_lookup=self._lookup_terminal)
+
+    def _lookup_terminal(self, trade_id: str) -> CFDTrade | None:
+        row = self.store.get_cfd_trade(self.session_id, self.analysis_id, trade_id)
+        if row is None:
+            return None
+        payload = row.get("payload") if isinstance(row, Mapping) else None
+        source = payload if isinstance(payload, Mapping) else row
+        if not isinstance(source, Mapping):
+            raise CTraderWatchError("fila CFD PAPER sin payload recuperable")
+        try:
+            trade = CFDTrade.from_mapping(source)
+        except (CFDSimulationError, TypeError, ValueError) as exc:
+            raise CTraderWatchError(f"fila CFD PAPER inválida: {exc}") from exc
+        return trade if trade.is_terminal else None
+
+    def _persist(self, trades: Iterable[CFDTrade]) -> None:
+        for trade in trades:
+            self.store.save_cfd_trade(
+                self.session_id,
+                self.analysis_id,
+                trade,
+                variant=PAPER_WATCH_VARIANT,
+                partition="paper",
+                analysis_config_hash=self.application_config_hash,
+                contract_hash=self.config.config_hash,
+            )
+
+    def _issue(self, reason: str, *, quote_id: str | None = None) -> None:
+        value = str(reason).strip() or "UNKNOWN"
+        self._issues.append(f"paper_quote_blocked:{quote_id}:{value}" if quote_id else f"paper:{value}")
+
+    def note(self, reason: str) -> None:
+        """Retain a bounded product diagnostic without changing state."""
+
+        self._issue(reason)
+
+    def _event_admissible(self, event: Event) -> bool:
+        metadata = event.metadata if isinstance(event.metadata, Mapping) else {}
+        quote_id = event.source_event_id or event.data_id
+        if event.is_snapshot:
+            self._issue("SNAPSHOT", quote_id=quote_id)
+            return False
+        if event.bid is None:
+            self._issue("MISSING_BID", quote_id=quote_id)
+            return False
+        if event.ask is None:
+            self._issue("MISSING_ASK", quote_id=quote_id)
+            return False
+        # Equality is not a zero-spread executable quote.  It is the same
+        # crossed/invalid class as bid > ask and must not be normalized away.
+        if event.bid >= event.ask:
+            self._issue("CROSSED", quote_id=quote_id)
+            return False
+        if bool(metadata.get("partial_update", False)):
+            self._issue("PARTIAL_UPDATE", quote_id=quote_id)
+            return False
+        quality_state = str(metadata.get("quality_state", "")).strip().upper()
+        if quality_state and quality_state != "VALID":
+            self._issue(f"QUALITY_{quality_state}", quote_id=quote_id)
+            return False
+        if "quote_usable" in metadata and metadata.get("quote_usable") is not True:
+            self._issue("QUOTE_NOT_USABLE", quote_id=quote_id)
+            return False
+        return True
+
+    def on_signal(self, signal: Any, *, capture_hash: str) -> None:
+        try:
+            converted = signal_to_cfd_signal(signal, capture_hash=capture_hash)
+            trades = self.simulator.submit_all(converted)
+        except (CFDSimulationError, TypeError, ValueError) as exc:
+            self._issue(f"SIGNAL_{getattr(exc, 'code', type(exc).__name__)}")
+            return
+        self._persist(trades)
+
+    def on_event(self, event: Event, *, capture_hash: str) -> None:
+        if not self._event_admissible(event):
+            return
+        try:
+            quote = spot_event_to_cfd_quote(event, capture_hash=capture_hash)
+            changed = self.simulator.on_quote(quote)
+        except (CFDSimulationError, TypeError, ValueError) as exc:
+            self._issue(getattr(exc, "code", type(exc).__name__), quote_id=event.source_event_id or event.data_id)
+            return
+        self._persist(changed)
+
+    def advance(self, watermark: datetime) -> None:
+        current = watermark.astimezone(UTC)
+        previous = self.simulator.snapshot().get("last_watermark")
+        if previous is not None:
+            previous_dt = datetime.fromisoformat(str(previous).replace("Z", "+00:00"))
+            if current < previous_dt:
+                # A caller's wall clock can lag the provider's stamped
+                # availability (notably after a bounded resume).  Do not
+                # move the PAPER clock backwards or turn this observation
+                # mismatch into a fake expiry; the next monotone quote/clock
+                # event remains authoritative.
+                return
+        self._persist(self.simulator.advance(current, capture_complete=False))
+
+    def disconnect(self, *, reason: str = "DISCONNECTED") -> None:
+        self.simulator.disconnect(reason=reason)
+
+    def reconnect(self, generation: int | None = None) -> None:
+        self.simulator.reconnect(generation)
+
+    def restore(self, state: Mapping[str, Any], *, generation: int | None = None) -> None:
+        if state.get("version") != PAPER_WATCH_CHECKPOINT_VERSION:
+            raise CTraderWatchError("versión de checkpoint PAPER cTrader incompatible")
+        if str(state.get("analysis_id")) != self.analysis_id:
+            raise CTraderWatchError("checkpoint PAPER pertenece a otro análisis")
+        snapshot = state.get("simulator")
+        if not isinstance(snapshot, Mapping):
+            raise CTraderWatchError("checkpoint PAPER sin snapshot del simulador")
+        try:
+            # Restore the durable trade/cursor ledger first.  ``reconnect``
+            # immediately clears the restored in-memory quote book and forces
+            # a fresh baseline; a prior process's quote can never fill a new
+            # signal after resume.
+            self.simulator.restore(snapshot, config=self.config)
+            self.simulator.reconnect(generation)
+            # ``ingest_sequence`` is owned by the newly prepared cTrader
+            # reader and may restart at zero.  The watch capture cursor and
+            # market/availability clock remain the durable ordering proofs;
+            # retaining the old process-local sequence would reject every
+            # post-resume quote as out of order.
+            self.simulator._last_sequence = None
+        except (CFDSimulationError, TypeError, ValueError) as exc:
+            raise CTraderWatchError(f"checkpoint PAPER inválido: {exc}") from exc
+        for item in state.get("issues", ()):
+            self._issues.append(str(item))
+        self._resumed = True
+
+    def checkpoint(self) -> dict[str, Any]:
+        return {
+            "version": PAPER_WATCH_CHECKPOINT_VERSION,
+            "analysis_id": self.analysis_id,
+            "simulator": self.simulator.snapshot(),
+            "issues": list(self._issues),
+        }
+
+    def projection(self) -> dict[str, Any]:
+        counters = dict(self.simulator.counters)
+        return {
+            "enabled": True,
+            "product": CFD_PRODUCT,
+            "variant": PAPER_WATCH_VARIANT,
+            "analysis_id": self.analysis_id,
+            "capture_complete": False,
+            "finished": self.simulator.finished,
+            "resumed": self._resumed,
+            "trades": [trade.to_dict() for trade in self.simulator.trades],
+            "counters": counters,
+            "issues": list(self._issues),
+            "connected": self.simulator._connected,
+            "session_generation": self.simulator.session_generation,
+            "snapshot_hash": self.simulator.snapshot()["snapshot_hash"],
+        }
+
+
 class CTraderWatchRunner:
     """Run one bounded read-only slice against a prepared provider."""
 
@@ -497,12 +729,28 @@ class CTraderWatchRunner:
         self._resumed = False
         self._run_messages_start = 0
         self._run_events_start = 0
+        if not isinstance(context.paper_enabled, bool):
+            raise CTraderWatchError("paper_enabled debe ser booleano")
+        self._paper: _WatchPaper | None = None
+        self._last_record_signals: tuple[Any, ...] = ()
+        self._last_decorated_record: Event | Bar | None = None
 
     @property
     def coordinator(self) -> RuntimeCoordinator:
         if self._coordinator is None:
             raise RuntimeError("runner no inicializado")
         return self._coordinator
+
+    @property
+    def last_record_signals(self) -> tuple[Any, ...]:
+        """Signals emitted by the last transition, independent of history retention."""
+        return self._last_record_signals
+
+    @property
+    def paper(self) -> _WatchPaper | None:
+        """The local PAPER sink, when enabled for this watch session."""
+
+        return self._paper
 
     def _semantic_identity(self) -> str:
         spec = getattr(self.context.provider, "spec", None)
@@ -699,6 +947,28 @@ class CTraderWatchRunner:
                 "synthetic": self.metadata.synthetic,
             },
         )
+        if self.context.paper_enabled:
+            self._paper = _WatchPaper(
+                store=self.context.store,
+                session_id=session_id,
+                config=self.context.config,
+                paper_config=self.context.paper_config,
+                semantic_identity=self.semantic_identity,
+                runtime_analysis_id=self.coordinator.analysis_id,
+            )
+            if self._previous_watch is not None:
+                previous_paper = self._previous_watch.get("paper")
+                if isinstance(previous_paper, Mapping):
+                    self._paper.restore(
+                        previous_paper,
+                        generation=_parse_generation(getattr(self.context.provider, "generation", None)),
+                    )
+                else:
+                    # A checkpoint created before the PAPER sink was added is
+                    # still readable, but it cannot prove the prior product
+                    # state.  Start only the new local namespace and expose
+                    # the missing evidence instead of claiming a resume.
+                    self._paper.note("PAPER_STATE_UNAVAILABLE_ON_RESUME")
         # A bounded slice is resumable, not terminal.  PAUSED is intentionally
         # outside RuntimeCoordinator's terminal blocking states.
         self.coordinator.capture_state = "CAPTURING"
@@ -733,7 +1003,7 @@ class CTraderWatchRunner:
     def _watch_state(self) -> dict[str, Any]:
         provider = self.context.provider
         quote_state = provider.snapshot_quote_state() if hasattr(provider, "snapshot_quote_state") else None
-        return {
+        state = {
             "version": WATCH_CHECKPOINT_VERSION,
             "semantic_identity": self.semantic_identity,
             "data_chain": self._chain,
@@ -751,6 +1021,9 @@ class CTraderWatchRunner:
             "provider_quote_state": quote_state,
             "execution_enabled": False,
         }
+        if self._paper is not None:
+            state["paper"] = self._paper.checkpoint()
+        return state
 
     def _checkpoint(self) -> None:
         with self.context.store.atomic_batch():
@@ -776,6 +1049,10 @@ class CTraderWatchRunner:
             )
         self.stats.checkpoint_events = self.stats.events
 
+    def _paper_reconnect(self, generation: int) -> None:
+        if self._paper is not None:
+            self._paper.reconnect(generation)
+
     def _observe_generation(self, generation: int | None) -> None:
         if generation is None:
             return
@@ -796,6 +1073,7 @@ class CTraderWatchRunner:
             self.stats.last_generation = generation
             self._generation_recovery_pending = True
             self.context.provider.reset_generation(generation)
+            self._paper_reconnect(generation)
             self.coordinator.update_feed_state(
                 connection="CONNECTED",
                 reconciliation="NEEDS_RECONCILIATION",
@@ -816,6 +1094,7 @@ class CTraderWatchRunner:
             self._generation_recovery_pending = True
             self._recovery_verified = False
             self.context.provider.reset_generation(generation)
+            self._paper_reconnect(generation)
             self.coordinator.update_feed_state(
                 connection="CONNECTED",
                 reconciliation="NEEDS_RECONCILIATION",
@@ -903,24 +1182,93 @@ class CTraderWatchRunner:
         )
 
     def _process_record(self, record: Event | Bar, raw_synthetic: bool) -> bool:
+        self._last_record_signals = ()
         decorated = _decorate_record(record, self.metadata, raw_synthetic)
+        self._last_decorated_record = decorated
         self._recover_after_quote(decorated)
+        basis = str(self.context.config.price_base).strip().lower()
+        analysis_record = (isinstance(decorated, Event) and basis in {"mid", "bid", "ask"}) or (
+            isinstance(decorated, Bar) and basis == "native"
+        )
         if isinstance(decorated, Event) and decorated.is_snapshot:
             self.coordinator.capture_only(decorated)
             self.stats.snapshots += 1
+        elif not analysis_record:
+            # A SpotEvent may carry a native trendbar for evidence.  When the
+            # configured analysis basis is bid/ask/mid, persist that bar but
+            # do not feed it into the MTF detector: doing so would create a
+            # price_base_mismatch and silently suppress every later signal.
+            # The converse keeps a native-only context from treating a quote
+            # as an OHLC bar.
+            self.coordinator.capture_only(decorated)
         else:
-            self.coordinator.process(decorated)
-        if self.mode == "LIVE" and not self._generation_recovery_pending:
-            self.coordinator.update_feed_state(
-                connection="CONNECTED",
-                freshness="VALID",
-                reconciliation="VERIFIED" if self._feed_verified else self.coordinator.reconciliation_state,
-            )
+            result = self.coordinator.process(decorated)
+            self._last_record_signals = tuple(result.signals)
+            if self._paper is not None:
+                for signal in self._last_record_signals:
+                    self._paper.on_signal(signal, capture_hash=self._chain)
+        self._update_live_freshness(decorated)
         self._chain = _append_chain(self._chain, _semantic_record(decorated))
         self.stats.events += 1
         if isinstance(decorated, Bar):
             self.stats.bars += 1
         return True
+
+    def _paper_on_events(self, events: Iterable[Event]) -> None:
+        if self._paper is None:
+            return
+        for event in events:
+            self._paper.on_event(event, capture_hash=self._chain)
+
+    def _advance_paper(self, watermark: datetime) -> None:
+        if self._paper is not None:
+            self._paper.advance(watermark)
+
+    @staticmethod
+    def _live_event_usable(event: Event) -> bool:
+        metadata = event.metadata if isinstance(event.metadata, Mapping) else {}
+        return (
+            not event.is_snapshot
+            and event.bid is not None
+            and event.ask is not None
+            and event.bid < event.ask
+            and metadata.get("quality_state") == "VALID"
+            and metadata.get("quote_usable") is True
+            and not bool(metadata.get("partial_update", False))
+        )
+
+    def _update_live_freshness(self, record: Event | Bar) -> None:
+        """Project provider quote quality without turning bars into health."""
+
+        if self.mode != "LIVE" or self._generation_recovery_pending or not isinstance(record, Event):
+            return
+        blocked = [
+            reason
+            for reason in self.coordinator.external_blocked_reasons
+            if reason not in {"feed_stale", "quote_invalid", "quote_partial", "quote_snapshot"}
+        ]
+        if self._live_event_usable(record):
+            self.coordinator.update_feed_state(
+                connection="CONNECTED",
+                freshness="VALID",
+                reconciliation=self.coordinator.reconciliation_state,
+                blocked_reasons=blocked,
+            )
+            return
+        metadata = record.metadata if isinstance(record.metadata, Mapping) else {}
+        reason = (
+            "quote_partial"
+            if bool(metadata.get("partial_update", False))
+            else "quote_snapshot"
+            if record.is_snapshot
+            else "quote_invalid"
+        )
+        self.coordinator.update_feed_state(
+            connection="CONNECTED",
+            freshness="BLOCKED",
+            reconciliation=self.coordinator.reconciliation_state,
+            blocked_reasons=(*blocked, reason),
+        )
 
     def _process_message(self, message: WireMessage) -> None:
         if self._resume_duplicate(message):
@@ -932,12 +1280,17 @@ class CTraderWatchRunner:
         payload_type = message.payload_type_id
         if payload_type == PAYLOAD["PROTO_HEARTBEAT_EVENT"]:
             self.stats.heartbeats += 1
-            self.coordinator.heartbeat(message.available_at or message.received_at or self._clock())
+            watermark = message.available_at or message.received_at or self._clock()
+            self.coordinator.heartbeat(watermark)
+            if self._paper is not None:
+                self._paper.advance(watermark)
             return
         if payload_type in _CONTROL_PAYLOADS or message.message_class == "connection":
             generation = _parse_generation(message.connection_generation)
             if generation is not None:
                 self.context.provider.reset_discontinuity("SESSION_CONTROL", generation=generation)
+            if self._paper is not None:
+                self._paper.disconnect(reason="SESSION_CONTROL")
             self._generation_recovery_pending = True
             self._recovery_verified = False
             self.coordinator.update_feed_state(
@@ -962,8 +1315,17 @@ class CTraderWatchRunner:
             generation=_parse_generation(message.connection_generation),
         )
         raw_synthetic = self._raw_synthetic(message)
+        paper_events: list[Event] = []
         for record in normalized.records:
             self._process_record(record, raw_synthetic)
+            if isinstance(self._last_decorated_record, Event):
+                paper_events.append(self._last_decorated_record)
+        # Deliver quotes after the message's detector records.  This keeps a
+        # signal emitted at the close of the current bar causal while still
+        # allowing its own valid bid/ask observation to be the first eligible
+        # PAPER fill.  No quote is reconstructed from a bar or from a missing
+        # side; only normalized Event records cross this boundary.
+        self._paper_on_events(paper_events)
 
     def _poll_timeout(self, started: float, now: float) -> float:
         elapsed = now - started
@@ -1034,7 +1396,7 @@ class CTraderWatchRunner:
 
     def _status_mapping(self) -> dict[str, Any]:
         status = self.coordinator.status()
-        return {
+        result = {
             "capture_id": status.capture_id,
             "analysis_id": status.analysis_id,
             "mode": status.mode,
@@ -1054,13 +1416,34 @@ class CTraderWatchRunner:
             "block_details": dict(status.block_details),
             "block_history": list(status.block_history),
         }
+        if self._paper is not None:
+            paper = self._paper.projection()
+            result["paper_analysis_id"] = self._paper.analysis_id
+            result["paper"] = {
+                "enabled": True,
+                "product": paper["product"],
+                "trades": len(paper["trades"]),
+                "filled": paper["counters"].get("fills", 0),
+                "closed": paper["counters"].get("closures", 0),
+                "unknown": paper["counters"].get("unknown", 0),
+                "quote_rejections": len(paper["issues"]),
+            }
+        else:
+            result["paper"] = {"enabled": False}
+        return result
 
     def _result(self, stop_reason: WatchStopReason, started: float, clean_stop: bool) -> CTraderWatchResult:
+        paper = self._paper.projection() if self._paper is not None else {"enabled": False}
         result_identity = fingerprint(
             {
                 "semantic_identity": self.semantic_identity,
                 "data_semantic_hash": self._chain,
                 "signals": [_semantic_signal(item) for item in self.coordinator.signals],
+                "paper": {
+                    "trades": paper.get("trades", ()),
+                    "counters": paper.get("counters", {}),
+                    "issues": paper.get("issues", ()),
+                },
             }
         )
         now = self._monotonic()
@@ -1087,6 +1470,8 @@ class CTraderWatchRunner:
             self._resumed,
             self._status_mapping(),
             self.metadata.to_dict(),
+            self._paper.analysis_id if self._paper is not None else None,
+            paper,
         )
 
     def _cleanup(self, clean_stop: bool) -> BaseException | None:
@@ -1101,6 +1486,7 @@ class CTraderWatchRunner:
                     first_error = exc
 
         if self._coordinator is not None:
+            attempt(lambda: self._advance_paper(self._clock()))
             attempt(lambda: self.coordinator.advance(self._clock(), complete=False))
             if clean_stop:
                 self.coordinator.capture_state = "PAUSED"
@@ -1193,6 +1579,8 @@ __all__ = [
     "CTraderWatchOptions",
     "CTraderWatchResult",
     "CTraderWatchRunner",
+    "PAPER_WATCH_CHECKPOINT_VERSION",
+    "PAPER_WATCH_VARIANT",
     "WATCH_CHECKPOINT_VERSION",
     "WatchStopReason",
     "run_ctrader_watch",

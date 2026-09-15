@@ -14,11 +14,13 @@ import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation, localcontext
 from enum import StrEnum
 from typing import Any, Literal, TypeAlias
 
 from .ctrader_accounts import normalize_account_payload
 from .ctrader_config import CTraderConfig, normalize_symbol_name
+from .ctrader_diagnostics import CTraderSpotDiagnostic, build_spot_diagnostic
 from .ctrader_errors import (
     AuthState,
     CTraderAuthError,
@@ -31,6 +33,7 @@ from .ctrader_protocol import (
     TREND_PERIODS,
     DependencyReport,
     WireMessage,
+    field_present,
     jsonable,
     message_to_mapping,
     read_field,
@@ -290,6 +293,189 @@ class CTraderFetchResult:
             "request": self.request.to_dict(),
             "response_type": self.response.payload_type_name,
         }
+
+
+TickQuoteType: TypeAlias = Literal["BID", "ASK"]
+
+
+@dataclass(frozen=True, slots=True)
+class CTraderTick:
+    """One native, one-sided historical cTrader tick.
+
+    ``ProtoOAGetTickDataRes`` returns either bid or ask data per request; it
+    does not return a paired quote.  This record therefore deliberately has a
+    single ``price`` and an explicit ``quote_type`` instead of manufacturing a
+    bid/ask pair from two independent requests.
+    """
+
+    symbol: str
+    symbol_id: int
+    quote_type: TickQuoteType
+    event_time: datetime
+    price: Decimal
+    raw_tick: int
+    received_at: datetime
+    available_at: datetime
+    absolute_raw_tick: int | None = None
+    raw_tick_delta: int | None = None
+    page: int = 0
+    ordinal: int = 0
+    timestamp_delta_ms: int | None = None
+    source: str = "ctrader-open-api"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        symbol = _tick_symbol(self.symbol)
+        _tick_symbol_id(self.symbol_id)
+        quote_type, _ = _tick_quote_type(self.quote_type)
+        event_time, received_at, available_at = _tick_times(self.event_time, self.received_at, self.available_at)
+        raw_tick = _tick_raw_value(self.raw_tick)
+        absolute_raw_tick = _tick_absolute_raw_value(self.absolute_raw_tick, raw_tick)
+        raw_tick_delta = _tick_raw_delta_value(self.raw_tick_delta, raw_tick)
+        price = _tick_decimal_price(self.price)
+        _tick_position(self.page, self.ordinal)
+        _tick_delta(self.timestamp_delta_ms)
+        metadata = _tick_metadata(self.metadata)
+        object.__setattr__(self, "symbol", symbol)
+        object.__setattr__(self, "quote_type", quote_type)
+        object.__setattr__(self, "event_time", event_time)
+        object.__setattr__(self, "received_at", received_at)
+        object.__setattr__(self, "available_at", available_at)
+        object.__setattr__(self, "price", price)
+        object.__setattr__(self, "raw_tick", raw_tick)
+        object.__setattr__(self, "absolute_raw_tick", absolute_raw_tick)
+        object.__setattr__(self, "raw_tick_delta", raw_tick_delta)
+        object.__setattr__(self, "source", str(self.source).strip() or "unknown")
+        object.__setattr__(self, "metadata", metadata)
+
+    @property
+    def price_basis(self) -> str:
+        """The one observed side; never a reconstructed ``mid``/BBO."""
+
+        return self.quote_type.lower()
+
+    @property
+    def native(self) -> bool:
+        return True
+
+    @property
+    def timestamp(self) -> datetime:
+        return self.event_time
+
+    @property
+    def source_record_id(self) -> str:
+        return (
+            "ctrader-tick-"
+            + stable_hash(
+                {
+                    "source": self.source,
+                    "symbol_id": self.symbol_id,
+                    "quote_type": self.quote_type,
+                    "event_time_ms": _unix_ms(self.event_time),
+                    "raw_tick": self.raw_tick,
+                    "absolute_raw_tick": self.absolute_raw_tick,
+                    "raw_tick_delta": self.raw_tick_delta,
+                    "page": self.page,
+                    "ordinal": self.ordinal,
+                }
+            )[:32]
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "record_type": "ctrader_tick",
+            "source_record_id": self.source_record_id,
+            "source": self.source,
+            "symbol": self.symbol,
+            "symbol_id": self.symbol_id,
+            "quote_type": self.quote_type,
+            "price_basis": self.price_basis,
+            "native": True,
+            "event_time": _iso(self.event_time),
+            "timestamp_ms": _unix_ms(self.event_time),
+            "price": str(self.price),
+            "raw_tick": self.raw_tick,
+            "absolute_raw_tick": self.absolute_raw_tick,
+            "raw_tick_delta": self.raw_tick_delta,
+            "received_at": _iso(self.received_at),
+            "available_at": _iso(self.available_at),
+            "page": self.page,
+            "ordinal": self.ordinal,
+            "timestamp_delta_ms": self.timestamp_delta_ms,
+            "metadata": jsonable(self.metadata),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class CTraderTickDataResult:
+    """Bounded paginated result for one cTrader bid/ask tick side."""
+
+    ticks: tuple[CTraderTick, ...]
+    quote_type: TickQuoteType
+    symbol: CTraderInstrumentSpec
+    from_timestamp: datetime
+    to_timestamp: datetime
+    pages: int
+    complete: bool
+    has_more: bool
+    issues: tuple[str, ...] = ()
+    raw_pages: tuple[Mapping[str, Any], ...] = ()
+    page_metadata: tuple[Mapping[str, Any], ...] = ()
+
+    def __post_init__(self) -> None:
+        quote_type, _ = _tick_quote_type(self.quote_type)
+        start = ensure_utc(self.from_timestamp, field_name="from_timestamp")
+        end = ensure_utc(self.to_timestamp, field_name="to_timestamp")
+        if start > end:
+            raise CTraderConfigurationError("from_timestamp no puede ser posterior a to_timestamp")
+        if isinstance(self.pages, bool) or not isinstance(self.pages, int) or self.pages < 0:
+            raise CTraderDataError("tick pages debe ser entero no negativo")
+        if not isinstance(self.complete, bool) or not isinstance(self.has_more, bool):
+            raise CTraderDataError("tick complete/has_more deben ser booleanos")
+        if any(not isinstance(item, CTraderTick) for item in self.ticks):
+            raise CTraderDataError("ticks debe contener CTraderTick")
+        if any(
+            item.quote_type != quote_type
+            or item.symbol != self.symbol.symbol
+            or item.symbol_id != self.symbol.symbol_id
+            or not start <= item.event_time <= end
+            for item in self.ticks
+        ):
+            raise CTraderDataError("tick no coincide con la identidad o ventana del resultado")
+        object.__setattr__(self, "quote_type", quote_type)
+        object.__setattr__(self, "from_timestamp", start)
+        object.__setattr__(self, "to_timestamp", end)
+        object.__setattr__(self, "ticks", tuple(self.ticks))
+        object.__setattr__(self, "issues", tuple(str(item) for item in self.issues))
+        object.__setattr__(self, "raw_pages", tuple(self.raw_pages))
+        object.__setattr__(self, "page_metadata", tuple(self.page_metadata))
+
+    def __iter__(self) -> Iterator[CTraderTick]:
+        return iter(self.ticks)
+
+    def __len__(self) -> int:
+        return len(self.ticks)
+
+    def to_dict(self, *, include_ticks: bool = False) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "quote_type": self.quote_type,
+            "symbol": self.symbol.to_dict(),
+            "from_timestamp": _iso(self.from_timestamp),
+            "to_timestamp": _iso(self.to_timestamp),
+            "source_order": "newest_first",
+            "timestamp_encoding": "first_absolute_ms_then_deltas_ms",
+            "price_encoding": "first_absolute_relative_then_deltas",
+            "count": len(self.ticks),
+            "pages": self.pages,
+            "complete": self.complete,
+            "has_more": self.has_more,
+            "issues": list(self.issues),
+            "raw_page_count": len(self.raw_pages),
+            "page_receipt_count": len(self.page_metadata),
+        }
+        if include_ticks:
+            result["ticks"] = [item.to_dict() for item in self.ticks]
+        return result
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,19 +763,36 @@ class CTraderProvider:
         raw_bars = read_repeated(response.payload, "trendbar", "trendbars")
         bars: list[Bar] = []
         issues: list[str] = []
-        for raw in raw_bars:
-            try:
-                bars.append(
-                    normalize_trendbar(
-                        raw,
-                        spec=spec,
-                        received_at=received,
-                        request_id=response.client_msg_id or "history",
-                        mode="REPLAY",
+        response_period = read_field(response.payload, "period", default=None)
+        try:
+            # ProtoOAGetTrendbarsRes.period is the response-level context for
+            # a ProtoOATrendbar whose optional period field is absent.  Check
+            # it once against the request before normalizing any child bars;
+            # a mismatched page must not be relabeled with the requested
+            # timeframe.
+            _resolve_trendbar_period(
+                None,
+                requested_period=period,
+                response_period=response_period,
+            )
+        except (CTraderConfigurationError, CTraderDataError) as exc:
+            issues.append(str(exc))
+        else:
+            for raw in raw_bars:
+                try:
+                    bars.append(
+                        normalize_trendbar(
+                            raw,
+                            spec=spec,
+                            received_at=received,
+                            requested_period=period,
+                            response_period=response_period,
+                            request_id=response.client_msg_id or "history",
+                            mode="REPLAY",
+                        )
                     )
-                )
-            except CTraderDataError as exc:
-                issues.append(str(exc))
+                except CTraderDataError as exc:
+                    issues.append(str(exc))
         bars.sort(key=lambda item: item.interval_start)
         actual_request = WireMessage(request.payload_type, request.payload, response.client_msg_id, False)
         has_more = bool(read_field(response.payload, "hasMore", "has_more", default=False))
@@ -599,6 +802,109 @@ class CTraderProvider:
 
     fetch_bars = fetch
     fetch_trendbars = fetch
+
+    def fetch_tick_data(
+        self,
+        quote_type: str | int = "BID",
+        *,
+        from_timestamp: datetime | None = None,
+        to_timestamp: datetime | None = None,
+        max_pages: int = 20,
+    ) -> CTraderTickDataResult:
+        """Fetch one bounded, native cTrader bid or ask tick series.
+
+        cTrader returns each page newest-first.  The first page timestamp is
+        absolute milliseconds and later timestamps are deltas from the prior
+        item, so pagination and normalization must reconstruct the page before
+        choosing its oldest boundary.  Bid and ask are intentionally fetched
+        and returned independently; this method never joins two requests into
+        a synthetic quote.
+        """
+
+        account_id = self._require_authenticated()
+        spec = self._ensure_symbol()
+        quote_name, quote_code = _tick_quote_type(quote_type)
+        start, end, start_ms, end_ms = _tick_window(from_timestamp, to_timestamp)
+        if isinstance(max_pages, bool) or not isinstance(max_pages, int) or max_pages <= 0:
+            raise CTraderConfigurationError("max_pages debe ser entero positivo")
+
+        ticks: list[CTraderTick] = []
+        issues: list[str] = []
+        raw_pages: list[Mapping[str, Any]] = []
+        page_metadata: list[Mapping[str, Any]] = []
+        cursor_to_ms = end_ms
+        pages = 0
+        has_more = False
+
+        while pages < max_pages:
+            params: dict[str, Any] = {
+                "ctidTraderAccountId": account_id,
+                "symbolId": spec.symbol_id,
+                "type": quote_code,
+                "fromTimestamp": start_ms,
+                "toTimestamp": cursor_to_ms,
+            }
+            request = WireMessage("PROTO_OA_GET_TICKDATA_REQ", params, None, False)
+            response = self.client.request(request.payload_type, request.payload)
+            pages += 1
+            received = response.received_at or self._clock()
+            available = response.available_at or received
+            page_ticks, page_issues, page_has_more, raw_page, receipt = _normalize_tick_response(
+                response,
+                request,
+                account_id=account_id,
+                spec=spec,
+                quote_type=quote_name,
+                from_ms=start_ms,
+                to_ms=end_ms,
+                received_at=received,
+                available_at=available,
+                page=pages - 1,
+            )
+            raw_pages.append(raw_page)
+            page_metadata.append(receipt)
+            issues.extend(page_issues)
+            ticks.extend(page_ticks)
+            has_more = page_has_more
+            if page_issues:
+                break
+            if not page_ticks:
+                issues.append("tick_data sin registros válidos; cobertura incompleta")
+                break
+            if not has_more:
+                break
+            last_ms = receipt["last_timestamp_ms"]
+            if not isinstance(last_ms, int):
+                issues.append("tick_data hasMore sin timestamp de progreso; cobertura incompleta")
+                break
+            if last_ms <= start_ms or last_ms >= cursor_to_ms:
+                issues.append("tick_data hasMore sin progreso temporal; cobertura incompleta")
+                break
+            cursor_to_ms = last_ms - 1
+        else:
+            if has_more:
+                issues.append("tick_data excedió max_pages; cobertura incompleta")
+
+        ordered_ticks = tuple(sorted(ticks, key=lambda item: (item.event_time, item.page, item.ordinal)))
+        if not ordered_ticks:
+            issues.append("tick_data sin ticks; cobertura incompleta")
+        unique_issues = tuple(dict.fromkeys(issues))
+        complete = bool(ordered_ticks) and not has_more and not unique_issues
+        return CTraderTickDataResult(
+            ordered_ticks,
+            quote_name,
+            spec,
+            start,
+            end,
+            pages,
+            complete,
+            has_more,
+            unique_issues,
+            tuple(raw_pages),
+            tuple(page_metadata),
+        )
+
+    fetch_ticks = fetch_tick_data
 
     def fetch_history(
         self,
@@ -853,6 +1159,19 @@ class CTraderProvider:
             generation=self._generation,
             spec=self.spec,
         )
+        observed_diagnostic = build_spot_diagnostic(
+            event_time=event_time,
+            timestamp_original=read_field(payload, "timestamp", default=None),
+            timestamp_unit=read_field(payload, "timestamp_unit", "timestampUnit", default="ms"),
+            received_at=_received_or_none(received_at),
+            available_at=availability,
+            bid_raw=read_field(payload, "bid", default=None),
+            ask_raw=read_field(payload, "ask", default=None),
+            price_scale=self.spec.price_scale,
+            digits=self.spec.digits,
+            fields_present=_spot_fields_present(payload),
+            updated_sides=accepted,
+        )
         if not _book_has_both(state):
             return _incomplete_book_result(result, rejected)
         combined = _compose_book_quote(
@@ -885,6 +1204,7 @@ class CTraderProvider:
             accepted=accepted,
             rejected=rejected,
             generation=self._generation,
+            observed_diagnostic=observed_diagnostic,
         )
         issues = _book_issues(result, combined, quality, rejected)
         return CTraderNormalizationResult(
@@ -1110,6 +1430,7 @@ def _decorate_book_events(
     accepted: set[str],
     rejected: Sequence[QuoteQualityReason],
     generation: int,
+    observed_diagnostic: CTraderSpotDiagnostic | None = None,
 ) -> list[Event]:
     result: list[Event] = []
     for event in events:
@@ -1130,6 +1451,8 @@ def _decorate_book_events(
         }
         if rejected:
             metadata["rejected_update_reasons"] = [item.value for item in _unique_reasons(rejected)]
+        if observed_diagnostic is not None:
+            metadata["spot_diagnostic"] = observed_diagnostic.to_dict()
         result.append(replace(event, metadata=metadata))
     return result
 
@@ -1157,6 +1480,8 @@ def normalize_trendbar(
     spec: CTraderInstrumentSpec,
     received_at: datetime | None = None,
     available_at: datetime | None | object = _DEFAULT_AVAILABILITY,
+    requested_period: str | int | None = None,
+    response_period: str | int | None = None,
     request_id: str = "",
     mode: str = "REPLAY",
     revision: int = 0,
@@ -1166,7 +1491,9 @@ def normalize_trendbar(
 
     A missing receipt is preserved as unknown availability; it never becomes
     ``datetime.now()`` or zero latency.  Trendbars are native provider
-    series and are never relabeled as traded ticks.
+    series and are never relabeled as traded ticks.  When the child
+    ``period`` is absent, ``requested_period`` and ``response_period`` are
+    the only accepted context; any observed disagreement is rejected.
     """
 
     low_raw = read_field(raw, "low", default=None)
@@ -1184,7 +1511,11 @@ def normalize_trendbar(
         close_price = spec.price_from_relative(int(low_raw) + int(close_delta))
         high_price = spec.price_from_relative(int(low_raw) + int(high_delta))
         start = datetime.fromtimestamp(int(timestamp_minutes) * 60, UTC)
-        period_code = _period_code(period_raw)
+        period_code, period_source = _resolve_trendbar_period(
+            period_raw,
+            requested_period=requested_period,
+            response_period=response_period,
+        )
         timeframe = _period_name(period_code)
         seconds = resolution_to_seconds(timeframe)
         protocol_volume = int(volume_raw)
@@ -1206,6 +1537,10 @@ def normalize_trendbar(
         "mode": mode,
         "relative_scale": spec.price_scale,
         "period_code": period_code,
+        "period_source": period_source,
+        "requested_period": _period_code(requested_period) if requested_period is not None else None,
+        "response_period": _period_code(response_period) if response_period is not None else None,
+        "bar_period_observed": _period_code(period_raw) if period_raw is not None else None,
         "request_id": request_id,
         "price_basis_note": "trendbar nativa del proveedor; no se infiere bid/ask/mid",
         "protocol_volume": protocol_volume,
@@ -1265,6 +1600,19 @@ def normalize_spot_event(
         timestamp_unit=timestamp_unit,
     )
     bid_raw, ask_raw, bid, ask = _spot_prices(payload, spec)
+    declared_unit = read_field(payload, "timestamp_unit", "timestampUnit", default=timestamp_unit)
+    diagnostic = build_spot_diagnostic(
+        event_time=event_time,
+        timestamp_original=raw_timestamp,
+        timestamp_unit=declared_unit,
+        received_at=received,
+        available_at=available,
+        bid_raw=bid_raw,
+        ask_raw=ask_raw,
+        price_scale=spec.price_scale,
+        digits=spec.digits,
+        fields_present=_spot_fields_present(payload),
+    )
     basis = _quote_basis(quote_basis)
     issues, reasons = _spot_quality_inputs(
         bid,
@@ -1273,6 +1621,17 @@ def normalize_spot_event(
         basis=basis,
     )
     selected = _select_quote_price(bid, ask, basis, digits=spec.digits)
+    # A complete, selected quote cannot be represented by Event when the
+    # local availability precedes the source timestamp. Reject that raw
+    # observation with its bounded diagnostic rather than clamping or
+    # reassigning either timestamp.
+    if selected is not None and diagnostic.timing_invalid:
+        violation = diagnostic.timing_status.lower()
+        raise CTraderDataError(
+            f"SpotEvent timing inválido: {violation}; "
+            f"available_minus_event_seconds={diagnostic.available_minus_event_seconds!r}",
+            diagnostic=diagnostic.to_dict(),
+        )
     quality = _stateless_quality(
         bid,
         ask,
@@ -1304,6 +1663,7 @@ def normalize_spot_event(
         sequence=sequence,
         generation=generation,
         quality=quality,
+        diagnostic=diagnostic,
     )
     bars, bar_issues = _normalize_spot_bars(
         payload,
@@ -1358,6 +1718,19 @@ def _spot_prices(
     bid = spec.price_from_relative(bid_raw) if bid_raw is not None else None
     ask = spec.price_from_relative(ask_raw) if ask_raw is not None else None
     return bid_raw, ask_raw, bid, ask
+
+
+def _spot_fields_present(payload: Any) -> tuple[str, ...]:
+    """Return presence of the raw fields needed to audit one SpotEvent."""
+
+    names = (
+        ("timestamp", ("timestamp",)),
+        ("bid", ("bid",)),
+        ("ask", ("ask",)),
+        ("sessionClose", ("sessionClose", "session_close")),
+        ("trendbar", ("trendbar", "trendbars")),
+    )
+    return tuple(label for label, aliases in names if any(field_present(payload, alias) for alias in aliases))
 
 
 def _quote_basis(value: str) -> QuoteBasis:
@@ -1443,6 +1816,7 @@ def _build_spot_event(
     sequence: int | str | None,
     generation: int,
     quality: QuoteQuality,
+    diagnostic: CTraderSpotDiagnostic,
 ) -> Event | None:
     if selected is None:
         return None
@@ -1472,6 +1846,7 @@ def _build_spot_event(
         "ask_relative": ask_raw,
         "session_close_relative": read_field(payload, "sessionClose", "session_close", default=None),
         "quality": "PUBLIC_PROVIDER",
+        "spot_diagnostic": diagnostic.to_dict(),
         "connection_generation": generation,
         "availability_unknown": available is None,
         "available_at_policy": "OBSERVED_RECEIPT" if available is not None else "UNKNOWN_NO_RECEIPT",
@@ -1720,6 +2095,431 @@ def _unix_ms(value: datetime) -> int:
     return int(ensure_utc(value, field_name="timestamp").timestamp() * 1_000)
 
 
+def _resolve_trendbar_period(
+    bar_period: Any,
+    *,
+    requested_period: str | int | None = None,
+    response_period: str | int | None = None,
+) -> tuple[int, Literal["bar", "response", "request"]]:
+    """Resolve a trendbar period without guessing an absent child field.
+
+    ``ProtoOATrendbar.period`` is optional in the generated schema.  For
+    historical responses, the request and ``ProtoOAGetTrendbarsRes.period``
+    provide explicit context, but neither may override an observed
+    contradiction.  A standalone child without any context still fails as
+    before instead of defaulting to M1.
+    """
+
+    requested_code = _period_code(requested_period) if requested_period is not None else None
+    response_code = _period_code(response_period) if response_period is not None else None
+    bar_code = _period_code(bar_period) if bar_period is not None else None
+    if requested_code is not None and response_code is not None and requested_code != response_code:
+        raise CTraderDataError(f"trendbar period discrepancy: requested={requested_code}, response={response_code}")
+    if bar_code is not None and requested_code is not None and bar_code != requested_code:
+        raise CTraderDataError(f"trendbar period discrepancy: requested={requested_code}, bar={bar_code}")
+    if bar_code is not None and response_code is not None and bar_code != response_code:
+        raise CTraderDataError(f"trendbar period discrepancy: response={response_code}, bar={bar_code}")
+    if bar_code is not None:
+        return bar_code, "bar"
+    if response_code is not None:
+        return response_code, "response"
+    if requested_code is not None:
+        return requested_code, "request"
+    # Preserve the existing fail-closed error for a standalone periodless
+    # trendbar.  The caller must supply request/response context explicitly.
+    return _period_code(bar_period), "bar"
+
+
+_CTRADER_TICK_MAX_TIMESTAMP_MS = 2_147_483_646_000
+
+
+def _tick_symbol(value: Any) -> str:
+    symbol = normalize_symbol_name(str(value))
+    if not symbol:
+        raise CTraderDataError("tick symbol no puede estar vacío")
+    return symbol
+
+
+def _tick_symbol_id(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise CTraderDataError("tick symbol_id debe ser positivo")
+    return value
+
+
+def _tick_times(
+    event_time: datetime,
+    received_at: datetime,
+    available_at: datetime,
+) -> tuple[datetime, datetime, datetime]:
+    event = ensure_utc(event_time, field_name="tick event_time")
+    received = ensure_utc(received_at, field_name="tick received_at")
+    available = ensure_utc(available_at, field_name="tick available_at")
+    if available < event:
+        raise CTraderDataError("tick available_at no puede preceder event_time")
+    if received < event:
+        raise CTraderDataError("tick received_at no puede preceder event_time")
+    return event, received, available
+
+
+def _tick_raw_value(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CTraderDataError("tick raw price debe ser entero")
+    return value
+
+
+def _tick_absolute_raw_value(value: Any, fallback: int) -> int:
+    absolute = fallback if value is None else value
+    if isinstance(absolute, bool) or not isinstance(absolute, int) or absolute <= 0:
+        raise CTraderDataError("tick absolute raw price debe ser entero positivo")
+    return absolute
+
+
+def _tick_raw_delta_value(value: Any, raw_tick: int) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value != raw_tick:
+        raise CTraderDataError("tick raw delta debe conservar el valor wire")
+    return value
+
+
+def _tick_decimal_price(value: Any) -> Decimal:
+    try:
+        price = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise CTraderDataError("tick price debe ser Decimal finito") from exc
+    if not price.is_finite() or price <= 0:
+        raise CTraderDataError("tick price debe ser Decimal positivo")
+    return price
+
+
+def _tick_position(page: Any, ordinal: Any) -> None:
+    for name, value in (("page", page), ("ordinal", ordinal)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CTraderDataError(f"tick {name} debe ser entero no negativo")
+
+
+def _tick_delta(value: Any) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+        raise CTraderDataError("tick timestamp_delta_ms debe ser entero")
+
+
+def _tick_metadata(value: Any) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise CTraderDataError("tick metadata debe ser un mapping")
+    return dict(value)
+
+
+def _tick_quote_type(value: Any) -> tuple[TickQuoteType, int]:
+    """Normalize the official ProtoOAQuoteType BID/ASK enum only."""
+
+    named = getattr(value, "name", None)
+    if named is not None:
+        value = named
+    if isinstance(value, bool):
+        raise CTraderConfigurationError("quote_type debe ser BID/ASK o 1/2")
+    if isinstance(value, int):
+        if value == 1:
+            return "BID", 1
+        if value == 2:
+            return "ASK", 2
+        raise CTraderConfigurationError(f"quote_type no soportado: {value!r}")
+    text = str(value).strip().upper()
+    if text in {"BID", "1"}:
+        return "BID", 1
+    if text in {"ASK", "2"}:
+        return "ASK", 2
+    raise CTraderConfigurationError(f"quote_type no soportado: {value!r}")
+
+
+def _tick_window(
+    from_timestamp: datetime | None,
+    to_timestamp: datetime | None,
+) -> tuple[datetime, datetime, int, int]:
+    if from_timestamp is None or to_timestamp is None:
+        raise CTraderConfigurationError("fetch_tick_data requiere from_timestamp y to_timestamp explícitos")
+    start = ensure_utc(from_timestamp, field_name="from_timestamp")
+    end = ensure_utc(to_timestamp, field_name="to_timestamp")
+    if start > end:
+        raise CTraderConfigurationError("from_timestamp no puede ser posterior a to_timestamp")
+    if end - start > timedelta(days=7):
+        raise CTraderConfigurationError("fetch_tick_data sólo admite ventanas de hasta 7 días")
+    if start.microsecond % 1_000 or end.microsecond % 1_000:
+        raise CTraderConfigurationError("from_timestamp/to_timestamp deben tener precisión de milisegundos")
+    start_ms = _unix_ms(start)
+    end_ms = _unix_ms(end)
+    if start_ms < 0 or end_ms > _CTRADER_TICK_MAX_TIMESTAMP_MS:
+        raise CTraderConfigurationError("ventana tick fuera del rango de timestamps cTrader")
+    return start, end, start_ms, end_ms
+
+
+def _strict_int(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise CTraderDataError(f"{name} debe ser entero")
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise CTraderDataError(f"{name} debe ser entero") from exc
+    if isinstance(value, float) and not value.is_integer():
+        raise CTraderDataError(f"{name} debe ser entero")
+    if isinstance(value, Decimal) and value != value.to_integral_value():
+        raise CTraderDataError(f"{name} debe ser entero")
+    if isinstance(value, str) and str(result) != value.strip():
+        raise CTraderDataError(f"{name} debe ser entero")
+    return result
+
+
+def _tick_datetime(timestamp_ms: int) -> datetime:
+    if timestamp_ms < 0 or timestamp_ms > _CTRADER_TICK_MAX_TIMESTAMP_MS:
+        raise CTraderDataError("tick timestamp fuera del rango cTrader")
+    try:
+        return datetime(1970, 1, 1, tzinfo=UTC) + timedelta(milliseconds=timestamp_ms)
+    except (OverflowError, ValueError) as exc:
+        raise CTraderDataError("tick timestamp inválido") from exc
+
+
+def _decimal_price_from_relative(spec: CTraderInstrumentSpec, value: Any) -> Decimal:
+    relative = _strict_int(value, "tick")
+    if relative <= 0:
+        raise CTraderDataError("tick price relativo debe ser positivo")
+    try:
+        # The protocol declares a relative integer and an explicit price scale.
+        # Use a widened local context so the Decimal result does not inherit a
+        # caller's low precision; no float conversion or pair construction is
+        # involved.
+        with localcontext() as context:
+            context.prec = max(28, len(str(relative)) + len(str(spec.price_scale)) + spec.digits + 4)
+            price = Decimal(relative) / Decimal(spec.price_scale)
+    except (InvalidOperation, ValueError) as exc:
+        raise CTraderDataError("tick price relativo no es representable") from exc
+    if not price.is_finite() or price <= 0:
+        raise CTraderDataError("tick price escalado inválido")
+    return price
+
+
+def _strict_bool(value: Any, name: str, issues: list[str]) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and not isinstance(value, bool) and value in {0, 1}:
+        return bool(value)
+    issues.append(f"{name} inválido; cobertura incompleta")
+    return False
+
+
+def _normalize_tick_response(
+    response: WireMessage,
+    request: WireMessage,
+    *,
+    account_id: int,
+    spec: CTraderInstrumentSpec,
+    quote_type: TickQuoteType,
+    from_ms: int,
+    to_ms: int,
+    received_at: datetime,
+    available_at: datetime,
+    page: int,
+) -> tuple[list[CTraderTick], list[str], bool, Mapping[str, Any], Mapping[str, Any]]:
+    """Validate and normalize one correlated tick-data response page."""
+
+    issues: list[str] = []
+    raw_page = message_to_mapping(response.payload)
+    actual_request = WireMessage(
+        request.payload_type,
+        request.payload,
+        response.client_msg_id,
+        False,
+        received_at=response.received_at,
+        available_at=response.available_at,
+        connection_generation=response.connection_generation,
+    )
+    if response.payload_type_id != PAYLOAD["PROTO_OA_GET_TICKDATA_RES"]:
+        issues.append(
+            f"respuesta tick_data inesperada: {response.payload_type_name} "
+            f"(esperada {PAYLOAD['PROTO_OA_GET_TICKDATA_RES']})"
+        )
+        return (
+            [],
+            issues,
+            False,
+            raw_page,
+            _tick_page_receipt(
+                page=page,
+                quote_type=quote_type,
+                request=actual_request,
+                response=response,
+                received_at=received_at,
+                available_at=available_at,
+                tick_count=0,
+                first_ms=None,
+                last_ms=None,
+            ),
+        )
+    response_account = _int_or_none(
+        read_field(response.payload, "ctidTraderAccountId", "ctid_trader_account_id", default=None)
+    )
+    if response_account != account_id:
+        issues.append(f"respuesta tick_data account_id inválido: {response_account!r} != {account_id}")
+        return (
+            [],
+            issues,
+            False,
+            raw_page,
+            _tick_page_receipt(
+                page=page,
+                quote_type=quote_type,
+                request=actual_request,
+                response=response,
+                received_at=received_at,
+                available_at=available_at,
+                tick_count=0,
+                first_ms=None,
+                last_ms=None,
+            ),
+        )
+    page_ticks, page_issues, first_ms, last_ms = _normalize_tick_page(
+        read_repeated(response.payload, "tickData", "tick_data"),
+        spec=spec,
+        quote_type=quote_type,
+        from_ms=from_ms,
+        to_ms=to_ms,
+        received_at=received_at,
+        available_at=available_at,
+        page=page,
+    )
+    has_more = _strict_bool(
+        read_field(response.payload, "hasMore", "has_more", default=False),
+        "tick_data.hasMore",
+        page_issues,
+    )
+    return (
+        page_ticks,
+        page_issues,
+        has_more,
+        raw_page,
+        _tick_page_receipt(
+            page=page,
+            quote_type=quote_type,
+            request=actual_request,
+            response=response,
+            received_at=received_at,
+            available_at=available_at,
+            tick_count=len(page_ticks),
+            first_ms=first_ms,
+            last_ms=last_ms,
+        ),
+    )
+
+
+def _tick_page_receipt(
+    *,
+    page: int,
+    quote_type: TickQuoteType,
+    request: WireMessage,
+    response: WireMessage,
+    received_at: datetime,
+    available_at: datetime,
+    tick_count: int,
+    first_ms: int | None,
+    last_ms: int | None,
+) -> dict[str, Any]:
+    return {
+        "page": page,
+        "quote_type": quote_type,
+        "request": request.to_dict(),
+        "response_type": response.payload_type_name,
+        "received_at": received_at,
+        "available_at": available_at,
+        "ingest_sequence": response.ingest_sequence,
+        "connection_generation": response.connection_generation,
+        "source_identity": response.source_identity,
+        "tick_count": tick_count,
+        "first_timestamp_ms": first_ms,
+        "last_timestamp_ms": last_ms,
+        "timestamp_encoding": "first_absolute_ms_then_deltas_ms",
+        "source_order": "newest_first",
+    }
+
+
+def _normalize_tick_page(
+    raw_items: Sequence[Any],
+    *,
+    spec: CTraderInstrumentSpec,
+    quote_type: TickQuoteType,
+    from_ms: int,
+    to_ms: int,
+    received_at: datetime,
+    available_at: datetime,
+    page: int,
+) -> tuple[list[CTraderTick], list[str], int | None, int | None]:
+    """Decode one newest-first page without manufacturing a bid/ask pair."""
+
+    result: list[CTraderTick] = []
+    issues: list[str] = []
+    first_ms: int | None = None
+    last_ms: int | None = None
+    previous_ms: int | None = None
+    previous_raw_tick: int | None = None
+    for ordinal, raw in enumerate(raw_items):
+        try:
+            encoded_timestamp = read_field(raw, "timestamp", default=None)
+            encoded_tick = read_field(raw, "tick", default=None)
+            if encoded_timestamp is None or encoded_tick is None:
+                raise CTraderDataError("tickData requiere timestamp y tick")
+            timestamp_value = _strict_int(encoded_timestamp, f"tickData[{ordinal}].timestamp")
+            raw_tick = _strict_int(encoded_tick, f"tickData[{ordinal}].tick")
+            if ordinal == 0:
+                absolute_ms = timestamp_value
+                first_ms = absolute_ms
+                delta_ms = None
+                absolute_raw_tick = raw_tick
+                raw_tick_delta = None
+            else:
+                if previous_ms is None:
+                    raise CTraderDataError("tickData sin timestamp previo")
+                delta_ms = timestamp_value
+                absolute_ms = previous_ms + delta_ms
+                if previous_raw_tick is None:
+                    raise CTraderDataError("tickData sin precio relativo previo")
+                raw_tick_delta = raw_tick
+                absolute_raw_tick = previous_raw_tick + raw_tick_delta
+            event_time = _tick_datetime(absolute_ms)
+            if previous_ms is not None and absolute_ms > previous_ms:
+                raise CTraderDataError("tickData no está en orden newest-first")
+            if not from_ms <= absolute_ms <= to_ms:
+                raise CTraderDataError("tickData fuera de la ventana solicitada")
+            result.append(
+                CTraderTick(
+                    symbol=spec.symbol,
+                    symbol_id=int(spec.symbol_id or 0),
+                    quote_type=quote_type,
+                    event_time=event_time,
+                    price=_decimal_price_from_relative(spec, absolute_raw_tick),
+                    raw_tick=raw_tick,
+                    received_at=received_at,
+                    available_at=available_at,
+                    absolute_raw_tick=absolute_raw_tick,
+                    raw_tick_delta=raw_tick_delta,
+                    page=page,
+                    ordinal=ordinal,
+                    timestamp_delta_ms=delta_ms,
+                    metadata={
+                        "native": True,
+                        "quote_type": quote_type,
+                        "timestamp_encoding": "absolute_first_then_delta_ms",
+                        "price_encoding": "absolute_first_then_delta",
+                        "source_order": "newest_first",
+                        "pair_constructed": False,
+                    },
+                )
+            )
+            previous_ms = absolute_ms
+            previous_raw_tick = absolute_raw_tick
+            last_ms = absolute_ms
+        except (CTraderDataError, TypeError, ValueError) as exc:
+            issues.append(f"tickData[{ordinal}]: {exc}")
+            break
+    return result, issues, first_ms, last_ms
+
+
 def _period_code(value: Any) -> int:
     if isinstance(value, bool):
         raise CTraderConfigurationError("period inválido")
@@ -1793,11 +2593,14 @@ __all__ = [
     "CTraderProvider",
     "CTraderSessionWindow",
     "CTraderSymbol",
+    "CTraderTick",
+    "CTraderTickDataResult",
     "QuoteLegQuality",
     "QuoteQuality",
     "QuoteQualityReason",
     "QuoteQualityState",
     "SymbolCatalog",
+    "TickQuoteType",
     "normalize_account_payload",
     "normalize_spot_event",
     "normalize_symbol_name",
