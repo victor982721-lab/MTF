@@ -14,7 +14,8 @@ producir un servidor autenticado.
 
 El receipt privado, fuera del repositorio (SHA-256
 `a2d6af011fa43b05187c2aace05f6b5c51e592dc9a5e506f872b4cf1f43ac72e`; no se
-reproduce el identificador concreto), deja constancia de OAuth vigente con
+reproduce el identificador concreto), deja constancia de OAuth observado vigente
+en esa captura con
 `SCOPE_VIEW`/`accounts` para una sola cuenta DEMO Winter. No se autorizó REAL,
 trading ni órdenes, y no se repitió OAuth.
 
@@ -153,6 +154,17 @@ uniendo dos solicitudes. La canaria de lectura observó 386 ticks BID y 386 ASK,
 una página por lado, completas y sin incidencias, en
 `../runtime/market-evidence/ctrader-tick-data-read-only-canary-20260915.json`
 (SHA-256 `c3abd241781c2f6742b9610f9e0d90a61f0f7187c11a1198f7d12f106f45053f`).
+
+El preflight de `watch --network` sobre el árbol actual del 2026-09-16 se detuvo
+antes de construir el proveedor por `APP_CREDENTIALS_REQUIRED`; no intentó red,
+OAuth, SQLite ni órdenes (`network_attempted=false`, `orders_sent=false`). Su
+receipt es `../runtime/market-evidence/ctrader-watch-live-paper-preflight-20260916.json`
+(SHA-256
+`7f472aa69477d55545ddb10ce67cc45141a6758b899ef3f78b75474263f00e7b`). Esto no
+es una canaria conectada
+ni invalida la observación DEMO histórica: sólo deja explícito que ese proceso no
+puede reproducirse hasta que las credenciales de aplicación estén disponibles en la
+superficie local autorizada.
 
 El código local de `watch --network` (aún pendiente de gate completo y canaria
 conectada) conserva una separación explícita de bases:

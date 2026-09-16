@@ -60,6 +60,6 @@ La prueba viva de sólo lectura del inventario canónico registró 12 raws,
 `/home/winterboss/MTF/runtime/market-evidence/storage-budget-live-20260914T2355Z.json`
 (SHA-256 `0576b2673358d3b0d0207759c493c300e5b369d740d55fa52f78bab63489a09b`).
 La regresión focal `tests/test_storage_budget.py` contiene 8 casos; el gate
-global final19 ejecutó 948/948 pruebas. El contrato agregado queda habilitado
+global histórico final19 ejecutó 948/948 pruebas. El contrato agregado queda habilitado
 para las futuras adquisiciones sólo después de conservar sus receipts y gates
 de proveedor.

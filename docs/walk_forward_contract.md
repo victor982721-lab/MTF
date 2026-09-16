@@ -90,8 +90,9 @@ La implementación offline está en `mtf_lab/data/walk_forward.py` y
 `tools/run_historical_campaign.py` y las regresiones en
 `tests/test_walk_forward_contract.py`,
 `tests/test_historical_campaign_walk_forward_contract.py` y
-`tests/test_walk_forward_warmup_resume.py`; el gate global
-`quality-gate-20260915-ctrader-paper-tick-v3.json` ejecutó 990/990 pruebas. El receipt
+`tests/test_walk_forward_warmup_resume.py`; la última referencia del gate global
+anterior a los bytes actuales, `quality-gate-20260915-ctrader-paper-tick-v3.json`,
+ejecutó 990/990 pruebas. El receipt
 `runtime/market-evidence/wf-warmup-resume-fixture-20260915.json` cubre las
 cuatro ventanas y cortes de reanudación, con salidas byte-equivalentes,
 holdout `CLOSED` y sin red/adquisición.

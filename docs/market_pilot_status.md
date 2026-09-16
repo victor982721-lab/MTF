@@ -184,13 +184,14 @@ HistData/Dukascopy y el contrato aislado WF ya están implementados y probados,
 sin habilitar adquisiciones o ejecución. La validación previa del diagnóstico
 causal pasó 955/955 tests, cero omitidos/fallos, Ruff/formato/mypy/Pyright/
 arquitectura y `pip check` en cero errores, con 79.717% de líneas y 62.686%
-de ramas. El gate global vigente pasó 990/990 pruebas, con 79.871% de líneas
-y 62.989% de ramas. Receipt versionado:
+de ramas. La última referencia global previa a los cambios locales pasó 990/990
+pruebas, con 79.871% de líneas y 62.989% de ramas. Receipt versionado:
 `runtime/market-evidence/quality-gate-20260915-ctrader-paper-tick-v3.json`
 (SHA-256 `5d572ea09264914ffc95fef5318aa4f252a165ec25e7c749e22be7080339d2b4`).
-Este
-resultado valida el checkout y el runtime de QA; no publica ni instala una
-release, no abre el holdout y no acredita ventaja económica.
+Este resultado valida el checkout y el runtime de QA de aquella referencia; no
+valida los bytes posteriores del commit `58a2fdd`. No publica ni instala una
+release, no abre el holdout y no acredita ventaja económica. El gate completo del
+árbol actual se pospone hasta que termine la reanudación V17.
 
 El servicio de campaña conserva además un permiso de holdout no secreto,
 ligado a candidatos, intentos, dataset, escenarios y la ventana fija
@@ -404,9 +405,13 @@ contrato WF, diagnóstico cTrader acotado y continuidad/coverage bounded. El
 wheel staged SHA-256 es
 `9d41522208be17d546001df9011199453cf236f28fd16ea0b2922e4405291191`.
 Dos builds independientes con `SOURCE_DATE_EPOCH=0` y mtimes distintos fueron
-byte-identical; su correspondencia fuente→wheel→instalación quedó validada. La edición documental y la comprobación estática posterior se
-conservaron en `runtime/market-evidence/docs-static-20260915-v32.json`;
-el receipt V19 parcial y su gate fail-closed se conservan como antecedentes.
+byte-identical; su correspondencia fuente→wheel→instalación quedó validada. La
+edición documental histórica y su comprobación estática se conservaron en
+`runtime/market-evidence/docs-static-20260915-v32.json`; la verificación posterior
+a esta auditoría está en
+`runtime/market-evidence/docs-static-20260916-post-independent-audit.json`
+(receipt local; la suma vigente se conserva en el propio archivo). El receipt V19
+parcial y su gate fail-closed se conservan como antecedentes.
 El smoke de presupuesto agregado del inventario canónico está en
 `runtime/market-evidence/storage-budget-live-20260914T2355Z.json`, SHA-256
 `0576b2673358d3b0d0207759c493c300e5b369d740d55fa52f78bab63489a09b`.
@@ -451,7 +456,8 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.
 3. Reconstruir y verificar el runtime STAGED desde el SHA final de código;
-   los cambios locales cTrader/warmup siguen `NOT_VALIDATED` hasta el próximo
+   V27 es sólo el último staging disponible anterior a `58a2fdd`, por lo que los
+   cambios locales cTrader/warmup/reporting siguen `NOT_VALIDATED` hasta el próximo
    gate completo. No promoverlo ni instalarlo operativamente por inferencia.
 4. Preparar una futura campaña holdout sólo con un contrato de dataset 2024–2025,
    permiso confirmatorio tipado y acceso humano único; la resistencia 72h,

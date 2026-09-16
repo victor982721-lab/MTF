@@ -70,11 +70,13 @@ validación local, la instalación operativa y las ventanas de 72 horas/30
 sesiones son estados distintos. Ningún comando nuevo activa trading por defecto.
 
 El runtime privado candidato se conserva en `STAGED_RUNTIME` y
-`NOT_PROMOTED`; el staging vigente se identifica en el [estado del piloto](docs/market_pilot_status.md)
-y se liga al árbol validado. La revisión vigente V27 está en
+`NOT_PROMOTED`; el staging más reciente disponible se identifica en el [estado del piloto](docs/market_pilot_status.md)
+y se liga al árbol que fue validado. La revisión V27 está en
 `/home/winterboss/.local/share/mtf-lab/runtime-review-20260915-0335/runtime/STAGED_RUNTIME.json`
 (SHA-256 `25d36afd060d8fb50d7a41e434753c33c55be93a020300399c516d10fe3c6b3d`);
-el entorno operativo y sus launchers no fueron sustituidos.
+es anterior al commit `58a2fdd` y no contiene la frontera local de warmup/salud/refactor
+actual. El entorno operativo y sus launchers no fueron sustituidos; este staging no
+debe promoverse ni presentarse como validación del árbol actual.
 
 ### IMPLEMENTADO Y COMPROBADO OFFLINE
 
