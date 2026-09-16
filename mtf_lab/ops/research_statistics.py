@@ -46,6 +46,31 @@ class _TradeFacts:
     currencies: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _MetricComputation:
+    """Purely computed metric components and their evidence completeness."""
+
+    drawdown: dict[str, Any]
+    facts: _TradeFacts
+    net: dict[str, Any]
+    worst: dict[str, Any]
+    exposure: dict[str, Any]
+    turnover: dict[str, Any]
+    concentration: dict[str, Any]
+    margin: dict[str, Any]
+    unknown_marks: int
+    mark_reasons: tuple[str, ...]
+    unknown_costs: int
+    drawdown_complete: bool
+    net_complete: bool
+    worst_complete: bool
+    exposure_complete: bool
+    turnover_complete: bool
+    concentration_complete: bool
+    complete: bool
+    reasons: tuple[str, ...]
+
+
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
@@ -630,16 +655,9 @@ def _partial_payload(
     }
 
 
-def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
-    """Return explicit risk/performance metrics for one CFD result mapping.
+def _compute_metric_components(result: Mapping[str, Any]) -> _MetricComputation:
+    """Compute metric components and completeness without building the output envelope."""
 
-    The primary fields are withheld whenever the result contains unknown mark
-    or cost evidence.  ``partial`` retains known subtotals and labels the
-    narrower evidence basis; it is never presented as a complete estimate.
-    """
-
-    if not isinstance(result, Mapping):
-        raise TypeError("result_metrics requiere un Mapping")
     marks, unknown_marks, mark_reasons = _parse_marks(result)
     drawdown = _drawdown_metrics(marks)
     drawdown["unknown_mark_count"] = unknown_marks
@@ -666,59 +684,100 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
         reasons.append("equity_marks_missing_or_unusable")
     if not facts.known_net:
         reasons.append("no_known_closed_trade_net_pnl")
-    reasons = sorted(set(reasons))
-    main = {
-        "max_drawdown_abs": _decimal_text(drawdown.get("max_drawdown")) if drawdown_complete else None,
-        "max_drawdown_peak_at": _iso(drawdown.get("max_drawdown_peak_at")) if drawdown_complete else None,
-        "max_drawdown_trough_at": _iso(drawdown.get("max_drawdown_trough_at")) if drawdown_complete else None,
+    return _MetricComputation(
+        drawdown=drawdown,
+        facts=facts,
+        net=net,
+        worst=worst,
+        exposure=exposure,
+        turnover=turnover,
+        concentration=concentration,
+        margin=margin,
+        unknown_marks=unknown_marks,
+        mark_reasons=tuple(mark_reasons),
+        unknown_costs=unknown_costs,
+        drawdown_complete=drawdown_complete,
+        net_complete=net_complete,
+        worst_complete=worst_complete,
+        exposure_complete=exposure_complete,
+        turnover_complete=turnover_complete,
+        concentration_complete=concentration_complete,
+        complete=complete,
+        reasons=tuple(sorted(set(reasons))),
+    )
+
+
+def _main_metric_payload(computed: _MetricComputation) -> dict[str, Any]:
+    """Serialize the primary metric fields while preserving their evidence gates."""
+
+    drawdown = computed.drawdown
+    facts = computed.facts
+    net = computed.net
+    worst = computed.worst
+    exposure = computed.exposure
+    turnover = computed.turnover
+    concentration = computed.concentration
+    unknown_costs = computed.unknown_costs
+    return {
+        "max_drawdown_abs": _decimal_text(drawdown.get("max_drawdown")) if computed.drawdown_complete else None,
+        "max_drawdown_peak_at": _iso(drawdown.get("max_drawdown_peak_at")) if computed.drawdown_complete else None,
+        "max_drawdown_trough_at": _iso(drawdown.get("max_drawdown_trough_at")) if computed.drawdown_complete else None,
         "recovery_duration_seconds": (
-            _decimal_text(drawdown.get("recovery_duration_seconds")) if drawdown_complete else None
+            _decimal_text(drawdown.get("recovery_duration_seconds")) if computed.drawdown_complete else None
         ),
         "max_recovery_duration_seconds": (
-            _decimal_text(drawdown.get("recovery_duration_seconds")) if drawdown_complete else None
+            _decimal_text(drawdown.get("recovery_duration_seconds")) if computed.drawdown_complete else None
         ),
-        "recovery_duration": (_decimal_text(drawdown.get("recovery_duration_seconds")) if drawdown_complete else None),
-        "unrecovered_state": drawdown.get("unrecovered_state") if drawdown_complete else "NOT_ASSESSED",
-        "unrecovered_since": _iso(drawdown.get("unrecovered_since")) if drawdown_complete else None,
+        "recovery_duration": (
+            _decimal_text(drawdown.get("recovery_duration_seconds")) if computed.drawdown_complete else None
+        ),
+        "unrecovered_state": (drawdown.get("unrecovered_state") if computed.drawdown_complete else "NOT_ASSESSED"),
+        "unrecovered_since": _iso(drawdown.get("unrecovered_since")) if computed.drawdown_complete else None,
         "unrecovered_duration_seconds": (
-            _decimal_text(drawdown.get("unrecovered_duration_seconds")) if drawdown_complete else None
+            _decimal_text(drawdown.get("unrecovered_duration_seconds")) if computed.drawdown_complete else None
         ),
-        "net_pnl": _decimal_text(net.get("net")) if net_complete else None,
-        "expectancy": _decimal_text(net.get("expectancy")) if net_complete else None,
+        "net_pnl": _decimal_text(net.get("net")) if computed.net_complete else None,
+        "expectancy": _decimal_text(net.get("expectancy")) if computed.net_complete else None,
         "known_net_pnl_subtotal": _decimal_text(net.get("known_subtotal")),
         "known_expectancy": _decimal_text(net.get("known_expectancy")),
         "worst_utc_observed_day": (
-            {"date": worst.get("day"), "pnl": _decimal_text(worst.get("pnl"))} if worst_complete else None
+            {"date": worst.get("day"), "pnl": _decimal_text(worst.get("pnl"))} if computed.worst_complete else None
         ),
         "worst_utc_observed_day_basis": worst.get("basis"),
         "worst_session_basis": worst.get("session_basis"),
-        "exposure_peak": _decimal_text(exposure.get("peak")) if exposure_complete else None,
-        "exposure_peak_at": _iso(exposure.get("peak_at")) if exposure_complete else None,
-        "exposure_peak_quantity": _decimal_text(exposure.get("peak_quantity")) if exposure_complete else None,
-        "peak_exposure": _decimal_text(exposure.get("peak")) if exposure_complete else None,
-        "peak_exposure_at": _iso(exposure.get("peak_at")) if exposure_complete else None,
-        "peak_exposure_quantity": _decimal_text(exposure.get("peak_quantity")) if exposure_complete else None,
+        "exposure_peak": _decimal_text(exposure.get("peak")) if computed.exposure_complete else None,
+        "exposure_peak_at": _iso(exposure.get("peak_at")) if computed.exposure_complete else None,
+        "exposure_peak_quantity": _decimal_text(exposure.get("peak_quantity")) if computed.exposure_complete else None,
+        "peak_exposure": _decimal_text(exposure.get("peak")) if computed.exposure_complete else None,
+        "peak_exposure_at": _iso(exposure.get("peak_at")) if computed.exposure_complete else None,
+        "peak_exposure_quantity": _decimal_text(exposure.get("peak_quantity")) if computed.exposure_complete else None,
         "exposure_currency": exposure.get("currency"),
-        "exposure_duration_seconds": (_decimal_text(exposure.get("duration_seconds")) if exposure_complete else None),
-        "exposure_duration": _decimal_text(exposure.get("duration_seconds")) if exposure_complete else None,
-        "exposure_notional_time": _decimal_text(exposure.get("notional_time")) if exposure_complete else None,
-        "turnover_notional": _decimal_text(turnover.get("notional")) if turnover_complete else None,
-        "turnover_notional_value": _decimal_text(turnover.get("notional")) if turnover_complete else None,
+        "exposure_duration_seconds": (
+            _decimal_text(exposure.get("duration_seconds")) if computed.exposure_complete else None
+        ),
+        "exposure_duration": _decimal_text(exposure.get("duration_seconds")) if computed.exposure_complete else None,
+        "exposure_notional_time": _decimal_text(exposure.get("notional_time")) if computed.exposure_complete else None,
+        "turnover_notional": _decimal_text(turnover.get("notional")) if computed.turnover_complete else None,
+        "turnover_notional_value": _decimal_text(turnover.get("notional")) if computed.turnover_complete else None,
         "turnover_currency": turnover.get("currency"),
         "turnover_basis": turnover.get("basis"),
         "turnover_unknown_count": turnover.get("unknown_count", 0),
         "turnover_capital_ratio": None,
         "trade_concentration_hhi": (
-            _decimal_text(_mapping(concentration.get("trade")).get("value")) if concentration_complete else None
+            _decimal_text(_mapping(concentration.get("trade")).get("value"))
+            if computed.concentration_complete
+            else None
         ),
         "concentration_trade_hhi": (
-            _decimal_text(_mapping(concentration.get("trade")).get("value")) if concentration_complete else None
+            _decimal_text(_mapping(concentration.get("trade")).get("value"))
+            if computed.concentration_complete
+            else None
         ),
         "day_concentration_hhi": (
-            _decimal_text(_mapping(concentration.get("day")).get("value")) if concentration_complete else None
+            _decimal_text(_mapping(concentration.get("day")).get("value")) if computed.concentration_complete else None
         ),
         "concentration_day_hhi": (
-            _decimal_text(_mapping(concentration.get("day")).get("value")) if concentration_complete else None
+            _decimal_text(_mapping(concentration.get("day")).get("value")) if computed.concentration_complete else None
         ),
         "trade_concentration_hhi_known": _decimal_text(_mapping(concentration.get("trade")).get("known_subtotal")),
         "day_concentration_hhi_known": _decimal_text(_mapping(concentration.get("day")).get("known_subtotal")),
@@ -732,16 +791,31 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
             "status": "ASSESSED" if not unknown_costs else "NOT_ASSESSED",
         },
     }
-    partial = _partial_payload(drawdown, facts, net, worst, exposure, turnover, concentration)
+
+
+def _metrics_envelope(
+    computed: _MetricComputation,
+    main: Mapping[str, Any],
+    partial: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build the versioned public envelope from already computed metric fields."""
+
+    drawdown = computed.drawdown
+    net = computed.net
+    worst = computed.worst
+    exposure = computed.exposure
+    turnover = computed.turnover
+    concentration = computed.concentration
+    unknown_costs = computed.unknown_costs
     metrics: dict[str, Any] = {
         "metrics_version": 1,
-        "status": "ASSESSED" if complete else "NOT_ASSESSED",
-        "reason": None if complete else (";".join(reasons) or "insufficient_metric_evidence"),
-        "reasons": reasons,
+        "status": "ASSESSED" if computed.complete else "NOT_ASSESSED",
+        "reason": None if computed.complete else (";".join(computed.reasons) or "insufficient_metric_evidence"),
+        "reasons": list(computed.reasons),
         **main,
         "max_drawdown_basis": "mark_to_market_equity",
         "drawdown": {
-            "status": "ASSESSED" if drawdown_complete else "NOT_ASSESSED",
+            "status": "ASSESSED" if computed.drawdown_complete else "NOT_ASSESSED",
             "value": main["max_drawdown_abs"],
             "basis": "mark_to_market_equity",
             "calculation_basis": "ordered_aware_equity_mark_to_market_absolute",
@@ -749,7 +823,7 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
             "trough_at": main["max_drawdown_trough_at"],
         },
         "max_drawdown": {
-            "status": "ASSESSED" if drawdown_complete else "NOT_ASSESSED",
+            "status": "ASSESSED" if computed.drawdown_complete else "NOT_ASSESSED",
             "value": main["max_drawdown_abs"],
             "basis": "mark_to_market_equity",
             "calculation_basis": "ordered_aware_equity_mark_to_market_absolute",
@@ -765,10 +839,10 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
         "recovery": {
             "duration_seconds": main["recovery_duration_seconds"],
             "unrecovered_duration_seconds": (
-                _decimal_text(drawdown.get("unrecovered_duration_seconds")) if drawdown_complete else None
+                _decimal_text(drawdown.get("unrecovered_duration_seconds")) if computed.drawdown_complete else None
             ),
             "unrecovered_state": main["unrecovered_state"],
-            "status": "ASSESSED" if drawdown_complete else "NOT_ASSESSED",
+            "status": "ASSESSED" if computed.drawdown_complete else "NOT_ASSESSED",
         },
         "net": {
             "value": main["net_pnl"],
@@ -804,7 +878,7 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
             "notional_time": main["exposure_notional_time"],
             "quantity_status": exposure.get("quantity_status"),
             "currency": main["exposure_currency"],
-            "status": exposure.get("status") if exposure_complete else "NOT_ASSESSED",
+            "status": exposure.get("status") if computed.exposure_complete else "NOT_ASSESSED",
         },
         "turnover": {
             "notional": main["turnover_notional"],
@@ -816,7 +890,7 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
                 "value": None,
                 "reason": "capital_or_margin_inputs_missing",
             },
-            "status": turnover.get("status") if turnover_complete else "NOT_ASSESSED",
+            "status": turnover.get("status") if computed.turnover_complete else "NOT_ASSESSED",
         },
         "costs": {
             "known_total": main["cost_total_known"],
@@ -825,7 +899,7 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
             "status": "ASSESSED" if not unknown_costs else "NOT_ASSESSED",
         },
         "concentration": _concentration_json(concentration),
-        "margin": margin,
+        "margin": computed.margin,
         "partial": partial,
         "basis": {
             "drawdown": "mark_to_market_equity",
@@ -837,6 +911,30 @@ def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
         },
     }
     return metrics
+
+
+def result_metrics(result: Mapping[str, Any]) -> dict[str, Any]:
+    """Return explicit risk/performance metrics for one CFD result mapping.
+
+    The primary fields are withheld whenever the result contains unknown mark
+    or cost evidence.  ``partial`` retains known subtotals and labels the
+    narrower evidence basis; it is never presented as a complete estimate.
+    """
+
+    if not isinstance(result, Mapping):
+        raise TypeError("result_metrics requiere un Mapping")
+    computed = _compute_metric_components(result)
+    main = _main_metric_payload(computed)
+    partial = _partial_payload(
+        computed.drawdown,
+        computed.facts,
+        computed.net,
+        computed.worst,
+        computed.exposure,
+        computed.turnover,
+        computed.concentration,
+    )
+    return _metrics_envelope(computed, main, partial)
 
 
 __all__ = ["result_metrics"]

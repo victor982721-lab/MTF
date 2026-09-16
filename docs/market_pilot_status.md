@@ -1,6 +1,6 @@
 # Piloto histórico — estado y límites de la evidencia
 
-Verificado el 2026-09-15. Este registro distingue resultados descriptivos
+Verificado el 2026-09-16. Este registro distingue resultados descriptivos
 intermedios, implementación, validación de una release y operación externa.
 No hay todavía una estrategia seleccionada ni evidencia de ventaja neta.
 
@@ -44,8 +44,9 @@ en este archivo sigue siendo sólo marzo: su contenedor mensual contiene
   `dataset_id` `histdata:EUR/USD:201601-201612:3beebfb5ed44b15fa9fb55699008fefe`,
   19,026,438 ticks y cobertura 2016-01-03 22:00:15.493 a
   2016-12-30 21:59:20.383 UTC. La composición fue exclusiva, ordenada y sin
-  colisiones; aún no se ha ejecutado el backtest anual ni se ha seleccionado un
-  candidato.
+  colisiones. El backtest anual `development-2016-full-v17` está en curso,
+  reanudado desde un checkpoint parcial, sin receipt terminal ni candidato
+  seleccionado.
 - No se han adquirido años 2017–2019 ni abierto la reserva 2024–2025.
 
 El contrato de lectura ya acepta una composición explícita de particiones
@@ -242,6 +243,18 @@ captura → indicadores/señal → PAPER → SQLite → reporte y reanudación e
 `runtime/market-evidence/paper-report-e2e-20260914T194812Z-v18/paper-report-e2e-receipt.json`.
 No es evidencia de mercado real, frescura, costes, fills ni rentabilidad.
 
+El código local en validación separa la base de análisis del origen de
+cotización (sin canaria conectada posterior todavía).
+Con `price_base="native"`, `ctrader watch --network` solicita un prefijo causal
+cerrado/contiguo de M1/M5/M15 con un solo `cutoff`, lo pasa como
+`WARMUP_ONLY` al mismo `RuntimeCoordinator` y suscribe spots y trendbars live;
+`hasMore` queda sólo como procedencia de la consulta. Los trendbars periodless
+requieren contexto de periodo explícito. El sink `FOREX_CFD_LOCAL_PAPER` nunca
+convierte una vela en bid/ask: sólo un SpotEvent `VALID` con `bid < ask` puede
+llenar. Los perfiles `mid`/`bid`/`ask` no inyectan historia nativa y calientan
+con spots; EOF, backpressure o `needs_reconciliation` bloquean la continuidad
+y desconectan PAPER sin reintentar ni enviar órdenes.
+
 ### Captura histórica DEMO bounded V22 — 2026-09-15
 
 La ventana DEMO histórica acotada ya existente se conserva en
@@ -430,20 +443,16 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
 1. Mantener costes contractuales, financiación, fills y calendario histórico
    como desconocidos hasta contar con una fuente vinculada a la cuenta; los
    specs explícitos conocidos sólo habilitan neto condicional.
-2. Auditar la equivalencia parcial/resume ya verificada y ejecutar primero un
-   canario de capacidad de 1,048,576 cotizaciones con el runtime único congelado.
-   Después, ejecutar el desarrollo 2016 completo como una secuencia única por
-   bloques de 2,048, con snapshots por defecto cada 65,536 cotizaciones y
-   medición de pared/CPU/RSS, reanudación y crecimiento de artefactos. Sólo
-   después, y con nuevos gates, ampliar por meses contiguos
-   hacia 2017–2019. WF 2020–2023 necesita antes un contrato/fuente de datos
-   separado; el contrato y la fixture offline `WARMUP_ONLY → WF` con resume ya
-   están implementados/validados (receipt
-   `runtime/market-evidence/wf-warmup-resume-fixture-20260915.json`), pero no
-   hay datos WF adquiridos ni consumidor productivo habilitado y el
-   `DatasetManifest` HistData actual los rechaza. No usar 2024–2025.
-3. Reconstruir y verificar un runtime STAGED desde el SHA final; no promoverlo
-   ni instalarlo operativamente por inferencia.
+2. Mantener la única corrida `development-2016-full-v17` desde su checkpoint
+   parcial, auditar su terminalidad/offsets/artefactos y no iniciar otra
+   campaña pesada en paralelo. Sólo después de un receipt terminal, y con
+   nuevos gates, ampliar por meses contiguos hacia 2017–2019. WF 2020–2023
+   necesita antes un contrato/fuente separado; el contrato y la fixture offline
+   `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
+   datos WF ni consumidor productivo habilitado. No usar 2024–2025.
+3. Reconstruir y verificar el runtime STAGED desde el SHA final de código;
+   los cambios locales cTrader/warmup siguen `NOT_VALIDATED` hasta el próximo
+   gate completo. No promoverlo ni instalarlo operativamente por inferencia.
 4. Preparar una futura campaña holdout sólo con un contrato de dataset 2024–2025,
    permiso confirmatorio tipado y acceso humano único; la resistencia 72h,
    ejecución DEMO y forward siguen cerrados (OAuth sólo lectura ya verificado;

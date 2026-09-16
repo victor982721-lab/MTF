@@ -154,6 +154,18 @@ una página por lado, completas y sin incidencias, en
 `../runtime/market-evidence/ctrader-tick-data-read-only-canary-20260915.json`
 (SHA-256 `c3abd241781c2f6742b9610f9e0d90a61f0f7187c11a1198f7d12f106f45053f`).
 
+El código local de `watch --network` (aún pendiente de gate completo y canaria
+conectada) conserva una separación explícita de bases:
+con `price_base="native"` consulta un sufijo cerrado y contiguo de M1/M5/M15
+con un único `cutoff`, lo ingiere como `WARMUP_ONLY` en el mismo
+`RuntimeCoordinator` y después suscribe spots y trendbars live. `has_more` de
+la consulta fuente permanece en la procedencia; no se presenta como historia
+completa. Un trendbar live sin `period` sólo se admite cuando el payload trae
+contexto de periodo explícito. Los perfiles `mid`/`bid`/`ask` no mezclan
+trendbars nativas con sus indicadores y deben calentar con SpotEvents válidos.
+El lector proyecta EOF/backpressure en la barrera de reconciliación y
+desconecta el sink PAPER; ninguna de estas rutas envía órdenes.
+
 ### Evolución H0–H6 local — 2026-09-13
 
 La [matriz de implementación y aceptación](demo_reliability_plan.md) describe
@@ -207,8 +219,9 @@ archivos privados y publicación sin reemplazo. La reproducción exige
 `price_base=native` y `order=market_time_corrected`, conserva la recepción original
 y no fabrica bid/ask ni fills. Las capturas parciales, vacías o incompatibles no
 se presentan como análisis completo. La ruta y los comandos están en el README.
-Esa preparación de 422 pruebas no incluía aún el runner continuo. **La conexión
-real de MTF por Open API sigue pendiente de aprobación y OAuth**.
+Esa preparación de 422 pruebas no incluía aún el runner continuo. La ejecución
+de MTF por Open API, los scopes de trading y la operación continua siguen
+pendientes; la lectura DEMO `accounts` ya observada no los acredita.
 
 ### Runner y observabilidad offline — 2026-09-12
 

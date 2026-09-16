@@ -97,8 +97,8 @@ def _validate_args(args: argparse.Namespace, config: EffectiveConfig) -> CTrader
         raise ConfigError("elija exactamente --fixture o --network")
     if bool(getattr(args, "session", None)) != bool(getattr(args, "resume", False)):
         raise ConfigError("--session y --resume se requieren juntos")
-    if config.price_base not in {"mid", "bid", "ask"}:
-        raise ConfigError("watch observa spots mid/bid/ask; use cfd-paper para histórico native")
+    if config.price_base not in {"mid", "bid", "ask", "native"}:
+        raise ConfigError("watch sólo admite base mid/bid/ask/native")
     if str(config.ctrader.get("environment", "DEMO")).upper() != "DEMO":
         raise ConfigError("watch sólo admite DEMO")
     if config.execution.get("enabled", False) is not False:
@@ -155,7 +155,7 @@ def _fixture_frontier(store: SQLiteStore, session_id: str | None, config: Effect
 
 
 def _fixture_provider(
-    config: EffectiveConfig, start: int, count: int
+    config: EffectiveConfig, start: int, count: int, *, include_trendbars: bool = False
 ) -> tuple[CTraderProvider, Callable[[], datetime]]:
     from ..data.ctrader import (
         PAYLOAD,
@@ -178,7 +178,11 @@ def _fixture_provider(
             raise ConfigError("la fixture rechazó una solicitud no observacional")
         messages = [WireMessage("PROTO_OA_SUBSCRIBE_SPOTS_RES", {}, request.client_msg_id)]
         for item in payloads:
-            payload = {key: value for key, value in item.items() if key not in {"trendbar", "trendbars"}}
+            payload = (
+                dict(item)
+                if include_trendbars
+                else {key: value for key, value in item.items() if key not in {"trendbar", "trendbars"}}
+            )
             when = datetime.fromtimestamp(int(payload["timestamp"]) / 1000, UTC) + timedelta(seconds=1)
             messages.append(
                 WireMessage(
@@ -197,7 +201,7 @@ def _fixture_provider(
         symbol=config.instrument,
         symbol_id=99,
         account_id=7,
-        quote_basis=config.price_base,
+        quote_basis=config.price_base if config.price_base in {"mid", "bid", "ask"} else "mid",
         queue_maxsize=count + 32,
         heartbeat_seconds=60.0,
     )
@@ -296,6 +300,7 @@ class CTraderWatchCliService:
     def _network(
         self, args: argparse.Namespace, context: Any, options: CTraderWatchOptions
     ) -> CTraderWatchResult | CommandResult:
+        from .ctrader_warmup import CTraderWarmupError, fetch_causal_warmup
         from .ctrader_watch import CTraderWatchContext, run_ctrader_watch
 
         provider = None
@@ -305,7 +310,14 @@ class CTraderWatchCliService:
             ready = self.query_service._authorize_readonly_provider(context, provider, observed)
             if isinstance(ready, CommandResult):
                 return ready
-            provider.subscribe(timeframes=())
+            # Bootstrap all strategy timeframes only when the configured
+            # analysis basis is the provider-native trendbar series.  A
+            # ``mid``/bid/ask watch cannot silently feed native OHLC into its
+            # indicator stream; it must warm from valid SpotEvents instead.
+            warmup = None
+            if context.config.price_base == "native":
+                warmup = fetch_causal_warmup(provider, context.config)
+            provider.subscribe(timeframes=tuple(str(item.name) for item in context.config.timeframes))
             provenance = {
                 "provider": "ctrader_open_api",
                 "source_mode": "LIVE",
@@ -314,6 +326,10 @@ class CTraderWatchCliService:
                 "network_performed": True,
                 "execution_enabled": False,
                 "data_identity": {"account": context.profile.account_id, "instrument": context.config.instrument},
+                "warmup": warmup.to_dict()
+                if warmup is not None
+                else {"state": "NOT_REQUESTED", "reason": "spot_basis_requires_quote_warmup"},
+                "stream_timeframes": [str(item.name) for item in context.config.timeframes],
             }
             with SQLiteStore(_database_path(args.db)) as store, _StopSignals() as stop:
                 print("CTRADER_WATCH_STARTED DEMO read-only; no orders", file=sys.stderr, flush=True)
@@ -326,9 +342,25 @@ class CTraderWatchCliService:
                         provenance,
                         session_id=getattr(args, "session", None),
                         stop_event=stop,
+                        bootstrap_bars=warmup.bars if warmup is not None else {},
+                        bootstrap_metadata=warmup.to_dict()
+                        if warmup is not None
+                        else {"state": "NOT_REQUESTED", "reason": "spot_basis_requires_quote_warmup"},
                     ),
                     options,
                 )
+        except CTraderWarmupError as exc:
+            return CommandResult.json(
+                {
+                    "ok": False,
+                    "state": "WARMUP_FAILED",
+                    "error": str(exc),
+                    "network_attempted": True,
+                    "execution_enabled": False,
+                },
+                code=2,
+                stderr=True,
+            )
         finally:
             context.client_secret = ""
             if provider is not None and not handed_to_runner:

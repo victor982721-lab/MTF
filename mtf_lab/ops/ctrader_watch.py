@@ -128,6 +128,11 @@ class CTraderWatchContext:
     # when the profile does not contain a ``[cfd]`` section.
     paper_enabled: bool = True
     paper_config: CFDConfig | Mapping[str, Any] | None = None
+    # Optional causal native-bar prefix fetched by the composition root. The
+    # runner consumes it through the same RuntimeCoordinator before polling
+    # live SpotEvents; it never performs history I/O itself.
+    bootstrap_bars: Mapping[str, tuple[Bar, ...]] = field(default_factory=dict)
+    bootstrap_metadata: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,6 +232,7 @@ class _WatchStats:
     last_generation: int | None = None
     last_activity_monotonic: float = 0.0
     checkpoint_events: int = 0
+    bootstrap_bars: int = 0
 
 
 def _short_hash(value: Any) -> str:
@@ -729,6 +735,7 @@ class CTraderWatchRunner:
         self._resumed = False
         self._run_messages_start = 0
         self._run_events_start = 0
+        self._last_idle_tick_monotonic = 0.0
         if not isinstance(context.paper_enabled, bool):
             raise CTraderWatchError("paper_enabled debe ser booleano")
         self._paper: _WatchPaper | None = None
@@ -874,6 +881,7 @@ class CTraderWatchRunner:
         self.stats.ignored_messages = int(watch.get("ignored_messages", 0))
         self.stats.duplicates = int(watch.get("duplicates", 0))
         self.stats.generation_changes = int(watch.get("generation_changes", 0))
+        self.stats.bootstrap_bars = int(watch.get("bootstrap_bars", 0) or 0)
         # The quote state from disk is diagnostic and is never restored.  A
         # new process can recreate
         # generation ``1`` and a numeric equality is not proof of the same
@@ -923,6 +931,101 @@ class CTraderWatchRunner:
         self._assert_capture_boundary(session_id, checkpoint)
         self._restore_watch_checkpoint(checkpoint)
 
+    def _bootstrap_history(self) -> None:
+        """Feed one validated native-bar prefix before live polling.
+
+        History bars are evidence and indicator state only: ``bootstrap=True``
+        suppresses strategy decisions and the PAPER sink never receives a
+        bar.  The composition root owns the network query and supplies the
+        already validated mapping, keeping this runner's single-reader rule
+        intact.
+        """
+
+        if not self.context.bootstrap_bars:
+            return
+        configured = {str(item.name).upper(): int(item.seconds) for item in self.context.config.timeframes}
+        expected_instrument = str(self.context.config.instrument).strip().upper().replace("-", "/")
+        cutoff = self._bootstrap_cutoff()
+        ordered = sorted(
+            self.context.bootstrap_bars.items(),
+            key=lambda item: configured.get(str(item[0]).upper(), -1),
+            reverse=True,
+        )
+        for raw_timeframe, raw_bars in ordered:
+            self._bootstrap_timeframe(str(raw_timeframe), raw_bars, configured, expected_instrument, cutoff)
+        self.coordinator.update_feed_state(
+            connection="CONNECTED",
+            reconciliation=self.coordinator.reconciliation_state,
+            freshness="UNKNOWN" if self.mode == "LIVE" else "NOT_APPLICABLE",
+            continuity="CONTINUOUS",
+            blocked_reasons=self.coordinator.external_blocked_reasons,
+            block_details={"warmup": dict(self.context.bootstrap_metadata)},
+        )
+
+    def _bootstrap_timeframe(
+        self,
+        raw_timeframe: str,
+        raw_bars: Any,
+        configured: Mapping[str, int],
+        expected_instrument: str,
+        cutoff: datetime | None,
+    ) -> None:
+        timeframe = str(raw_timeframe).strip().upper()
+        if timeframe not in configured:
+            raise CTraderWatchError(f"warmup timeframe no configurado: {timeframe}")
+        if not isinstance(raw_bars, (tuple, list)):
+            raise CTraderWatchError(f"warmup {timeframe} requiere una secuencia de barras")
+        previous: Bar | None = None
+        ordered = sorted(
+            raw_bars,
+            key=lambda item: item.interval_start if isinstance(item, Bar) else datetime.min.replace(tzinfo=UTC),
+        )
+        for bar in ordered:
+            if not isinstance(bar, Bar):
+                raise CTraderWatchError(f"warmup {timeframe} contiene un registro no-Bar")
+            if bar.instrument != expected_instrument or bar.timeframe != timeframe:
+                raise CTraderWatchError(f"warmup {timeframe} no coincide con instrumento/temporalidad")
+            if not bar.closed or bar.available_at is None or bar.available_at < bar.interval_end:
+                raise CTraderWatchError(f"warmup {timeframe} contiene barra no cerrada/disponible")
+            if cutoff is not None and bar.interval_end > cutoff:
+                raise CTraderWatchError(f"warmup {timeframe} contiene datos posteriores al cutoff causal")
+            if previous is not None and bar.interval_start != previous.interval_end:
+                raise CTraderWatchError(f"warmup {timeframe} contiene un hueco o solapamiento")
+            result = self.coordinator.process(bar, bootstrap=True)
+            if not result.accepted:
+                raise CTraderWatchError(f"warmup {timeframe} fue rechazado por el procesador")
+            previous = bar
+            self.stats.bootstrap_bars += 1
+            self.stats.bars += 1
+
+    def _bootstrap_cutoff(self) -> datetime | None:
+        raw = self.context.bootstrap_metadata.get("cutoff")
+        if raw is None:
+            return None
+        if not isinstance(raw, str) or not raw.strip():
+            raise CTraderWatchError("warmup cutoff debe ser timestamp UTC")
+        try:
+            parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise CTraderWatchError("warmup cutoff inválido") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise CTraderWatchError("warmup cutoff debe incluir zona horaria")
+        return parsed.astimezone(UTC)
+
+    def _record_normalization_issues(self, issues: Iterable[Any]) -> None:
+        bounded = [str(item)[:200] for item in tuple(issues)[:8]]
+        if self._paper is not None:
+            for issue in bounded:
+                self._paper.note(f"NORMALIZATION_{issue}")
+        self.coordinator.update_feed_state(
+            connection="CONNECTED",
+            reconciliation="NEEDS_RECONCILIATION",
+            freshness="BLOCKED",
+            continuity="BROKEN",
+            blocked_reasons=tuple(dict.fromkeys((*self.coordinator.external_blocked_reasons, "normalization_error"))),
+            block_details={"normalization_error": {"issues": bounded}},
+        )
+
     def _prepare(self) -> None:
         session_id = self._session_id()
         self._load_previous_checkpoint(session_id)
@@ -969,6 +1072,10 @@ class CTraderWatchRunner:
                     # state.  Start only the new local namespace and expose
                     # the missing evidence instead of claiming a resume.
                     self._paper.note("PAPER_STATE_UNAVAILABLE_ON_RESUME")
+        if self._previous_watch is None:
+            self._bootstrap_history()
+        elif self.context.bootstrap_bars and int(self._previous_watch.get("bootstrap_bars", 0) or 0) <= 0:
+            raise CTraderWatchError("checkpoint existente no conserva el warmup causal requerido")
         # A bounded slice is resumable, not terminal.  PAUSED is intentionally
         # outside RuntimeCoordinator's terminal blocking states.
         self.coordinator.capture_state = "CAPTURING"
@@ -1019,6 +1126,8 @@ class CTraderWatchRunner:
             "generation_changes": self.stats.generation_changes,
             "provider_generation": getattr(provider, "generation", None),
             "provider_quote_state": quote_state,
+            "bootstrap_bars": self.stats.bootstrap_bars,
+            "bootstrap": dict(self.context.bootstrap_metadata),
             "execution_enabled": False,
         }
         if self._paper is not None:
@@ -1052,6 +1161,45 @@ class CTraderWatchRunner:
     def _paper_reconnect(self, generation: int) -> None:
         if self._paper is not None:
             self._paper.reconnect(generation)
+
+    def _observe_provider_health(self) -> None:
+        """Project reader/backpressure failures into the operational gate."""
+
+        status = getattr(self.context.provider, "status", None)
+        if status is None:
+            return
+        connection = _connection_value(status)
+        needs = bool(getattr(status, "needs_reconciliation", False))
+        dropped = int(getattr(status, "dropped_messages", 0) or 0)
+        if not needs and connection in {"CONNECTED", "HEALTHY"}:
+            return
+        if connection not in {"CONNECTED", "HEALTHY"}:
+            reason = "reader_failure" if getattr(status, "last_error", None) else "feed_discontinuity"
+            state = "DISCONNECTED"
+        elif dropped:
+            reason = "market_backpressure"
+            state = "CONNECTED"
+        else:
+            reason = "feed_discontinuity"
+            state = connection or "UNKNOWN"
+        self._generation_recovery_pending = True
+        self._recovery_verified = False
+        if self._paper is not None:
+            self._paper.disconnect(reason=reason)
+        self.coordinator.update_feed_state(
+            connection=state,
+            reconciliation="NEEDS_RECONCILIATION",
+            freshness="BLOCKED" if state in {"CONNECTED", "HEALTHY"} else "DISCONNECTED",
+            continuity="BROKEN",
+            blocked_reasons=tuple(dict.fromkeys((*self.coordinator.external_blocked_reasons, reason))),
+            block_details={
+                reason: {
+                    "active": True,
+                    "dropped_messages": dropped,
+                    "last_error": str(getattr(status, "last_error", "") or "")[:240],
+                }
+            },
+        )
 
     def _observe_generation(self, generation: int | None) -> None:
         if generation is None:
@@ -1118,15 +1266,15 @@ class CTraderWatchRunner:
         del message
         return False
 
-    def _save_message(self, message: WireMessage) -> None:
+    def _save_message(self, message: WireMessage) -> bool:
         try:
             envelope = message.capture_envelope()
         except Exception:
             self.stats.ignored_messages += 1
-            return
+            return False
         if envelope.get("ingest_sequence") is None or envelope.get("connection_generation") is None:
             self.stats.ignored_messages += 1
-            return
+            return False
         source_sequence = _parse_sequence(envelope.get("ingest_sequence"))
         durable_sequence = source_sequence
         if source_sequence is not None and self.stats.last_sequence is not None:
@@ -1141,14 +1289,15 @@ class CTraderWatchRunner:
             envelope = {**envelope, "ingest_sequence": durable_sequence, "payload": payload}
         try:
             self.context.store.save_capture_envelope(self.coordinator.session_id, envelope)
-        except IdempotencyConflict:
-            # A provider restarted with a reset local ingest counter.  Do not
-            # skip the new tick merely because the durable capture key is
-            # occupied; RuntimeCoordinator still receives the normalized
-            # record and its own idempotency/quality gates remain active.
-            self.stats.duplicates += 1
+        except IdempotencyConflict as exc:
+            # A reset local counter is handled above by allocating the next
+            # durable sequence.  Reaching this branch means the same durable
+            # identity carries different bytes/generation; continuing would
+            # corrupt the capture prefix used for resume.
+            raise CTraderWatchError("conflicto de payload en la captura durable") from exc
         if durable_sequence is not None:
             self.stats.last_sequence = durable_sequence
+        return True
 
     def _raw_synthetic(self, message: WireMessage) -> bool:
         payload = message.payload
@@ -1274,9 +1423,10 @@ class CTraderWatchRunner:
         if self._resume_duplicate(message):
             return
         self._observe_generation(_parse_generation(message.connection_generation))
-        self._save_message(message)
         sequence = _parse_sequence(message.ingest_sequence)
         self.stats.messages += 1
+        if not self._save_message(message):
+            return
         payload_type = message.payload_type_id
         if payload_type == PAYLOAD["PROTO_HEARTBEAT_EVENT"]:
             self.stats.heartbeats += 1
@@ -1303,6 +1453,9 @@ class CTraderWatchRunner:
         if payload_type != PAYLOAD["PROTO_OA_SPOT_EVENT"]:
             self.stats.ignored_messages += 1
             return
+        self._process_spot_message(message, sequence)
+
+    def _process_spot_message(self, message: WireMessage, sequence: int | None) -> None:
         raw_payload = message.payload
         normalized = self.context.provider.normalize_spot(
             raw_payload,
@@ -1314,11 +1467,16 @@ class CTraderWatchRunner:
             sequence=sequence,
             generation=_parse_generation(message.connection_generation),
         )
+        if normalized.issues:
+            # Preserve the malformed payload in the capture ledger, but do
+            # not allow a partially normalized record to emit a signal or
+            # PAPER fill.  The issue text is bounded and contains no tokens.
+            self._record_normalization_issues(normalized.issues)
         raw_synthetic = self._raw_synthetic(message)
         paper_events: list[Event] = []
         for record in normalized.records:
             self._process_record(record, raw_synthetic)
-            if isinstance(self._last_decorated_record, Event):
+            if not normalized.issues and isinstance(self._last_decorated_record, Event):
                 paper_events.append(self._last_decorated_record)
         # Deliver quotes after the message's detector records.  This keeps a
         # signal emitted at the close of the current bar causal while still
@@ -1376,11 +1534,21 @@ class CTraderWatchRunner:
             stop_reason = self._poll_stop_reason(started)
             if stop_reason is not None:
                 return stop_reason
+            self._observe_provider_health()
             message = poll_event(self._poll_timeout(started, self._monotonic()))
             post_poll_stop = self._post_poll_stop_reason(started)
             if post_poll_stop is not None:
                 return post_poll_stop
             if message is None:
+                now = self._clock()
+                current = self.coordinator.last_received_at
+                if current is not None and now < current:
+                    now = current
+                if self._monotonic() - self._last_idle_tick_monotonic >= 1.0:
+                    self._advance_paper(now)
+                    self.coordinator.tick(now)
+                    self._last_idle_tick_monotonic = self._monotonic()
+                self._observe_provider_health()
                 continue
             self.stats.last_activity_monotonic = self._monotonic()
             self._process_message(message)
@@ -1415,6 +1583,9 @@ class CTraderWatchRunner:
             "last_heartbeat_at": status.last_heartbeat_at,
             "block_details": dict(status.block_details),
             "block_history": list(status.block_history),
+            "warmup_pending": dict(self.coordinator.processor.status.get("warmup_pending", {})),
+            "bootstrap_bars": self.stats.bootstrap_bars,
+            "bootstrap": dict(self.context.bootstrap_metadata),
         }
         if self._paper is not None:
             paper = self._paper.projection()
@@ -1491,6 +1662,9 @@ class CTraderWatchRunner:
             if clean_stop:
                 self.coordinator.capture_state = "PAUSED"
             attempt(self._checkpoint)
+        paper = self._paper
+        if paper is not None:
+            attempt(lambda: paper.disconnect(reason="WATCH_CLOSED"))
         if self._coordinator is not None and self.context.close_provider:
             needs_reconciliation = self._previous_watch is not None or self._generation_recovery_pending
             attempt(
@@ -1519,6 +1693,11 @@ class CTraderWatchRunner:
         try:
             self._prepare()
             self._check_provider_ready()
+            # Causal bootstrap is deliberately performed before polling and
+            # may take longer than the live idle timeout.  Start the idle
+            # budget at the first live-reader poll, not at process startup.
+            self.stats.last_activity_monotonic = self._monotonic()
+            self._last_idle_tick_monotonic = self.stats.last_activity_monotonic
             poll_event = self._poll_event()
             self._run_messages_start = self.stats.messages
             self._run_events_start = self.stats.events

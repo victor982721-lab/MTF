@@ -914,9 +914,14 @@ class CTraderProvider:
         from_timestamp: datetime | None = None,
         to_timestamp: datetime | None = None,
         max_pages: int = 20,
+        stop_after_bars: int | None = None,
     ) -> CTraderHistoryResult:
         if isinstance(max_pages, bool) or max_pages <= 0:
             raise CTraderConfigurationError("max_pages debe ser positivo")
+        if stop_after_bars is not None and (
+            isinstance(stop_after_bars, bool) or not isinstance(stop_after_bars, int) or stop_after_bars <= 0
+        ):
+            raise CTraderConfigurationError("stop_after_bars debe ser entero positivo")
         start_bound = ensure_utc(from_timestamp, field_name="from_timestamp") if from_timestamp is not None else None
         cursor_to = to_timestamp
         collected: dict[tuple[datetime, int], Bar] = {}
@@ -947,7 +952,11 @@ class CTraderProvider:
                 collected[(bar.interval_start, int(bar.revision))] = bar
             if any(not bar.closed for bar in page.bars):
                 issues.append("histórico incluye un intervalo abierto; cobertura cerrada incompleta")
-            if not page.has_more:
+            if not page.has_more or (stop_after_bars is not None and len(collected) >= stop_after_bars):
+                # Keep the source ``has_more`` signal as provenance while
+                # avoiding an unnecessary walk through older pages.  The
+                # caller still validates continuity/cutoff on the selected
+                # suffix and never relabels this bounded view as complete.
                 break
             earliest = min((bar.interval_start for bar in page.bars), default=None)
             if earliest is None or (previous_earliest is not None and earliest >= previous_earliest):
@@ -1881,6 +1890,11 @@ def _normalize_spot_bars(
 ) -> tuple[list[Bar], list[str]]:
     bars: list[Bar] = []
     issues: list[str] = []
+    # Live trendbar notifications can omit the child ``period`` while the
+    # enclosing spot payload carries the subscription context.  Reuse that
+    # explicit response-level value; never guess a timeframe from a bar's
+    # timestamp or from the configured base interval.
+    response_period = read_field(payload, "period", "timeframe", default=None)
     for index, raw_bar in enumerate(read_repeated(payload, "trendbar", "trendbars")):
         try:
             bars.append(
@@ -1889,6 +1903,7 @@ def _normalize_spot_bars(
                     spec=spec,
                     received_at=received,
                     available_at=available,
+                    response_period=response_period,
                     request_id=f"spot-{sequence if sequence is not None else index}",
                     mode="LIVE",
                 )

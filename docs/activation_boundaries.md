@@ -66,15 +66,18 @@ se convierte en certeza de que una orden nunca existió.
 
 ### C — INTERVENCIÓN DEL USUARIO PENDIENTE
 
-1. Registrar y obtener la aprobación de una aplicación cTrader.
-2. Disponer externamente de `CTRADER_CLIENT_ID` y `CTRADER_CLIENT_SECRET`.
-3. Completar OAuth y consentir el alcance aplicable.
-4. Descubrir las cuentas realmente autorizadas por ese consentimiento.
-5. Seleccionar explícitamente una cuenta **DEMO**, sin selección automática.
-6. Verificar catálogo y condiciones reales del bróker para la cuenta/símbolo.
-7. Autorizar y verificar la ruta contra el servidor **DEMO**, incluidos permisos,
-   ejecución y reconciliación. El gate offline no ejecuta este paso.
-8. Confirmar condiciones contractuales de Pepperstone relevantes para México,
+La lectura DEMO de sólo lectura con OAuth y alcance `accounts` ya fue observada
+en el estado vigente. No se reabren OAuth, discovery ni selección de cuenta para
+esta fase. Los gates externos que permanecen son:
+
+1. Obtener y verificar cualquier aprobación adicional de aplicación/scope que
+   sea necesaria para ejecución DEMO; no se ha solicitado `trading`.
+2. Verificar catálogo, límites y condiciones reales del bróker para la
+   cuenta/símbolo, sin convertir una plantilla local en autorización.
+3. Autorizar y verificar la ruta contra el servidor **DEMO**, incluidos
+   ejecución, reconciliación, operación continua y forward. El gate offline no
+   ejecuta este paso.
+4. Confirmar condiciones contractuales de Pepperstone relevantes para México,
    uso/almacenamiento/redistribución de datos y costes. No se declara validación
    contractual ni se recomienda contratar en función de los sintéticos.
 

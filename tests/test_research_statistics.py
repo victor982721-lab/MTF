@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from copy import deepcopy
 from decimal import getcontext
 
 from mtf_lab.ops.research_statistics import result_metrics
@@ -145,6 +146,14 @@ class ResearchStatisticsTests(unittest.TestCase):
         self.assertIsNone(metrics["margin"]["value"])
         self.assertEqual(metrics["cost_total_known"], "0")
         self.assertEqual(metrics["cost_unknown_count"], 0)
+
+    def test_metric_calculation_does_not_mutate_the_result_mapping(self) -> None:
+        result = _result()
+        original = deepcopy(result)
+
+        result_metrics(result)
+
+        self.assertEqual(result, original)
 
 
 if __name__ == "__main__":

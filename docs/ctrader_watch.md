@@ -13,9 +13,12 @@ conservan como evidencia bloqueada y nunca producen un fill. La prueba offline
 utiliza ese mismo cliente/proveedor con un transporte controlado; no sustituye
 al runner por uno de demostración.
 
-La aplicación externa sigue pendiente de Spotware y OAuth, según el
-[estado de integración](ctrader_integration_status.md). Esta mejora local no
-acredita conexión, permisos ni datos observados en el bróker.
+La lectura DEMO de sólo lectura ya fue observada con el OAuth existente; siguen
+pendientes la ejecución, cualquier scope de trading, shadow/forward y la
+aceptación contractual, según el [estado de integración](ctrader_integration_status.md).
+Esta mejora local no acredita una operación ni una ventaja económica. El
+warmup/trendbar descrito abajo es código local en validación; no sustituye una
+canaria conectada.
 
 ## Uso offline desde el checkout
 
@@ -79,12 +82,29 @@ conserva los hashes semánticos aunque cambien los identificadores de sesión.
   Un `SpotEvent` válido puede producir un fill **PAPER local** determinista y
   su cierre posterior; el [flujo histórico nativo](../README.md) sigue
   separado y no fabrica bid/ask ni fills.
+- El código local en validación, cuando el perfil explícito usa
+  `instrument.price_base = "native"`, prepara la ruta `--network` para
+  consultar primero un sufijo causal cerrado de M1/M5/M15 con un
+  único `cutoff`, valida continuidad y lo entrega al mismo
+  `RuntimeCoordinator` como `WARMUP_ONLY`; después suscribe spots **y** live
+  trendbars. `source_has_more` queda como procedencia de la consulta y nunca
+  se relabela como historia completa. Los trendbars periodless sólo se
+  aceptan si el payload trae un `period` explícito. El detector puede emitir
+  señales desde la serie nativa, pero el sink PAPER sigue aceptando fills
+  únicamente desde un SpotEvent bid/ask `VALID` (`bid < ask`); una vela nunca
+  se convierte en cotización.
+- Con `mid`/`bid`/`ask`, una historia nativa no se inyecta en los indicadores
+  porque mezclar bases sería una inferencia no observada: el proceso queda en
+  calentamiento de SpotEvents hasta reunir barras cerradas válidas. Si el
+  lector reporta EOF, backpressure o `needs_reconciliation`, el estado pasa a
+  bloqueado, el PAPER se desconecta y no se inventa un backfill.
 
-`--network` es una ruta distinta, explícita, para una futura sesión DEMO ya
-autorizada. Reutiliza la preparación y verificación fresca de `ctrader query`
-antes de autorizar la cuenta, resolver el símbolo y suscribir spots. Rechaza
+`--network` es una ruta distinta y explícita para una sesión DEMO ya autorizada.
+Reutiliza la preparación y verificación fresca de `ctrader query` antes de
+autorizar la cuenta, resolver el símbolo y suscribir el stream. Rechaza
 REAL/LIVE, inventarios mixtos, permisos de trading no solicitados y ejecución
-habilitada. No se utilizó esa ruta externa para validar esta entrega.
+habilitada. La canaria conectada de esta variante aún está pendiente; las
+pruebas actuales son locales y no acreditan una operación externa.
 
 ## Qué muestra el panel
 

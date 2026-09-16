@@ -108,6 +108,16 @@ la verificación integrada, sin abrir sus bases.
 
 La autenticación y la observación del servidor siguen reservadas para Víctor.
 
+## Estado posterior — 2026-09-16
+
+El árbol actual añade la frontera local de warmup cTrader, salud del lector y
+PAPER fail-closed, además de una extracción mecánica de `result_metrics` en
+componentes puros. La validación focal (cTrader/warmup/reporting) y los checks
+Ruff/formato/mypy/Pyright están en verde; el último gate global completo
+(`990/990`) es el receipt anterior a estos bytes. El gate global nuevo y el
+runtime que lo contenga se emitirán después de que termine la reanudación V17;
+ningún resultado focal se presenta como una release o como evidencia económica.
+
 ## Ampliación verificada: runner continuo y observabilidad — 2026-09-12
 
 La base cTrader de **422 pruebas** se consolidó en `9d066c6`; el runner continuo

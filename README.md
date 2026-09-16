@@ -26,7 +26,8 @@ integración. Su [piloto real y límites](docs/market_pilot_status.md) registra
 la semana/mes descriptivos de marzo de 2016, distintos de los fixtures y de la
 entrega H0–H6. Se conserva el año 2016 completo de HistData (12 ZIPs y un
 manifiesto compuesto con 19,026,438 ticks); el piloto descriptivo documentado
-sigue siendo sólo marzo y todavía no se ha ejecutado el backtest anual.
+sigue siendo sólo marzo. El backtest anual V17 está en curso/reanudación desde
+un checkpoint parcial; todavía no existe receipt terminal ni resultado económico.
 Antes de ese backtest se completó un canario de capacidad de 1,048,576
 cotizaciones sobre el manifiesto 2016; midió 45:42 de pared y RSS máximo de
 263,488 KiB con la cadencia durable de 65,536 cotizaciones, sin selección,
@@ -50,8 +51,9 @@ y receipts fail-closed; la fixture offline `WARMUP_ONLY → WF` con reanudación
 byte-equivalente ya está validada en
 `runtime/market-evidence/wf-warmup-resume-fixture-20260915.json`. Todavía no
 hay datos WF ni consumidor productivo ejecutable: el runner sólo enlaza el
-contrato en preflight y cierra antes de leer datos. La referencia
-global reproducible vigente pasó 990/990 pruebas sin omisiones, con
+contrato en preflight y cierra antes de leer datos. La última referencia
+global reproducible completa, previa a los cambios locales warmup/health y al
+refactor de reporting, pasó 990/990 pruebas sin omisiones, con
 líneas/ramas 79.871%/62.989%; su receipt está en
 `runtime/market-evidence/quality-gate-20260915-ctrader-paper-tick-v3.json`. El gate
 histórico bounded previo pasó 964/964 pruebas, con líneas/ramas
@@ -97,7 +99,9 @@ el entorno operativo y sus launchers no fueron sustituidos.
   offline, lint/formato/tipos y auditoría arquitectónica.
 - Runner `ctrader watch` de lectura, acotado y reanudable, con sink local
   `FOREX_CFD_LOCAL_PAPER`, persistencia/checkpoint de `cfd_trades`, fixture de
-  fills deterministas y panel de procedencia/frescura/estado/errores. El
+  fills deterministas y panel de procedencia/frescura/estado/errores. La base
+  `native` admite warmup causal cerrado M1/M5/M15 y suscripción conjunta de
+  spots/trendbars; PAPER sólo usa bid/ask válidos de SpotEvent. El
   [manual de observación continua](docs/ctrader_watch.md) separa el uso offline
   de la validación externa y operación aún pendientes.
 - Lector `ProtoOAGetTickDataReq` para BID/ASK históricos independientes, con

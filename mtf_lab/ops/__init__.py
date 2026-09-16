@@ -92,6 +92,13 @@ from .ctrader_history_export import (
     HistoryCaptureError,
     select_bounded_history_window,
 )
+from .ctrader_warmup import (
+    CTraderWarmupError,
+    CTraderWarmupResult,
+    fetch_causal_warmup,
+    validate_history_result,
+    warmup_requirements,
+)
 from .persistence import SQLiteStore
 from .reporting import ReportBuilder
 from .simulation import (
@@ -132,6 +139,11 @@ __all__ = [
     "BoundedHistorySelection",
     "HistoryCaptureError",
     "select_bounded_history_window",
+    "CTraderWarmupError",
+    "CTraderWarmupResult",
+    "fetch_causal_warmup",
+    "validate_history_result",
+    "warmup_requirements",
     "run_ctrader_fixture",
     "CTraderDemoTransport",
     "CTraderOfficialDemoTransport",
