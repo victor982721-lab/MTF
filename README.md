@@ -70,7 +70,7 @@ validación local, la instalación operativa y las ventanas de 72 horas/30
 sesiones son estados distintos. Ningún comando nuevo activa trading por defecto.
 
 El runtime privado candidato se conserva en `STAGED_RUNTIME` y
-`NOT_PROMOTED`; el staging más reciente disponible se identifica en el [estado del piloto](docs/market_pilot_status.md)
+`NOT_PROMOTED`; el staging de referencia con la validación indicada se identifica en el [estado del piloto](docs/market_pilot_status.md)
 y se liga al árbol que fue validado. La revisión V27 está en
 `/home/winterboss/.local/share/mtf-lab/runtime-review-20260915-0335/runtime/STAGED_RUNTIME.json`
 (SHA-256 `25d36afd060d8fb50d7a41e434753c33c55be93a020300399c516d10fe3c6b3d`);

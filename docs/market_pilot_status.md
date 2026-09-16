@@ -456,7 +456,7 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.
 3. Reconstruir y verificar el runtime STAGED desde el SHA final de código;
-   V27 es sólo el último staging disponible anterior a `58a2fdd`, por lo que los
+   V27 es sólo el staging de referencia documentado, anterior a `58a2fdd`, por lo que los
    cambios locales cTrader/warmup/reporting siguen `NOT_VALIDATED` hasta el próximo
    gate completo. No promoverlo ni instalarlo operativamente por inferencia.
 4. Preparar una futura campaña holdout sólo con un contrato de dataset 2024–2025,
