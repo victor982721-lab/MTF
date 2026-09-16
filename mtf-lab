@@ -4,4 +4,10 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
 PY_BIN="${PYTHON:-$ROOT/.venv/bin/python}"
 if [[ ! -x "$PY_BIN" ]]; then PY_BIN="python3"; fi
+# The selected interpreter owns its prefix.  A runtime wrapper may export a
+# different PYTHONHOME (for example, the staged 3.12 runtime while the
+# checkout launcher uses 3.14); forwarding that value makes Python fail before
+# importing ``encodings``.  The launcher already chooses the executable
+# explicitly, so do not let ambient PYTHONHOME override it.
+unset PYTHONHOME
 exec "$PY_BIN" -m mtf_lab "$@"
