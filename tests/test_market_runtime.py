@@ -473,6 +473,8 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             def fake_prepare(**kwargs: object) -> dict[str, object]:
                 target = Path(str(kwargs["destination"]))
                 target.mkdir(parents=True)
+                for relative in ("base-python", "runtime-python", "dev-python"):
+                    (target / relative).mkdir()
                 _write_json(
                     target / runtime_lifecycle.STAGED_MARKER,
                     {
