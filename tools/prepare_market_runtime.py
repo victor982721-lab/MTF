@@ -32,6 +32,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 from mtf_lab.ops.runtime_lifecycle import DEFAULT_RUNTIME_ROOT, RuntimeLifecycle, RuntimeLifecycleError
 
 _DEFAULT_RUNTIME_CACHE_ROOT = Path.home() / ".cache" / "codex-runtimes"

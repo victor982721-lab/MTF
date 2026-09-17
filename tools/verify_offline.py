@@ -12,7 +12,7 @@ is missing or fails.  Writing the canonical reports is explicit::
 
     .venv/bin/python tools/verify_offline.py --write-reports
 
-Use explicit ``--runtime-python``, ``--dev-python`` and ``--node`` paths in
+Use explicit ``--runtime-python``, ``--dev-python``, ``--build-python`` and ``--node`` paths in
 automation when the checkout is not using the conventional ``.venv`` and
 ``.venv-dev`` directories.  No dependency installation is attempted here.
 """
@@ -1084,6 +1084,7 @@ def run(
     *,
     runtime_python: str | os.PathLike[str] | None = None,
     dev_python: str | os.PathLike[str] | None = None,
+    build_python: str | os.PathLike[str] | None = None,
     node: str | os.PathLike[str] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     benchmark_events: int = DEFAULT_BENCHMARK_EVENTS,
@@ -1098,6 +1099,9 @@ def run(
         runtime_path = root_path / runtime_path
     if not dev_path.is_absolute():
         dev_path = root_path / dev_path
+    build_path = Path(build_python or dev_path)
+    if not build_path.is_absolute():
+        build_path = root_path / build_path
     configured_node = os.environ.get("MTF_NODE_BIN")
     discovered_node = shutil.which("node")
     node_candidate = node or configured_node or discovered_node
@@ -1162,7 +1166,7 @@ def run(
                 environment=environment,
                 temporary_root=temporary_root,
                 timeout=timeout,
-                build_python=dev_path if dev_exists else None,
+                build_python=build_path if build_path.is_file() and os.access(build_path, os.X_OK) else None,
             )
             if runtime_exists
             else {"ok": False, "reason": "runtime-python-not-found"}
@@ -1357,6 +1361,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--dev-python", default=None, help="intérprete dev explícito; por defecto root/.venv-dev/bin/python"
     )
+    parser.add_argument(
+        "--build-python",
+        default=None,
+        help="intérprete para smokes de empaquetado; por defecto usa --dev-python",
+    )
     parser.add_argument("--node", default=None, help="binario Node explícito; por defecto se busca en PATH")
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT)
     parser.add_argument("--benchmark-events", type=int, default=DEFAULT_BENCHMARK_EVENTS)
@@ -1374,6 +1383,7 @@ def main(argv: list[str] | None = None) -> int:
         args.root,
         runtime_python=args.runtime_python,
         dev_python=args.dev_python,
+        build_python=args.build_python,
         node=args.node,
         timeout=args.timeout,
         benchmark_events=args.benchmark_events,

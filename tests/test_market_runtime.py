@@ -296,7 +296,7 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             root = Path(raw)
             destination = _make_review(root, "runtime-review-live")
             child = subprocess.Popen(
-                [sys.executable, "-c", "import time; time.sleep(5)"],
+                [sys.executable, "-c", "import time; time.sleep(1)"],
                 cwd=destination,
             )
             try:
@@ -305,7 +305,7 @@ class MarketRuntimePreparationTests(unittest.TestCase):
                 self.assertEqual("needs_review", preserved["action"])
                 self.assertTrue(destination.parent.is_dir())
             finally:
-                child.wait(timeout=5)
+                child.wait(timeout=10)
             result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
             self.assertEqual("runtime-review-live", result["deleted"][0]["name"])
 
