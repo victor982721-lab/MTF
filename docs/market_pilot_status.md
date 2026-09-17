@@ -408,10 +408,16 @@ No se inició resistencia de 72 horas, shadow, OAuth ni órdenes DEMO por esta
 limpieza.
 
 El runtime actual fue construido por el preparador gestionado el 2026-09-17 y
-promovido tras validar Python 3.12.14/SQLite 3.53.1/Protobuf 7.36.1, `pip check`,
-imports aislados y el launcher (`--help`). El receipt de promoción es
-`runtime/verification/runtime-promotion-lifecycle-20260917.json`; el manifiesto
-activo conserva el run `20260917T145251Z-d364e4bd`.
+promovido de forma controlada tras validar Python 3.12.14/SQLite 3.53.1/
+Protobuf 7.36.1, `pip check`, imports aislados y el launcher (`--help`). El
+manifiesto activo conserva el run `20260917T165344Z-4e04a033`, en
+`state=ACTIVE_RUNTIME`/`promotion_state=ACTIVE`, y su SHA-256 es
+`52f6ec23c8b91bf72ea9d5b4a93b272d2458b3cd8fa0aa3fbaeef9dda9ca2eee`.
+El receipt vigente de promoción es
+`runtime/verification/runtime-lifecycle-final3-promote-20260917.json` (SHA-256
+`78026e0ab119626d4d12d10731dc87537c335da3ca485aa9808dae1ab8589c86`). Los
+receipts `runtime-promotion-lifecycle-20260917.json` y `*-final-verification*`
+anteriores se conservan como antecedentes, no como estado vivo.
 Dos builds independientes con `SOURCE_DATE_EPOCH=0` y mtimes distintos fueron
 byte-identical; su correspondencia fuente→wheel→instalación quedó validada. La
 edición documental histórica y su comprobación estática se conservaron en
