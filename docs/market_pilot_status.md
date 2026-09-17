@@ -464,10 +464,10 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
    specs explícitos conocidos sólo habilitan neto condicional.
 2. La auditoría de terminalidad, offsets, artefactos, registry y hashes de
    `development-2016-full-v17` quedó verificada en el receipt indicado arriba;
-   no repetirla ni iniciar otra campaña pesada en paralelo. El siguiente paso
-   es ejecutar el gate global sobre el árbol actual y reconstruir/verificar el
-   runtime STAGED desde el SHA final. Sólo después de esos gates ampliar por
-   meses contiguos hacia 2017–2019. WF 2020–2023
+   no repetirla ni iniciar otra campaña pesada en paralelo. El gate global
+   offline y la reconstrucción/promoción controlada del runtime ya quedaron
+   verificados en los receipts finales; sólo queda ampliar por meses contiguos
+   hacia 2017–2019 cuando sus gates lo permitan. WF 2020–2023
    necesita antes un contrato/fuente separado; el contrato y la fixture offline
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.
