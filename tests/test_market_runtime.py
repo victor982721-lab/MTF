@@ -618,6 +618,26 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             ):
                 runtime_lifecycle._proc_references([root / "candidate"])
 
+    def test_opaque_process_with_empty_command_line_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            real_iterdir = Path.iterdir
+            process_path = Path(f"/proc/{os.getpid()}")
+
+            def deny_proc_fd(path: Path) -> Iterator[Path]:
+                if path == Path("/proc"):
+                    return iter([process_path])
+                if path == process_path / "fd":
+                    raise PermissionError(errno.EACCES, "synthetic proc denial", str(path))
+                return real_iterdir(path)
+
+            with (
+                mock.patch.object(Path, "iterdir", deny_proc_fd),
+                mock.patch.object(runtime_lifecycle, "_proc_commandline", return_value=""),
+                self.assertRaises(runtime_lifecycle.RuntimeLifecycleError),
+            ):
+                runtime_lifecycle._proc_references([root / "candidate"])
+
     def test_incomplete_process_scan_preserves_review_and_allows_inspect(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

@@ -376,7 +376,7 @@ def _proc_is_non_mtf(process: Path, roots: Sequence[Path]) -> bool:
     if commandline is None:
         return True
     if not commandline:
-        return True
+        return False
     if any(marker in commandline for marker in ("mtf_lab", "mtf-lab", "prepare_market_runtime", "runtime_lifecycle")):
         return False
     if any(str(root) in commandline for root in roots):
@@ -580,6 +580,7 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
     root_resolved = root.resolve(strict=True)
     if not _is_within(path, root):
         raise RuntimeLifecycleError(f"runtime tree escapes root: {path}")
+    root_device = root_info.st_dev
     stack = [path]
     while stack:
         current = stack.pop()
@@ -589,6 +590,8 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
             raise RuntimeLifecycleError(f"runtime entry disappeared: {current}") from exc
         if current_info.st_uid != uid:
             raise RuntimeLifecycleError(f"runtime entry has unexpected owner: {current}")
+        if current_info.st_dev != root_device:
+            raise RuntimeLifecycleError(f"runtime entry is on a different filesystem: {current}")
         if stat.S_ISLNK(current_info.st_mode):
             target = (current.parent / os.readlink(current)).resolve(strict=False)
             if not _is_within(target, root_resolved):
@@ -608,8 +611,12 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
                 if not _is_within(target, root_resolved):
                     raise RuntimeLifecycleError(f"runtime symlink escapes candidate: {child}")
             elif stat.S_ISDIR(info.st_mode):
+                if info.st_dev != root_device:
+                    raise RuntimeLifecycleError(f"runtime entry is on a different filesystem: {child}")
                 stack.append(child)
             elif stat.S_ISREG(info.st_mode):
+                if info.st_dev != root_device:
+                    raise RuntimeLifecycleError(f"runtime entry is on a different filesystem: {child}")
                 if info.st_uid != uid:
                     raise RuntimeLifecycleError(f"runtime file has unexpected owner: {child}")
             else:
@@ -632,15 +639,23 @@ def _validate_runtime_layout(path: Path) -> None:
 def _remove_tree(path: Path) -> None:
     """Remove a previously validated tree without following symlinks."""
 
-    try:
-        top_info = os.lstat(path)
-    except OSError as exc:
-        raise RuntimeLifecycleError(f"runtime tree is unavailable: {path}") from exc
-    if stat.S_ISLNK(top_info.st_mode) or not stat.S_ISDIR(top_info.st_mode):
-        raise RuntimeLifecycleError(f"runtime tree is not a regular directory: {path}")
     if not shutil.rmtree.avoids_symlink_attacks:
         raise RuntimeLifecycleError("runtime removal lacks symlink-attack protection")
-    shutil.rmtree(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(path.parent, flags)
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"runtime parent is unavailable: {path.parent}") from exc
+    try:
+        try:
+            top_info = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise RuntimeLifecycleError(f"runtime tree is unavailable: {path}") from exc
+        if stat.S_ISLNK(top_info.st_mode) or not stat.S_ISDIR(top_info.st_mode):
+            raise RuntimeLifecycleError(f"runtime tree is not a regular directory: {path}")
+        shutil.rmtree(path.name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def _managed_temporary_paths(parent: Path, root: Path) -> list[Path]:
