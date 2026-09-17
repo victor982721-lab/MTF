@@ -45,6 +45,7 @@ def _default_handlers() -> dict[str, Handler]:
         cmd_replay,
         cmd_report,
         cmd_research,
+        cmd_runtime,
         cmd_ui,
         cmd_watch,
     )
@@ -72,6 +73,7 @@ def _default_handlers() -> dict[str, Handler]:
         "ctrader_fixture": cmd_ctrader_fixture,
         "cfd_paper": cmd_cfd_paper,
         "research": cmd_research,
+        "runtime": cmd_runtime,
         "ctrader_supervise": cmd_ctrader_supervise,
     }
 
@@ -285,6 +287,29 @@ def build_parser(handlers: Mapping[str, Handler] | None = None) -> argparse.Argu
     q = research.add_parser("validate", help="verifica integridad, particiones, economía y límites de evidencia")
     q.add_argument("manifest", type=Path)
     q.set_defaults(func=callbacks["research"])
+
+    p = subs.add_parser("runtime", help="gestiona runtimes privados MTF sin tocar datos de investigación")
+    runtime = p.add_subparsers(dest="runtime_action", required=True)
+    q = runtime.add_parser("inspect", help="clasifica runtime activo, reviews, rollback y residuos")
+    q.add_argument("--root", type=Path, default=Path.home() / ".local/share/mtf-lab")
+    q.set_defaults(func=callbacks["runtime"])
+    q = runtime.add_parser("gc", help="limpia sólo runtimes gestionados y obsoletos")
+    q.add_argument("--root", type=Path, default=Path.home() / ".local/share/mtf-lab")
+    q.add_argument("--dry-run", action="store_true", help="clasifica sin borrar")
+    q.add_argument("--keep-reviews", type=int, default=1)
+    q.add_argument("--keep-rollbacks", type=int, default=1)
+    q.add_argument("--stale-after-seconds", type=float, default=3600.0)
+    q.add_argument(
+        "--purge-review-evidence",
+        action="store_true",
+        help="elimina también logs/validation heredados, sólo tras preservar su receipt",
+    )
+    q.set_defaults(func=callbacks["runtime"])
+    q = runtime.add_parser("promote", help="promueve explícitamente un review validado")
+    q.add_argument("--root", type=Path, default=Path.home() / ".local/share/mtf-lab")
+    q.add_argument("--path", type=Path, required=True, help=".../runtime dentro de un review gestionado")
+    q.add_argument("--keep-rollback", type=int, default=1)
+    q.set_defaults(func=callbacks["runtime"])
 
     p = subs.add_parser("report", help="genera o imprime informe de una sesión")
     p.add_argument("--session")

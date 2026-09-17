@@ -127,6 +127,52 @@ def cmd_ctrader_supervise(args: argparse.Namespace) -> int:
     return _emit(CommandService().run(args))
 
 
+def cmd_runtime(args: argparse.Namespace) -> int:
+    """Inspect, collect, or explicitly promote managed private runtimes."""
+
+    from .runtime_lifecycle import DEFAULT_RUNTIME_ROOT, RuntimeLifecycle, RuntimeLifecycleError
+
+    requested_root = args.root.expanduser().resolve(strict=False)
+    if requested_root != DEFAULT_RUNTIME_ROOT.expanduser().resolve(strict=False):
+        return _emit(
+            CommandResult.json(
+                {
+                    "schema": "mtf-lab.runtime-lifecycle.v1",
+                    "ok": False,
+                    "error": "runtime root is fixed to ~/.local/share/mtf-lab",
+                },
+                code=2,
+                stderr=True,
+            )
+        )
+
+    manager = RuntimeLifecycle(
+        args.root,
+        keep_reviews=getattr(args, "keep_reviews", 1) if getattr(args, "runtime_action", None) == "gc" else 1,
+        keep_rollbacks=getattr(args, "keep_rollbacks", 1) if getattr(args, "runtime_action", None) == "gc" else 1,
+        stale_after_seconds=getattr(args, "stale_after_seconds", 3600.0),
+    )
+    try:
+        action = args.runtime_action
+        if action == "inspect":
+            payload = manager.inspect()
+        elif action == "gc":
+            payload = manager.gc(
+                dry_run=bool(args.dry_run),
+                max_reviews=args.keep_reviews,
+                max_rollbacks=args.keep_rollbacks,
+                purge_review_evidence=bool(args.purge_review_evidence),
+            )
+        elif action == "promote":
+            payload = manager.promote(args.path, keep_rollback=args.keep_rollback)
+        else:  # pragma: no cover - argparse enforces the action set
+            raise RuntimeLifecycleError(f"unsupported runtime action: {action}")
+    except RuntimeLifecycleError as exc:
+        payload = {"schema": "mtf-lab.runtime-lifecycle.v1", "ok": False, "error": str(exc)}
+        return _emit(CommandResult.json(payload, code=2, stderr=True))
+    return _emit(CommandResult.json(payload))
+
+
 def cmd_ui(args: argparse.Namespace) -> int:
     from .application_services import _config_for, _db_for
     from .ui import serve
@@ -167,6 +213,7 @@ __all__ = [
     "cmd_market_data",
     "cmd_market_research",
     "cmd_ctrader_supervise",
+    "cmd_runtime",
     "cmd_ui",
 ]
 

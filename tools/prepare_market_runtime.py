@@ -32,6 +32,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from mtf_lab.ops.runtime_lifecycle import DEFAULT_RUNTIME_ROOT, RuntimeLifecycle, RuntimeLifecycleError
+
 _DEFAULT_RUNTIME_CACHE_ROOT = Path.home() / ".cache" / "codex-runtimes"
 DEFAULT_SOURCE_PYTHON = _DEFAULT_RUNTIME_CACHE_ROOT / "codex-primary-runtime/dependencies/python/bin/python3"
 DEFAULT_DESTINATION = Path("~/.local/share/mtf-lab/runtime")
@@ -1444,7 +1446,7 @@ def _validate_and_relocate(
     return stage
 
 
-def prepare_runtime(
+def _prepare_runtime_impl(
     *,
     repo_root: Path,
     source_python: Path = DEFAULT_SOURCE_PYTHON,
@@ -1651,11 +1653,62 @@ def prepare_runtime(
             shutil.rmtree(relocated, ignore_errors=True)
 
 
+def prepare_runtime(
+    *,
+    repo_root: Path,
+    source_python: Path = DEFAULT_SOURCE_PYTHON,
+    destination: Path,
+    log_dir: Path | None = None,
+    lifecycle_root: Path = DEFAULT_RUNTIME_ROOT,
+) -> dict[str, Any]:
+    """Build one managed review runtime and reconcile older reviews.
+
+    A caller can no longer publish an arbitrary ``.../runtime`` directory.
+    Review destinations are allocated under the MTF runtime root and are
+    removed on failure; one successful review is retained for inspection until
+    the next lifecycle operation.  Promotion remains an explicit operation.
+    """
+
+    lifecycle = RuntimeLifecycle(lifecycle_root)
+    try:
+        managed_destination = lifecycle.validate_build_destination(destination)
+    except RuntimeLifecycleError as exc:
+        raise PreparationError(str(exc)) from exc
+    with lifecycle.lock():
+        try:
+            lifecycle.recover_unlocked()
+            if os.path.lexists(managed_destination):
+                raise PreparationError(f"staged destination already exists; refusing overwrite: {managed_destination}")
+            lifecycle.gc_unlocked(max_reviews=lifecycle.keep_reviews, preserve=[managed_destination.parent])
+            lifecycle.begin_unlocked(managed_destination)
+            result = _prepare_runtime_impl(
+                repo_root=repo_root,
+                source_python=source_python,
+                destination=managed_destination,
+                log_dir=log_dir,
+            )
+            lifecycle.mark_completed_unlocked(managed_destination, result)
+            lifecycle.gc_unlocked(max_reviews=lifecycle.keep_reviews, preserve=[managed_destination.parent])
+            return result
+        except BaseException as exc:
+            with contextlib.suppress(Exception):
+                lifecycle.mark_failed_unlocked(managed_destination, exc)
+                lifecycle.gc_unlocked(max_reviews=0)
+            raise
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--source-python", type=Path, default=DEFAULT_SOURCE_PYTHON)
-    parser.add_argument("--destination", type=Path, default=DEFAULT_DESTINATION)
+    parser.add_argument(
+        "--destination",
+        type=Path,
+        default=None,
+        help="review destination managed under ~/.local/share/mtf-lab; omitted allocates one",
+    )
+    parser.add_argument("--promote", action="store_true", help="promote the freshly validated review explicitly")
+    parser.add_argument("--root", type=Path, default=DEFAULT_RUNTIME_ROOT, help=argparse.SUPPRESS)
     parser.add_argument("--log-dir", type=Path, default=None)
     return parser
 
@@ -1663,13 +1716,24 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
+        if args.root.expanduser().resolve(strict=False) != DEFAULT_RUNTIME_ROOT.expanduser().resolve(strict=False):
+            raise RuntimeLifecycleError("runtime root is fixed to ~/.local/share/mtf-lab")
+        lifecycle = RuntimeLifecycle(args.root)
+        destination = args.destination or lifecycle.allocate_review()
         manifest = prepare_runtime(
             repo_root=args.repo_root,
             source_python=args.source_python,
-            destination=args.destination,
+            destination=destination,
             log_dir=args.log_dir,
+            lifecycle_root=args.root,
         )
+        promotion = None
+        if args.promote:
+            promotion = lifecycle.promote(destination)
     except PreparationError as exc:
+        print(f"STAGED_RUNTIME blocked: {exc}", file=sys.stderr)
+        return 2
+    except RuntimeLifecycleError as exc:
         print(f"STAGED_RUNTIME blocked: {exc}", file=sys.stderr)
         return 2
     except Exception as exc:  # pragma: no cover - defensive boundary
@@ -1679,6 +1743,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "state": manifest["state"],
+                "destination": str(destination),
+                "promotion": promotion,
                 "runtime_python": manifest["entrypoints"]["runtime_python"],
                 "dev_python": manifest["entrypoints"]["dev_python"],
             },

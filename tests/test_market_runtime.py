@@ -9,12 +9,17 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
 from types import ModuleType
+from unittest import mock
+
+from mtf_lab.ops import runtime_lifecycle
 
 
 def _load_preparer() -> ModuleType:
@@ -29,6 +34,61 @@ def _load_preparer() -> ModuleType:
 
 
 PREPARER = _load_preparer()
+
+
+def _write_json(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, sort_keys=True), encoding="utf-8")
+
+
+def _make_review(root: Path, name: str, *, marker_state: str | None = "REVIEW_READY") -> Path:
+    parent = root / name
+    runtime = parent / "runtime"
+    (runtime / "base-python").mkdir(parents=True)
+    (runtime / "runtime-python/bin").mkdir(parents=True)
+    (runtime / "dev-python/bin").mkdir(parents=True)
+    (runtime / "payload.txt").write_text(name + "\n", encoding="utf-8")
+    _write_json(
+        runtime / runtime_lifecycle.STAGED_MARKER,
+        {
+            "project": "mtf-lab",
+            "state": "STAGED_RUNTIME",
+            "promotion_state": "NOT_PROMOTED",
+            "current_pointer": None,
+            "destination": str(runtime),
+        },
+    )
+    if marker_state is not None:
+        _write_json(
+            parent / runtime_lifecycle.LIFECYCLE_MARKER,
+            {
+                "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                "project": "mtf-lab",
+                "role": "review",
+                "state": marker_state,
+                "pid": None,
+                "destination": str(runtime),
+            },
+        )
+    return runtime
+
+
+def _make_active(root: Path) -> Path:
+    active = root / "runtime"
+    (active / "runtime-python/bin").mkdir(parents=True)
+    (active / "base-python").mkdir()
+    (active / "active.txt").write_text("active\n", encoding="utf-8")
+    _write_json(
+        active / runtime_lifecycle.STAGED_MARKER,
+        {
+            "project": "mtf-lab",
+            "state": "ACTIVE_RUNTIME",
+            "promotion_state": "ACTIVE",
+            "current_pointer": str(active),
+            "destination": str(active),
+        },
+    )
+    return active
 
 
 class MarketRuntimePreparationTests(unittest.TestCase):
@@ -156,6 +216,265 @@ class MarketRuntimePreparationTests(unittest.TestCase):
         payload = json.loads(json.dumps(result.as_dict()))
         self.assertEqual(["python", "-V"], payload["argv"])
         self.assertNotIn("HOME", payload)
+
+    def test_review_allocation_and_completion_are_managed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            manager = runtime_lifecycle.RuntimeLifecycle(raw, stale_after_seconds=0)
+            destination = manager.allocate_review()
+            self.assertTrue(destination.parent.name.startswith("runtime-review-"))
+            building = manager.inspect()["records"][0]
+            self.assertEqual("temporary_in_use", building["role"])
+            (destination / "runtime-python/bin").mkdir(parents=True)
+            (destination / "dev-python/bin").mkdir(parents=True)
+            (destination / "base-python").mkdir()
+            _write_json(
+                destination / runtime_lifecycle.STAGED_MARKER,
+                {
+                    "project": "mtf-lab",
+                    "state": "STAGED_RUNTIME",
+                    "promotion_state": "NOT_PROMOTED",
+                    "current_pointer": None,
+                    "destination": str(destination),
+                },
+            )
+            with manager.lock():
+                manager.mark_completed_unlocked(destination, {"state": "STAGED_RUNTIME"})
+            record = next(item for item in manager.inspect()["records"] if item["name"] == destination.parent.name)
+            self.assertEqual("review", record["role"])
+            self.assertTrue(record["safe_to_delete"])
+
+    def test_gc_deletes_only_valid_reviews_and_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            first = _make_review(root, "runtime-review-20260101-0000")
+            second = _make_review(root, "runtime-review-20260102-0000")
+            (root / "runtime-review-unknown").mkdir()
+            (root / "runtime-review-unknown" / "keep.txt").write_text("keep\n", encoding="utf-8")
+            (root / "notes").mkdir()
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            result = manager.gc(max_reviews=0)
+            self.assertEqual(
+                {"runtime-review-20260101-0000", "runtime-review-20260102-0000"},
+                {item["name"] for item in result["deleted"]},
+            )
+            self.assertTrue(active.is_dir())
+            self.assertTrue(first.parent.exists() is False)
+            self.assertTrue(second.parent.exists() is False)
+            self.assertTrue((root / "runtime-review-unknown").is_dir())
+            self.assertEqual([], manager.gc(max_reviews=0)["deleted"])
+
+    def test_gc_retains_newest_review_by_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            oldest = _make_review(root, "runtime-review-20260101-0000")
+            newest = _make_review(root, "runtime-review-20260102-0000")
+            os.utime(oldest.parent, (1, 1))
+            os.utime(newest.parent, (2, 2))
+            manager = runtime_lifecycle.RuntimeLifecycle(root, keep_reviews=1)
+            result = manager.gc()
+            self.assertEqual(["runtime-review-20260101-0000"], [item["name"] for item in result["deleted"]])
+            self.assertTrue(newest.parent.is_dir())
+
+    def test_gc_preserves_legacy_evidence_unless_explicitly_purged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            destination = _make_review(root, "runtime-review-with-evidence")
+            evidence = destination.parent / "logs"
+            evidence.mkdir()
+            (evidence / "validation.log").write_text("receipt\n", encoding="utf-8")
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            result = manager.gc(max_reviews=0)
+            self.assertEqual("payload_deleted", result["deleted"][0]["action"])
+            self.assertTrue(evidence.is_dir())
+            result = manager.gc(max_reviews=0, purge_review_evidence=True)
+            self.assertEqual("deleted", result["deleted"][0]["action"])
+            self.assertFalse(destination.parent.exists())
+
+    def test_gc_protects_live_process_and_deletes_after_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            destination = _make_review(root, "runtime-review-live")
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(5)"],
+                cwd=destination,
+            )
+            try:
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
+                preserved = next(item for item in result["preserved"] if item["name"] == "runtime-review-live")
+                self.assertEqual("needs_review", preserved["action"])
+                self.assertTrue(destination.parent.is_dir())
+            finally:
+                child.wait(timeout=5)
+            result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
+            self.assertEqual("runtime-review-live", result["deleted"][0]["name"])
+
+    def test_unknown_and_symlink_trees_are_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = Path(raw).parent / (Path(raw).name + "-outside")
+            outside.mkdir()
+            try:
+                (root / "runtime-review-symlink").symlink_to(outside, target_is_directory=True)
+                destination = _make_review(root, "runtime-review-escape")
+                (destination / "escape").symlink_to(outside, target_is_directory=True)
+                manager = runtime_lifecycle.RuntimeLifecycle(root)
+                result = manager.gc(max_reviews=0)
+                names = {item["name"] for item in result["preserved"]}
+                self.assertIn("runtime-review-symlink", names)
+                self.assertIn("runtime-review-escape", names)
+                with self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                    manager.validate_build_destination(root / ".." / "outside" / "runtime-review-x" / "runtime")
+            finally:
+                outside.rmdir()
+
+    def test_promotion_keeps_one_real_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            candidate = _make_review(root, "runtime-review-promote")
+            result = runtime_lifecycle.RuntimeLifecycle(root).promote(candidate)
+            self.assertEqual("PROMOTED", result["state"])
+            self.assertTrue((root / "runtime" / "payload.txt").is_file())
+            rollback = Path(result["rollback"])
+            self.assertTrue(rollback.is_dir())
+            self.assertTrue((rollback / "active.txt").is_file())
+            self.assertFalse(candidate.parent.exists())
+            self.assertFalse((active / "active.txt").exists())
+            rollback_record = next(
+                item
+                for item in runtime_lifecycle.RuntimeLifecycle(root).inspect()["records"]
+                if item["name"] == rollback.name
+            )
+            self.assertEqual("rollback", rollback_record["role"])
+
+    def test_promotion_failure_restores_active_and_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            candidate = _make_review(root, "runtime-review-fail")
+            real_rename = os.rename
+            calls = 0
+
+            def fail_second(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("synthetic promotion failure")
+                real_rename(source, target)
+
+            with mock.patch.object(runtime_lifecycle.os, "rename", side_effect=fail_second), self.assertRaises(OSError):
+                runtime_lifecycle.RuntimeLifecycle(root).promote(candidate)
+            self.assertTrue(active.is_dir())
+            self.assertTrue(candidate.is_dir())
+            # A subsequent lifecycle operation reconciles the journal rather
+            # than silently deleting either side of the failed transaction.
+            runtime_lifecycle.RuntimeLifecycle(root).inspect()
+            self.assertFalse((root / ".runtime-promotion.json").exists())
+
+    def test_failed_review_without_payload_is_collectable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            parent = root / "runtime-review-failed"
+            parent.mkdir()
+            _write_json(
+                parent / runtime_lifecycle.LIFECYCLE_MARKER,
+                {
+                    "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                    "project": "mtf-lab",
+                    "role": "review",
+                    "state": "FAILED",
+                    "destination": str(parent / "runtime"),
+                },
+            )
+            result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
+            self.assertEqual("runtime-review-failed", result["deleted"][0]["name"])
+
+    def test_prepare_wrapper_rejects_destination_outside_managed_root(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "runtime-root"
+            destination = Path(raw) / "elsewhere" / "runtime-review-x" / "runtime"
+            with self.assertRaises(PREPARER.PreparationError):
+                PREPARER.prepare_runtime(
+                    repo_root=Path(__file__).resolve().parents[1],
+                    destination=destination,
+                    lifecycle_root=root,
+                )
+
+    def test_prepare_wrapper_removes_failed_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "runtime-root"
+            destination = root / "runtime-review-failed" / "runtime"
+
+            def fake_prepare(**kwargs: object) -> dict[str, object]:
+                target = Path(str(kwargs["destination"]))
+                target.mkdir(parents=True)
+                (target / "partial.txt").write_text("partial\n", encoding="utf-8")
+                raise RuntimeError("synthetic validation failure")
+
+            with (
+                mock.patch.object(PREPARER, "_prepare_runtime_impl", side_effect=fake_prepare),
+                self.assertRaises(RuntimeError),
+            ):
+                PREPARER.prepare_runtime(
+                    repo_root=Path(__file__).resolve().parents[1],
+                    destination=destination,
+                    lifecycle_root=root,
+                )
+            self.assertFalse(destination.parent.exists())
+
+    def test_prepare_wrapper_reconciles_previous_review_after_success(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "runtime-root"
+            old = _make_review(root, "runtime-review-old")
+            os.utime(old.parent, (1, 1))
+            destination = root / "runtime-review-new" / "runtime"
+
+            def fake_prepare(**kwargs: object) -> dict[str, object]:
+                target = Path(str(kwargs["destination"]))
+                target.mkdir(parents=True)
+                _write_json(
+                    target / runtime_lifecycle.STAGED_MARKER,
+                    {
+                        "project": "mtf-lab",
+                        "state": "STAGED_RUNTIME",
+                        "promotion_state": "NOT_PROMOTED",
+                        "current_pointer": None,
+                        "destination": str(target),
+                    },
+                )
+                return {"state": "STAGED_RUNTIME"}
+
+            with mock.patch.object(PREPARER, "_prepare_runtime_impl", side_effect=fake_prepare):
+                PREPARER.prepare_runtime(
+                    repo_root=Path(__file__).resolve().parents[1],
+                    destination=destination,
+                    lifecycle_root=root,
+                )
+            self.assertTrue(destination.parent.is_dir())
+            self.assertFalse(old.parent.exists())
+
+    def test_lifecycle_lock_serializes_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "runtime-root"
+            started_path = Path(raw) / "child-started"
+            script = (
+                "import sys,time; "
+                "from mtf_lab.ops.runtime_lifecycle import RuntimeLifecycle; "
+                "m=RuntimeLifecycle(sys.argv[1]); "
+                "p=__import__('pathlib').Path(sys.argv[2]); "
+                "\nwith m.lock(): p.write_text('ready'); time.sleep(0.45)"
+            )
+            child = subprocess.Popen([sys.executable, "-c", script, str(root), str(started_path)])
+            deadline = time.monotonic() + 5
+            while not started_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(started_path.exists())
+            started = time.monotonic()
+            with runtime_lifecycle.RuntimeLifecycle(root).lock():
+                waited = time.monotonic() - started
+            child.wait(timeout=5)
+            self.assertGreaterEqual(waited, 0.25)
 
 
 if __name__ == "__main__":

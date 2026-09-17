@@ -67,6 +67,13 @@ ya conserva costes desconocidos como `UNKNOWN_NOT_ZERO` y sólo acepta una
 especificación explícita para calcular neto; aún faltan desarrollo multiaño,
 holdout, resistencia y validación DEMO.
 
+El lifecycle del runtime privado está definido en
+[`docs/runtime_lifecycle.md`](docs/runtime_lifecycle.md). El único runtime
+canónico es `~/.local/share/mtf-lab/runtime`; las reviews se crean bajo esa
+raíz, se reconcilian con lock y se recogen de forma conservadora. El comando
+`mtf-lab runtime inspect|gc|promote` es una superficie administrativa
+complementaria; no toca el estado de investigación.
+
 La evolución H0–H6 hacia una DEMO fiable se documenta en la
 [matriz de implementación y aceptación](docs/demo_reliability_plan.md). Su
 validación local, la instalación operativa y las ventanas de 72 horas/30
