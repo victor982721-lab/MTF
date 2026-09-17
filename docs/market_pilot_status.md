@@ -410,18 +410,18 @@ limpieza.
 El runtime actual fue construido por el preparador gestionado el 2026-09-17 y
 promovido de forma controlada tras validar Python 3.12.14/SQLite 3.53.1/
 Protobuf 7.36.1, `pip check`, imports aislados y el launcher (`--help`). El
-manifiesto activo conserva el run `20260917T185714Z-161a6aeb`, en
+manifiesto activo conserva el run `20260917T192349Z-0e52abd2`, en
 `state=ACTIVE_RUNTIME`/`promotion_state=ACTIVE`, y su SHA-256 es
-`4db9c1b149c64596530b8ab0433b3bb8252fa3d68342b1bd7e53497bb9d55c7f`.
+`2766dd4e1be0c8b0f417d7fd40a3a912bf628ab0839e6158f864ab12eb1a88ba`.
 El receipt vigente de promoción es
-`runtime/verification/runtime-lifecycle-final5-promote-20260917.json`; su hash
+`runtime/verification/runtime-lifecycle-final6-promote-20260917.json`; su hash
 vigente y el vínculo al HEAD se conservan en la verificación consolidada. Los
 receipts `runtime-promotion-lifecycle-20260917.json` y `*-final-verification*`
 anteriores se conservan como antecedentes, no como estado vivo.
 La verificación consolidada del filesystem, espacio liberado y pruebas finales
-está en `runtime/market-evidence/runtime-lifecycle-final-verification-20260917-v6.json`;
+está en `runtime/market-evidence/runtime-lifecycle-final-verification-20260917-v7.json`;
 la focal del lifecycle es
-`runtime/market-evidence/runtime-lifecycle-focused-tests-final-v4-20260917.json`.
+`runtime/market-evidence/runtime-lifecycle-focused-tests-final-v5-20260917.json`.
 Dos builds independientes con `SOURCE_DATE_EPOCH=0` y mtimes distintos fueron
 byte-identical; su correspondencia fuente→wheel→instalación quedó validada. La
 edición documental histórica y su comprobación estática se conservaron en
