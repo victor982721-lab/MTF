@@ -47,3 +47,9 @@ review fallido y reconcilia reviews anteriores bajo el lock. `SIGKILL` deja un
 marcador `BUILDING`, que sólo se recoge después de su periodo de gracia y con
 el PID sin vida; un proceso concurrente o un árbol inseguro se conserva para
 revisión humana.
+
+La migración legacy del 2026-09-17 eliminó 28 payloads completos después de
+comprobar manifiestos, ownership, symlinks internos, inodos y procesos. Sólo se
+conservaron manifests y logs/JSON acotados en
+`runtime/market-evidence/runtime-review-legacy-evidence-20260917/`; no se creó
+un backup de ningún entorno Python completo.
