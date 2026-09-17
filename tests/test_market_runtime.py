@@ -470,11 +470,16 @@ time.sleep(30)
                 (root / "runtime-review-symlink").symlink_to(outside, target_is_directory=True)
                 destination = _make_review(root, "runtime-review-escape")
                 (destination / "escape").symlink_to(outside, target_is_directory=True)
+                internal_target = root / "market-data"
+                internal_target.mkdir()
+                internal_destination = _make_review(root, "runtime-review-cross-tree")
+                (internal_destination / "cross-tree").symlink_to(internal_target, target_is_directory=True)
                 manager = runtime_lifecycle.RuntimeLifecycle(root)
                 result = manager.gc(max_reviews=0)
                 names = {item["name"] for item in result["preserved"]}
                 self.assertIn("runtime-review-symlink", names)
                 self.assertIn("runtime-review-escape", names)
+                self.assertIn("runtime-review-cross-tree", names)
                 with self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
                     manager.validate_build_destination(root / ".." / "outside" / "runtime-review-x" / "runtime")
             finally:
@@ -493,6 +498,20 @@ time.sleep(30)
                 runtime_lifecycle._remove_tree(link)
             self.assertTrue(sentinel.exists())
             self.assertTrue(link.is_symlink())
+
+    def test_shared_hardlink_payload_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside.bin"
+            outside.write_bytes(b"shared\n")
+            candidate = _make_review(root, "runtime-review-hardlink")
+            os.link(outside, candidate / "shared.bin")
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
+            preserved = next(item for item in result["preserved"] if item["name"] == candidate.parent.name)
+            self.assertEqual("unknown", preserved["role"])
+            self.assertTrue(outside.exists())
+            self.assertEqual(b"shared\n", outside.read_bytes())
 
     def test_incomplete_managed_layout_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -569,6 +588,41 @@ time.sleep(30)
             # than silently deleting either side of the failed transaction.
             runtime_lifecycle.RuntimeLifecycle(root).inspect()
             self.assertFalse((root / ".runtime-promotion.json").exists())
+
+    def test_late_promotion_cleanup_failure_recovers_committed_state(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            _make_active(root)
+            candidate = _make_review(root, "runtime-review-late-cleanup")
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            real_rmdir = Path.rmdir
+
+            def fail_review_rmdir(path: Path) -> None:
+                if path == candidate.parent:
+                    raise OSError("synthetic marker cleanup failure")
+                real_rmdir(path)
+
+            with (
+                mock.patch.object(
+                    Path,
+                    "rmdir",
+                    autospec=True,
+                    side_effect=fail_review_rmdir,
+                ),
+                self.assertRaises(OSError),
+            ):
+                manager.promote(candidate)
+            self.assertTrue((root / ".runtime-promotion.json").exists())
+            self.assertTrue((root / "runtime" / "payload.txt").is_file())
+            rollback_dirs = list(root.glob("runtime-rollback-*"))
+            self.assertEqual(1, len(rollback_dirs))
+            self.assertTrue((rollback_dirs[0] / runtime_lifecycle.STAGED_MARKER).is_file())
+            recovered = manager.inspect()
+            self.assertFalse((root / ".runtime-promotion.json").exists())
+            self.assertTrue((root / "runtime" / "payload.txt").is_file())
+            self.assertFalse(candidate.parent.exists())
+            rollback_records = [item for item in recovered["records"] if item["role"] == "rollback"]
+            self.assertEqual(1, len(rollback_records))
 
     def test_failed_review_is_not_promotable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

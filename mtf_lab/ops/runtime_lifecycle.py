@@ -194,7 +194,7 @@ def _marker_pid(marker: Mapping[str, Any] | None) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
 
-def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) -> None:
+def _atomic_bytes(path: Path, payload: bytes, *, replace: bool = True) -> None:
     if os.path.lexists(path.parent):
         parent_info = os.lstat(path.parent)
         if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
@@ -202,7 +202,6 @@ def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) 
     else:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(path.parent, 0o700)
-    payload = (json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
     fd = os.open(temporary, flags, 0o600)
@@ -230,6 +229,52 @@ def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) 
         with contextlib.suppress(FileNotFoundError):
             temporary.unlink()
         raise
+
+
+def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) -> None:
+    payload = (json.dumps(dict(value), ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    _atomic_bytes(path, payload, replace=replace)
+
+
+def _snapshot_regular_file(path: Path) -> bytes | None:
+    """Read a small lifecycle file without following a final symlink."""
+
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"lifecycle snapshot unavailable: {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise RuntimeLifecycleError(f"lifecycle snapshot is unsafe: {path}")
+    flags = os.O_RDONLY | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"lifecycle snapshot unavailable: {path}") from exc
+    try:
+        current = os.fstat(fd)
+        if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise RuntimeLifecycleError(f"lifecycle snapshot is unsafe: {path}")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _restore_regular_file(path: Path, payload: bytes | None) -> None:
+    """Restore one lifecycle snapshot or remove a file created by a failed move."""
+
+    if payload is None:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        return
+    _atomic_bytes(path, payload)
 
 
 def _retarget_venv_configs(runtime: Path) -> None:  # noqa: C901 - one post-move venv repair gate
@@ -578,6 +623,7 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
     if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(path_info.st_mode):
         raise RuntimeLifecycleError(f"runtime tree is not a regular directory: {path}")
     root_resolved = root.resolve(strict=True)
+    candidate_resolved = path.resolve(strict=True)
     if not _is_within(path, root):
         raise RuntimeLifecycleError(f"runtime tree escapes root: {path}")
     root_device = root_info.st_dev
@@ -594,7 +640,7 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
             raise RuntimeLifecycleError(f"runtime entry is on a different filesystem: {current}")
         if stat.S_ISLNK(current_info.st_mode):
             target = (current.parent / os.readlink(current)).resolve(strict=False)
-            if not _is_within(target, root_resolved):
+            if not _is_within(target, candidate_resolved) or not _is_within(target, root_resolved):
                 raise RuntimeLifecycleError(f"runtime symlink escapes candidate: {current}")
             continue
         if not stat.S_ISDIR(current_info.st_mode):
@@ -608,7 +654,7 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
             info = entry.stat(follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
                 target = (child.parent / os.readlink(child)).resolve(strict=False)
-                if not _is_within(target, root_resolved):
+                if not _is_within(target, candidate_resolved) or not _is_within(target, root_resolved):
                     raise RuntimeLifecycleError(f"runtime symlink escapes candidate: {child}")
             elif stat.S_ISDIR(info.st_mode):
                 if info.st_dev != root_device:
@@ -619,6 +665,8 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
                     raise RuntimeLifecycleError(f"runtime entry is on a different filesystem: {child}")
                 if info.st_uid != uid:
                     raise RuntimeLifecycleError(f"runtime file has unexpected owner: {child}")
+                if info.st_nlink != 1:
+                    raise RuntimeLifecycleError(f"runtime file has shared hardlinks: {child}")
             else:
                 raise RuntimeLifecycleError(f"unsupported runtime entry type: {child}")
 
@@ -1726,6 +1774,11 @@ class RuntimeLifecycle:
                 raise RuntimeLifecycleError(f"staged runtime is not promotable: {record.reason}")
             if not candidate.is_dir() or candidate.resolve(strict=False) == self.active.resolve(strict=False):
                 raise RuntimeLifecycleError("staged runtime is not a distinct review")
+            active_manifest_snapshot = (
+                _snapshot_regular_file(self.active / STAGED_MARKER) if self.active.exists() else None
+            )
+            candidate_manifest_snapshot = _snapshot_regular_file(candidate / STAGED_MARKER)
+            lifecycle_marker_snapshot = _snapshot_regular_file(parent / LIFECYCLE_MARKER)
             rollback = self.root / f"{ROLLBACK_PREFIX}{dt.datetime.now(dt.UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
             journal = self.root / ".runtime-promotion.json"
             _atomic_json(
@@ -1741,6 +1794,7 @@ class RuntimeLifecycle:
             )
             active_moved = False
             staged_moved = False
+            committed = False
             try:
                 if os.path.lexists(self.active):
                     active_info = os.lstat(self.active)
@@ -1781,12 +1835,19 @@ class RuntimeLifecycle:
                 _atomic_json(self.active / STAGED_MARKER, active_manifest)
                 if active_moved:
                     self._mark_rollback_unlocked(rollback)
+                committed = True
                 with contextlib.suppress(FileNotFoundError):
                     (parent / LIFECYCLE_MARKER).unlink()
                 if parent.exists() and not any(parent.iterdir()):
                     parent.rmdir()
                 journal.unlink()
             except BaseException:
+                if committed:
+                    raise
+                if not active_moved and not staged_moved:
+                    with contextlib.suppress(OSError):
+                        journal.unlink()
+                    raise
                 with contextlib.suppress(OSError):
                     if staged_moved and self.active.exists() and not candidate.exists():
                         os.rename(self.active, candidate)
@@ -1797,6 +1858,12 @@ class RuntimeLifecycle:
                         os.rename(rollback, self.active)
                         with contextlib.suppress(RuntimeLifecycleError, OSError):
                             _retarget_venv_configs(self.active)
+                with contextlib.suppress(RuntimeLifecycleError, OSError):
+                    _restore_regular_file(self.active / STAGED_MARKER, active_manifest_snapshot)
+                with contextlib.suppress(RuntimeLifecycleError, OSError):
+                    _restore_regular_file(candidate / STAGED_MARKER, candidate_manifest_snapshot)
+                with contextlib.suppress(RuntimeLifecycleError, OSError):
+                    _restore_regular_file(parent / LIFECYCLE_MARKER, lifecycle_marker_snapshot)
                 raise
             self.gc_unlocked(max_reviews=0, max_rollbacks=keep_rollback, preserve=[self.active])
             result = {
