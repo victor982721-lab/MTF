@@ -79,14 +79,14 @@ La evolución H0–H6 hacia una DEMO fiable se documenta en la
 validación local, la instalación operativa y las ventanas de 72 horas/30
 sesiones son estados distintos. Ningún comando nuevo activa trading por defecto.
 
-El runtime privado candidato se conserva en `STAGED_RUNTIME` y
-`NOT_PROMOTED`; el staging de referencia con la validación indicada se identifica en el [estado del piloto](docs/market_pilot_status.md)
-y se liga al árbol que fue validado. La revisión V27 está en
-`/home/winterboss/.local/share/mtf-lab/runtime-review-20260915-0335/runtime/STAGED_RUNTIME.json`
-(SHA-256 `25d36afd060d8fb50d7a41e434753c33c55be93a020300399c516d10fe3c6b3d`);
-es anterior al commit `58a2fdd` y no contiene la frontera local de warmup/salud/refactor
-actual. El entorno operativo y sus launchers no fueron sustituidos; este staging no
-debe promoverse ni presentarse como validación del árbol actual.
+El runtime privado canónico quedó reconstruido y promovido de forma explícita
+desde una review validada: `/home/winterboss/.local/share/mtf-lab/runtime`.
+Su manifiesto está en `state=ACTIVE_RUNTIME`, `promotion_state=ACTIVE` y
+`current_pointer` apunta al propio destino; Python 3.12.14, SQLite 3.53.1 y
+Protobuf 7.36.1 pasan el smoke aislado y `pip check`. Las 28 reviews históricas
+se limpiaron con el GC seguro; sus manifests y logs acotados quedaron en
+`runtime/market-evidence/runtime-review-legacy-evidence-20260917/index.json`.
+El runtime activo y el estado de investigación no forman parte de esa limpieza.
 
 ### IMPLEMENTADO Y COMPROBADO OFFLINE
 

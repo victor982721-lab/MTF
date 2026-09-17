@@ -399,22 +399,19 @@ el aislamiento del runner. La revisión V2 carga en un proceso nuevo Python
 Codex. Sus smokes aislados y codec no acreditan por sí solos la suite completa
 del código final ni una instalación operativa.
 
-Receipt V2: `/home/winterboss/.local/share/mtf-lab/runtime-review-20260913-1638/runtime/STAGED_RUNTIME.json`.
-El entorno operativo anterior, los launchers públicos y el host no se sustituyen
-por este staging. No se ha iniciado resistencia de 72 horas, shadow, OAuth ni
-órdenes DEMO.
+Los payloads de las reviews V2/V27 históricas ya no están en el árbol de
+usuario. Sus manifests y logs acotados se preservan, sin copiar los runtimes
+completos, en
+`/home/winterboss/MTF/runtime/market-evidence/runtime-review-legacy-evidence-20260917/index.json`
+(SHA-256 `a47c3cec49f9af9afbdf39c21bde600c32c97b77317e3f6ce20f5794f05e237b`).
+No se inició resistencia de 72 horas, shadow, OAuth ni órdenes DEMO por esta
+limpieza.
 
-La reconstrucción V27 STAGED posterior al guard agregado, al contrato WF, a la
-fixture causal offline y al gate bounded de histórico está en
-`/home/winterboss/.local/share/mtf-lab/runtime-review-20260915-0335/runtime/STAGED_RUNTIME.json`;
-receipt SHA-256 `25d36afd060d8fb50d7a41e434753c33c55be93a020300399c516d10fe3c6b3d`.
-Carga Python 3.12.14/SQLite 3.53.1/Protobuf 7.36.1, pasa `pip check`,
-imports aislados y smoke del launcher (`--help` y `doctor`); permanece
-`NOT_PROMOTED` y no sustituye el runtime operativo. Incluye la corrección de
-period/export, normalización de trendbars periodless, presupuesto agregado,
-contrato WF, diagnóstico cTrader acotado y continuidad/coverage bounded. El
-wheel staged SHA-256 es
-`9d41522208be17d546001df9011199453cf236f28fd16ea0b2922e4405291191`.
+El runtime actual fue construido por el preparador gestionado el 2026-09-17 y
+promovido tras validar Python 3.12.14/SQLite 3.53.1/Protobuf 7.36.1, `pip check`,
+imports aislados y el launcher (`--help`). El receipt de promoción es
+`runtime/verification/runtime-promotion-lifecycle-20260917.json`; el manifiesto
+activo conserva el run `20260917T145251Z-d364e4bd`.
 Dos builds independientes con `SOURCE_DATE_EPOCH=0` y mtimes distintos fueron
 byte-identical; su correspondencia fuente→wheel→instalación quedó validada. La
 edición documental histórica y su comprobación estática se conservaron en
@@ -468,11 +465,7 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
    necesita antes un contrato/fuente separado; el contrato y la fixture offline
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.
-3. Reconstruir y verificar el runtime STAGED desde el SHA final de código;
-   V27 es sólo el staging de referencia documentado, anterior a `58a2fdd`, por lo que los
-   cambios locales cTrader/warmup/reporting siguen `NOT_VALIDATED` hasta el próximo
-   gate completo. No promoverlo ni instalarlo operativamente por inferencia.
-4. Preparar una futura campaña holdout sólo con un contrato de dataset 2024–2025,
+3. Preparar una futura campaña holdout sólo con un contrato de dataset 2024–2025,
    permiso confirmatorio tipado y acceso humano único; la resistencia 72h,
    ejecución DEMO y forward siguen cerrados (OAuth sólo lectura ya verificado;
    no se repite ni se amplían scopes).
