@@ -414,10 +414,14 @@ manifiesto activo conserva el run `20260917T165344Z-4e04a033`, en
 `state=ACTIVE_RUNTIME`/`promotion_state=ACTIVE`, y su SHA-256 es
 `52f6ec23c8b91bf72ea9d5b4a93b272d2458b3cd8fa0aa3fbaeef9dda9ca2eee`.
 El receipt vigente de promoción es
-`runtime/verification/runtime-lifecycle-final3-promote-20260917.json` (SHA-256
-`78026e0ab119626d4d12d10731dc87537c335da3ca485aa9808dae1ab8589c86`). Los
+`runtime/verification/runtime-lifecycle-final3-promote-20260917.json`; su hash
+vigente y el vínculo al HEAD se conservan en la verificación consolidada. Los
 receipts `runtime-promotion-lifecycle-20260917.json` y `*-final-verification*`
 anteriores se conservan como antecedentes, no como estado vivo.
+La verificación consolidada del filesystem, espacio liberado y pruebas finales
+está en `runtime/market-evidence/runtime-lifecycle-final-verification-20260917-v4.json`;
+la focal del lifecycle es
+`runtime/market-evidence/runtime-lifecycle-focused-tests-final-v2-20260917.json`.
 Dos builds independientes con `SOURCE_DATE_EPOCH=0` y mtimes distintos fueron
 byte-identical; su correspondencia fuente→wheel→instalación quedó validada. La
 edición documental histórica y su comprobación estática se conservaron en
