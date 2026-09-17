@@ -943,7 +943,11 @@ def _run_quality_gates(
                 "--explicit-package-bases",
                 "--no-incremental",
                 "--python-executable",
-                str(runtime_python),
+                # Generated protobuf stubs are a development-time dependency;
+                # resolve them with the same dev interpreter that runs mypy.
+                # The runtime remains execution-only and intentionally does
+                # not carry types-protobuf.
+                str(dev_python),
                 "--cache-dir",
                 str(mypy_cache),
                 "--show-error-codes",
