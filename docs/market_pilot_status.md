@@ -44,9 +44,17 @@ en este archivo sigue siendo sólo marzo: su contenedor mensual contiene
   `dataset_id` `histdata:EUR/USD:201601-201612:3beebfb5ed44b15fa9fb55699008fefe`,
   19,026,438 ticks y cobertura 2016-01-03 22:00:15.493 a
   2016-12-30 21:59:20.383 UTC. La composición fue exclusiva, ordenada y sin
-  colisiones. El backtest anual `development-2016-full-v17` está en curso,
-  reanudado desde un checkpoint parcial, sin receipt terminal ni candidato
-  seleccionado.
+  colisiones. El backtest anual `development-2016-full-v17` terminó en
+  `COMPLETED_DEVELOPMENT_REVIEW_ONLY`, sin candidato seleccionado.
+  El checkpoint terminal conserva `finished=true`, `status=COMPLETED`, cursor
+  `2016-12-30T21:59:20.383000Z` y 19,026,438 cotizaciones; su SHA-256 es
+  `f2b4e084aa1e3797a0f0da34bd0caa0c3840d470b96d91a9797f1dccb54348ce`.
+  Receipt terminal:
+  `/home/winterboss/.local/state/mtf-lab/research/market-backtest/2016-full/runs/development-2016-full-v17/resume-receipt-bd14ebb22e894eec8eeb142994c56477.json`,
+  SHA-256 `e987bb99de2d67fbafcf0cef219de1c6f24561e6258d526cca96e9c84e0bca01`.
+  La corrida es `resumable=false`, `promotable=false`, con
+  `UNKNOWN_COSTS`, `economic_conclusion=NOT_ASSESSED`, `holdout=CLOSED`, sin
+  red, escritura de base de datos, selección, promoción ni trading.
 - No se han adquirido años 2017–2019 ni abierto la reserva 2024–2025.
 
 El contrato de lectura ya acepta una composición explícita de particiones
@@ -191,7 +199,7 @@ pruebas, con 79.871% de líneas y 62.989% de ramas. Receipt versionado:
 Este resultado valida el checkout y el runtime de QA de aquella referencia; no
 valida los bytes posteriores del commit `58a2fdd`. No publica ni instala una
 release, no abre el holdout y no acredita ventaja económica. El gate completo del
-árbol actual se pospone hasta que termine la reanudación V17.
+árbol actual permanece pendiente después de la terminalidad de V17.
 
 El servicio de campaña conserva además un permiso de holdout no secreto,
 ligado a candidatos, intentos, dataset, escenarios y la ventana fija
@@ -448,10 +456,11 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
 1. Mantener costes contractuales, financiación, fills y calendario histórico
    como desconocidos hasta contar con una fuente vinculada a la cuenta; los
    specs explícitos conocidos sólo habilitan neto condicional.
-2. Mantener la única corrida `development-2016-full-v17` desde su checkpoint
-   parcial, auditar su terminalidad/offsets/artefactos y no iniciar otra
-   campaña pesada en paralelo. Sólo después de un receipt terminal, y con
-   nuevos gates, ampliar por meses contiguos hacia 2017–2019. WF 2020–2023
+2. Auditar la terminalidad, offsets, artefactos, registry y hashes de
+   `development-2016-full-v17`; no repetirla ni iniciar otra campaña pesada en
+   paralelo. Después del receipt terminal, ejecutar el gate global sobre el
+   árbol actual y reconstruir/verificar el runtime STAGED desde el SHA final.
+   Sólo después de esos gates ampliar por meses contiguos hacia 2017–2019. WF 2020–2023
    necesita antes un contrato/fuente separado; el contrato y la fixture offline
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.

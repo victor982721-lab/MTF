@@ -26,8 +26,9 @@ integración. Su [piloto real y límites](docs/market_pilot_status.md) registra
 la semana/mes descriptivos de marzo de 2016, distintos de los fixtures y de la
 entrega H0–H6. Se conserva el año 2016 completo de HistData (12 ZIPs y un
 manifiesto compuesto con 19,026,438 ticks); el piloto descriptivo documentado
-sigue siendo sólo marzo. El backtest anual V17 está en curso/reanudación desde
-un checkpoint parcial; todavía no existe receipt terminal ni resultado económico.
+sigue siendo sólo marzo. El backtest anual V17 terminó en modo
+`COMPLETED_DEVELOPMENT_REVIEW_ONLY`: procesó 19,026,438 cotizaciones y conserva
+un receipt terminal; esto no es un resultado económico ni una release.
 Antes de ese backtest se completó un canario de capacidad de 1,048,576
 cotizaciones sobre el manifiesto 2016; midió 45:42 de pared y RSS máximo de
 263,488 KiB con la cadencia durable de 65,536 cotizaciones, sin selección,
