@@ -28,7 +28,9 @@ entrega H0–H6. Se conserva el año 2016 completo de HistData (12 ZIPs y un
 manifiesto compuesto con 19,026,438 ticks); el piloto descriptivo documentado
 sigue siendo sólo marzo. El backtest anual V17 terminó en modo
 `COMPLETED_DEVELOPMENT_REVIEW_ONLY`: procesó 19,026,438 cotizaciones y conserva
-un receipt terminal; esto no es un resultado económico ni una release.
+un receipt terminal; la auditoría de terminalidad quedó en
+`runtime/market-evidence/development-2016-v17-terminal-audit-20260917.json`;
+esto no es un resultado económico ni una release.
 Antes de ese backtest se completó un canario de capacidad de 1,048,576
 cotizaciones sobre el manifiesto 2016; midió 45:42 de pared y RSS máximo de
 263,488 KiB con la cadencia durable de 65,536 cotizaciones, sin selección,

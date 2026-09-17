@@ -1,6 +1,6 @@
 # Piloto histórico — estado y límites de la evidencia
 
-Verificado el 2026-09-16. Este registro distingue resultados descriptivos
+Verificado el 2026-09-17. Este registro distingue resultados descriptivos
 intermedios, implementación, validación de una release y operación externa.
 No hay todavía una estrategia seleccionada ni evidencia de ventaja neta.
 
@@ -55,6 +55,9 @@ en este archivo sigue siendo sólo marzo: su contenedor mensual contiene
   La corrida es `resumable=false`, `promotable=false`, con
   `UNKNOWN_COSTS`, `economic_conclusion=NOT_ASSESSED`, `holdout=CLOSED`, sin
   red, escritura de base de datos, selección, promoción ni trading.
+  La auditoría de terminalidad, offsets, artefactos y registry está en
+  `runtime/market-evidence/development-2016-v17-terminal-audit-20260917.json`,
+  SHA-256 `920c18ced374bb4dee8ec4d53f1f84083de6946510dc156bee76b240cd2d6122`.
 - No se han adquirido años 2017–2019 ni abierto la reserva 2024–2025.
 
 El contrato de lectura ya acepta una composición explícita de particiones
@@ -456,11 +459,12 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
 1. Mantener costes contractuales, financiación, fills y calendario histórico
    como desconocidos hasta contar con una fuente vinculada a la cuenta; los
    specs explícitos conocidos sólo habilitan neto condicional.
-2. Auditar la terminalidad, offsets, artefactos, registry y hashes de
-   `development-2016-full-v17`; no repetirla ni iniciar otra campaña pesada en
-   paralelo. Después del receipt terminal, ejecutar el gate global sobre el
-   árbol actual y reconstruir/verificar el runtime STAGED desde el SHA final.
-   Sólo después de esos gates ampliar por meses contiguos hacia 2017–2019. WF 2020–2023
+2. La auditoría de terminalidad, offsets, artefactos, registry y hashes de
+   `development-2016-full-v17` quedó verificada en el receipt indicado arriba;
+   no repetirla ni iniciar otra campaña pesada en paralelo. El siguiente paso
+   es ejecutar el gate global sobre el árbol actual y reconstruir/verificar el
+   runtime STAGED desde el SHA final. Sólo después de esos gates ampliar por
+   meses contiguos hacia 2017–2019. WF 2020–2023
    necesita antes un contrato/fuente separado; el contrato y la fixture offline
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.
