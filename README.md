@@ -69,8 +69,9 @@ holdout, resistencia y validación DEMO.
 
 El lifecycle del runtime privado está definido en
 [`docs/runtime_lifecycle.md`](docs/runtime_lifecycle.md). El único runtime
-canónico es `~/.local/share/mtf-lab/runtime`; las reviews se crean bajo esa
-raíz, se reconcilian con lock y se recogen de forma conservadora. El comando
+canónico es `~/.local/share/mtf-lab/runtime`; las reviews se crean como
+hermanas bajo `~/.local/share/mtf-lab/` (`runtime-review-.../runtime`), se
+reconcilian con lock y se recogen de forma conservadora. El comando
 `mtf-lab runtime inspect|gc|promote` es una superficie administrativa
 complementaria; no toca el estado de investigación.
 

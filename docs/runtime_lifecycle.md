@@ -16,6 +16,16 @@ un journal de promoción, un symlink fuera de la review, un owner inesperado o
 un manifiesto ambiguo dejan el candidato en `needs_review`; nunca se borra por
 nombre. La segunda ejecución de GC no cambia el resultado.
 
+`inspect` expone `process_scan.status`. `COMPLETE` significa que se pudieron
+examinar los procesos del usuario que administra el runtime; `INCOMPLETE`
+conserva todos los candidatos y nunca autoriza un borrado. Los procesos de otro
+UID se omiten por el contrato explícito de MTF (el runtime y sus launchers son
+user-owned); una denegación de un proceso del UID actual sólo se tolera para
+los daemons de sesión Kubuntu conocidos y, para cualquier otro proceso, deja
+el scan incompleto. La eliminación usa `shutil.rmtree` con descriptors,
+`O_NOFOLLOW` y validación del mismo filesystem para no seguir sustituciones de
+symlink.
+
 El GC integrado se ejecuta al comenzar y al terminar una preparación. También
 está disponible de forma complementaria:
 
@@ -47,6 +57,14 @@ review fallido y reconcilia reviews anteriores bajo el lock. `SIGKILL` deja un
 marcador `BUILDING`, que sólo se recoge después de su periodo de gracia y con
 el PID sin vida; un proceso concurrente o un árbol inseguro se conserva para
 revisión humana.
+
+Los marcadores completados incluyen timestamps, estado y el SHA-256 exacto del
+`STAGED_RUNTIME.json`; un hash ausente, corrupto o inconsistente es desconocido
+y no se promociona ni se elimina. Los journals sólo aceptan `PREPARED` o
+`APPLYING` y la recuperación cubre tanto el runtime canónico legado como una
+primera promoción sin rollback. El valor predeterminado conserva una review y
+un rollback inmediato para inspección; `--keep-reviews 0` y
+`--keep-rollbacks 0` son las retenciones explícitas para una limpieza total.
 
 La migración legacy del 2026-09-17 eliminó 28 payloads completos después de
 comprobar manifiestos, ownership, symlinks internos, inodos y procesos. Sólo se
