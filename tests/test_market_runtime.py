@@ -632,6 +632,18 @@ time.sleep(30)
                 runtime_lifecycle.RuntimeLifecycle(root).promote(candidate)
             self.assertTrue(candidate.parent.is_dir())
 
+    def test_invalid_active_manifest_is_rejected_before_promotion_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            (active / runtime_lifecycle.STAGED_MARKER).unlink()
+            candidate = _make_review(root, "runtime-review-invalid-active")
+            with self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                runtime_lifecycle.RuntimeLifecycle(root).promote(candidate)
+            self.assertTrue(active.is_dir())
+            self.assertTrue(candidate.is_dir())
+            self.assertFalse((root / ".runtime-promotion.json").exists())
+
     def test_promotion_protects_active_runtime_in_use(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

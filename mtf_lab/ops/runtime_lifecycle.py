@@ -975,11 +975,7 @@ class RuntimeLifecycle:
         """Validate the canonical tree before a promotion journal is closed."""
 
         try:
-            info = os.lstat(self.active)
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-                return False
-            manifest = _safe_json(self.active / STAGED_MARKER)
-            if not _is_canonical_active_manifest(manifest, self.active):
+            if not self._active_metadata_is_valid_unlocked():
                 return False
             for name in ("runtime-python", "dev-python"):
                 config = self.active / name / "pyvenv.cfg"
@@ -990,6 +986,22 @@ class RuntimeLifecycle:
             _validate_confined_tree(self.active, self.root)
             if not _venv_configs_are_retargeted(self.active):
                 return False
+        except (OSError, RuntimeLifecycleError, UnicodeError, json.JSONDecodeError):
+            return False
+        return True
+
+    def _active_metadata_is_valid_unlocked(self) -> bool:
+        """Validate active metadata/layout without changing any files."""
+
+        try:
+            info = os.lstat(self.active)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return False
+            manifest = _safe_json(self.active / STAGED_MARKER)
+            if not _is_canonical_active_manifest(manifest, self.active):
+                return False
+            _validate_runtime_layout(self.active)
+            _validate_confined_tree(self.active, self.root)
         except (OSError, RuntimeLifecycleError, UnicodeError, json.JSONDecodeError):
             return False
         return True
@@ -1774,6 +1786,8 @@ class RuntimeLifecycle:
                 raise RuntimeLifecycleError(f"staged runtime is not promotable: {record.reason}")
             if not candidate.is_dir() or candidate.resolve(strict=False) == self.active.resolve(strict=False):
                 raise RuntimeLifecycleError("staged runtime is not a distinct review")
+            if os.path.lexists(self.active) and not self._active_metadata_is_valid_unlocked():
+                raise RuntimeLifecycleError("canonical runtime manifest or layout is invalid")
             active_manifest_snapshot: bytes | None = None
             if os.path.lexists(self.active):
                 active_info = os.lstat(self.active)
