@@ -595,18 +595,15 @@ time.sleep(30)
             _make_active(root)
             candidate = _make_review(root, "runtime-review-late-cleanup")
             manager = runtime_lifecycle.RuntimeLifecycle(root)
-            real_rmdir = Path.rmdir
 
-            def fail_review_rmdir(path: Path) -> None:
+            def fail_review_rmdir(_root: Path, path: Path) -> None:
                 if path == candidate.parent:
                     raise OSError("synthetic marker cleanup failure")
-                real_rmdir(path)
 
             with (
                 mock.patch.object(
-                    Path,
-                    "rmdir",
-                    autospec=True,
+                    runtime_lifecycle,
+                    "_rmdir_child",
                     side_effect=fail_review_rmdir,
                 ),
                 self.assertRaises(OSError),

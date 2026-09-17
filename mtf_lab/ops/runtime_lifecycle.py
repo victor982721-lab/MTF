@@ -706,6 +706,36 @@ def _remove_tree(path: Path) -> None:
         os.close(parent_fd)
 
 
+def _unlink_child(parent: Path, name: str) -> None:
+    """Unlink one direct child through an ``O_NOFOLLOW`` directory fd."""
+
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        parent_fd = os.open(parent, flags)
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"lifecycle parent is unavailable: {parent}") from exc
+    try:
+        os.unlink(name, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def _rmdir_child(root: Path, child: Path) -> None:
+    """Remove one direct child through its stable root directory fd."""
+
+    if child.parent != root:
+        raise RuntimeLifecycleError(f"lifecycle child is not a direct root entry: {child}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_fd = os.open(root, flags)
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"lifecycle root is unavailable: {root}") from exc
+    try:
+        os.rmdir(child.name, dir_fd=root_fd)
+    finally:
+        os.close(root_fd)
+
+
 def _managed_temporary_paths(parent: Path, root: Path) -> list[Path]:
     """Return validated hidden build trees, rejecting unknown siblings."""
 
@@ -1024,15 +1054,15 @@ class RuntimeLifecycle:
         )
         _atomic_json(rollback / STAGED_MARKER, manifest)
 
-    @staticmethod
-    def _remove_review_marker_unlocked(staged: Path) -> None:
+    def _remove_review_marker_unlocked(self, staged: Path) -> None:
         """Remove only lifecycle metadata after a review has been promoted."""
 
         marker = staged.parent / LIFECYCLE_MARKER
         with contextlib.suppress(FileNotFoundError):
-            marker.unlink()
+            _unlink_child(staged.parent, marker.name)
         if staged.parent.exists() and not any(staged.parent.iterdir()):
-            staged.parent.rmdir()
+            with contextlib.suppress(OSError):
+                _rmdir_child(self.root, staged.parent)
 
     def recover_unlocked(self) -> dict[str, Any]:  # noqa: C901 - crash recovery state machine
         journal = self.root / ".runtime-promotion.json"
@@ -1690,7 +1720,7 @@ class RuntimeLifecycle:
                     _remove_tree(temporary)
             marker = record.path / LIFECYCLE_MARKER
             if os.path.lexists(marker):
-                os.unlink(marker)
+                _unlink_child(record.path, marker.name)
             if purge_review_evidence or record.role == "review_evidence":
                 # This mode is an explicit, audited migration of legacy
                 # review roots.  New lifecycle runs never place evidence next
@@ -1700,7 +1730,7 @@ class RuntimeLifecycle:
                     _remove_tree(record.path)
                 return
             if not any(record.path.iterdir()):
-                os.rmdir(record.path)
+                _rmdir_child(self.root, record.path)
         else:
             _remove_tree(record.path)
 
@@ -1854,9 +1884,9 @@ class RuntimeLifecycle:
                     self._mark_rollback_unlocked(rollback)
                 committed = True
                 with contextlib.suppress(FileNotFoundError):
-                    (parent / LIFECYCLE_MARKER).unlink()
+                    _unlink_child(parent, LIFECYCLE_MARKER)
                 if parent.exists() and not any(parent.iterdir()):
-                    parent.rmdir()
+                    _rmdir_child(self.root, parent)
                 journal.unlink()
             except BaseException:
                 if committed:
