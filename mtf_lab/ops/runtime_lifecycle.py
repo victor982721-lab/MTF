@@ -111,6 +111,13 @@ def _safe_json(path: Path) -> dict[str, Any] | None:
     return dict(value) if isinstance(value, Mapping) else None
 
 
+def _marker_pid(marker: Mapping[str, Any] | None) -> int:
+    if marker is None:
+        return 0
+    value = marker.get("pid", 0)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
 def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) -> None:
     if os.path.lexists(path.parent):
         parent_info = os.lstat(path.parent)
@@ -521,10 +528,12 @@ class RuntimeLifecycle:
             "created_at": _now(),
         }
         existing = _safe_json(parent / LIFECYCLE_MARKER)
-        if existing is not None and existing.get("state") == "BUILDING" and _pid_alive(int(existing.get("pid", 0))):
-            if int(existing.get("pid", 0)) == os.getpid():
-                return
-            raise RuntimeLifecycleError("runtime review is already being built")
+        if existing is not None and existing.get("state") == "BUILDING":
+            existing_pid = _marker_pid(existing)
+            if _pid_alive(existing_pid):
+                if existing_pid == os.getpid():
+                    return
+                raise RuntimeLifecycleError("runtime review is already being built")
         _atomic_json(parent / LIFECYCLE_MARKER, marker)
 
     def begin_unlocked(self, destination: str | Path) -> Path:
@@ -579,9 +588,18 @@ class RuntimeLifecycle:
                 raise RuntimeLifecycleError("promotion journal path escapes runtime root")
         # The only automatic recovery is restoring a missing canonical runtime
         # from the known rollback.  Ambiguous states remain fail-closed.
-        if not os.path.lexists(active) and os.path.isdir(rollback) and not os.path.lexists(staged):
+        active_info = os.lstat(active) if os.path.lexists(active) else None
+        rollback_info = os.lstat(rollback) if os.path.lexists(rollback) else None
+        staged_info = os.lstat(staged) if os.path.lexists(staged) else None
+        if (
+            active_info is None
+            and rollback_info is not None
+            and stat.S_ISDIR(rollback_info.st_mode)
+            and staged_info is None
+        ):
             os.rename(rollback, active)
-        if os.path.lexists(active) and os.path.isdir(active):
+            active_info = os.lstat(active)
+        if active_info is not None and stat.S_ISDIR(active_info.st_mode) and not stat.S_ISLNK(active_info.st_mode):
             journal.unlink()
             return {"state": "RECOVERED", "recovered": True}
         raise RuntimeLifecycleError("promotion journal requires manual review")
@@ -594,6 +612,26 @@ class RuntimeLifecycle:
         manifest_sha: str | None = None
         marker = _safe_json(parent / LIFECYCLE_MARKER)
         state = str(marker.get("state")) if marker else "LEGACY"
+        if marker is not None and (
+            marker.get("schema") != LIFECYCLE_SCHEMA
+            or marker.get("project") != "mtf-lab"
+            or marker.get("role") != "review"
+            or marker.get("destination") != str(destination)
+            or state not in {"BUILDING", "REVIEW_READY", "FAILED"}
+        ):
+            return RuntimeRecord(
+                parent.name,
+                parent,
+                "unknown",
+                state,
+                False,
+                "lifecycle marker is missing or ambiguous",
+                0,
+                0,
+                0,
+                1,
+                0,
+            )
         reason = "legacy review metadata"
         safe = False
         in_use = False
@@ -623,7 +661,7 @@ class RuntimeLifecycle:
                     parent.name, parent, "review", state, True, "failed review without payload", 0, 0, 0, 1, 0
                 )
             if state == "BUILDING" and not os.path.lexists(destination):
-                pid = int(marker.get("pid", 0)) if marker else 0
+                pid = _marker_pid(marker)
                 if _pid_alive(pid):
                     return RuntimeRecord(
                         parent.name, parent, "temporary_in_use", state, False, "build is live", 0, 0, 0, 1, 0, True
@@ -692,7 +730,7 @@ class RuntimeLifecycle:
             reference = _proc_reference(destination)
         in_use = reference is not None
         if state == "BUILDING":
-            pid = int(marker.get("pid", 0)) if marker else 0
+            pid = _marker_pid(marker)
             if _pid_alive(pid) or in_use:
                 return RuntimeRecord(
                     parent.name,
