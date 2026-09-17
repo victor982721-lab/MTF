@@ -1774,9 +1774,12 @@ class RuntimeLifecycle:
                 raise RuntimeLifecycleError(f"staged runtime is not promotable: {record.reason}")
             if not candidate.is_dir() or candidate.resolve(strict=False) == self.active.resolve(strict=False):
                 raise RuntimeLifecycleError("staged runtime is not a distinct review")
-            active_manifest_snapshot = (
-                _snapshot_regular_file(self.active / STAGED_MARKER) if self.active.exists() else None
-            )
+            active_manifest_snapshot: bytes | None = None
+            if os.path.lexists(self.active):
+                active_info = os.lstat(self.active)
+                if stat.S_ISLNK(active_info.st_mode) or not stat.S_ISDIR(active_info.st_mode):
+                    raise RuntimeLifecycleError("canonical runtime is not a regular directory")
+                active_manifest_snapshot = _snapshot_regular_file(self.active / STAGED_MARKER)
             candidate_manifest_snapshot = _snapshot_regular_file(candidate / STAGED_MARKER)
             lifecycle_marker_snapshot = _snapshot_regular_file(parent / LIFECYCLE_MARKER)
             rollback = self.root / f"{ROLLBACK_PREFIX}{dt.datetime.now(dt.UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:8]}"
