@@ -44,9 +44,14 @@ def _write_json(path: Path, value: dict[str, object]) -> None:
 def _make_review(root: Path, name: str, *, marker_state: str | None = "REVIEW_READY") -> Path:
     parent = root / name
     runtime = parent / "runtime"
-    (runtime / "base-python").mkdir(parents=True)
+    (runtime / "base-python/bin").mkdir(parents=True)
     (runtime / "runtime-python/bin").mkdir(parents=True)
     (runtime / "dev-python/bin").mkdir(parents=True)
+    for name in ("runtime-python", "dev-python"):
+        (runtime / name / "pyvenv.cfg").write_text(
+            "home = /old/base/bin\ninclude-system-site-packages = false\nversion = 3.12.14\n",
+            encoding="utf-8",
+        )
     (runtime / "payload.txt").write_text(name + "\n", encoding="utf-8")
     _write_json(
         runtime / runtime_lifecycle.STAGED_MARKER,
@@ -77,6 +82,12 @@ def _make_active(root: Path) -> Path:
     active = root / "runtime"
     (active / "runtime-python/bin").mkdir(parents=True)
     (active / "base-python").mkdir()
+    (active / "base-python/bin").mkdir()
+    for name in ("runtime-python",):
+        (active / name / "pyvenv.cfg").write_text(
+            "home = /old/base/bin\ninclude-system-site-packages = false\nversion = 3.12.14\n",
+            encoding="utf-8",
+        )
     (active / "active.txt").write_text("active\n", encoding="utf-8")
     _write_json(
         active / runtime_lifecycle.STAGED_MARKER,
@@ -341,6 +352,13 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             self.assertTrue((rollback / "active.txt").is_file())
             self.assertFalse(candidate.parent.exists())
             self.assertFalse((active / "active.txt").exists())
+            self.assertIn(
+                f"home = {root / 'runtime' / 'base-python' / 'bin'}",
+                (root / "runtime/runtime-python/pyvenv.cfg").read_text(),
+            )
+            self.assertIn(
+                f"home = {rollback / 'base-python' / 'bin'}", (rollback / "runtime-python/pyvenv.cfg").read_text()
+            )
             rollback_record = next(
                 item
                 for item in runtime_lifecycle.RuntimeLifecycle(root).inspect()["records"]

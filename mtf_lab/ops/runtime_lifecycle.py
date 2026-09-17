@@ -149,6 +149,51 @@ def _atomic_json(path: Path, value: Mapping[str, Any], *, replace: bool = True) 
         raise
 
 
+def _retarget_venv_configs(runtime: Path) -> None:  # noqa: C901 - one post-move venv repair gate
+    """Repair absolute ``pyvenv.cfg`` references after a directory move."""
+
+    base_bin = (runtime / "base-python" / "bin").resolve(strict=False)
+    if not _is_within(base_bin, runtime) or not base_bin.is_dir():
+        raise RuntimeLifecycleError(f"runtime base is missing or escapes candidate: {runtime}")
+    for name in ("runtime-python", "dev-python"):
+        config = runtime / name / "pyvenv.cfg"
+        if not os.path.lexists(config):
+            continue
+        info = os.lstat(config)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise RuntimeLifecycleError(f"venv config is unsafe: {config}")
+        lines = config.read_text(encoding="utf-8").splitlines(keepends=True)
+        replaced: list[str] = []
+        seen_home = seen_executable = False
+        for line in lines:
+            if line.startswith("home = "):
+                replaced.append(f"home = {base_bin}\n")
+                seen_home = True
+            elif line.startswith("executable = "):
+                replaced.append(f"executable = {base_bin / 'python3.12'}\n")
+                seen_executable = True
+            else:
+                replaced.append(line)
+        if not seen_home:
+            replaced.insert(0, f"home = {base_bin}\n")
+        if not seen_executable:
+            replaced.insert(1, f"executable = {base_bin / 'python3.12'}\n")
+        payload = "".join(replaced).encode("utf-8")
+        temporary = config.with_name(f".{config.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, payload)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        try:
+            os.replace(temporary, config)
+        except BaseException:
+            with contextlib.suppress(FileNotFoundError):
+                temporary.unlink()
+            raise
+
+
 def _tree_stats(path: Path) -> tuple[int, int, int, int, int, set[tuple[int, int]]]:
     apparent = allocated = files = directories = symlinks = 0
     seen: set[tuple[int, int]] = set()
@@ -1027,8 +1072,10 @@ class RuntimeLifecycle:
                     _validate_confined_tree(self.active, self.root)
                     os.rename(self.active, rollback)
                     active_moved = True
+                    _retarget_venv_configs(rollback)
                 os.rename(candidate, self.active)
                 staged_moved = True
+                _retarget_venv_configs(self.active)
                 _atomic_json(
                     journal,
                     {
@@ -1048,6 +1095,7 @@ class RuntimeLifecycle:
                         "state": "ACTIVE_RUNTIME",
                         "promotion_state": "ACTIVE",
                         "current_pointer": str(self.active),
+                        "destination": str(self.active),
                         "promoted_at": _now(),
                     }
                 )
@@ -1060,6 +1108,7 @@ class RuntimeLifecycle:
                                 "state": "ROLLBACK_RUNTIME",
                                 "promotion_state": "ROLLBACK",
                                 "rollback_of": str(self.active),
+                                "destination": str(rollback),
                                 "rollback_created_at": _now(),
                             }
                         )
@@ -1073,17 +1122,21 @@ class RuntimeLifecycle:
                 with contextlib.suppress(OSError):
                     if staged_moved and self.active.exists() and not candidate.exists():
                         os.rename(self.active, candidate)
+                        with contextlib.suppress(RuntimeLifecycleError, OSError):
+                            _retarget_venv_configs(candidate)
                 with contextlib.suppress(OSError):
                     if active_moved and rollback.exists() and not self.active.exists():
                         os.rename(rollback, self.active)
+                        with contextlib.suppress(RuntimeLifecycleError, OSError):
+                            _retarget_venv_configs(self.active)
                 raise
+            self.gc_unlocked(max_reviews=0, max_rollbacks=keep_rollback, preserve=[self.active])
             result = {
                 "schema": LIFECYCLE_SCHEMA,
                 "state": "PROMOTED",
                 "active": str(self.active),
-                "rollback": str(rollback) if active_moved else None,
+                "rollback": str(rollback) if active_moved and rollback.exists() else None,
             }
-            self.gc_unlocked(max_reviews=0, max_rollbacks=keep_rollback, preserve=[self.active])
             return result
 
 
