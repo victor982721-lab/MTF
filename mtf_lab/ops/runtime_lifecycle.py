@@ -679,7 +679,7 @@ def _managed_temporary_paths(parent: Path, root: Path) -> list[Path]:
     return temporary
 
 
-def _legacy_evidence_is_known(parent: Path) -> bool:
+def _legacy_evidence_is_known(parent: Path) -> bool:  # noqa: C901 - conservative evidence-shape gate
     """Recognize only the narrow evidence shapes eligible for explicit purge."""
 
     evidence_dirs = {"logs", "validation", "probe", "verification", "evidence"}
@@ -707,6 +707,26 @@ def _legacy_evidence_is_known(parent: Path) -> bool:
         except OSError:
             return False
         if stat.S_ISDIR(info.st_mode) and child.name in evidence_dirs:
+            stack = [child]
+            while stack:
+                directory = stack.pop()
+                try:
+                    nested = list(directory.iterdir())
+                except OSError:
+                    return False
+                for item in nested:
+                    try:
+                        nested_info = os.lstat(item)
+                    except OSError:
+                        return False
+                    if stat.S_ISLNK(nested_info.st_mode):
+                        return False
+                    if stat.S_ISDIR(nested_info.st_mode):
+                        stack.append(item)
+                    elif stat.S_ISREG(nested_info.st_mode) and item.suffix.lower() in {".json", ".log"}:
+                        continue
+                    else:
+                        return False
             useful = True
             continue
         if stat.S_ISREG(info.st_mode) and child.suffix.lower() in {".json", ".log"}:

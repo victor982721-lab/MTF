@@ -411,6 +411,18 @@ time.sleep(30)
             self.assertEqual("unknown", preserved["role"])
             self.assertTrue(parent.exists())
 
+    def test_unrecognized_evidence_file_is_not_purged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            parent = root / "runtime-review-evidence-unknown-file"
+            (parent / "logs").mkdir(parents=True)
+            (parent / "logs" / "keep.bin").write_bytes(b"unknown\n")
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0, purge_review_evidence=True)
+            preserved = next(item for item in result["preserved"] if item["name"] == parent.name)
+            self.assertEqual("unknown", preserved["role"])
+            self.assertTrue(parent.exists())
+
     def test_foreign_rollback_metadata_is_not_collectable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
