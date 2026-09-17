@@ -6,6 +6,7 @@ download packages, touch the staged user runtime, or open a broker connection.
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
@@ -15,6 +16,7 @@ import tempfile
 import time
 import unittest
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 from types import ModuleType
 from unittest import mock
@@ -64,26 +66,44 @@ def _make_review(root: Path, name: str, *, marker_state: str | None = "REVIEW_RE
         },
     )
     if marker_state is not None:
-        _write_json(
-            parent / runtime_lifecycle.LIFECYCLE_MARKER,
-            {
-                "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
-                "project": "mtf-lab",
-                "role": "review",
-                "state": marker_state,
-                "pid": None,
-                "destination": str(runtime),
-            },
-        )
+        marker: dict[str, object] = {
+            "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+            "project": "mtf-lab",
+            "role": "review",
+            "state": marker_state,
+            "pid": None,
+            "destination": str(runtime),
+        }
+        if marker_state == "BUILDING":
+            marker.update({"pid": os.getpid(), "created_at": "2026-09-17T00:00:00Z"})
+        elif marker_state == "REVIEW_READY":
+            marker.update(
+                {
+                    "created_at": "2026-09-17T00:00:00Z",
+                    "completed_at": "2026-09-17T00:01:00Z",
+                    "manifest_sha256": runtime_lifecycle._sha256(runtime / runtime_lifecycle.STAGED_MARKER),
+                    "manifest_state": "STAGED_RUNTIME",
+                }
+            )
+        elif marker_state == "FAILED":
+            marker.update(
+                {
+                    "failed_at": "2026-09-17T00:01:00Z",
+                    "error_type": "RuntimeError",
+                    "error": "synthetic fixture failure",
+                }
+            )
+        _write_json(parent / runtime_lifecycle.LIFECYCLE_MARKER, marker)
     return runtime
 
 
 def _make_active(root: Path) -> Path:
     active = root / "runtime"
     (active / "runtime-python/bin").mkdir(parents=True)
+    (active / "dev-python/bin").mkdir(parents=True)
     (active / "base-python").mkdir()
     (active / "base-python/bin").mkdir()
-    for name in ("runtime-python",):
+    for name in ("runtime-python", "dev-python"):
         (active / name / "pyvenv.cfg").write_text(
             "home = /old/base/bin\ninclude-system-site-packages = false\nversion = 3.12.14\n",
             encoding="utf-8",
@@ -302,6 +322,80 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             self.assertEqual("deleted", result["deleted"][0]["action"])
             self.assertFalse(destination.parent.exists())
 
+    def test_gc_removes_failed_hidden_staging_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            parent = root / "runtime-review-failed-staging"
+            parent.mkdir()
+            hidden = parent / ".runtime-staging-crashed"
+            hidden.mkdir()
+            (hidden / "partial.txt").write_text("partial\n", encoding="utf-8")
+            _write_json(
+                parent / runtime_lifecycle.LIFECYCLE_MARKER,
+                {
+                    "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                    "project": "mtf-lab",
+                    "role": "review",
+                    "state": "FAILED",
+                    "pid": None,
+                    "destination": str(parent / "runtime"),
+                    "failed_at": "2026-09-17T00:01:00Z",
+                    "error_type": "RuntimeError",
+                    "error": "synthetic fixture failure",
+                },
+            )
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
+            self.assertEqual("deleted", result["deleted"][0]["action"])
+            self.assertFalse(parent.exists())
+
+    def test_unmarked_unknown_review_is_not_purged_as_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            parent = root / "runtime-review-unknown"
+            parent.mkdir()
+            (parent / "keep.txt").write_text("unknown\n", encoding="utf-8")
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0, purge_review_evidence=True)
+            preserved = next(item for item in result["preserved"] if item["name"] == parent.name)
+            self.assertEqual("unknown", preserved["role"])
+            self.assertEqual("preserve", preserved["action"])
+            self.assertTrue(parent.exists())
+
+    def test_corrupt_legacy_evidence_marker_is_not_purged(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            parent = root / "runtime-review-corrupt-evidence"
+            parent.mkdir()
+            _write_json(parent / runtime_lifecycle.STAGED_MARKER, {"project": "foreign"})
+            (parent / "logs").mkdir()
+            (parent / "logs" / "old.log").write_text("evidence\n", encoding="utf-8")
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0, purge_review_evidence=True)
+            preserved = next(item for item in result["preserved"] if item["name"] == parent.name)
+            self.assertEqual("unknown", preserved["role"])
+            self.assertTrue(parent.exists())
+
+    def test_foreign_rollback_metadata_is_not_collectable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            rollback = root / "runtime-rollback-foreign"
+            rollback.mkdir()
+            (rollback / "keep.bin").write_bytes(b"foreign\n")
+            _write_json(
+                rollback / runtime_lifecycle.STAGED_MARKER,
+                {
+                    "project": "mtf-lab",
+                    "state": "ROLLBACK_RUNTIME",
+                    "promotion_state": "ROLLBACK",
+                },
+            )
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_rollbacks=0)
+            preserved = next(item for item in result["preserved"] if item["name"] == rollback.name)
+            self.assertEqual("unknown", preserved["role"])
+            self.assertTrue(rollback.exists())
+
     def test_gc_protects_live_process_and_deletes_after_exit(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -338,6 +432,20 @@ class MarketRuntimePreparationTests(unittest.TestCase):
                     manager.validate_build_destination(root / ".." / "outside" / "runtime-review-x" / "runtime")
             finally:
                 outside.rmdir()
+
+    def test_remove_tree_rejects_top_level_symlink_without_touching_target(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            outside = root / "outside"
+            outside.mkdir()
+            sentinel = outside / "keep.txt"
+            sentinel.write_text("keep\n", encoding="utf-8")
+            link = root / "runtime-review-link"
+            link.symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                runtime_lifecycle._remove_tree(link)
+            self.assertTrue(sentinel.exists())
+            self.assertTrue(link.is_symlink())
 
     def test_incomplete_managed_layout_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -403,7 +511,10 @@ class MarketRuntimePreparationTests(unittest.TestCase):
                     raise OSError("synthetic promotion failure")
                 real_rename(source, target)
 
-            with mock.patch.object(runtime_lifecycle.os, "rename", side_effect=fail_second), self.assertRaises(OSError):
+            with (
+                mock.patch("mtf_lab.ops.runtime_lifecycle.os.rename", side_effect=fail_second),
+                self.assertRaises(OSError),
+            ):
                 runtime_lifecycle.RuntimeLifecycle(root).promote(candidate)
             self.assertTrue(active.is_dir())
             self.assertTrue(candidate.is_dir())
@@ -411,6 +522,261 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             # than silently deleting either side of the failed transaction.
             runtime_lifecycle.RuntimeLifecycle(root).inspect()
             self.assertFalse((root / ".runtime-promotion.json").exists())
+
+    def test_failed_review_is_not_promotable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate = _make_review(root, "runtime-review-failed", marker_state="FAILED")
+            with self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                runtime_lifecycle.RuntimeLifecycle(root).promote(candidate)
+            self.assertTrue(candidate.parent.is_dir())
+
+    def test_promotion_protects_active_runtime_in_use(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            candidate = _make_review(root, "runtime-review-active-live")
+            child = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(2)"],
+                cwd=active,
+            )
+            try:
+                with self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                    runtime_lifecycle.RuntimeLifecycle(root).promote(candidate)
+                self.assertTrue((active / "active.txt").is_file())
+                self.assertTrue(candidate.is_dir())
+            finally:
+                child.wait(timeout=10)
+
+    def test_unknown_marker_cannot_be_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            parent = root / "runtime-review-unknown-marker"
+            parent.mkdir()
+            marker = parent / runtime_lifecycle.LIFECYCLE_MARKER
+            original: dict[str, object] = {
+                "schema": "other",
+                "project": "other",
+                "role": "review",
+                "state": "UNKNOWN",
+                "destination": str(parent / "runtime"),
+            }
+            _write_json(marker, original)
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with manager.lock(), self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                manager.begin_unlocked(parent / "runtime")
+            self.assertEqual(original, json.loads(marker.read_text(encoding="utf-8")))
+
+    def test_incomplete_ready_marker_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate = _make_review(root, "runtime-review-incomplete-marker")
+            marker = candidate.parent / runtime_lifecycle.LIFECYCLE_MARKER
+            malformed = json.loads(marker.read_text(encoding="utf-8"))
+            malformed.pop("manifest_sha256")
+            _write_json(marker, malformed)
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
+            preserved = next(item for item in result["preserved"] if item["name"] == candidate.parent.name)
+            self.assertEqual("unknown", preserved["role"])
+            self.assertEqual("preserve", preserved["action"])
+            self.assertTrue(candidate.parent.exists())
+
+    def test_ready_marker_hash_mismatch_is_preserved_and_not_promotable(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate = _make_review(root, "runtime-review-tampered-manifest")
+            manifest_path = candidate / runtime_lifecycle.STAGED_MARKER
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["tampered"] = True
+            _write_json(manifest_path, manifest)
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with mock.patch.object(runtime_lifecycle, "_proc_references", return_value={}):
+                record = next(item for item in manager.inspect()["records"] if item["name"] == candidate.parent.name)
+                self.assertEqual("unknown", record["role"])
+                self.assertFalse(record["safe_to_delete"])
+            with self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                manager.promote(candidate)
+
+    def test_process_descriptor_permission_is_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            real_iterdir = Path.iterdir
+            process_path = Path(f"/proc/{os.getpid()}")
+
+            def deny_proc_fd(path: Path) -> Iterator[Path]:
+                if path == Path("/proc"):
+                    return iter([process_path])
+                if path == process_path / "fd":
+                    raise PermissionError(errno.EACCES, "synthetic proc denial", str(path))
+                return real_iterdir(path)
+
+            with (
+                mock.patch.object(Path, "iterdir", deny_proc_fd),
+                mock.patch.object(runtime_lifecycle, "_proc_is_non_mtf", return_value=False),
+                self.assertRaises(runtime_lifecycle.RuntimeLifecycleError),
+            ):
+                runtime_lifecycle._proc_references([root / "candidate"])
+
+    def test_incomplete_process_scan_preserves_review_and_allows_inspect(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            candidate = _make_review(root, "runtime-review-proc-incomplete")
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with mock.patch.object(
+                runtime_lifecycle,
+                "_proc_references",
+                side_effect=runtime_lifecycle.RuntimeLifecycleError("synthetic process scan denial"),
+            ):
+                result = manager.gc(max_reviews=0)
+                self.assertTrue(candidate.parent.exists())
+                preserved = next(item for item in result["preserved"] if item["name"] == candidate.parent.name)
+                self.assertEqual("needs_review", preserved["action"])
+                inspected = manager.inspect()
+            self.assertEqual("INCOMPLETE", inspected["process_scan"]["status"])
+
+    def test_recovery_restores_active_after_interrupted_move(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            staged = _make_review(root, "runtime-review-recovery")
+            rollback = root / "runtime-rollback-recovery"
+            os.rename(active, rollback)
+            os.rename(staged, active)
+            journal = root / ".runtime-promotion.json"
+            runtime_lifecycle._atomic_json(
+                journal,
+                {
+                    "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                    "state": "APPLYING",
+                    "active": str(root / "runtime"),
+                    "staged": str(staged),
+                    "rollback": str(rollback),
+                },
+            )
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with manager.lock():
+                recovered = manager.recover_unlocked()
+            self.assertTrue(recovered["recovered"])
+            self.assertTrue((active / "active.txt").is_file())
+            self.assertTrue(staged.parent.is_dir())
+            self.assertFalse(journal.exists())
+
+    def test_recovery_restores_legacy_active_after_first_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            legacy_manifest = json.loads((active / runtime_lifecycle.STAGED_MARKER).read_text(encoding="utf-8"))
+            legacy_manifest.update(
+                {"state": "STAGED_RUNTIME", "promotion_state": "NOT_PROMOTED", "current_pointer": None}
+            )
+            _write_json(active / runtime_lifecycle.STAGED_MARKER, legacy_manifest)
+            staged = _make_review(root, "runtime-review-legacy-recovery")
+            rollback = root / "runtime-rollback-legacy-recovery"
+            os.rename(active, rollback)
+            journal = root / ".runtime-promotion.json"
+            runtime_lifecycle._atomic_json(
+                journal,
+                {
+                    "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                    "state": "PREPARED",
+                    "active": str(root / "runtime"),
+                    "staged": str(staged),
+                    "rollback": str(rollback),
+                },
+            )
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with manager.lock():
+                recovered = manager.recover_unlocked()
+            self.assertTrue(recovered["recovered"])
+            self.assertTrue((root / "runtime" / "active.txt").is_file())
+            self.assertTrue(staged.parent.is_dir())
+            self.assertFalse(journal.exists())
+
+    def test_recovery_restores_first_promotion_candidate_without_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            staged = _make_review(root, "runtime-review-first-promotion")
+            active = root / "runtime"
+            os.rename(staged, active)
+            journal = root / ".runtime-promotion.json"
+            runtime_lifecycle._atomic_json(
+                journal,
+                {
+                    "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                    "state": "APPLYING",
+                    "active": str(active),
+                    "staged": str(staged),
+                    "rollback": str(root / "runtime-rollback-first-promotion"),
+                },
+            )
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with manager.lock():
+                recovered = manager.recover_unlocked()
+            self.assertTrue(recovered["recovered"])
+            self.assertFalse(active.exists())
+            self.assertTrue(staged.is_dir())
+            self.assertFalse(journal.exists())
+
+    def test_recovery_finalizes_rollback_after_candidate_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            active = _make_active(root)
+            staged = _make_review(root, "runtime-review-finalize-rollback")
+            rollback = root / "runtime-rollback-finalize-rollback"
+            os.rename(active, rollback)
+            os.rename(staged, root / "runtime")
+            runtime_lifecycle._retarget_venv_configs(root / "runtime")
+            promoted = json.loads((root / "runtime" / runtime_lifecycle.STAGED_MARKER).read_text(encoding="utf-8"))
+            promoted.update(
+                {
+                    "state": "ACTIVE_RUNTIME",
+                    "promotion_state": "ACTIVE",
+                    "current_pointer": str(root / "runtime"),
+                    "destination": str(root / "runtime"),
+                }
+            )
+            _write_json(root / "runtime" / runtime_lifecycle.STAGED_MARKER, promoted)
+            journal = root / ".runtime-promotion.json"
+            runtime_lifecycle._atomic_json(
+                journal,
+                {
+                    "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                    "state": "APPLYING",
+                    "active": str(root / "runtime"),
+                    "staged": str(staged),
+                    "rollback": str(rollback),
+                },
+            )
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with manager.lock():
+                recovered = manager.recover_unlocked()
+            self.assertTrue(recovered["recovered"])
+            rollback_manifest = json.loads((rollback / runtime_lifecycle.STAGED_MARKER).read_text(encoding="utf-8"))
+            self.assertEqual("ROLLBACK_RUNTIME", rollback_manifest["state"])
+            self.assertEqual("ROLLBACK", rollback_manifest["promotion_state"])
+            rollback_record = next(item for item in manager.inspect()["records"] if item["name"] == rollback.name)
+            self.assertEqual("rollback", rollback_record["role"])
+            self.assertFalse(journal.exists())
+
+    def test_unknown_promotion_journal_state_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            journal = root / ".runtime-promotion.json"
+            runtime_lifecycle._atomic_json(
+                journal,
+                {
+                    "schema": runtime_lifecycle.LIFECYCLE_SCHEMA,
+                    "state": "UNKNOWN",
+                    "active": str(root / "runtime"),
+                    "staged": str(root / "runtime-review-x" / "runtime"),
+                    "rollback": str(root / "runtime-rollback-x"),
+                },
+            )
+            manager = runtime_lifecycle.RuntimeLifecycle(root)
+            with manager.lock(), self.assertRaises(runtime_lifecycle.RuntimeLifecycleError):
+                manager.recover_unlocked()
+            self.assertTrue(journal.exists())
 
     def test_failed_review_without_payload_is_collectable(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -424,7 +790,11 @@ class MarketRuntimePreparationTests(unittest.TestCase):
                     "project": "mtf-lab",
                     "role": "review",
                     "state": "FAILED",
+                    "pid": None,
                     "destination": str(parent / "runtime"),
+                    "failed_at": "2026-09-17T00:01:00Z",
+                    "error_type": "RuntimeError",
+                    "error": "synthetic fixture failure",
                 },
             )
             result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
@@ -462,6 +832,26 @@ class MarketRuntimePreparationTests(unittest.TestCase):
                     lifecycle_root=root,
                 )
             self.assertFalse(destination.parent.exists())
+
+    def test_prepare_wrapper_does_not_touch_preexisting_unknown_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw) / "runtime-root"
+            destination = root / "runtime-review-foreign" / "runtime"
+            destination.mkdir(parents=True)
+            payload = destination / "keep.bin"
+            payload.write_bytes(b"foreign bytes\n")
+            marker = destination.parent / runtime_lifecycle.LIFECYCLE_MARKER
+            marker.write_text('{"schema":"foreign","state":"UNKNOWN"}\n', encoding="utf-8")
+            payload_before = payload.read_bytes()
+            marker_before = marker.read_bytes()
+            with self.assertRaises(PREPARER.PreparationError):
+                PREPARER.prepare_runtime(
+                    repo_root=Path(__file__).resolve().parents[1],
+                    destination=destination,
+                    lifecycle_root=root,
+                )
+            self.assertEqual(payload_before, payload.read_bytes())
+            self.assertEqual(marker_before, marker.read_bytes())
 
     def test_prepare_wrapper_reconciles_previous_review_after_success(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

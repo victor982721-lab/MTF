@@ -1678,12 +1678,14 @@ def prepare_runtime(
     except RuntimeLifecycleError as exc:
         raise PreparationError(str(exc)) from exc
     with lifecycle.lock():
+        build_started = False
         try:
             lifecycle.recover_unlocked()
             if os.path.lexists(managed_destination):
                 raise PreparationError(f"staged destination already exists; refusing overwrite: {managed_destination}")
             lifecycle.gc_unlocked(max_reviews=lifecycle.keep_reviews, preserve=[managed_destination.parent])
             lifecycle.begin_unlocked(managed_destination)
+            build_started = True
             result = _prepare_runtime_impl(
                 repo_root=repo_root,
                 source_python=source_python,
@@ -1691,12 +1693,14 @@ def prepare_runtime(
                 log_dir=log_dir,
             )
             lifecycle.mark_completed_unlocked(managed_destination, result)
+            build_started = False
             lifecycle.gc_unlocked(max_reviews=lifecycle.keep_reviews, preserve=[managed_destination.parent])
             return result
         except BaseException as exc:
-            with contextlib.suppress(Exception):
-                lifecycle.mark_failed_unlocked(managed_destination, exc)
-                lifecycle.gc_unlocked(max_reviews=0)
+            if build_started:
+                with contextlib.suppress(Exception):
+                    lifecycle.mark_failed_unlocked(managed_destination, exc)
+                    lifecycle.gc_unlocked(max_reviews=0)
             raise
 
 

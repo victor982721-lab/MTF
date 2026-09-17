@@ -12,15 +12,17 @@ from __future__ import annotations
 
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import uuid
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +39,10 @@ _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 class RuntimeLifecycleError(RuntimeError):
     """A lifecycle operation cannot prove its safety contract."""
+
+
+class _ProcAccessDenied(RuntimeError):
+    """A process reference exists but one proc attribute is not readable."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +115,76 @@ def _safe_json(path: Path) -> dict[str, Any] | None:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     return dict(value) if isinstance(value, Mapping) else None
+
+
+def _is_canonical_active_manifest(manifest: Mapping[str, Any] | None, active: Path) -> bool:
+    """Recognize current and legacy manifests for the canonical path only."""
+
+    if manifest is None or manifest.get("project") != "mtf-lab" or manifest.get("destination") != str(active):
+        return False
+    if (
+        manifest.get("state") == "ACTIVE_RUNTIME"
+        and manifest.get("promotion_state") == "ACTIVE"
+        and manifest.get("current_pointer") == str(active)
+    ):
+        return True
+    # The pre-lifecycle canonical runtime was intentionally staged but was
+    # still the protected operational path.  Recovery must not strand it in
+    # rollback merely because its old manifest predates ACTIVE_RUNTIME.
+    return (
+        manifest.get("state") == "STAGED_RUNTIME"
+        and manifest.get("promotion_state") == "NOT_PROMOTED"
+        and manifest.get("current_pointer") is None
+    )
+
+
+def _valid_timestamp(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.utcoffset() is not None
+
+
+def _valid_lifecycle_marker(marker: Mapping[str, Any], destination: Path) -> bool:
+    """Validate marker fields needed to make a lifecycle decision."""
+
+    if (
+        marker.get("schema") != LIFECYCLE_SCHEMA
+        or marker.get("project") != "mtf-lab"
+        or marker.get("role") != "review"
+        or marker.get("destination") != str(destination)
+    ):
+        return False
+    state = marker.get("state")
+    if state == "BUILDING":
+        pid = marker.get("pid")
+        return (
+            isinstance(pid, int)
+            and not isinstance(pid, bool)
+            and pid > 0
+            and _valid_timestamp(marker.get("created_at"))
+        )
+    if state == "REVIEW_READY":
+        manifest_sha = marker.get("manifest_sha256")
+        return (
+            _valid_timestamp(marker.get("created_at"))
+            and _valid_timestamp(marker.get("completed_at"))
+            and isinstance(manifest_sha, str)
+            and re.fullmatch(r"[0-9a-f]{64}", manifest_sha) is not None
+            and marker.get("manifest_state") == "STAGED_RUNTIME"
+        )
+    if state == "FAILED":
+        return (
+            _valid_timestamp(marker.get("failed_at"))
+            and isinstance(marker.get("error_type"), str)
+            and bool(marker.get("error_type"))
+            and isinstance(marker.get("error"), str)
+            and bool(marker.get("error"))
+        )
+    return False
 
 
 def _marker_pid(marker: Mapping[str, Any] | None) -> int:
@@ -201,6 +277,27 @@ def _retarget_venv_configs(runtime: Path) -> None:  # noqa: C901 - one post-move
             raise
 
 
+def _venv_configs_are_retargeted(runtime: Path) -> bool:
+    """Read-only check that both venv configs point inside this runtime."""
+
+    base_bin = (runtime / "base-python" / "bin").resolve(strict=False)
+    if not _is_within(base_bin, runtime) or not base_bin.is_dir():
+        return False
+    for name in ("runtime-python", "dev-python"):
+        config = runtime / name / "pyvenv.cfg"
+        try:
+            info = os.lstat(config)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return False
+            lines = config.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError):
+            return False
+        values = {line.split(" = ", 1)[0]: line.split(" = ", 1)[1] for line in lines if " = " in line}
+        if values.get("home") != str(base_bin) or values.get("executable") != str(base_bin / "python3.12"):
+            return False
+    return True
+
+
 def _tree_stats(path: Path) -> tuple[int, int, int, int, int, set[tuple[int, int]]]:
     apparent = allocated = files = directories = symlinks = 0
     seen: set[tuple[int, int]] = set()
@@ -249,6 +346,57 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _proc_owner_uid(process: Path) -> int | None:
+    try:
+        return os.lstat(process).st_uid
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ESRCH}:
+            return None
+        raise RuntimeLifecycleError(f"process owner scan unavailable: {process}") from exc
+
+
+def _proc_is_current_user(process: Path) -> bool:
+    return _proc_owner_uid(process) == os.getuid()
+
+
+def _proc_commandline(process: Path) -> str | None:
+    try:
+        payload = (process / "cmdline").read_bytes()
+    except OSError as exc:
+        if exc.errno in {errno.ENOENT, errno.ESRCH}:
+            return None
+        raise RuntimeLifecycleError(f"process command line scan unavailable: {process}") from exc
+    return payload.replace(b"\0", b" ").decode("utf-8", errors="replace").strip()
+
+
+def _proc_is_non_mtf(process: Path, roots: Sequence[Path]) -> bool:
+    """Allow only known opaque desktop/system daemons without hiding runtimes."""
+
+    commandline = _proc_commandline(process)
+    if commandline is None:
+        return True
+    if not commandline:
+        return True
+    if any(marker in commandline for marker in ("mtf_lab", "mtf-lab", "prepare_market_runtime", "runtime_lifecycle")):
+        return False
+    if any(str(root) in commandline for root in roots):
+        return False
+    # These processes are expected to be opaque under Kubuntu's ptrace and
+    # /proc permissions; they cannot be MTF launchers by the user-only
+    # runtime contract.  Any other denied process remains a hard failure.
+    return any(
+        marker in commandline
+        for marker in (
+            "/usr/lib/systemd/systemd --user",
+            "(sd-pam)",
+            "/usr/bin/ssh-agent",
+            "kwin_wayland",
+            "polkit-kde-authentication-agent",
+            "org_kde_powerdevil",
+        )
+    )
+
+
 def _proc_reference(path: Path) -> tuple[int, str] | None:  # noqa: C901 - bounded process-reference safety gate
     """Return a live process reference to *path*, if observable."""
 
@@ -256,15 +404,19 @@ def _proc_reference(path: Path) -> tuple[int, str] | None:  # noqa: C901 - bound
     proc = Path("/proc")
     try:
         processes = list(proc.iterdir())
-    except OSError:
-        return None
+    except OSError as exc:
+        raise RuntimeLifecycleError("process reference scan unavailable") from exc
     numeric = [process for process in processes if process.name.isdigit()]
 
     def read_target(link: Path) -> Path | None:
         try:
             value = os.readlink(link)
-        except OSError:
-            return None
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                return None
+            if isinstance(exc, PermissionError):
+                raise _ProcAccessDenied(str(link)) from exc
+            raise RuntimeLifecycleError(f"process reference read unavailable: {link}") from exc
         if not value.startswith("/"):
             return None
         return Path(value.removesuffix(" (deleted)"))
@@ -276,21 +428,49 @@ def _proc_reference(path: Path) -> tuple[int, str] | None:  # noqa: C901 - bound
     for process in numeric:
         if not process.name.isdigit():
             continue
+        owner = _proc_owner_uid(process)
+        if owner is None:
+            continue
+        if owner != os.getuid():
+            continue
         pid = int(process.name)
+        opaque = False
         for name in ("cwd", "exe", "root"):
-            target = read_target(process / name)
+            try:
+                target = read_target(process / name)
+            except _ProcAccessDenied as exc:
+                if _proc_is_non_mtf(process, (target_root,)):
+                    opaque = True
+                    break
+                raise RuntimeLifecycleError(f"process reference scan denied: {process}") from exc
             if target is not None:
                 with contextlib.suppress(ValueError):
                     target.relative_to(target_root)
                     return pid, name
+        if opaque:
+            continue
     for process in numeric:
+        owner = _proc_owner_uid(process)
+        if owner is None:
+            continue
+        if owner != os.getuid():
+            continue
         pid = int(process.name)
         try:
             descriptors = list((process / "fd").iterdir())
-        except OSError:
-            continue
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            if isinstance(exc, PermissionError) and _proc_is_non_mtf(process, (target_root,)):
+                continue
+            raise RuntimeLifecycleError(f"process descriptor scan unavailable: {process / 'fd'}") from exc
         for descriptor in descriptors:
-            target = read_target(descriptor)
+            try:
+                target = read_target(descriptor)
+            except _ProcAccessDenied as exc:
+                if _proc_is_non_mtf(process, (target_root,)):
+                    break
+                raise RuntimeLifecycleError(f"process descriptor scan denied: {process}") from exc
             if target is not None:
                 with contextlib.suppress(ValueError):
                     target.relative_to(target_root)
@@ -303,10 +483,12 @@ def _proc_references(paths: Sequence[Path]) -> dict[Path, tuple[int, str]]:  # n
 
     roots = {path.resolve(strict=False): path for path in paths}
     found: dict[Path, tuple[int, str]] = {}
+    if not roots:
+        return found
     try:
         processes = [item for item in Path("/proc").iterdir() if item.name.isdigit()]
-    except OSError:
-        return found
+    except OSError as exc:
+        raise RuntimeLifecycleError("process reference scan unavailable") from exc
 
     def remember(target: Path, pid: int, reference: str) -> None:
         for candidate_root, candidate in roots.items():
@@ -319,30 +501,62 @@ def _proc_references(paths: Sequence[Path]) -> dict[Path, tuple[int, str]]:  # n
     def read_target(link: Path) -> Path | None:
         try:
             value = os.readlink(link)
-        except OSError:
-            return None
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                return None
+            if isinstance(exc, PermissionError):
+                raise _ProcAccessDenied(str(link)) from exc
+            raise RuntimeLifecycleError(f"process reference read unavailable: {link}") from exc
         if not value.startswith("/"):
             return None
         return Path(value.removesuffix(" (deleted)"))
 
     for process in processes:
+        owner = _proc_owner_uid(process)
+        if owner is None:
+            continue
+        if owner != os.getuid():
+            continue
         pid = int(process.name)
+        opaque = False
         for name in ("cwd", "exe", "root"):
-            target = read_target(process / name)
+            try:
+                target = read_target(process / name)
+            except _ProcAccessDenied as exc:
+                if _proc_is_non_mtf(process, tuple(roots.keys())):
+                    opaque = True
+                    break
+                raise RuntimeLifecycleError(f"process reference scan denied: {process}") from exc
             if target is not None:
                 remember(target, pid, name)
+        if opaque:
+            continue
         if len(found) == len(roots):
             return found
     # File descriptors are more expensive, so only inspect candidates that did
     # not already have a cwd/executable/root reference.
     for process in processes:
+        owner = _proc_owner_uid(process)
+        if owner is None:
+            continue
+        if owner != os.getuid():
+            continue
         pid = int(process.name)
         try:
             descriptors = list((process / "fd").iterdir())
-        except OSError:
-            continue
+        except OSError as exc:
+            if exc.errno in {errno.ENOENT, errno.ESRCH}:
+                continue
+            if isinstance(exc, PermissionError) and _proc_is_non_mtf(process, tuple(roots.keys())):
+                continue
+            raise RuntimeLifecycleError(f"process descriptor scan unavailable: {process / 'fd'}") from exc
         for descriptor in descriptors:
-            target = read_target(descriptor)
+            try:
+                target = read_target(descriptor)
+            except _ProcAccessDenied as exc:
+                if _proc_is_non_mtf(process, tuple(roots.keys())):
+                    break
+                raise RuntimeLifecycleError(f"process descriptor scan denied: {process}") from exc
             if target is not None:
                 remember(target, pid, f"fd/{descriptor.name}")
             if len(found) == len(roots):
@@ -354,7 +568,18 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
     """Validate ownership, entry types, and internal-only symlinks."""
 
     uid = os.getuid()
-    root_resolved = path.resolve(strict=False)
+    try:
+        root_info = os.lstat(root)
+        path_info = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"runtime tree is unavailable: {path}") from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise RuntimeLifecycleError(f"runtime root is not a regular directory: {root}")
+    if stat.S_ISLNK(path_info.st_mode) or not stat.S_ISDIR(path_info.st_mode):
+        raise RuntimeLifecycleError(f"runtime tree is not a regular directory: {path}")
+    root_resolved = root.resolve(strict=True)
+    if not _is_within(path, root):
+        raise RuntimeLifecycleError(f"runtime tree escapes root: {path}")
     stack = [path]
     while stack:
         current = stack.pop()
@@ -407,20 +632,73 @@ def _validate_runtime_layout(path: Path) -> None:
 def _remove_tree(path: Path) -> None:
     """Remove a previously validated tree without following symlinks."""
 
-    directories: list[Path] = []
-    stack = [path]
-    while stack:
-        current = stack.pop()
-        directories.append(current)
-        for entry in os.scandir(current):
-            child = Path(entry.path)
-            info = entry.stat(follow_symlinks=False)
-            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                stack.append(child)
-            else:
-                os.unlink(child)
-    for directory in reversed(directories):
-        os.rmdir(directory)
+    try:
+        top_info = os.lstat(path)
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"runtime tree is unavailable: {path}") from exc
+    if stat.S_ISLNK(top_info.st_mode) or not stat.S_ISDIR(top_info.st_mode):
+        raise RuntimeLifecycleError(f"runtime tree is not a regular directory: {path}")
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise RuntimeLifecycleError("runtime removal lacks symlink-attack protection")
+    shutil.rmtree(path)
+
+
+def _managed_temporary_paths(parent: Path, root: Path) -> list[Path]:
+    """Return validated hidden build trees, rejecting unknown siblings."""
+
+    try:
+        children = list(parent.iterdir())
+    except OSError as exc:
+        raise RuntimeLifecycleError(f"review directory unreadable: {parent}") from exc
+    temporary = [child for child in children if any(child.name.startswith(prefix) for prefix in BUILD_PREFIXES)]
+    if not temporary:
+        return []
+    unknown = [child for child in children if child.name != LIFECYCLE_MARKER and child not in temporary]
+    if unknown:
+        raise RuntimeLifecycleError(f"review contains unmanaged siblings: {unknown[0]}")
+    for child in temporary:
+        info = os.lstat(child)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeLifecycleError(f"managed temporary is not a directory: {child}")
+        _validate_confined_tree(child, root)
+    return temporary
+
+
+def _legacy_evidence_is_known(parent: Path) -> bool:
+    """Recognize only the narrow evidence shapes eligible for explicit purge."""
+
+    evidence_dirs = {"logs", "validation", "probe", "verification", "evidence"}
+    try:
+        children = list(parent.iterdir())
+    except OSError:
+        return False
+    useful = False
+    for child in children:
+        if child.name == STAGED_MARKER:
+            manifest = _safe_json(child)
+            if (
+                manifest is None
+                or manifest.get("project") != "mtf-lab"
+                or manifest.get("state") != "STAGED_RUNTIME"
+                or manifest.get("promotion_state") != "NOT_PROMOTED"
+                or manifest.get("current_pointer") is not None
+                or manifest.get("destination") != str(parent / "runtime")
+            ):
+                return False
+            useful = True
+            continue
+        try:
+            info = os.lstat(child)
+        except OSError:
+            return False
+        if stat.S_ISDIR(info.st_mode) and child.name in evidence_dirs:
+            useful = True
+            continue
+        if stat.S_ISREG(info.st_mode) and child.suffix.lower() in {".json", ".log"}:
+            useful = True
+            continue
+        return False
+    return useful
 
 
 class RuntimeLifecycle:
@@ -441,6 +719,8 @@ class RuntimeLifecycle:
         self.keep_reviews = max(0, int(keep_reviews))
         self.keep_rollbacks = max(0, int(keep_rollbacks))
         self.stale_after_seconds = max(0.0, float(stale_after_seconds))
+        self._process_scan_status = "UNKNOWN"
+        self._process_scan_error: str | None = None
 
     @property
     def active(self) -> Path:
@@ -540,13 +820,19 @@ class RuntimeLifecycle:
             "destination": str(destination),
             "created_at": _now(),
         }
-        existing = _safe_json(parent / LIFECYCLE_MARKER)
-        if existing is not None and existing.get("state") == "BUILDING":
-            existing_pid = _marker_pid(existing)
-            if _pid_alive(existing_pid):
-                if existing_pid == os.getpid():
-                    return
-                raise RuntimeLifecycleError("runtime review is already being built")
+        marker_path = parent / LIFECYCLE_MARKER
+        if os.path.lexists(marker_path):
+            existing = _safe_json(marker_path)
+            if existing is None or not _valid_lifecycle_marker(existing, destination):
+                raise RuntimeLifecycleError("existing lifecycle marker is unknown; refusing reuse")
+            if existing.get("state") == "BUILDING":
+                existing_pid = _marker_pid(existing)
+                if _pid_alive(existing_pid):
+                    if existing_pid == os.getpid():
+                        return
+                    raise RuntimeLifecycleError("runtime review is already being built")
+            elif existing.get("state") in {"REVIEW_READY", "FAILED"}:
+                raise RuntimeLifecycleError("completed runtime review already exists; refusing overwrite")
         _atomic_json(parent / LIFECYCLE_MARKER, marker)
 
     def begin_unlocked(self, destination: str | Path) -> Path:
@@ -556,7 +842,15 @@ class RuntimeLifecycle:
 
     def mark_completed_unlocked(self, destination: str | Path, manifest: Mapping[str, Any]) -> None:
         target = self.validate_build_destination(destination)
-        previous = _safe_json(target.parent / LIFECYCLE_MARKER)
+        marker_path = target.parent / LIFECYCLE_MARKER
+        previous = _safe_json(marker_path)
+        if (
+            previous is None
+            or not _valid_lifecycle_marker(previous, target)
+            or previous.get("state") != "BUILDING"
+            or previous.get("pid") != os.getpid()
+        ):
+            raise RuntimeLifecycleError("cannot complete a review not owned by this build")
         marker = {
             "schema": LIFECYCLE_SCHEMA,
             "project": "mtf-lab",
@@ -573,6 +867,14 @@ class RuntimeLifecycle:
 
     def mark_failed_unlocked(self, destination: str | Path, error: BaseException) -> None:
         target = self.validate_build_destination(destination)
+        previous = _safe_json(target.parent / LIFECYCLE_MARKER)
+        if (
+            previous is None
+            or not _valid_lifecycle_marker(previous, target)
+            or previous.get("state") != "BUILDING"
+            or previous.get("pid") != os.getpid()
+        ):
+            raise RuntimeLifecycleError("cannot fail a review not owned by this build")
         marker = {
             "schema": LIFECYCLE_SCHEMA,
             "project": "mtf-lab",
@@ -586,33 +888,175 @@ class RuntimeLifecycle:
         }
         _atomic_json(target.parent / LIFECYCLE_MARKER, marker)
 
-    def recover_unlocked(self) -> dict[str, Any]:
+    def _active_is_valid_unlocked(self) -> bool:
+        """Validate the canonical tree before a promotion journal is closed."""
+
+        try:
+            info = os.lstat(self.active)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                return False
+            manifest = _safe_json(self.active / STAGED_MARKER)
+            if not _is_canonical_active_manifest(manifest, self.active):
+                return False
+            for name in ("runtime-python", "dev-python"):
+                config = self.active / name / "pyvenv.cfg"
+                config_info = os.lstat(config)
+                if stat.S_ISLNK(config_info.st_mode) or not stat.S_ISREG(config_info.st_mode):
+                    return False
+            _validate_runtime_layout(self.active)
+            _validate_confined_tree(self.active, self.root)
+            if not _venv_configs_are_retargeted(self.active):
+                return False
+        except (OSError, RuntimeLifecycleError, UnicodeError, json.JSONDecodeError):
+            return False
+        return True
+
+    def _mark_rollback_unlocked(self, rollback: Path) -> None:
+        """Finalize rollback metadata after a crash during promotion."""
+
+        manifest = _safe_json(rollback / STAGED_MARKER)
+        if manifest is None or manifest.get("project") != "mtf-lab":
+            raise RuntimeLifecycleError("rollback manifest is unreadable")
+        manifest.update(
+            {
+                "state": "ROLLBACK_RUNTIME",
+                "promotion_state": "ROLLBACK",
+                "current_pointer": None,
+                "rollback_of": str(self.active),
+                "destination": str(rollback),
+                "rollback_created_at": _now(),
+            }
+        )
+        _atomic_json(rollback / STAGED_MARKER, manifest)
+
+    @staticmethod
+    def _remove_review_marker_unlocked(staged: Path) -> None:
+        """Remove only lifecycle metadata after a review has been promoted."""
+
+        marker = staged.parent / LIFECYCLE_MARKER
+        with contextlib.suppress(FileNotFoundError):
+            marker.unlink()
+        if staged.parent.exists() and not any(staged.parent.iterdir()):
+            staged.parent.rmdir()
+
+    def recover_unlocked(self) -> dict[str, Any]:  # noqa: C901 - crash recovery state machine
         journal = self.root / ".runtime-promotion.json"
         if not os.path.lexists(journal):
             return {"state": "CLEAN", "recovered": False}
         record = _safe_json(journal)
         if record is None or record.get("schema") != LIFECYCLE_SCHEMA:
             raise RuntimeLifecycleError("promotion journal is malformed; recovery required")
+        if record.get("state") not in {"PREPARED", "APPLYING"}:
+            raise RuntimeLifecycleError("promotion journal state is unknown; recovery required")
+        if not all(isinstance(record.get(field), str) for field in ("active", "staged", "rollback")):
+            raise RuntimeLifecycleError("promotion journal paths are malformed")
         active = self.active
-        rollback = Path(str(record.get("rollback", "")))
-        staged = Path(str(record.get("staged", "")))
+        rollback = Path(record["rollback"])
+        staged = Path(record["staged"])
+        if record.get("active") != str(active):
+            raise RuntimeLifecycleError("promotion journal active path mismatch")
         for candidate in (rollback, staged):
             if not candidate.is_absolute() or not _is_within(candidate, self.root):
                 raise RuntimeLifecycleError("promotion journal path escapes runtime root")
-        # The only automatic recovery is restoring a missing canonical runtime
-        # from the known rollback.  Ambiguous states remain fail-closed.
+        if rollback.parent != self.root or not rollback.name.startswith(ROLLBACK_PREFIX):
+            raise RuntimeLifecycleError("promotion journal rollback path is not managed")
+        try:
+            self.validate_build_destination(staged)
+        except RuntimeLifecycleError as exc:
+            raise RuntimeLifecycleError("promotion journal staged path is not managed") from exc
+        if os.path.lexists(active) and _proc_reference(active) is not None:
+            raise RuntimeLifecycleError("canonical runtime is in use; recovery deferred")
         active_info = os.lstat(active) if os.path.lexists(active) else None
         rollback_info = os.lstat(rollback) if os.path.lexists(rollback) else None
         staged_info = os.lstat(staged) if os.path.lexists(staged) else None
+        rollback_valid = False
+        rollback_needs_finalize = False
         if (
-            active_info is None
-            and rollback_info is not None
+            rollback_info is not None
             and stat.S_ISDIR(rollback_info.st_mode)
-            and staged_info is None
+            and not stat.S_ISLNK(rollback_info.st_mode)
         ):
+            rollback_record = self._record_rollback_unlocked(rollback)
+            # A crash immediately after active -> rollback leaves the old
+            # active manifest untouched.  It is not a normal rollback for GC,
+            # but the promotion journal makes this exact path recoverable.
+            rollback_manifest = _safe_json(rollback / STAGED_MARKER)
+            interrupted_active = _is_canonical_active_manifest(rollback_manifest, self.active)
+            rollback_valid = rollback_record.role == "rollback" or interrupted_active
+            rollback_needs_finalize = interrupted_active and rollback_record.role != "rollback"
+        staged_valid = False
+        if staged_info is not None and stat.S_ISDIR(staged_info.st_mode) and not stat.S_ISLNK(staged_info.st_mode):
+            staged_record = self._record_review_unlocked(staged.parent)
+            staged_valid = staged_record.role == "review" and staged_record.state == "REVIEW_READY"
+
+        if self._active_is_valid_unlocked():
+            if rollback_info is None and staged_valid:
+                journal.unlink()
+                return {"state": "RECOVERED", "recovered": True}
+            if staged_info is None and (rollback_info is None or rollback_valid):
+                if rollback_needs_finalize:
+                    self._mark_rollback_unlocked(rollback)
+                self._remove_review_marker_unlocked(staged)
+                journal.unlink()
+                return {"state": "RECOVERED", "recovered": True}
+            raise RuntimeLifecycleError("promotion journal has ambiguous validated paths")
+
+        # The promotion code restores both original paths in its exception
+        # handler but deliberately leaves the journal until the next locked
+        # operation.  This is safe for either PREPARED or APPLYING when the
+        # candidate is still at its managed review path.
+        if rollback_info is None and staged_valid and active_info is None:
+            journal.unlink()
+            return {"state": "RECOVERED", "recovered": True}
+
+        # A crash after candidate -> runtime (or during venv/manifest repair)
+        # must put the candidate back first, then restore the old active tree.
+        if rollback_valid and staged_info is None and active_info is not None and stat.S_ISDIR(active_info.st_mode):
+            _validate_confined_tree(active, self.root)
+            os.rename(active, staged)
+            _retarget_venv_configs(staged)
             os.rename(rollback, active)
-            active_info = os.lstat(active)
-        if active_info is not None and stat.S_ISDIR(active_info.st_mode) and not stat.S_ISLNK(active_info.st_mode):
+            _retarget_venv_configs(active)
+            if not self._active_is_valid_unlocked():
+                raise RuntimeLifecycleError("promotion recovery did not restore a valid active runtime")
+            journal.unlink()
+            return {"state": "RECOVERED", "recovered": True}
+        # A first promotion has no rollback.  If the process dies after the
+        # candidate is moved into the canonical path but before its manifest
+        # is activated, put it back in the journaled review location.
+        if (
+            rollback_info is None
+            and staged_info is None
+            and active_info is not None
+            and stat.S_ISDIR(active_info.st_mode)
+        ):
+            candidate_manifest = _safe_json(active / STAGED_MARKER)
+            if (
+                candidate_manifest is not None
+                and candidate_manifest.get("project") == "mtf-lab"
+                and candidate_manifest.get("state") == "STAGED_RUNTIME"
+                and candidate_manifest.get("promotion_state") == "NOT_PROMOTED"
+                and candidate_manifest.get("current_pointer") is None
+                and candidate_manifest.get("destination") == str(staged)
+            ):
+                _validate_runtime_layout(active)
+                _validate_confined_tree(active, self.root)
+                os.rename(active, staged)
+                _retarget_venv_configs(staged)
+                journal.unlink()
+                return {"state": "RECOVERED", "recovered": True}
+        if rollback_valid and staged_info is None and active_info is None:
+            os.rename(rollback, active)
+            _retarget_venv_configs(active)
+            if not self._active_is_valid_unlocked():
+                raise RuntimeLifecycleError("promotion recovery restored an invalid active runtime")
+            journal.unlink()
+            return {"state": "RECOVERED", "recovered": True}
+        if rollback_valid and staged_valid and active_info is None and record.get("state") == "PREPARED":
+            os.rename(rollback, active)
+            _retarget_venv_configs(active)
+            if not self._active_is_valid_unlocked():
+                raise RuntimeLifecycleError("promotion recovery restored an invalid active runtime")
             journal.unlink()
             return {"state": "RECOVERED", "recovered": True}
         raise RuntimeLifecycleError("promotion journal requires manual review")
@@ -623,15 +1067,25 @@ class RuntimeLifecycle:
         destination = parent / "runtime"
         apparent = allocated = files = directories = symlinks = 0
         manifest_sha: str | None = None
-        marker = _safe_json(parent / LIFECYCLE_MARKER)
+        marker_path = parent / LIFECYCLE_MARKER
+        marker_exists = os.path.lexists(marker_path)
+        marker = _safe_json(marker_path)
         state = str(marker.get("state")) if marker else "LEGACY"
-        if marker is not None and (
-            marker.get("schema") != LIFECYCLE_SCHEMA
-            or marker.get("project") != "mtf-lab"
-            or marker.get("role") != "review"
-            or marker.get("destination") != str(destination)
-            or state not in {"BUILDING", "REVIEW_READY", "FAILED"}
-        ):
+        if marker_exists and marker is None:
+            return RuntimeRecord(
+                parent.name,
+                parent,
+                "unknown",
+                "UNKNOWN",
+                False,
+                "lifecycle marker is malformed or unreadable",
+                0,
+                0,
+                0,
+                1,
+                0,
+            )
+        if marker is not None and not _valid_lifecycle_marker(marker, destination):
             return RuntimeRecord(
                 parent.name,
                 parent,
@@ -663,6 +1117,8 @@ class RuntimeLifecycle:
                 and manifest.get("current_pointer") is None
                 and manifest.get("destination") == str(destination)
             )
+            if valid and marker is not None and state == "REVIEW_READY":
+                valid = marker.get("manifest_sha256") == _sha256(destination / STAGED_MARKER)
             if valid:
                 _validate_runtime_layout(destination)
             _validate_confined_tree(destination, self.root)
@@ -671,13 +1127,84 @@ class RuntimeLifecycle:
             if manifest_path.is_file():
                 manifest_sha = _sha256(manifest_path)
         except (OSError, RuntimeLifecycleError) as exc:
-            if state == "FAILED" and not os.path.lexists(destination):
-                return RuntimeRecord(
-                    parent.name, parent, "review", state, True, "failed review without payload", 0, 0, 0, 1, 0
+            if not os.path.lexists(destination):
+                try:
+                    temporary_paths = _managed_temporary_paths(parent, self.root)
+                except RuntimeLifecycleError as temporary_exc:
+                    return RuntimeRecord(
+                        parent.name,
+                        parent,
+                        "unknown",
+                        state,
+                        False,
+                        str(temporary_exc),
+                        0,
+                        0,
+                        0,
+                        1,
+                        0,
+                    )
+                reference = (
+                    process_references.get(parent.resolve(strict=False))
+                    if process_references is not None
+                    else _proc_reference(parent)
                 )
+                in_use = reference is not None
+                if temporary_paths:
+                    try:
+                        temporary_stats = _tree_stats(parent)
+                    except RuntimeLifecycleError:
+                        temporary_stats = (0, 0, 0, 1, 0, set())
+                    if marker is None:
+                        return RuntimeRecord(
+                            parent.name,
+                            parent,
+                            "review",
+                            "TEMPORARY_RESIDUE",
+                            not in_use,
+                            "managed temporary residue",
+                            temporary_stats[0],
+                            temporary_stats[1],
+                            temporary_stats[2],
+                            temporary_stats[3],
+                            temporary_stats[4],
+                            in_use,
+                            None,
+                        )
+                    if state == "FAILED":
+                        return RuntimeRecord(
+                            parent.name,
+                            parent,
+                            "review",
+                            state,
+                            not in_use,
+                            "failed review with temporary payload" if not in_use else "failed review is in use",
+                            temporary_stats[0],
+                            temporary_stats[1],
+                            temporary_stats[2],
+                            temporary_stats[3],
+                            temporary_stats[4],
+                            in_use,
+                            None,
+                        )
+                if state == "FAILED":
+                    return RuntimeRecord(
+                        parent.name,
+                        parent,
+                        "review",
+                        state,
+                        not in_use,
+                        "failed review without payload" if not in_use else "failed review is in use",
+                        0,
+                        0,
+                        0,
+                        1,
+                        0,
+                        in_use,
+                    )
             if state == "BUILDING" and not os.path.lexists(destination):
                 pid = _marker_pid(marker)
-                if _pid_alive(pid):
+                if _pid_alive(pid) or in_use:
                     return RuntimeRecord(
                         parent.name, parent, "temporary_in_use", state, False, "build is live", 0, 0, 0, 1, 0, True
                     )
@@ -694,6 +1221,20 @@ class RuntimeLifecycle:
                     )
                 return RuntimeRecord(
                     parent.name, parent, "temporary_stale", state, False, "build payload is incomplete", 0, 0, 0, 1, 0
+                )
+            if not os.path.lexists(destination) and marker is None and not _legacy_evidence_is_known(parent):
+                return RuntimeRecord(
+                    parent.name,
+                    parent,
+                    "unknown",
+                    "UNKNOWN",
+                    False,
+                    "unmarked review contents are not recognized evidence",
+                    0,
+                    0,
+                    0,
+                    1,
+                    0,
                 )
             if not os.path.lexists(destination) and marker is None:
                 try:
@@ -842,6 +1383,9 @@ class RuntimeLifecycle:
             and manifest.get("project") == "mtf-lab"
             and manifest.get("promotion_state") == "ROLLBACK"
             and manifest.get("state") == "ROLLBACK_RUNTIME"
+            and manifest.get("destination") == str(path)
+            and manifest.get("current_pointer") is None
+            and manifest.get("rollback_of") == str(self.active)
         )
         if not valid:
             return RuntimeRecord(
@@ -882,10 +1426,25 @@ class RuntimeLifecycle:
         self._ensure_root()
         records: list[RuntimeRecord] = []
         entries = sorted(self.root.iterdir(), key=lambda item: item.name)
-        process_references = _proc_references(
-            [item for entry in entries if entry.name.startswith(REVIEW_PREFIX) for item in (entry, entry / "runtime")]
-            + [entry for entry in entries if entry.name.startswith(ROLLBACK_PREFIX)]
-        )
+        self._process_scan_status = "COMPLETE"
+        self._process_scan_error = None
+        try:
+            process_references = _proc_references(
+                [
+                    item
+                    for entry in entries
+                    if entry.name.startswith(REVIEW_PREFIX)
+                    for item in (entry, entry / "runtime")
+                ]
+                + [entry for entry in entries if entry.name.startswith(ROLLBACK_PREFIX)]
+            )
+        except RuntimeLifecycleError as exc:
+            # A denied or otherwise incomplete /proc scan must never authorize
+            # deletion.  Inspection and allocation remain usable, but every
+            # potentially collectable record is conservatively retained.
+            process_references = {}
+            self._process_scan_status = "INCOMPLETE"
+            self._process_scan_error = str(exc)
         for entry in entries:
             if entry.name.startswith("."):
                 continue
@@ -934,7 +1493,18 @@ class RuntimeLifecycle:
                         )
                     )
                 else:
-                    records.append(self._record_review_unlocked(entry, process_references))
+                    record = self._record_review_unlocked(entry, process_references)
+                    if self._process_scan_status != "COMPLETE" and record.role in {
+                        "review",
+                        "review_evidence",
+                        "rollback",
+                    }:
+                        record = replace(
+                            record,
+                            safe_to_delete=False,
+                            reason=f"process reference scan incomplete: {self._process_scan_error}",
+                        )
+                    records.append(record)
             elif entry.name.startswith(ROLLBACK_PREFIX):
                 try:
                     info = os.lstat(entry)
@@ -957,7 +1527,18 @@ class RuntimeLifecycle:
                         )
                     )
                 else:
-                    records.append(self._record_rollback_unlocked(entry, process_references))
+                    record = self._record_rollback_unlocked(entry, process_references)
+                    if self._process_scan_status != "COMPLETE" and record.role in {
+                        "review",
+                        "review_evidence",
+                        "rollback",
+                    }:
+                        record = replace(
+                            record,
+                            safe_to_delete=False,
+                            reason=f"process reference scan incomplete: {self._process_scan_error}",
+                        )
+                    records.append(record)
             elif any(entry.name.startswith(prefix) for prefix in BUILD_PREFIXES):
                 records.append(
                     RuntimeRecord(
@@ -978,6 +1559,7 @@ class RuntimeLifecycle:
             "schema": LIFECYCLE_SCHEMA,
             "root": str(self.root),
             "active": str(self.active),
+            "process_scan": {"status": self._process_scan_status, "error": self._process_scan_error},
             "records": [record.to_dict(root=self.root) for record in records],
             "totals": {
                 "apparent_bytes": sum(record.apparent_bytes for record in records),
@@ -991,7 +1573,9 @@ class RuntimeLifecycle:
             self.recover_unlocked()
             return self.inspect_unlocked()
 
-    def _delete_record_unlocked(self, record: RuntimeRecord, *, purge_review_evidence: bool = False) -> None:
+    def _delete_record_unlocked(  # noqa: C901 - one conservative deletion gate
+        self, record: RuntimeRecord, *, purge_review_evidence: bool = False
+    ) -> None:
         evidence_only = record.role == "review_evidence"
         if (not record.safe_to_delete and not (evidence_only and purge_review_evidence)) or record.role not in {
             "review",
@@ -1006,6 +1590,9 @@ class RuntimeLifecycle:
             runtime = record.path / "runtime"
             if record.role == "review" and os.path.lexists(runtime):
                 _remove_tree(runtime)
+            if record.role == "review":
+                for temporary in _managed_temporary_paths(record.path, self.root):
+                    _remove_tree(temporary)
             marker = record.path / LIFECYCLE_MARKER
             if os.path.lexists(marker):
                 os.unlink(marker)
@@ -1100,7 +1687,7 @@ class RuntimeLifecycle:
             candidate = self.validate_build_destination(candidate)
             parent = candidate.parent
             record = self._record_review_unlocked(parent)
-            if record.role != "review" or not record.safe_to_delete:
+            if record.role != "review" or record.state != "REVIEW_READY" or not record.safe_to_delete:
                 raise RuntimeLifecycleError(f"staged runtime is not promotable: {record.reason}")
             if not candidate.is_dir() or candidate.resolve(strict=False) == self.active.resolve(strict=False):
                 raise RuntimeLifecycleError("staged runtime is not a distinct review")
@@ -1124,6 +1711,8 @@ class RuntimeLifecycle:
                     active_info = os.lstat(self.active)
                     if stat.S_ISLNK(active_info.st_mode) or not stat.S_ISDIR(active_info.st_mode):
                         raise RuntimeLifecycleError("canonical runtime is not a regular directory")
+                    if _proc_reference(self.active) is not None:
+                        raise RuntimeLifecycleError("canonical runtime is in use")
                     _validate_confined_tree(self.active, self.root)
                     os.rename(self.active, rollback)
                     active_moved = True
@@ -1156,18 +1745,7 @@ class RuntimeLifecycle:
                 )
                 _atomic_json(self.active / STAGED_MARKER, active_manifest)
                 if active_moved:
-                    rollback_manifest = _safe_json(rollback / STAGED_MARKER)
-                    if rollback_manifest is not None:
-                        rollback_manifest.update(
-                            {
-                                "state": "ROLLBACK_RUNTIME",
-                                "promotion_state": "ROLLBACK",
-                                "rollback_of": str(self.active),
-                                "destination": str(rollback),
-                                "rollback_created_at": _now(),
-                            }
-                        )
-                        _atomic_json(rollback / STAGED_MARKER, rollback_manifest)
+                    self._mark_rollback_unlocked(rollback)
                 with contextlib.suppress(FileNotFoundError):
                     (parent / LIFECYCLE_MARKER).unlink()
                 if parent.exists() and not any(parent.iterdir()):
