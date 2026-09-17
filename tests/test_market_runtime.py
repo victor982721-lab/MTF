@@ -349,6 +349,41 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             self.assertEqual("deleted", result["deleted"][0]["action"])
             self.assertFalse(parent.exists())
 
+    def test_sigkill_build_is_collected_after_stale_grace(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            child_code = """
+import sys
+import time
+from pathlib import Path
+from mtf_lab.ops.runtime_lifecycle import RuntimeLifecycle
+
+destination = RuntimeLifecycle(Path(sys.argv[1]), stale_after_seconds=0).allocate_review()
+print(destination, flush=True)
+time.sleep(30)
+"""
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_code, str(root)],
+                cwd=Path(__file__).resolve().parents[1],
+                stdout=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                assert child.stdout is not None
+                destination = Path(child.stdout.readline().strip())
+                self.assertTrue((destination.parent / runtime_lifecycle.LIFECYCLE_MARKER).is_file())
+                child.kill()
+                child.wait(timeout=10)
+                result = runtime_lifecycle.RuntimeLifecycle(root, stale_after_seconds=0).gc(max_reviews=0)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+                if child.stdout is not None:
+                    child.stdout.close()
+            self.assertIn(destination.parent.name, {item["name"] for item in result["deleted"]})
+            self.assertFalse(destination.parent.exists())
+
     def test_unmarked_unknown_review_is_not_purged_as_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
