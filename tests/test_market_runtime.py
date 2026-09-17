@@ -339,6 +339,28 @@ class MarketRuntimePreparationTests(unittest.TestCase):
             finally:
                 outside.rmdir()
 
+    def test_incomplete_managed_layout_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            parent = root / "runtime-review-incomplete"
+            runtime = parent / "runtime"
+            runtime.mkdir(parents=True)
+            _write_json(
+                runtime / runtime_lifecycle.STAGED_MARKER,
+                {
+                    "project": "mtf-lab",
+                    "state": "STAGED_RUNTIME",
+                    "promotion_state": "NOT_PROMOTED",
+                    "current_pointer": None,
+                    "destination": str(runtime),
+                },
+            )
+            result = runtime_lifecycle.RuntimeLifecycle(root).gc(max_reviews=0)
+            preserved = next(item for item in result["preserved"] if item["name"] == parent.name)
+            self.assertEqual("unknown", preserved["role"])
+            self.assertEqual("preserve", preserved["action"])
+            self.assertTrue(runtime.is_dir())
+
     def test_promotion_keeps_one_real_rollback(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

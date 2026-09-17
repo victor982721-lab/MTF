@@ -391,6 +391,19 @@ def _validate_confined_tree(path: Path, root: Path) -> None:  # noqa: C901 - one
                 raise RuntimeLifecycleError(f"unsupported runtime entry type: {child}")
 
 
+def _validate_runtime_layout(path: Path) -> None:
+    """Require the minimum venv layout before a review can be collected."""
+
+    for relative in ("base-python", "runtime-python", "dev-python"):
+        target = path / relative
+        try:
+            info = os.lstat(target)
+        except OSError as exc:
+            raise RuntimeLifecycleError(f"runtime layout is incomplete: {target}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise RuntimeLifecycleError(f"runtime layout entry is unsafe: {target}")
+
+
 def _remove_tree(path: Path) -> None:
     """Remove a previously validated tree without following symlinks."""
 
@@ -650,6 +663,8 @@ class RuntimeLifecycle:
                 and manifest.get("current_pointer") is None
                 and manifest.get("destination") == str(destination)
             )
+            if valid:
+                _validate_runtime_layout(destination)
             _validate_confined_tree(destination, self.root)
             apparent, allocated, files, directories, symlinks, _ = _tree_stats(destination)
             manifest_path = destination / STAGED_MARKER
@@ -1037,7 +1052,9 @@ class RuntimeLifecycle:
                 preserved.append(item)
                 continue
             if record.role not in {"review", "review_evidence", "rollback"}:
-                preserved.append(record.to_dict(root=self.root))
+                item = record.to_dict(root=self.root)
+                item["action"] = "preserve"
+                preserved.append(item)
                 continue
             keep = record.name in (keep_review_names if record.role == "review" else keep_rollback_names)
             if record.path.resolve(strict=False) in preserve_paths:
