@@ -1,6 +1,6 @@
 # Piloto histórico — estado y límites de la evidencia
 
-Verificado el 2026-09-18. Este registro distingue resultados descriptivos
+Verificado el 2026-09-19. Este registro distingue resultados descriptivos
 intermedios, implementación, validación de una release y operación externa.
 No hay todavía una estrategia seleccionada ni evidencia de ventaja neta.
 
@@ -90,6 +90,18 @@ expresan en UTC (sufijo `Z`); la fecha de verificación del documento usa
   `c39e49ac3fca03a782157c5e01d9970d68014929092137f3e2cca03873d16be5`; los
   reportes JSON/HTML y sus hashes están bajo
   `/home/winterboss/.local/state/mtf-lab/research/market-structure/`.
+- La QA descriptiva estricta de los 11 meses válidos de 2019
+  (`201901–201909`, `201911–201912`) terminó por manifiesto mensual, sin
+  componer un año ni incluir `201910`: 26,877,692 cotizaciones, sin red ni
+  estrategia. El receipt consolidado es
+  `runtime/market-evidence/qa-descriptive-2019-valid-months-20260919T133407Z.json`,
+  SHA-256 `1624c41736b423f334fa447d8b40545f7fa1df2701bbc76aebcb9994a94dbeab`;
+  la auditoría posterior, que confirmó los 11 directorios, hashes e invariantes,
+  está en
+  `runtime/market-evidence/qa-descriptive-2019-valid-months-20260919T133407Z-audit.json`,
+  SHA-256 `92417e910c2f82b8a7d486b111dc3a258a343cdf9e6337efe26aaa5e50d6034d`.
+  El watcher terminó con fallo sólo al escribir su marcador después de publicar
+  el receipt (`WATCH` no definido); no se repitió la corrida ni se alteró el raw.
 - La anomalía de `201910` quedó documentada sin alterar bytes en
   `runtime/market-evidence/histdata-201910-source-order-block-20260919T034708Z.json`,
   SHA-256 `5f9fdf370dc58138612409f5ba9f3c146abb60fc31b452f781a631d5f869a99f`:
@@ -518,8 +530,9 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
    no repetirla ni iniciar otra campaña pesada en paralelo. El gate global
    offline y la reconstrucción/promoción controlada del runtime ya quedaron
    verificados en los receipts finales; 2017 y 2018 ya están ampliados,
-   validados y descritos, y 2019 permanece incompleto por la partición inválida
-   `201910`. Gate actual sobre el árbol ejecutable `HEAD`
+   validados y descritos. Los 11 meses válidos de 2019 ya tienen QA descriptivo
+   mensual independiente, pero 2019 permanece incompleto por la partición
+   inválida `201910`. Gate actual sobre el árbol ejecutable `HEAD`
    `d951ed5ab8391098e307eb13cdd42f59350d8e11`: `PASS`, enlazado por
    `runtime/market-evidence/quality-gate-current-tree-20260919T050125Z.json`;
    sigue sin ser una release. WF 2020–2023

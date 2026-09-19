@@ -32,7 +32,13 @@ En 2019 hay 11/12 meses válidos (`201901–201909`, `201911–201912`), con
 una regresión de orden temporal y no se cuenta como válido. No existe todavía
 manifiesto anual de 2019 ni compuesto `2016–2019`. El piloto descriptivo
 documentado sigue siendo sólo marzo; el QA anual descriptivo de 2017 y 2018
-terminó sin red ni estrategia y conserva receipts JSON/HTML separados. El
+terminó sin red ni estrategia y conserva receipts JSON/HTML separados. La QA
+descriptiva estricta de los 11 meses válidos de 2019 (`201901–201909`,
+`201911–201912`) también terminó por manifiesto mensual, sin componer un año ni
+incluir `201910`; su receipt consolidado es
+`runtime/market-evidence/qa-descriptive-2019-valid-months-20260919T133407Z.json`
+(SHA-256 `1624c41736b423f334fa447d8b40545f7fa1df2701bbc76aebcb9994a94dbeab`).
+No abrió WF/holdout ni evaluó estrategia. El
 backtest anual V17 terminó en modo
 `COMPLETED_DEVELOPMENT_REVIEW_ONLY`: procesó 19,026,438 cotizaciones y conserva
 un receipt terminal; la auditoría de terminalidad quedó en
