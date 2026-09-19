@@ -392,7 +392,7 @@ def _merge_canary_economics_contract(base: Mapping[str, Any], projection: Any) -
     if not callable(to_contract) or not callable(required_margin) or quantity is None:
         raise RiskLimitRejected("canary_economics no expone projection tipada")
     try:
-        buy = dict(to_contract("BUY"))
+        buy: dict[str, Any] = dict(cast(Mapping[str, Any], to_contract("BUY")))
         margins = [Decimal(str(required_margin("BUY"))), Decimal(str(required_margin("SELL")))]
         quantity_decimal = Decimal(str(quantity))
         if quantity_decimal <= 0 or any(value <= 0 for value in margins):
@@ -424,7 +424,7 @@ def _update_executor_from_canary_economics(executor: Any, projection: Any, side:
     if not callable(to_contract) or not isinstance(calendar, Mapping) or not generation or observed_at is None:
         raise RiskLimitRejected("canary_economics contract/calendario carece de observación tipada")
     try:
-        contract = dict(to_contract(contract_side))
+        contract: dict[str, Any] = dict(cast(Mapping[str, Any], to_contract(contract_side)))
     except (TypeError, ValueError, ArithmeticError) as exc:
         raise RiskLimitRejected("canary_economics contract_spec inválido") from exc
     contract["connection_generation"] = generation
@@ -451,7 +451,7 @@ def _update_executor_from_canary_economics(executor: Any, projection: Any, side:
         updater = getattr(projection, "to_update_risk_kwargs", None)
         if not callable(updater):
             raise RiskLimitRejected("canary_economics no expone métricas tipadas")
-        values = dict(updater("BUY"))
+        values: dict[str, Any] = dict(cast(Mapping[str, Any], updater("BUY")))
         values["margin_required"] = required_margin
         values["margin_level"] = min(levels)
         executor.update_risk_metrics(**values)
@@ -459,10 +459,11 @@ def _update_executor_from_canary_economics(executor: Any, projection: Any, side:
     updater = getattr(projection, "to_update_risk_kwargs", None)
     if not callable(updater):
         raise RiskLimitRejected("canary_economics no expone métricas tipadas")
-    values = updater(side)
-    if not isinstance(values, Mapping):
+    raw_values = updater(side)
+    if not isinstance(raw_values, Mapping):
         raise RiskLimitRejected("canary_economics risk kwargs inválidos")
-    executor.update_risk_metrics(**dict(values))
+    side_values: dict[str, Any] = dict(cast(Mapping[str, Any], raw_values))
+    executor.update_risk_metrics(**side_values)
 
 
 def _catalog_raw_full_symbol(provider: Any) -> Mapping[str, Any] | None:

@@ -25,7 +25,7 @@ import os
 import sys
 import tempfile
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -1674,6 +1674,7 @@ def network_cli_preflight(  # noqa: C901
     runner; no order is attempted unless all of those gates pass.
     """
 
+    preparation_start: datetime | None = None
     if execute:
         if approval is None:
             return {
@@ -1718,7 +1719,7 @@ def network_cli_preflight(  # noqa: C901
     session = prepare_cli_session(config_path, state_dir, execution=execute)
     try:
         if execute:
-            assert approved is not None and event_limit is not None
+            assert approved is not None and event_limit is not None and preparation_start is not None
             from mtf_lab.ops.ctrader_account_risk import AccountRiskObserver
             from mtf_lab.ops.ctrader_canary_economics import ExitSlippageHypothesis, observe_canary_economics
             from mtf_lab.ops.ctrader_canary_inputs import CanarySessionEvidence, collect_canary_inputs
@@ -1773,10 +1774,13 @@ def network_cli_preflight(  # noqa: C901
                     # A live provider may enter this path without a preloaded
                     # BBO.  Poll only the existing authenticated reader; do
                     # not create a client, reconnect, or synthesize prices.
-                    for _record in stream(
-                        max_events=max(1, min(int(event_limit), 4)),
-                        duration_seconds=5.0,
-                        timeout_seconds=0.25,
+                    for _record in cast(
+                        Iterable[Any],
+                        stream(
+                            max_events=max(1, min(int(event_limit), 4)),
+                            duration_seconds=5.0,
+                            timeout_seconds=0.25,
+                        ),
                     ):
                         del _record
 

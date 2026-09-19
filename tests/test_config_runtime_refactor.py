@@ -57,6 +57,11 @@ def _coordinator(config: object, store: _RecordingStore) -> RuntimeCoordinator:
     coordinator.capture_id = "session"
     coordinator.config = config
     coordinator.mode = OperationMode.REPLAY
+    # This fixture bypasses RuntimeCoordinator.__init__; keep the new
+    # technical-canary opt-in explicit so the legacy LIVE gate test continues
+    # to exercise the default strict path rather than relying on attributes
+    # initialized only by the real constructor.
+    coordinator.technical_canary_quote_gap_seconds = None
     coordinator.analysis_id = "analysis"
     coordinator.analysis_config_hash = "config-hash"
     coordinator.contract_hash = "contract-hash"
