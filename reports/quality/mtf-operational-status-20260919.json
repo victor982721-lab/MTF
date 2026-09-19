@@ -139,7 +139,27 @@
     "orders_sent": 0,
     "execution_enabled": false,
     "new_oauth": false,
-    "trading_scope_requested": false
+    "trading_scope_requested": false,
+    "bounded_history": {
+      "requested_start": "2026-09-18T19:00:00Z",
+      "requested_end": "2026-09-18T20:00:00Z",
+      "requested_period": "M1",
+      "bounded_complete": true,
+      "bounded_has_more": false,
+      "bounded_selected_bars": 60,
+      "source_pages": 1,
+      "source_has_more": true,
+      "source_complete": false,
+      "capture_status": "COMPLETE",
+      "continuity": "CONTINUOUS",
+      "quote_events": 0,
+      "paper_fills": 0,
+      "evidence": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260919-bounded-window/summary-redacted.json",
+        "sha256": "2a361ff183a86e48172ce426b1832cb479e03253f6651c84230c55a9ea122c08"
+      },
+      "limitation": "Complete only for requested 60-minute native M1 window; no observed BBO, fill or live freshness claim"
+    }
   },
   "external_gates": {
     "source_correction": "PENDING_PROVIDER",

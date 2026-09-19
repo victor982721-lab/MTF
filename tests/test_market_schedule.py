@@ -168,7 +168,7 @@ class MarketScheduleTests(unittest.TestCase):
         self.assertEqual(observed_market_state(partial, datetime(2026, 1, 4, 1, 30, tzinfo=UTC)), CLOSED_SCHEDULED)
         self.assertEqual(observed_market_state(partial, datetime(2026, 1, 4, 3, 30, tzinfo=UTC)), OPEN)
 
-    def test_holiday_requires_exact_timezone_and_complete_metadata(self) -> None:
+    def test_holiday_uses_own_timezone_and_requires_complete_metadata(self) -> None:
         now = datetime(2026, 1, 4, 12, tzinfo=UTC)
         mismatch = _provider(
             _full_symbol(
@@ -176,7 +176,7 @@ class MarketScheduleTests(unittest.TestCase):
                 holidays=(_holiday(date(2026, 1, 4), timezone="America/New_York"),),
             )
         )
-        self.assertEqual(observed_market_state(mismatch, now), UNKNOWN)
+        self.assertEqual(observed_market_state(mismatch, now), CLOSED_SCHEDULED)
         incomplete = _holiday(date(2026, 1, 4))
         del incomplete["isRecurring"]
         self.assertEqual(
@@ -186,6 +186,52 @@ class MarketScheduleTests(unittest.TestCase):
             ),
             UNKNOWN,
         )
+
+    def test_holiday_timezone_is_independent_at_date_boundary(self) -> None:
+        provider = _provider(
+            _full_symbol(
+                timezone="America/New_York",
+                schedule=({"startSecond": 0, "endSecond": 604_800},),
+                holidays=(_holiday(date(2026, 1, 4), timezone="UTC"),),
+            )
+        )
+        self.assertEqual(observed_market_state(provider, datetime(2026, 1, 4, 23, 30, tzinfo=UTC)), CLOSED_SCHEDULED)
+        self.assertEqual(observed_market_state(provider, datetime(2026, 1, 5, 0, 30, tzinfo=UTC)), OPEN)
+
+    def test_partial_holiday_uses_its_own_timezone(self) -> None:
+        provider = _provider(
+            _full_symbol(
+                timezone="America/New_York",
+                schedule=({"startSecond": 0, "endSecond": 604_800},),
+                holidays=(_holiday(date(2026, 1, 4), timezone="UTC", start=3_600, end=7_200),),
+            )
+        )
+        self.assertEqual(observed_market_state(provider, datetime(2026, 1, 4, 1, 30, tzinfo=UTC)), CLOSED_SCHEDULED)
+        self.assertEqual(observed_market_state(provider, datetime(2026, 1, 4, 3, 30, tzinfo=UTC)), OPEN)
+
+    def test_recurring_holiday_uses_its_own_date_boundary(self) -> None:
+        provider = _provider(
+            _full_symbol(
+                timezone="America/New_York",
+                schedule=({"startSecond": 0, "endSecond": 604_800},),
+                holidays=(_holiday(date(2026, 1, 4), timezone="UTC", recurring=True),),
+            )
+        )
+        self.assertEqual(observed_market_state(provider, datetime(2027, 1, 4, 23, 30, tzinfo=UTC)), CLOSED_SCHEDULED)
+        self.assertEqual(observed_market_state(provider, datetime(2027, 1, 5, 0, 30, tzinfo=UTC)), OPEN)
+
+    def test_holiday_invalid_timezone_or_zero_window_remains_unknown(self) -> None:
+        now = datetime(2026, 1, 4, 12, tzinfo=UTC)
+        for holiday in (
+            _holiday(date(2026, 1, 4), timezone=""),
+            _holiday(date(2026, 1, 4), timezone="Not/IANA"),
+            _holiday(date(2026, 1, 4), start=0, end=0),
+        ):
+            with self.subTest(holiday=holiday):
+                provider = _provider(
+                    _full_symbol(schedule=({"startSecond": 0, "endSecond": 604_800},), holidays=(holiday,))
+                )
+                self.assertEqual(observed_market_state(provider, now), UNKNOWN)
 
     def test_recurring_holiday_matches_month_and_day(self) -> None:
         provider = _provider(

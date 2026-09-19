@@ -11,6 +11,11 @@ Utilizo una integración local de investigación con una cuenta DEMO existente y
 3. Comisión efectiva, swaps, conversión de moneda, tarifas de históricos y cotizaciones, límites y política de expiración/actividad de la DEMO. Las tarifas publicitarias no se usarán como sustituto de las condiciones de la cuenta.
 4. Si el uso automatizado en DEMO y el almacenamiento histórico privado local descrito son compatibles con sus condiciones vigentes.
 5. Requisitos para distinguir correctamente entorno DEMO/REAL y permisos `accounts`/`trading`.
+6. La semántica de festivos de EURUSD que la API entrega con `startSecond=0` y
+   `endSecond=0` explícitos: ¿representan cierre de día completo, una ventana
+   vacía u otra convención? La zona semanal observada es `America/New_York`
+   y la de los festivos `Europe/Bucharest`; mantendré ambas zonas sin sustituir
+   una por otra y no asumiré un horario de apertura con campos ambiguos.
 
 No solicito apertura de cuenta, contratación, depósito, cuenta profesional, scope `trading` ni habilitación de operaciones reales mediante este mensaje. La consulta y el almacenamiento local no implican autorización de órdenes.
 

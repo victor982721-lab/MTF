@@ -41,7 +41,7 @@ class _CatalogView:
 
 @dataclass(frozen=True, slots=True)
 class _HolidayWindow:
-    schedule_timezone: str
+    timezone: ZoneInfo
     holiday_date: date
     recurring: bool
     start_microseconds: int
@@ -68,14 +68,18 @@ def observed_market_state(provider: Any, aware_now: datetime | None) -> str:
         local = instant.astimezone(timezone[1])
     except (OverflowError, ValueError):
         return UNKNOWN
-    holidays = _holiday_windows(view.full_symbol, timezone[0])
+    holidays = _holiday_windows(view.full_symbol)
     if holidays is None:
         return UNKNOWN
     local_microseconds = _week_microseconds(local)
     for holiday in holidays:
+        try:
+            holiday_local = instant.astimezone(holiday.timezone)
+        except (OverflowError, ValueError):
+            return UNKNOWN
         if (
-            _holiday_matches(holiday, local)
-            and holiday.start_microseconds <= _day_microseconds(local) < holiday.end_microseconds
+            _holiday_matches(holiday, holiday_local)
+            and holiday.start_microseconds <= _day_microseconds(holiday_local) < holiday.end_microseconds
         ):
             return CLOSED_SCHEDULED
     if any(start <= local_microseconds < end for start, end in schedule):
@@ -272,7 +276,7 @@ def _schedule_intervals(full_symbol: Mapping[str, Any]) -> tuple[tuple[int, int]
     return tuple(intervals)
 
 
-def _holiday_windows(full_symbol: Mapping[str, Any], schedule_timezone: str) -> tuple[_HolidayWindow, ...] | None:
+def _holiday_windows(full_symbol: Mapping[str, Any]) -> tuple[_HolidayWindow, ...] | None:
     raw = _value(full_symbol, "holiday", "holidays")
     items = _as_sequence(raw)
     if items is None:
@@ -282,10 +286,11 @@ def _holiday_windows(full_symbol: Mapping[str, Any], schedule_timezone: str) -> 
         holiday = _as_mapping(item)
         if holiday is None:
             return None
-        holiday_timezone = _value(holiday, "scheduleTimeZone", "schedule_time_zone")
+        # ProtoOAHoliday declares its own zone, independently of ProtoOASymbol.
+        holiday_timezone = _schedule_timezone(holiday)
         days = _int_value(_value(holiday, "holidayDate", "holiday_date"))
         recurring = _bool_value(_value(holiday, "isRecurring", "is_recurring"))
-        if not isinstance(holiday_timezone, str) or holiday_timezone.strip() != schedule_timezone:
+        if holiday_timezone is None:
             return None
         if days is None or days < 0 or recurring is None:
             return None
@@ -305,7 +310,15 @@ def _holiday_windows(full_symbol: Mapping[str, Any], schedule_timezone: str) -> 
             if start is None or end is None or start < 0 or end <= start or end > _DAY_SECONDS:
                 return None
             start_microseconds, end_microseconds = start * _MICROSECONDS, end * _MICROSECONDS
-        result.append(_HolidayWindow(schedule_timezone, holiday_date, recurring, start_microseconds, end_microseconds))
+        result.append(
+            _HolidayWindow(
+                holiday_timezone[1],
+                holiday_date,
+                recurring,
+                start_microseconds,
+                end_microseconds,
+            )
+        )
     return tuple(result)
 
 

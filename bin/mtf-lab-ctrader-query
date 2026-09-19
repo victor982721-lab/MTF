@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# The helper is stdlib-only.  Do not let ambient Python configuration affect
+# it, and let the helper apply the same isolation to the canonical child.
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONWARNINGS PYTHONINSPECT PYTHONUSERBASE PYTHONEXECUTABLE
+exec /usr/bin/python3 -I "$ROOT/tools/ctrader_query_launcher.py" "$@"

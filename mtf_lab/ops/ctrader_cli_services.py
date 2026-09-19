@@ -378,8 +378,12 @@ def _write_text_atomic(path: str | Path, text: str, *, overwrite: bool = True) -
             os.fsync(temporary.fileno())
         assert temporary_path is not None
         os.chmod(temporary_path, 0o600)
-        os.replace(temporary_path, target)
-        os.chmod(target, 0o600)
+        if overwrite:
+            os.replace(temporary_path, target)
+        else:
+            # Preserve a destination that appears after preflight, including a
+            # symlink.  The complete private temporary is on the same filesystem.
+            os.link(temporary_path, target, follow_symlinks=False)
     finally:
         if temporary_path is not None:
             with suppress(FileNotFoundError):
@@ -418,7 +422,9 @@ def _export_history_capture(
 
 def _write_query_report(path: str | Path, payload: Mapping[str, Any]) -> Path:
     return _write_text_atomic(
-        path, json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n"
+        path,
+        json.dumps(dict(payload), ensure_ascii=False, indent=2, sort_keys=True, default=str) + "\n",
+        overwrite=False,
     )
 
 
@@ -1230,7 +1236,7 @@ class CTraderCliService:
                     "state": "REPORT_WRITE_FAILED",
                     "network_performed": bool(output.get("network_performed", False)),
                     "error": _safe_error_code(exc),
-                    "next_action": "Elija una ruta de reporte escribible; no se modificó la sesión cTrader.",
+                    "next_action": "Elija una ruta nueva de reporte escribible; no se modificó la sesión cTrader.",
                 }
             )
         return CommandResult.json(output, code=result.code, stderr=result.stderr)
