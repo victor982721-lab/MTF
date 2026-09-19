@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -14,6 +14,7 @@ from mtf_lab.ops.market_schedule import (
     UNKNOWN,
     catalog_provenance,
     observed_market_state,
+    observed_market_window_state,
 )
 
 EPOCH = date(1970, 1, 1)
@@ -232,6 +233,138 @@ class MarketScheduleTests(unittest.TestCase):
                     _full_symbol(schedule=({"startSecond": 0, "endSecond": 604_800},), holidays=(holiday,))
                 )
                 self.assertEqual(observed_market_state(provider, now), UNKNOWN)
+
+    def test_window_rejects_malformed_or_overlong_bounds(self) -> None:
+        provider = _provider(_full_symbol(schedule=({"startSecond": 0, "endSecond": 604_800},)))
+        valid_start = datetime(2026, 1, 4, 0, 0, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, None, valid_start), UNKNOWN)
+        self.assertEqual(
+            observed_market_window_state(
+                provider, valid_start.replace(tzinfo=None), valid_start + timedelta(minutes=1)
+            ),
+            UNKNOWN,
+        )
+        self.assertEqual(
+            observed_market_window_state(provider, valid_start + timedelta(minutes=1), valid_start), UNKNOWN
+        )
+        self.assertEqual(
+            observed_market_window_state(provider, valid_start, valid_start + timedelta(hours=1, seconds=1)),
+            UNKNOWN,
+        )
+
+    def test_window_requires_every_integral_second_to_be_open(self) -> None:
+        provider = _provider(
+            _full_symbol(
+                schedule=(
+                    {"startSecond": 0, "endSecond": 3_600},
+                    {"startSecond": 3_720, "endSecond": 7_200},
+                )
+            )
+        )
+        open_window = datetime(2026, 1, 4, 0, 10, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, open_window, open_window + timedelta(seconds=30)), OPEN)
+        gap_window = datetime(2026, 1, 4, 0, 59, second=30, tzinfo=UTC)
+        self.assertEqual(
+            observed_market_window_state(provider, gap_window, gap_window + timedelta(seconds=60)),
+            CLOSED_SCHEDULED,
+        )
+
+    def test_window_zero_hour_holiday_only_blocks_relevant_date(self) -> None:
+        holiday = _holiday(date(2025, 12, 25), timezone="UTC", start=0, end=0)
+        provider = _provider(_full_symbol(schedule=({"startSecond": 0, "endSecond": 604_800},), holidays=(holiday,)))
+        outside = datetime(2026, 1, 4, 12, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, outside, outside + timedelta(minutes=1)), OPEN)
+        active = datetime(2025, 12, 25, 12, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, active, active + timedelta(minutes=1)), UNKNOWN)
+        full_day_provider = _provider(
+            _full_symbol(
+                schedule=({"startSecond": 0, "endSecond": 604_800},),
+                holidays=(_holiday(date(2025, 12, 25), timezone="UTC"),),
+            )
+        )
+        self.assertEqual(
+            observed_market_window_state(full_day_provider, active, active + timedelta(minutes=1)),
+            CLOSED_SCHEDULED,
+        )
+
+    def test_window_zero_hour_recurring_holiday_blocks_matching_date_only(self) -> None:
+        holiday = _holiday(date(2026, 1, 1), timezone="UTC", recurring=True, start=0, end=0)
+        provider = _provider(_full_symbol(schedule=({"startSecond": 0, "endSecond": 604_800},), holidays=(holiday,)))
+        outside = datetime(2026, 1, 2, 12, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, outside, outside + timedelta(minutes=1)), OPEN)
+        active = datetime(2027, 1, 1, 12, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, active, active + timedelta(minutes=1)), UNKNOWN)
+
+    def test_window_relevant_ambiguity_wins_over_another_known_closure(self) -> None:
+        known_close = _holiday(date(2026, 1, 4), timezone="UTC", start=3_600, end=7_200)
+        ambiguous = _holiday(date(2026, 1, 4), timezone="UTC", start=0, end=0)
+        provider = _provider(
+            _full_symbol(
+                schedule=({"startSecond": 0, "endSecond": 604_800},),
+                holidays=(known_close, ambiguous),
+            )
+        )
+        active = datetime(2026, 1, 4, 1, 30, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, active, active + timedelta(minutes=1)), UNKNOWN)
+
+    def test_window_holiday_timezone_and_midnight_boundary_are_exact(self) -> None:
+        holiday = _holiday(date(2026, 1, 4), timezone="UTC", start=3_600, end=7_200)
+        provider = _provider(
+            _full_symbol(
+                timezone="America/New_York",
+                schedule=({"startSecond": 0, "endSecond": 604_800},),
+                holidays=(holiday,),
+            )
+        )
+        before = datetime(2026, 1, 4, 0, 59, second=59, tzinfo=UTC)
+        self.assertEqual(
+            observed_market_window_state(provider, before, before + timedelta(seconds=2)), CLOSED_SCHEDULED
+        )
+        after = datetime(2026, 1, 4, 2, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, after, after + timedelta(minutes=1)), OPEN)
+
+    def test_window_never_marks_weekend_open_for_broker_weekly_schema(self) -> None:
+        provider = _provider(
+            _full_symbol(
+                timezone="America/New_York",
+                schedule=(
+                    {"startSecond": 61_260, "endSecond": 147_540},
+                    {"startSecond": 147_660, "endSecond": 233_940},
+                    {"startSecond": 234_060, "endSecond": 320_340},
+                    {"startSecond": 320_460, "endSecond": 406_740},
+                    {"startSecond": 406_860, "endSecond": 492_900},
+                ),
+                holidays=(_holiday(date(2025, 12, 25), start=0, end=0),),
+            )
+        )
+        saturday = datetime(2026, 9, 19, 12, tzinfo=UTC)
+        self.assertEqual(
+            observed_market_window_state(provider, saturday, saturday + timedelta(minutes=20)), CLOSED_SCHEDULED
+        )
+
+    def test_window_dst_fold_and_gap_remain_open_when_wall_schedule_covers_both(self) -> None:
+        provider = _provider(
+            _full_symbol(
+                timezone="America/New_York",
+                schedule=({"startSecond": 3_600, "endSecond": 10_800},),
+            )
+        )
+        spring = datetime(2026, 3, 8, 6, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, spring, spring + timedelta(hours=1)), OPEN)
+        fall = datetime(2026, 11, 1, 5, 30, tzinfo=UTC)
+        self.assertEqual(observed_market_window_state(provider, fall, fall + timedelta(hours=1)), OPEN)
+
+    def test_window_structural_holiday_errors_remain_global_unknown(self) -> None:
+        now = datetime(2026, 1, 4, 12, tzinfo=UTC)
+        invalid_zone = _holiday(date(2099, 1, 1), timezone="Not/IANA")
+        missing_recurrence = _holiday(date(2099, 1, 1))
+        del missing_recurrence["isRecurring"]
+        for holiday in (invalid_zone, missing_recurrence):
+            with self.subTest(holiday=holiday):
+                provider = _provider(
+                    _full_symbol(schedule=({"startSecond": 0, "endSecond": 604_800},), holidays=(holiday,))
+                )
+                self.assertEqual(observed_market_window_state(provider, now, now + timedelta(minutes=1)), UNKNOWN)
 
     def test_recurring_holiday_matches_month_and_day(self) -> None:
         provider = _provider(

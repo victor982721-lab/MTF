@@ -28,6 +28,7 @@ _MICROSECONDS = 1_000_000
 _DAY_MICROSECONDS = _DAY_SECONDS * _MICROSECONDS
 _WEEK_MICROSECONDS = _WEEK_SECONDS * _MICROSECONDS
 _EPOCH_DATE = date(1970, 1, 1)
+_MAX_MARKET_WINDOW = timedelta(hours=1)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +86,52 @@ def observed_market_state(provider: Any, aware_now: datetime | None) -> str:
     if any(start <= local_microseconds < end for start, end in schedule):
         return OPEN
     return CLOSED_SCHEDULED
+
+
+def observed_market_window_state(
+    provider: Any,
+    start: datetime | None,
+    end: datetime | None,
+) -> str:
+    """Accredit a short half-open UTC window without changing point semantics.
+
+    The result is ``OPEN`` only when every integral-second segment in the
+    maximum one-hour ``[start, end)`` window is observed as open by the symbol
+    schedule and all relevant holiday metadata.  A known scheduled closure returns
+    ``CLOSED_SCHEDULED``; malformed inputs, structurally invalid holidays, or
+    an ambiguous holiday window relevant to the requested interval return
+    ``UNKNOWN``.  Protocol schedule and holiday bounds are integral seconds,
+    so the bounded per-second partition is exact for the declared contract,
+    including the two-minute gaps commonly present in broker schedules.
+    """
+
+    window = _utc_window(start, end)
+    if window is None:
+        return UNKNOWN
+    start_utc, end_utc = window
+    if end_utc <= start_utc or end_utc - start_utc > _MAX_MARKET_WINDOW:
+        return UNKNOWN
+
+    view = _catalog_view(provider)
+    if view is None:
+        return UNKNOWN
+    timezone = _schedule_timezone(view.full_symbol)
+    schedule = _schedule_intervals(view.full_symbol)
+    if timezone is None or schedule is None:
+        return UNKNOWN
+    holidays = _window_holidays(view.full_symbol)
+    if holidays is None:
+        return UNKNOWN
+
+    saw_closed = False
+    for segment_start, segment_end in _integral_utc_segments(start_utc, end_utc):
+        midpoint = segment_start + (segment_end - segment_start) / 2
+        state = _window_point_state(midpoint, timezone[1], schedule, holidays)
+        if state == UNKNOWN:
+            return UNKNOWN
+        if state == CLOSED_SCHEDULED:
+            saw_closed = True
+    return CLOSED_SCHEDULED if saw_closed else OPEN
 
 
 def catalog_provenance(provider: Any, observed_at: datetime | None) -> dict[str, Any]:
@@ -238,6 +285,27 @@ def _aware_datetime(value: datetime | None) -> datetime | None:
     return value
 
 
+def _utc_window(start: datetime | None, end: datetime | None) -> tuple[datetime, datetime] | None:
+    start_value = _aware_datetime(start)
+    end_value = _aware_datetime(end)
+    if start_value is None or end_value is None:
+        return None
+    try:
+        return start_value.astimezone(UTC), end_value.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _integral_utc_segments(start: datetime, end: datetime) -> tuple[tuple[datetime, datetime], ...]:
+    boundaries = [start]
+    cursor = start.replace(microsecond=0) + timedelta(seconds=1)
+    while cursor < end:
+        boundaries.append(cursor)
+        cursor += timedelta(seconds=1)
+    boundaries.append(end)
+    return tuple(zip(boundaries[:-1], boundaries[1:], strict=True))
+
+
 def _iso_utc(value: datetime | None) -> str | None:
     if value is None:
         return None
@@ -322,6 +390,66 @@ def _holiday_windows(full_symbol: Mapping[str, Any]) -> tuple[_HolidayWindow, ..
     return tuple(result)
 
 
+@dataclass(frozen=True, slots=True)
+class _WindowHoliday:
+    timezone: ZoneInfo
+    holiday_date: date
+    recurring: bool
+    start_microseconds: int | None
+    end_microseconds: int | None
+
+
+def _window_holidays(full_symbol: Mapping[str, Any]) -> tuple[_WindowHoliday, ...] | None:
+    """Parse holidays while keeping ambiguous hours local to their date."""
+
+    raw = _value(full_symbol, "holiday", "holidays")
+    items = _as_sequence(raw)
+    if items is None:
+        return ()
+    result: list[_WindowHoliday] = []
+    for item in items:
+        holiday = _as_mapping(item)
+        if holiday is None:
+            return None
+        holiday_timezone = _schedule_timezone(holiday)
+        days = _int_value(_value(holiday, "holidayDate", "holiday_date"))
+        recurring = _bool_value(_value(holiday, "isRecurring", "is_recurring"))
+        if holiday_timezone is None or days is None or days < 0 or recurring is None:
+            return None
+        try:
+            holiday_date = _EPOCH_DATE + timedelta(days=days)
+        except (OverflowError, ValueError):
+            return None
+
+        start_present = _value_present(holiday, "startSecond", "start_second")
+        end_present = _value_present(holiday, "endSecond", "end_second")
+        if not start_present and not end_present:
+            start_microseconds, end_microseconds = 0, _DAY_MICROSECONDS
+        elif start_present and end_present:
+            start = _int_value(_value(holiday, "startSecond", "start_second"))
+            end = _int_value(_value(holiday, "endSecond", "end_second"))
+            if start is not None and end is not None and 0 <= start < end <= _DAY_SECONDS:
+                start_microseconds, end_microseconds = start * _MICROSECONDS, end * _MICROSECONDS
+            else:
+                # Includes explicit 0/0: the official contract does not
+                # define it as a full-day sentinel.  Relevance is decided
+                # later, so an unrelated ambiguous holiday does not poison
+                # the whole point-in-time window.
+                start_microseconds, end_microseconds = None, None
+        else:
+            start_microseconds, end_microseconds = None, None
+        result.append(
+            _WindowHoliday(
+                holiday_timezone[1],
+                holiday_date,
+                recurring,
+                start_microseconds,
+                end_microseconds,
+            )
+        )
+    return tuple(result)
+
+
 def _value_present(value: Mapping[str, Any], *names: str) -> bool:
     return any(name in value and value[name] is not None for name in names)
 
@@ -351,9 +479,44 @@ def _day_microseconds(local: datetime) -> int:
 
 
 def _holiday_matches(holiday: _HolidayWindow, local: datetime) -> bool:
-    if holiday.recurring:
-        return (holiday.holiday_date.month, holiday.holiday_date.day) == (local.month, local.day)
-    return holiday.holiday_date == local.date()
+    return _holiday_date_matches(holiday.holiday_date, holiday.recurring, local)
+
+
+def _holiday_date_matches(holiday_date: date, recurring: bool, local: datetime) -> bool:
+    if recurring:
+        return (holiday_date.month, holiday_date.day) == (local.month, local.day)
+    return holiday_date == local.date()
+
+
+def _window_point_state(
+    instant: datetime,
+    schedule_timezone: ZoneInfo,
+    schedule: tuple[tuple[int, int], ...],
+    holidays: tuple[_WindowHoliday, ...],
+) -> str:
+    try:
+        local = instant.astimezone(schedule_timezone)
+    except (OverflowError, ValueError):
+        return UNKNOWN
+    if not any(start <= _week_microseconds(local) < end for start, end in schedule):
+        return CLOSED_SCHEDULED
+    saw_closed = False
+    saw_unknown = False
+    for holiday in holidays:
+        try:
+            holiday_local = instant.astimezone(holiday.timezone)
+        except (OverflowError, ValueError):
+            return UNKNOWN
+        if not _holiday_date_matches(holiday.holiday_date, holiday.recurring, holiday_local):
+            continue
+        if holiday.start_microseconds is None or holiday.end_microseconds is None:
+            saw_unknown = True
+            continue
+        if holiday.start_microseconds <= _day_microseconds(holiday_local) < holiday.end_microseconds:
+            saw_closed = True
+    if saw_unknown:
+        return UNKNOWN
+    return CLOSED_SCHEDULED if saw_closed else OPEN
 
 
 def _compact_schedule(full_symbol: Mapping[str, Any] | None) -> list[dict[str, int | None]] | None:
@@ -433,4 +596,11 @@ def _text_or_none(value: Any) -> str | None:
     return value.strip() if isinstance(value, str) and value.strip() else None
 
 
-__all__ = ["CLOSED_SCHEDULED", "OPEN", "UNKNOWN", "catalog_provenance", "observed_market_state"]
+__all__ = [
+    "CLOSED_SCHEDULED",
+    "OPEN",
+    "UNKNOWN",
+    "catalog_provenance",
+    "observed_market_state",
+    "observed_market_window_state",
+]

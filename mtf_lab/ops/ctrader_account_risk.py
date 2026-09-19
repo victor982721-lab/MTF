@@ -1193,7 +1193,11 @@ class AccountRiskObserver:
     def observe(self, *, now: datetime | None = None) -> AccountRiskSnapshot:
         """Query trader, positions, unrealized PnL, and bounded daily deals."""
 
-        current = _utc(now or self.clock(), "now")
+        # An explicit ``now`` is the caller's fixed as-of reference.  With the
+        # default clock, the first instant bounds the UTC-day queries while a
+        # terminal clock sample is the only valid reference for local receive
+        # metadata: responses are naturally received after collection starts.
+        current = _utc(now if now is not None else self.clock(), "now")
         day_start = datetime(current.year, current.month, current.day, tzinfo=UTC)
         try:
             identity = self._session_identity()
@@ -1221,10 +1225,24 @@ class AccountRiskObserver:
 
         try:
             components = self._collect(identity, day_start, current)
+            freshness_now = current
+            if now is None:
+                freshness_now = _utc(self.clock(), "now")
+                if freshness_now < current:
+                    components["reasons"].append("observation_clock_regressed")
+                if freshness_now.date() != current.date():
+                    # Keep the query's original day in the projection.  A
+                    # collection straddling UTC midnight must not relabel
+                    # prior-day responses as current-day data.
+                    components["reasons"].append("utc_day_changed_during_observation")
+            components["reasons"].extend(
+                self._freshness_reasons(components["responses"], freshness_now, identity.generation)
+            )
+            report_now = freshness_now if freshness_now.date() == current.date() else current
             snapshot = self._compose_snapshot(
                 identity,
                 day_start,
-                current,
+                report_now,
                 components,
                 cache_invalidated=cache_invalidated,
                 cache_reason=cache_reason,
@@ -1299,7 +1317,6 @@ class AccountRiskObserver:
         final_identity = self._session_identity()
         if final_identity != identity:
             component_reasons.append("connection_generation_changed")
-        component_reasons.extend(self._freshness_reasons(responses, current, identity.generation))
         return {
             "responses": responses,
             "trader_digits": trader_digits,
@@ -1490,7 +1507,13 @@ class AccountRiskObserver:
     def _is_fresh(reasons: Sequence[str]) -> bool:
         return not any(
             reason.startswith("response_")
-            or reason in {"connection_generation_changed", "positions_pnl_snapshot_mismatch"}
+            or reason
+            in {
+                "connection_generation_changed",
+                "positions_pnl_snapshot_mismatch",
+                "observation_clock_regressed",
+                "utc_day_changed_during_observation",
+            }
             for reason in reasons
         )
 

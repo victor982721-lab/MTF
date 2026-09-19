@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from ..core.canonical import canonical_json
 from .ctrader_account_risk import AccountRiskObserver
@@ -68,6 +68,7 @@ class DemoExecutionBinding:
     intent_store: JsonlIntentStore
     callbacks: Any
     risk_observer: AccountRiskObserver | None = None
+    canary_economics: Any | None = None
 
     def close(self) -> None:
         """Close only the local journal; the provider owns the shared client."""
@@ -77,7 +78,7 @@ class DemoExecutionBinding:
             close()
 
 
-def build_demo_execution_binding(
+def build_demo_execution_binding(  # noqa: C901
     provider: Any,
     provenance: Mapping[str, Any],
     *,
@@ -86,6 +87,7 @@ def build_demo_execution_binding(
     resume: bool = True,
     account_key: str | None = None,
     policy: ExecutionPolicy | None = None,
+    canary_economics: Any | None = None,
     proto: Any | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> DemoExecutionBinding:
@@ -135,6 +137,7 @@ def build_demo_execution_binding(
         clock_fn(),
         volume_grid,
         connection_generation=observation.connection_generation,
+        canary_economics=canary_economics,
     )
 
     account = DemoAccount(
@@ -169,6 +172,8 @@ def build_demo_execution_binding(
             fixture_mode=False,
             **risk_binding,
         )
+        if canary_economics is not None:
+            _update_executor_from_canary_economics(executor, canary_economics, "BUY")
         # Recovery is registration-only: it hydrates durable identities and
         # never resubmits.  With --no-resume, an existing journal remains a
         # hard gate rather than being silently discarded.
@@ -189,8 +194,16 @@ def build_demo_execution_binding(
             allow_new_baseline=not bool(intent_store.intents),
             require_cashflows=True,
         )
-        callbacks = _callbacks_for(executor, provider, observation, risk_observer=observer)
-        return DemoExecutionBinding(gateway, observation, transport, executor, intent_store, callbacks, observer)
+        callbacks = _callbacks_for(
+            executor,
+            provider,
+            observation,
+            risk_observer=observer,
+            canary_economics=canary_economics,
+        )
+        return DemoExecutionBinding(
+            gateway, observation, transport, executor, intent_store, callbacks, observer, canary_economics
+        )
     except BaseException:
         with contextlib.suppress(Exception):
             intent_store.close()
@@ -319,6 +332,7 @@ def _risk_binding_kwargs(
     volume_grid: VolumeGrid,
     *,
     connection_generation: Any = None,
+    canary_economics: Any | None = None,
 ) -> dict[str, Any]:
     candidate_id = raw_execution.get("market_candidate_id")
     if candidate_id is None:
@@ -338,6 +352,9 @@ def _risk_binding_kwargs(
     if not isinstance(risk_calendar, Mapping):
         raise RiskLimitRejected("market_candidate_id requiere un calendario RiskExit explícito")
     contract_spec = dict(_observed_risk_contract_spec(provider, observed_at, volume_grid))
+    if canary_economics is not None:
+        contract_spec = _merge_canary_economics_contract(contract_spec, canary_economics)
+        risk_calendar = _canary_economics_calendar(canary_economics, connection_generation)
     if connection_generation is not None and str(connection_generation).strip():
         contract_spec["connection_generation"] = str(connection_generation).strip()
     return {
@@ -346,6 +363,106 @@ def _risk_binding_kwargs(
         "risk_calendar": risk_calendar,
         "market_candidate_id": candidate_text,
     }
+
+
+def _canary_economics_calendar(projection: Any, generation: Any) -> Mapping[str, Any]:
+    calendar = getattr(projection, "calendar_state", None)
+    if not isinstance(calendar, Mapping) or calendar.get("known") is not True:
+        raise RiskLimitRejected("canary_economics no conserva calendario OBSERVED_BROKER")
+    basis = str(calendar.get("basis", calendar.get("calendar_basis", ""))).upper()
+    if basis.startswith("MODEL"):
+        raise RiskLimitRejected("canary_economics calendario modelado")
+    provenance = getattr(projection, "provenance", None)
+    if not isinstance(provenance, Mapping):
+        raise RiskLimitRejected("canary_economics sin provenance")
+    observed_generation = str(provenance.get("connection_generation", provenance.get("generation", ""))).strip()
+    expected = str(generation or "").strip()
+    if not observed_generation or not expected or observed_generation != expected:
+        raise RiskLimitRejected("canary_economics calendario no coincide con generación DEMO")
+    return dict(calendar)
+
+
+def _merge_canary_economics_contract(base: Mapping[str, Any], projection: Any) -> dict[str, Any]:
+    """Merge typed observed economics without changing broker metadata."""
+
+    contract = dict(base)
+    to_contract = getattr(projection, "to_contract_spec", None)
+    required_margin = getattr(projection, "required_margin", None)
+    quantity = getattr(projection, "quantity", None)
+    if not callable(to_contract) or not callable(required_margin) or quantity is None:
+        raise RiskLimitRejected("canary_economics no expone projection tipada")
+    try:
+        buy = dict(to_contract("BUY"))
+        margins = [Decimal(str(required_margin("BUY"))), Decimal(str(required_margin("SELL")))]
+        quantity_decimal = Decimal(str(quantity))
+        if quantity_decimal <= 0 or any(value <= 0 for value in margins):
+            raise ValueError
+        margin_per_unit = max(margins) / quantity_decimal
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise RiskLimitRejected("canary_economics con margen observado inválido") from exc
+    contract.update(buy)
+    contract.update(
+        {
+            "margin_per_unit": str(margin_per_unit),
+            "canary_margin_buy": str(margins[0]),
+            "canary_margin_sell": str(margins[1]),
+            "margin_source": "ProtoOAExpectedMarginRes",
+        }
+    )
+    return contract
+
+
+def _update_executor_from_canary_economics(executor: Any, projection: Any, side: str) -> None:
+    normalized_side = str(side).upper()
+    if normalized_side not in {"BUY", "SELL", "CONSERVATIVE"}:
+        raise RiskLimitRejected("canary_economics side inválido")
+    contract_side = "BUY" if normalized_side == "CONSERVATIVE" else normalized_side
+    to_contract = getattr(projection, "to_contract_spec", None)
+    calendar = getattr(projection, "calendar_state", None)
+    generation = str(getattr(projection, "connection_generation", "")).strip()
+    observed_at = getattr(projection, "observed_at", None)
+    if not callable(to_contract) or not isinstance(calendar, Mapping) or not generation or observed_at is None:
+        raise RiskLimitRejected("canary_economics contract/calendario carece de observación tipada")
+    try:
+        contract = dict(to_contract(contract_side))
+    except (TypeError, ValueError, ArithmeticError) as exc:
+        raise RiskLimitRejected("canary_economics contract_spec inválido") from exc
+    contract["connection_generation"] = generation
+    contract["observed_at"] = observed_at
+    contract["calendar_observed_at"] = observed_at
+    # The executor has no public mutable contract setter: this narrow
+    # composition seam replaces the effective RiskExit evidence atomically
+    # immediately before planning.  It never changes policy limits or account
+    # identity, and fails closed if the canonical executor does not expose the
+    # expected slots.
+    if hasattr(executor, "_risk_contract_spec"):
+        executor._risk_contract_spec = dict(contract)
+    if hasattr(executor, "_risk_calendar"):
+        executor._risk_calendar = dict(calendar)
+    if str(side).upper() == "CONSERVATIVE":
+        required_margin = max(
+            Decimal(str(projection.required_margin("BUY"))),
+            Decimal(str(projection.required_margin("SELL"))),
+        )
+        levels = [
+            Decimal(str(projection.projected_margin_level("BUY"))),
+            Decimal(str(projection.projected_margin_level("SELL"))),
+        ]
+        updater = getattr(projection, "to_update_risk_kwargs", None)
+        if not callable(updater):
+            raise RiskLimitRejected("canary_economics no expone métricas tipadas")
+        values = dict(updater("BUY"))
+        values["margin_required"] = required_margin
+        values["margin_level"] = min(levels)
+        executor.update_risk_metrics(**values)
+        return
+    updater = getattr(projection, "to_update_risk_kwargs", None)
+    if not callable(updater):
+        raise RiskLimitRejected("canary_economics no expone métricas tipadas")
+    values = updater(side)
+    if not isinstance(values, Mapping):
+        raise RiskLimitRejected("canary_economics risk kwargs inválidos")
+    executor.update_risk_metrics(**dict(values))
 
 
 def _catalog_raw_full_symbol(provider: Any) -> Mapping[str, Any] | None:
@@ -524,13 +641,20 @@ def _journal_path(
     return root / "execution-intents" / f"{key}.jsonl"
 
 
-def _refresh_observed_risk(observer: AccountRiskObserver | None, executor: CTraderDemoExecutor) -> None:
+def _refresh_observed_risk(
+    observer: AccountRiskObserver | None,
+    executor: CTraderDemoExecutor,
+    canary_economics: Any | None = None,
+    side: str = "CONSERVATIVE",
+) -> None:
     if observer is None:
         return
     try:
         observer.update_executor(executor)
     except Exception as exc:
         raise RiskLimitRejected(f"la observación de riesgo DEMO no es utilizable: {type(exc).__name__}") from exc
+    if canary_economics is not None:
+        _update_executor_from_canary_economics(executor, canary_economics, side)
 
 
 def _management_quote(
@@ -575,6 +699,7 @@ def _callbacks_for(
     observation: ServerAccountObservation,
     *,
     risk_observer: AccountRiskObserver | None = None,
+    canary_economics: Any | None = None,
 ) -> Any:
     from .supervision_contracts import ExecutionCallbacks
 
@@ -588,11 +713,14 @@ def _callbacks_for(
         # REAL account. The account context comes only from this bound seam.
         data["data_mode"] = data.get("data_mode", data.get("mode", "LIVE"))
         data["account_environment"] = observation.environment
-        _refresh_observed_risk(risk_observer, executor)
+        data_side = str(data.get("side", data.get("direction", ""))).upper()
+        _refresh_observed_risk(
+            risk_observer, executor, canary_economics, data_side if data_side in {"BUY", "SELL"} else "CONSERVATIVE"
+        )
         return executor.submit_signal(data, selected_quote)
 
     def manage() -> tuple[OrderResult, ...]:
-        _refresh_observed_risk(risk_observer, executor)
+        _refresh_observed_risk(risk_observer, executor, canary_economics)
         # Account metrics never substitute for the execution journal's own
         # typed, account-scoped position/ownership reconciliation.
         executor.reconcile_positions()
@@ -616,7 +744,7 @@ def _callbacks_for(
 
     def reduce(_reason: Any = None) -> Mapping[str, Any]:
         del _reason
-        return executor.reduce_exposure()
+        return cast(Mapping[str, Any], executor.reduce_exposure())
 
     def observe_runtime(snapshot: Any) -> Mapping[str, Any]:
         return _observe_runtime_callback(executor, snapshot)
@@ -727,7 +855,10 @@ def _quote_time(value: Any, name: str) -> datetime:
     if value is None:
         raise RiskLimitRejected(f"la cotización carece de {name}")
     try:
-        return _parse_time(value)
+        parsed = _parse_time(value)
+        if not isinstance(parsed, datetime):
+            raise ValueError
+        return parsed
     except (TypeError, ValueError) as exc:
         raise RiskLimitRejected(f"la cotización tiene {name} inválido") from exc
 

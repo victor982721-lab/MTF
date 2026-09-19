@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime, timedelta
@@ -91,6 +92,68 @@ def _mode(value: str | OperationMode) -> OperationMode:
 
 def _timeframe_name(value: Timeframe | str | int) -> str:
     return parse_timeframe(value).name
+
+
+_TECHNICAL_CANARY_GAP_KEY = "technical_canary_quote_gap_seconds"
+
+
+def _validate_technical_canary_profile(config: EffectiveConfig, mode: OperationMode) -> None:
+    if mode is not OperationMode.LIVE:
+        raise ValueError("technical_canary_quote_gap_seconds requiere mode=LIVE")
+    if str(config.price_base).lower() != "mid":
+        raise ValueError("technical_canary_quote_gap_seconds requiere price_base=mid")
+    if str(config.instrument).strip().upper().replace("/", "").replace("-", "") != "EURUSD":
+        raise ValueError("technical_canary_quote_gap_seconds requiere EUR/USD")
+    if str(config.execution.get("market_candidate_id", "")).strip() != "tp_fast_v1":
+        raise ValueError("technical_canary_quote_gap_seconds requiere market_candidate_id=tp_fast_v1")
+    if int(config.indicators.atr_period) != 14:
+        raise ValueError("technical_canary_quote_gap_seconds requiere ATR14")
+    if "M1" not in {item.name for item in config.timeframes}:
+        raise ValueError("technical_canary_quote_gap_seconds requiere temporalidad M1")
+    if _timeframe_name(config.strategy.trigger_timeframe) != "M1":
+        raise ValueError("technical_canary_quote_gap_seconds requiere trigger M1")
+
+
+def _technical_canary_freshness_limits(config: EffectiveConfig) -> tuple[float, float]:
+    quality_limit = float(config.quality.max_feed_age_seconds)
+    execution_limit_raw = config.execution.get("max_price_age_seconds")
+    if isinstance(execution_limit_raw, bool) or execution_limit_raw is None:
+        raise ValueError("technical_canary_quote_gap_seconds requiere max_price_age_seconds de ejecución")
+    try:
+        execution_limit = float(execution_limit_raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_price_age_seconds de ejecución no es numérico") from exc
+    if not math.isfinite(quality_limit) or not math.isfinite(execution_limit):
+        raise ValueError("los límites de frescura deben ser finitos")
+    return quality_limit, execution_limit
+
+
+def _validate_technical_canary_quote_gap(
+    config: EffectiveConfig,
+    mode: OperationMode,
+    value: float | None,
+) -> float | None:
+    """Validate the narrow LIVE technical canary opt-in.
+
+    The default path intentionally returns ``None`` without touching the
+    legacy identity or processor coverage mode.
+    """
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise ValueError("technical_canary_quote_gap_seconds debe ser numérico")
+    try:
+        gap = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("technical_canary_quote_gap_seconds debe ser numérico") from exc
+    if not math.isfinite(gap) or gap <= 0 or gap > 30:
+        raise ValueError("technical_canary_quote_gap_seconds debe estar entre 0 y 30 segundos")
+    _validate_technical_canary_profile(config, mode)
+    quality_limit, execution_limit = _technical_canary_freshness_limits(config)
+    if gap > quality_limit or gap > execution_limit:
+        raise ValueError("technical_canary_quote_gap_seconds excede un límite de frescura")
+    return gap
 
 
 @dataclass(slots=True)
@@ -284,6 +347,7 @@ class RuntimeCoordinator:
         clock: Callable[[], datetime] | None = None,
         checkpoint_interval_seconds: float | None = None,
         identity_extra: Mapping[str, Any] | None = None,
+        technical_canary_quote_gap_seconds: float | None = None,
     ) -> None:
         self.store = store
         self.session_id = session_id
@@ -292,6 +356,11 @@ class RuntimeCoordinator:
         # local queda explícitamente fuera de estos bloqueos; watch lo actualiza
         # en cada transición observable del adaptador.
         normalized_mode = _mode(mode)
+        self.technical_canary_quote_gap_seconds = _validate_technical_canary_quote_gap(
+            config,
+            normalized_mode,
+            technical_canary_quote_gap_seconds,
+        )
         self.connection_state = (
             "OFFLINE" if normalized_mode in {OperationMode.REPLAY, OperationMode.SYNTHETIC} else "CONNECTING"
         )
@@ -335,6 +404,12 @@ class RuntimeCoordinator:
                 json.dumps(effective_simulation.to_dict(), sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest()
         )
+        analysis_identity_extra = dict(identity_extra or {})
+        if self.technical_canary_quote_gap_seconds is not None:
+            existing_gap = analysis_identity_extra.get(_TECHNICAL_CANARY_GAP_KEY)
+            if existing_gap is not None and float(existing_gap) != self.technical_canary_quote_gap_seconds:
+                raise ValueError("identity_extra no coincide con technical_canary_quote_gap_seconds")
+            analysis_identity_extra[_TECHNICAL_CANARY_GAP_KEY] = self.technical_canary_quote_gap_seconds
         self.analysis_id = store.create_analysis(
             session_id,
             dataset_hash=self.dataset_hash,
@@ -344,7 +419,7 @@ class RuntimeCoordinator:
             partition=self.partition,
             code_version=config.version,
             metadata={"config_path": config.path},
-            identity_extra=identity_extra or {},
+            identity_extra=analysis_identity_extra,
         )
         self.capture_id = session_id
         self._last_checkpoint_events = 0
@@ -366,12 +441,14 @@ class RuntimeCoordinator:
             processor_snapshot = None
             self.checkpoint_name = f"{checkpoint_name}:{self.analysis_id[:12]}"
         if processor_snapshot and snapshot is not None:
+            self._validate_technical_canary_snapshot(snapshot.get("state", snapshot))
             self.processor = IncrementalProcessor.from_checkpoint(
                 processor_snapshot,
                 signal_consumer=signal_consumer,
             )
             if self.processor.mode is not self.mode:
                 raise ValueError("el checkpoint y el modo de ejecución no coinciden")
+            self._validate_technical_canary_processor(self.processor)
             self._input_ordinal = int(snapshot.get("events_processed", 0))
             self._last_checkpoint_events = self._input_ordinal
             operational = (
@@ -414,7 +491,42 @@ class RuntimeCoordinator:
                 max_candles=max_candles,
                 signal_consumer=signal_consumer,
                 market_candidate_id=config.execution.get("market_candidate_id"),
+                quote_coverage_mode=(
+                    "continuous_quotes" if self.technical_canary_quote_gap_seconds is not None else "strict"
+                ),
+                max_quote_gap_seconds=self.technical_canary_quote_gap_seconds,
             )
+            self._validate_technical_canary_processor(self.processor)
+
+    def _validate_technical_canary_processor(self, processor: IncrementalProcessor) -> None:
+        expected_mode = "continuous_quotes" if self.technical_canary_quote_gap_seconds is not None else "strict"
+        expected_gap = self.technical_canary_quote_gap_seconds
+        if processor.quote_coverage_mode != expected_mode:
+            raise ValueError("el checkpoint no coincide en quote_coverage_mode")
+        actual_gap = processor.max_quote_gap_seconds
+        if expected_gap is None:
+            if actual_gap is not None:
+                raise ValueError("el checkpoint no coincide en max_quote_gap_seconds")
+        elif actual_gap is None or float(actual_gap) != expected_gap:
+            raise ValueError("el checkpoint no coincide en max_quote_gap_seconds")
+
+    def _validate_technical_canary_snapshot(self, snapshot: Any) -> None:
+        if not isinstance(snapshot, Mapping):
+            raise ValueError("checkpoint sin estado de technical canary")
+        raw_gap = snapshot.get(_TECHNICAL_CANARY_GAP_KEY)
+        if raw_gap is None:
+            snapshot_gap = None
+        else:
+            if isinstance(raw_gap, bool):
+                raise ValueError("checkpoint technical canary inválido")
+            try:
+                snapshot_gap = float(raw_gap)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("checkpoint technical canary inválido") from exc
+            if not math.isfinite(snapshot_gap) or snapshot_gap <= 0:
+                raise ValueError("checkpoint technical canary inválido")
+        if snapshot_gap != self.technical_canary_quote_gap_seconds:
+            raise ValueError("checkpoint no coincide en technical_canary_quote_gap_seconds")
 
     @property
     def signal_consumer(self) -> SignalConsumer:
@@ -694,7 +806,9 @@ class RuntimeCoordinator:
         self._startup_event_id = identity if isinstance(identity, str) else None
 
     def _remember_startup_observation(self, record: Any, result: ProcessResult) -> None:
-        if self.mode is OperationMode.LIVE or _looks_like_candle(record):
+        if (self.mode is OperationMode.LIVE and self.technical_canary_quote_gap_seconds is None) or _looks_like_candle(
+            record
+        ):
             return
         if self._startup_event_time is not None or self.processor.events_processed != 1:
             return
@@ -707,11 +821,15 @@ class RuntimeCoordinator:
         """Recognize clipped first buckets, not an interruption of an existing stream.
 
         The first accepted event is the evidence: later partials, other quality
-        flags, native input bars and LIVE are never classified this way.
+        flags, native input bars and default LIVE are never classified this way.
         Indicator warmup and every operational gate continue to apply.
         """
         first = self._startup_event_time
-        if self.mode is OperationMode.LIVE or first is None or self._startup_event_id is None:
+        if (
+            (self.mode is OperationMode.LIVE and self.technical_canary_quote_gap_seconds is None)
+            or first is None
+            or self._startup_event_id is None
+        ):
             return False
         if issue.code == "partial_bucket":
             return issue.timestamp == first and issue.record_id == self._startup_event_id
@@ -837,7 +955,7 @@ class RuntimeCoordinator:
         operational state. Product sessions can persist it beside their own
         snapshot and cursor without reaching into processor internals.
         """
-        return {
+        state = {
             "runtime_checkpoint_version": 1,
             "processor": self.processor.checkpoint(),
             "config_hash": self.config.config_hash,
@@ -862,6 +980,9 @@ class RuntimeCoordinator:
                 "last_checkpoint_at": _jsonable(self._last_checkpoint_at),
             },
         }
+        if self.technical_canary_quote_gap_seconds is not None:
+            state[_TECHNICAL_CANARY_GAP_KEY] = self.technical_canary_quote_gap_seconds
+        return state
 
     def restore_state(self, snapshot: Mapping[str, Any] | str) -> None:
         """Restore detector and coordinator state after validating identity."""
@@ -874,6 +995,7 @@ class RuntimeCoordinator:
         payload = snapshot.get("state", snapshot)
         if not isinstance(payload, Mapping):
             raise ValueError("state de coordinador inválido")
+        self._validate_technical_canary_snapshot(payload)
         analysis_id = payload.get("analysis_id")
         if analysis_id is not None and str(analysis_id) != self.analysis_id:
             raise ValueError("analysis_id del checkpoint no coincide")
@@ -1118,6 +1240,8 @@ class RuntimeCoordinator:
 
     def _operational_blocked_reasons(self) -> list[str]:
         blocked = list(self.external_blocked_reasons)
+        if self.technical_canary_quote_gap_seconds is not None:
+            blocked.append("technical_canary_signals_disabled")
         # Operational state is a separate gate from historical processor
         # issues: a socket/reconciliation/freshness failure remains blocking
         # until the adapter explicitly resolves it.

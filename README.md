@@ -36,12 +36,14 @@ Los launchers de usuario quedaron instalados en
 se probaron desde un cwd ajeno, con HOME/XDG/TMP aislados. El segundo usa sólo una referencia
 privada de credenciales: ningún valor secreto está en el repositorio.
 El portal de Spotware muestra **MTF Lab: Active**, con callback local configurado;
-esto es un estado administrativo y no autorización de trading. La lectura DEMO
-usa la autorización `accounts` existente. No hay autorización de trading ni
-órdenes. El histórico `201910` sigue rechazado: una nueva descarga oficial
-devolvió exactamente los mismos bytes inválidos. La prueba del sábado recibió
-precios del viernes; no prueba una avería del feed ni ausencia de credenciales.
-La frescura debe observarse en una sesión de mercado abierta.
+esto es un estado administrativo y no una autorización amplia de trading. La
+lectura DEMO usa la autorización `accounts` existente. El servidor DEMO concedió
+`TRADING` únicamente para la cuenta aprobada (sufijo `5097`) y el alcance VIEW
+original permanece intacto; aún hay 0 órdenes. El histórico `201910` sigue
+rechazado: una nueva descarga oficial devolvió exactamente los mismos bytes
+inválidos. La prueba del sábado recibió precios del viernes; no prueba una
+avería del feed ni ausencia de credenciales. La frescura debe observarse en una
+sesión de mercado abierta.
 
 **La campaña fue reanudada por Víctor el 2026-09-13 mediante una instrucción
 humana explícita.** El [handoff de pausa](docs/handoffs/2026-09-13-market-evidence-pause.md)
@@ -66,6 +68,13 @@ descriptiva estricta de los 11 meses válidos de 2019 (`201901–201909`,
 incluir `201910`; su receipt consolidado es
 `runtime/market-evidence/qa-descriptive-2019-valid-months-20260919T133407Z.json`
 (SHA-256 `1624c41736b423f334fa447d8b40545f7fa1df2701bbc76aebcb9994a94dbeab`).
+El piloto `tp_fast_v1` cubrió la semana 2016-03-07→14 con 499,804 cotizaciones
+por escenario: seis cierres base `2W/4L` dieron `net=-0.64 USD` de modelo,
+el escenario `adverse14` `net=-1.73` y `extreme14` `net=-2.20`; cada ventana expirada
+conservó un intent `UNKNOWN`. El resultado no se acepta globalmente: los costes
+son de modelo explícito, no cargos históricos observados, y no demuestra
+rentabilidad ni selección. El V17 previo tuvo 0 `RiskExit` fills evaluables;
+2017–2019 conserva sólo QA descriptivo, sin estrategia.
 No abrió WF/holdout ni evaluó estrategia. El
 backtest anual V17 terminó en modo
 `COMPLETED_DEVELOPMENT_REVIEW_ONLY`: procesó 19,026,438 cotizaciones y conserva
@@ -209,7 +218,27 @@ La ventana bounded vigente cubre 60/60 barras M1 nativas, `COMPLETE`/`CONTINUOUS
 y cero gaps. Esa cobertura sólo cierra la ventana solicitada: el `has_more=true`
 de la consulta fuente no se convierte en histórico completo y la captura no
 acredita frescura live, BBO, ejecución ni rentabilidad. Los launchers instalados
-usan una referencia privada de credenciales y no habilitan trading.
+usan una referencia privada de credenciales; el launcher de consulta no habilita
+trading y la canaria de software permanece `STAGED`.
+
+### Autorización de canaria técnica DEMO — 2026-09-21
+
+Víctor aprobó una canaria manual acotada para EUR/USD en la cuenta DEMO de sufijo
+`5097`, el lunes 2026-09-21 de 09:00 a 09:20 hora de México (inicio 15:00 UTC):
+dos ciclos independientes: primero 1 BUY y su cierre, después 1 SELL y su
+cierre, hasta 1,000 unidades (0.01 lot), una sola posición, SL de 1.5 ATR, TP de
+3 ATR, riesgo planeado de hasta 0.05% por ciclo, stop de prueba de 0.1% del
+equity, holding de hasta 300 s y cuatro mutaciones nominales (máximo seis).
+El alcance `TRADING` fue concedido por el servidor DEMO sólo para esa cuenta; no
+se repite OAuth ni se cambia la cuenta seleccionada, pero cada conexión exige
+discovery fresco de lectura y verificación de esa cuenta. Esto no autoriza REAL,
+estrategia, operación continua, extensión automática ni reintento de un resultado
+ambiguo. Es un gate técnico previo a cualquier histórico completo o ventana de 72
+horas, no una selección de estrategia. La canaria de software
+permanece `STAGED`, no instalada,
+y la automatización aún no está creada; se planifica un heartbeat nativo una vez
+que el software sea aceptado, sólo para esta ventana y sin extenderla. No se
+afirma ejecución hasta observarla.
 
 ### Antecedente: validación conectada DEMO de sólo lectura — 2026-09-14
 
@@ -305,17 +334,24 @@ compacto es
 La lista queda limitada a hechos, decisiones y autorizaciones externas:
 
 1. La observación administrativa del 2026-09-19 muestra `Active` y el callback
-   local correcto, sustituyendo `Submitted` como estado vigente. Esto no
-   autoriza trading. La ruta DEMO de sólo lectura `accounts` ya está verificada.
+   local correcto, sustituyendo `Submitted` como estado vigente. El servidor DEMO
+   concedió `TRADING` sólo para la cuenta aprobada (sufijo `5097`), sin órdenes;
+   esto no autoriza REAL ni amplía el alcance de la canaria manual.
 2. Verificar frescura, continuidad y calentamiento en una sesión de mercado
    abierta; la ventana bounded 60/60 y la consulta fuente `has_more=true` no
    acreditan por sí mismas una serie completa ni frescura live.
 3. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo;
-   la lectura administrativa y de catálogo no constituye permiso de ejecución.
-4. Resolver las condiciones contractuales de Pepperstone relevantes para
+   la lectura administrativa y de catálogo no sustituye la reconciliación de la
+   canaria técnica.
+4. Promover e instalar el software de canaria `STAGED` sólo para la ventana y
+   límites aprobados, y ejecutar manualmente dos ciclos independientes: 1 BUY y
+   cierre, después 1 SELL y cierre. La automatización aún no está creada; se
+   planifica un heartbeat nativo una vez que el software sea aceptado. No se
+   extiende la ventana ni se reintenta un resultado ambiguo.
+5. Resolver las condiciones contractuales de Pepperstone relevantes para
    México, almacenamiento/redistribución de datos y costes. Una especificación
    de costes no equivale a cargos observados.
-5. Sólo después evaluar resistencia, shadow/72 horas y cualquier canary DEMO
+6. Sólo después evaluar resistencia, shadow/72 horas y cualquier canary DEMO
    con autorización separada de cuenta, símbolo, volumen, ventana y límites.
 
 La validación conectada actual no autoriza ejecución. Pepperstone no está

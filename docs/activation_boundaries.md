@@ -57,6 +57,12 @@ market data y ejecución DEMO con persistencia/reconciliación. La composición 
 prueba localmente con credenciales ficticias y gateway controlado; sus pruebas
 no constituyen una sesión autorizada de cTrader.
 
+En el estado vigente, el servidor DEMO concedió el alcance `TRADING` únicamente
+para la cuenta aprobada (sufijo `5097`) y la ruta VIEW original permanece intacta.
+Esto prueba el alcance administrativo/técnico observado, no una ejecución: hay
+0 órdenes y la canaria de software sigue `STAGED`, sin instalación ni
+automatización creada.
+
 Lo no observado offline es el resultado que debe devolver el servidor real:
 permisos y entorno de la cuenta, símbolos habilitados, escalas, límites de volumen,
 negociación, horarios, spread/comisiones/conversiones, aceptación/rechazo,
@@ -64,33 +70,50 @@ fills, posiciones e historia. Un timeout ambiguo permanece `UNKNOWN` y exige
 reconciliación: no autoriza un reenvío automático. Ausencia en una respuesta no
 se convierte en certeza de que una orden nunca existió.
 
-### C — INTERVENCIÓN DEL USUARIO PENDIENTE
+### C — CANARIA DEMO ACOTADA Y GATES EXTERNOS
 
 La lectura DEMO de sólo lectura con OAuth y alcance `accounts` ya fue observada
-en el estado vigente. No se reabren OAuth, discovery ni selección de cuenta para
-esta fase. Los gates externos que permanecen son:
+en el estado vigente. El usuario aprobó una canaria manual para EUR/USD en la
+cuenta DEMO de sufijo `5097`, el lunes 2026-09-21 de 09:00 a 09:20 hora de
+México (inicio 15:00 UTC): dos ciclos independientes, primero 1 BUY y su cierre,
+después 1 SELL y su cierre, hasta 1,000 unidades (0.01 lot), una sola posición,
+SL de 1.5 ATR, TP de 3 ATR, riesgo de hasta 0.05% por
+ciclo, stop de prueba de 0.1% del equity, holding de hasta 300 s y cuatro
+mutaciones nominales (máximo seis). El servidor concedió `TRADING` DEMO sólo para
+esa cuenta; no se repite OAuth ni se cambia la cuenta seleccionada, pero cada
+conexión exige discovery fresco de lectura y verificación de esa cuenta. Los
+gates que permanecen son:
 
-1. Obtener y verificar cualquier aprobación adicional de aplicación/scope que
-   sea necesaria para ejecución DEMO; no se ha solicitado `trading`.
+1. Promover e instalar el software de la canaria, que permanece `STAGED`, sólo
+   para la ventana y límites aprobados. La automatización aún no está creada; se
+   planifica un heartbeat nativo una vez que el software sea aceptado. No se
+   extiende la ventana ni se reintenta un resultado ambiguo.
 2. Verificar catálogo, límites y condiciones reales del bróker para la
    cuenta/símbolo, sin convertir una plantilla local en autorización.
-3. Autorizar y verificar la ruta contra el servidor **DEMO**, incluidos
-   ejecución, reconciliación, operación continua y forward. El gate offline no
-   ejecuta este paso.
+3. Ejecutar y reconciliar dos ciclos independientes contra el servidor **DEMO**:
+   primero 1 BUY y cierre, después 1 SELL y cierre. Esta
+   autorización no abre estrategia, operación continua, forward, extensión
+   automática, REAL ni LIVE; el gate offline no ejecuta este paso.
 4. Confirmar condiciones contractuales de Pepperstone relevantes para México,
    uso/almacenamiento/redistribución de datos y costes. No se declara validación
-   contractual ni se recomienda contratar en función de los sintéticos.
+   contractual ni se recomienda contratar en función de los sintéticos; una
+   especificación de costes no equivale a cargos observados.
 
-La lista C contiene hechos, decisiones y autorizaciones externos, no tareas de
-programación diferidas. No se solicitan secretos ni se inicia autenticación como
-parte de la reproducción offline.
+La lista C contiene una acción técnica acotada y hechos, decisiones o
+autorizaciones externos, no una apertura general de trading. No se solicitan
+secretos ni se inicia autenticación como parte de la reproducción offline.
 
 ## Límites que no se levantan al aprobar el gate
 
-- El gate no inicia OAuth, consulta cuentas ni abre conexiones al bróker.
+- La reproducción del gate offline no inicia OAuth, consulta cuentas ni abre
+  conexiones al bróker.
 - No usa stores del usuario ni credenciales reales; HOME/XDG/SQLite se aíslan.
 - Los eventos de ejecución de las fixtures son **sintéticos**, no operaciones.
 - La ruta **REAL/LIVE sigue rechazada fail-closed** y no forma parte de esta entrega.
+- La concesión técnica `TRADING` DEMO sólo cubre la cuenta y ventana aprobadas;
+  el software sigue `STAGED`; la automatización aún no está creada y se planifica
+  un heartbeat nativo sólo después de aceptar el software. No habilita extensión
+  o reintento.
 - Una cuenta etiquetada localmente como DEMO no basta: la ruta externa exige
   evidencia de sesión, identidad, generación, entorno y permisos observados.
 - Los fixtures no demuestran rentabilidad, rendimiento futuro, tarifas vigentes

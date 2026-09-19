@@ -132,6 +132,18 @@ class ControlledClient:
         )
 
 
+class SequencedResponseClient(ControlledClient):
+    """Controlled gateway whose local receive metadata advances per response."""
+
+    def __init__(self, response_times: list[datetime]) -> None:
+        super().__init__()
+        self.response_times = iter(response_times)
+
+    def request_message(self, message: object, *, client_msg_id: str, timeout_seconds: float) -> WireMessage:
+        self.response_at = next(self.response_times)
+        return super().request_message(message, client_msg_id=client_msg_id, timeout_seconds=timeout_seconds)
+
+
 class Provider:
     def __init__(self, client: ControlledClient) -> None:
         self.client = client
@@ -267,6 +279,97 @@ class CTraderAccountRiskTests(unittest.TestCase):
         self.assertFalse(changed.fresh)
         self.assertIn("connection_generation_changed", changed.reasons)
         self.assertIsNone(changed.to_executor_kwargs()["equity"])
+
+    def test_default_clock_uses_terminal_instant_after_multiple_responses(self) -> None:
+        response_times = [NOW + timedelta(seconds=offset) for offset in (0.10, 0.25, 0.50, 0.75)]
+        client = SequencedResponseClient(response_times)
+        clock_times = iter((NOW, NOW + timedelta(seconds=1)))
+        observer = AccountRiskObserver(
+            Provider(client),
+            proto=proto,
+            clock=lambda: next(clock_times),
+            max_age_seconds=5,
+        )
+
+        snapshot = observer.observe()
+
+        self.assertTrue(snapshot.fresh)
+        self.assertTrue(snapshot.complete)
+        self.assertEqual(snapshot.observed_at, response_times[-1])
+        self.assertEqual(snapshot.day_end, NOW + timedelta(seconds=1))
+
+    def test_explicit_now_rejects_a_real_future_response_and_does_not_sample_clock(self) -> None:
+        self.client.response_at = NOW + timedelta(seconds=1)
+        clock_calls = []
+
+        def unexpected_clock_call():
+            clock_calls.append(True)
+            raise AssertionError("explicit now must bind the caller's reference")
+
+        observer = AccountRiskObserver(
+            self.provider,
+            proto=proto,
+            clock=unexpected_clock_call,
+            max_age_seconds=5,
+        )
+        snapshot = observer.observe(now=NOW)
+
+        self.assertFalse(snapshot.fresh)
+        self.assertIn("response_stale:-1.000", snapshot.reasons)
+        self.assertEqual(clock_calls, [])
+
+    def test_default_clock_crossing_utc_midnight_does_not_relabel_prior_day_data(self) -> None:
+        before_midnight = datetime(2026, 9, 13, 23, 59, 59, 500000, tzinfo=UTC)
+        after_midnight = datetime(2026, 9, 14, 0, 0, 0, 500000, tzinfo=UTC)
+        self.client.response_at = before_midnight + timedelta(milliseconds=100)
+        clock_times = iter((before_midnight, after_midnight))
+        observer = AccountRiskObserver(
+            self.provider,
+            proto=proto,
+            clock=lambda: next(clock_times),
+            max_age_seconds=5,
+        )
+
+        snapshot = observer.observe()
+
+        self.assertFalse(snapshot.fresh)
+        self.assertIn("utc_day_changed_during_observation", snapshot.reasons)
+        self.assertEqual(snapshot.day_start, datetime(2026, 9, 13, tzinfo=UTC))
+        self.assertEqual(snapshot.day_end, before_midnight)
+        self.assertIsNone(snapshot.equity)
+
+    def test_default_clock_marks_excessive_terminal_age_stale(self) -> None:
+        self.client.response_at = NOW + timedelta(seconds=0.1)
+        clock_times = iter((NOW, NOW + timedelta(seconds=6)))
+        observer = AccountRiskObserver(
+            self.provider,
+            proto=proto,
+            clock=lambda: next(clock_times),
+            max_age_seconds=5,
+        )
+
+        snapshot = observer.observe()
+
+        self.assertFalse(snapshot.fresh)
+        self.assertIn("response_stale:5.900", snapshot.reasons)
+        self.assertIsNone(snapshot.equity)
+
+    def test_default_clock_regression_is_not_clamped_into_freshness(self) -> None:
+        self.client.response_at = NOW - timedelta(seconds=0.25)
+        clock_times = iter((NOW, NOW - timedelta(seconds=0.5)))
+        observer = AccountRiskObserver(
+            self.provider,
+            proto=proto,
+            clock=lambda: next(clock_times),
+            max_age_seconds=5,
+        )
+
+        snapshot = observer.observe()
+
+        self.assertFalse(snapshot.fresh)
+        self.assertIn("observation_clock_regressed", snapshot.reasons)
+        self.assertIn("response_stale:-0.250", snapshot.reasons)
+        self.assertIsNone(snapshot.equity)
 
     def test_day_and_generation_are_cache_boundaries(self) -> None:
         observer = AccountRiskObserver(self.provider, proto=proto, clock=lambda: NOW)

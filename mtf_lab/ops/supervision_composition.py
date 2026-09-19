@@ -229,6 +229,7 @@ def prepare_network_supervision(args: Any) -> NetworkPreparation | CommandResult
     mode = str(getattr(args, "mode", "observe")).strip().lower()
     activate = bool(getattr(args, "activate", False))
     execution_requested = mode == "demo" and activate
+    defer_binding = bool(getattr(args, "defer_binding", False))
     query_context = service._prepare_query(args, execution=execution_requested)
     if isinstance(query_context, CommandResult):
         return query_context
@@ -247,7 +248,7 @@ def prepare_network_supervision(args: Any) -> NetworkPreparation | CommandResult
         provider.subscribe(timeframes=())
         account_id = int(query_context.profile.account_id)
         callbacks: Any | None = None
-        if execution_requested:
+        if execution_requested and not defer_binding:
             from .supervision_demo import build_demo_execution_binding
 
             binding = build_demo_execution_binding(

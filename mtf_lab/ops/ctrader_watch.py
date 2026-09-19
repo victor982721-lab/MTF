@@ -86,14 +86,22 @@ class CTraderWatchOptions:
     resume: bool = True
     max_candles: int | None = 5_000
     mode: str | None = None
+    technical_canary_quote_gap_seconds: float | None = None
 
     def __post_init__(self) -> None:
-        for name in ("duration_seconds", "idle_timeout_seconds", "poll_timeout_seconds"):
+        for name in (
+            "duration_seconds",
+            "idle_timeout_seconds",
+            "poll_timeout_seconds",
+            "technical_canary_quote_gap_seconds",
+        ):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not math.isfinite(float(value)) or float(value) < 0):
                 raise ValueError(f"{name} debe ser finito y no negativo")
         if self.poll_timeout_seconds <= 0:
             raise ValueError("poll_timeout_seconds debe ser positivo")
+        if self.technical_canary_quote_gap_seconds is not None and self.technical_canary_quote_gap_seconds <= 0:
+            raise ValueError("technical_canary_quote_gap_seconds debe ser positivo")
         for name in ("max_events", "checkpoint_every", "max_candles"):
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or int(value) <= 0):
@@ -393,7 +401,13 @@ def _apply_quote_quality(metadata: dict[str, Any]) -> None:
         metadata["quality_reasons"] = list(dict.fromkeys(reasons))
 
 
-def _decorate_record(record: Event | Bar, metadata: _WatchMetadata, raw_synthetic: bool) -> Event | Bar:
+def _decorate_record(
+    record: Event | Bar,
+    metadata: _WatchMetadata,
+    raw_synthetic: bool,
+    *,
+    technical_quote_mode: bool = False,
+) -> Event | Bar:
     if raw_synthetic != metadata.synthetic:
         raise CTraderWatchError("la etiqueta synthetic del protocolo no coincide con el contexto de procedencia")
     record_metadata = {
@@ -407,6 +421,11 @@ def _decorate_record(record: Event | Bar, metadata: _WatchMetadata, raw_syntheti
         "network_performed": metadata.network_performed,
         "execution_enabled": False,
     }
+    # A normalized SpotEvent with both legs is a quote at the core translation
+    # boundary.  Strict/default coverage is unchanged; the marker is consumed
+    # only by the opted-in continuous quote contract.
+    if technical_quote_mode and isinstance(record, Event) and record.bid is not None and record.ask is not None:
+        record_metadata.setdefault("event_kind", "quote")
     # Provider adapters expose a human-readable source quality label.  The
     # runtime's ``quality`` key is reserved for the typed DataQuality contract;
     # preserve the source label under the established non-blocking name.
@@ -1030,6 +1049,14 @@ class CTraderWatchRunner:
         session_id = self._session_id()
         self._load_previous_checkpoint(session_id)
         dataset_hash = f"ctrader-watch:{self.semantic_identity}"
+        technical_gap = (
+            self.options.technical_canary_quote_gap_seconds
+            if self.context.provenance.get("manual_technical") is True
+            else None
+        )
+        coordinator_kwargs: dict[str, Any] = {}
+        if technical_gap is not None:
+            coordinator_kwargs["technical_canary_quote_gap_seconds"] = technical_gap
         self._coordinator = RuntimeCoordinator(
             self.context.store,
             session_id,
@@ -1049,6 +1076,7 @@ class CTraderWatchRunner:
                 "environment": self.metadata.environment,
                 "synthetic": self.metadata.synthetic,
             },
+            **coordinator_kwargs,
         )
         if self.context.paper_enabled:
             self._paper = _WatchPaper(
@@ -1332,7 +1360,15 @@ class CTraderWatchRunner:
 
     def _process_record(self, record: Event | Bar, raw_synthetic: bool) -> bool:
         self._last_record_signals = ()
-        decorated = _decorate_record(record, self.metadata, raw_synthetic)
+        decorated = _decorate_record(
+            record,
+            self.metadata,
+            raw_synthetic,
+            technical_quote_mode=(
+                self.context.provenance.get("manual_technical") is True
+                and self.options.technical_canary_quote_gap_seconds is not None
+            ),
+        )
         self._last_decorated_record = decorated
         self._recover_after_quote(decorated)
         basis = str(self.context.config.price_base).strip().lower()

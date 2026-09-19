@@ -23,8 +23,9 @@ EUR/USD y consultó un catálogo de 1,940 símbolos. La consulta del launcher
 conservó 10,000 barras M1 en 20 páginas, pero la fuente indicó `has_more=true`:
 la captura es `PARTIAL`, no una cobertura histórica completa; no contiene bid/ask
 ni fills. La ventana bounded separada cubre 60/60 barras M1 nativas,
-`COMPLETE`/`CONTINUOUS` y cero gaps. Ninguno de estos hechos acredita frescura
-live, BBO ni autorización de trading.
+`COMPLETE`/`CONTINUOUS` y cero gaps. Estos hechos de datos no acreditan frescura
+live, BBO ni ejecución; el alcance `TRADING` concedido por el servidor DEMO para
+la cuenta aprobada se documenta en la canaria técnica siguiente.
 La ausencia de variables de entorno en un doctor lanzado sin inyección no
 significa que falten credenciales privadas. El watch del sábado recibió cuatro
 eventos cuya última marca era del viernes `2026-09-18T20:54:52.956Z`; se
@@ -37,6 +38,26 @@ credenciales; ningún valor secreto está en el repositorio y no inicia OAuth ni
 acepta scopes de trading.
 El [estado operativo](operational_status.md) separa los subgates administrativos,
 de datos, económicos y de autorización.
+
+### Autorización de canaria técnica DEMO — 2026-09-21
+
+Víctor aprobó una canaria manual acotada para EUR/USD en la cuenta DEMO de sufijo
+`5097`, el lunes 2026-09-21 de 09:00 a 09:20 hora de México (inicio 15:00 UTC):
+dos ciclos independientes: primero 1 BUY y su cierre, después 1 SELL y su
+cierre, hasta 1,000 unidades (0.01 lot), una sola posición, SL de 1.5 ATR, TP de
+3 ATR, riesgo planeado de hasta 0.05% por ciclo, stop de prueba de 0.1% del
+equity, holding de hasta 300 s y cuatro mutaciones nominales (máximo seis).
+El servidor DEMO concedió `TRADING` únicamente para esa cuenta; la ruta VIEW
+original permanece intacta. Esta autorización técnica no amplía a REAL, estrategia,
+operación continua, extensión automática ni reintento de un resultado ambiguo. Es
+un gate previo a cualquier histórico completo o ventana de 72 horas, no una
+selección de estrategia. No se repite OAuth ni se cambia la cuenta seleccionada;
+cada conexión debe completar discovery fresco de lectura y verificar esa cuenta.
+
+El software de la canaria permanece `STAGED` y no está instalado; la automatización
+aún no está creada y se planifica un heartbeat nativo una vez que el software sea
+aceptado, sólo para esta ventana y sin extenderla. Todavía no hay órdenes ni
+resultado de ejecución observado.
 
 ### Antecedente: validación DEMO conectada de sólo lectura — 2026-09-14
 
@@ -323,29 +344,37 @@ redistribución ni observación de mercado real.
 El código y los contratos para autenticación de aplicación, descubrimiento de
 cuentas, selección DEMO explícita, autorización de cuenta, catálogo/símbolo,
 market data y transporte DEMO están implementados y probados localmente. La
-prueba local no sustituye una respuesta de cTrader: quedan sin observar los
-permisos y entorno de la cuenta, símbolos habilitados, escalas, límites de
-volumen, horarios, spreads, comisiones, conversiones, fills, posiciones,
-historia y respuestas de aceptación/rechazo. Un timeout ambiguo permanece
-`UNKNOWN` y exige reconciliación; no autoriza reintentar una orden.
+prueba local no sustituye una respuesta de cTrader: para la canaria ya se observó
+el alcance `TRADING` DEMO de la cuenta aprobada, pero quedan por observar las
+escalas, límites de volumen, horarios, spreads, comisiones, conversiones, fills,
+posiciones, historia y respuestas de aceptación/rechazo efectivos. Un timeout
+ambiguo permanece `UNKNOWN` y exige reconciliación; no autoriza reintentar una
+orden.
 
-La ejecución externa permanece deshabilitada y **REAL/LIVE se rechaza
-fail-closed**. Ningún fixture prueba que una orden haya llegado a un servidor.
+El alcance `TRADING` DEMO está concedido sólo para la cuenta aprobada, pero la
+ejecución de la canaria aún no se observa: el software permanece `STAGED` y no
+instalado. **REAL/LIVE se rechaza fail-closed** y ningún fixture prueba que una
+orden haya llegado a un servidor.
 
 ### Pendientes externos vigentes — 2026-09-19
 
 La aplicación `Active`, la autorización `accounts`, la cuenta DEMO seleccionada,
 el discovery de 1,940 símbolos y la lectura bounded 60/60 ya fueron observados.
-Son permisos y hechos de lectura; no autorizan trading ni REAL/LIVE.
+El servidor DEMO concedió `TRADING` sólo para la cuenta aprobada (sufijo `5097`);
+no hay órdenes y esa autorización no se extiende a REAL/LIVE.
 
 1. Observar frescura, continuidad y calentamiento en una sesión de mercado
    abierta; la consulta fuente mantiene `has_more=true` y la ventana bounded no
    convierte el histórico completo en disponible.
 2. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo.
-3. Obtener cualquier autorización/scope separado que sea necesario para trading
-   DEMO y verificar ejecución, reconciliación, operación continua y forward. No
-   hay autorización de trading ni se inicia esa ruta en esta fase.
-4. Confirmar las condiciones contractuales de Pepperstone aplicables a México,
+3. Promover e instalar el software de canaria `STAGED` sólo para la ventana y
+   límites aprobados, y ejecutar manualmente dos ciclos independientes: 1 BUY y
+   cierre, después 1 SELL y cierre. La automatización aún no está creada; se
+   planifica un heartbeat nativo una vez que el software sea aceptado. No se
+   extiende la ventana ni se reintenta un resultado ambiguo.
+4. Verificar ejecución y reconciliación de esa canaria sin convertirla en
+   estrategia, operación continua ni forward.
+5. Confirmar las condiciones contractuales de Pepperstone aplicables a México,
    almacenamiento/redistribución de datos y costes; una especificación de costes
    no equivale a cargos observados.
 

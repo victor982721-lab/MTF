@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# Application values are read only by the bridge and only with --network.
+unset PYTHONHOME PYTHONPATH PYTHONSTARTUP PYTHONWARNINGS PYTHONINSPECT PYTHONUSERBASE PYTHONEXECUTABLE
+exec /usr/bin/python3 -I -B "$ROOT/tools/demo_canary_launcher.py" "$@"

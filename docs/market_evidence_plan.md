@@ -15,6 +15,27 @@ conservan consentimientos válidos existentes; las fases externas requieren su
 cuenta, política, ventana y límites inequívocos. REAL y fondos reales excluidos.
 No hay compras, cloud, suscripciones nuevas ni GitHub Actions.
 
+### Prioridad operativa aprobada — 2026-09-19
+
+Víctor aprobó priorizar la preparación de una **prueba técnica DEMO acotada** y
+continuar la evaluación histórica en paralelo. La primera entrega operativa debe
+comprobar entrada, protección, cierre y conciliación en un solo perfil, no sumar
+los seis candidatos ni presentar QA del software como rendimiento de estrategia.
+La prueba técnica no selecciona una estrategia por rentabilidad ni sustituye la
+campaña histórica, las 72 horas o la validación forward.
+
+Esta aprobación cambia la prioridad de preparación, **no habilita órdenes ni
+amplía scopes**. Antes de ejecutar se presentarán para aprobación específica la
+cuenta DEMO, EUR/USD, volumen, ventana y límites; se conservarán comprobaciones
+del servidor, cotización causal/fresca, calendario de toda la ventana, margen,
+costos previstos, stops, journal y conciliación. REAL sigue excluido.
+
+En el frente histórico se reutilizarán fuentes autorizadas y una ventana piloto
+pequeña antes de recalcular un año. Un contrato hipotético completo debe quedar
+versionado y distinguir costos modelados de cargos observados; nunca convierte
+datos actuales de DEMO en condiciones observadas de 2016. Los originales y V17
+permanecen intactos, el holdout cerrado y la elegibilidad DEMO separada.
+
 ## Decisiones y campaña congelable
 
 - EUR/USD inicial, dos familias y seis candidatos; no ampliar instrumentos ni
