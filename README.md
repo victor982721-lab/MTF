@@ -16,6 +16,21 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 
 ## Estado actual
 
+### Actualización operativa — 2026-09-19
+
+El [estado operativo y preservación](docs/operational_status.md) y su
+[receipt compacto versionado](reports/quality/mtf-operational-status-20260919.json)
+conservan los resultados actuales sin subir secretos, capturas ni corpus.
+Los 30 commits locales pendientes se publicaron por fast-forward en el remoto
+privado. El runtime instalado coincide con el paquete fuente validado y pasó
+1,037/1,037 pruebas, con cobertura de 79.912% de líneas y 63.297% de ramas.
+El portal de Spotware muestra **MTF Lab: Active**, con callback local configurado;
+la lectura DEMO usa la autorización `accounts` existente. No hay autorización de
+trading ni órdenes. El histórico `201910` sigue rechazado: una nueva descarga
+oficial devolvió exactamente los mismos bytes inválidos. La prueba del sábado
+recibió precios del viernes; no prueba una avería del feed ni ausencia de
+credenciales. La frescura debe observarse en una sesión de mercado abierta.
+
 **La campaña fue reanudada por Víctor el 2026-09-13 mediante una instrucción
 humana explícita.** El [handoff de pausa](docs/handoffs/2026-09-13-market-evidence-pause.md)
 conserva el punto anterior, los cambios sin commit, los artefactos y la ruta crítica;
@@ -256,9 +271,9 @@ compacto es
 
 La lista queda limitada a hechos, decisiones y autorizaciones externas:
 
-1. El portal conserva una observación administrativa histórica `Submitted`, no
-   `Approved`; no se usa para inferir autorización de trading. La ruta OAuth
-   DEMO de sólo lectura ya está verificada en el receipt anterior.
+1. La observación administrativa del 2026-09-19 muestra `Active` y el callback
+   local correcto, sustituyendo `Submitted` como estado vigente. Esto no
+   autoriza trading. La ruta OAuth DEMO de sólo lectura ya está verificada.
 2. La ventana bounded V22 satisface su cobertura acotada, pero la consulta
    fuente conserva `source_has_more=true`. El pipeline/reanudación local ya fue
    verificado sobre el raw existente; no presentar la consulta fuente como serie

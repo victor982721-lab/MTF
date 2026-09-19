@@ -10,6 +10,23 @@ producir un servidor autenticado.
 
 ## Estado actual
 
+### Verificación administrativa — 2026-09-19
+
+El portal `https://openapi.ctrader.com/apps` muestra **MTF Lab: Active**.
+La vista de configuración conserva `http://127.0.0.1:8767/oauth/callback`.
+La comprobación fue sólo lectura: no se modificó la aplicación, no se abrieron
+sus credenciales y no se amplió el scope. `Submitted` queda como antecedente
+del 12 de septiembre, no como bloqueo vigente de consulta.
+
+La canaria del 19 de septiembre autenticó DEMO con `SCOPE_VIEW`, seleccionó
+EUR/USD y consultó el catálogo. La ausencia de variables de entorno en un
+doctor lanzado sin inyección no significa que falten credenciales privadas.
+El watch del sábado recibió cuatro eventos cuya última marca era del viernes
+`2026-09-18T20:54:52.956Z`; se rechazaron como obsoletos y no hubo fills.
+Esta ventana no acredita frescura en mercado abierto ni una avería del servidor.
+El [estado operativo](operational_status.md) separa los subgates administrativos,
+de datos, económicos y de autorización.
+
 ### Validación DEMO conectada de sólo lectura — 2026-09-14
 
 El receipt privado, fuera del repositorio (SHA-256
