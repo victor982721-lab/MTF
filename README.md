@@ -25,8 +25,15 @@ La nueva [campaña histórica de evidencia](docs/market_evidence_plan.md) está 
 integración. Su [piloto real y límites](docs/market_pilot_status.md) registra
 la semana/mes descriptivos de marzo de 2016, distintos de los fixtures y de la
 entrega H0–H6. Se conserva el año 2016 completo de HistData (12 ZIPs y un
-manifiesto compuesto con 19,026,438 ticks); el piloto descriptivo documentado
-sigue siendo sólo marzo. El backtest anual V17 terminó en modo
+manifiesto compuesto con 19,026,438 ticks). Además, 2017 y 2018 están completos
+y validados: 2017 contiene 14,125,996 cotizaciones y 2018 contiene 18,393,327.
+En 2019 hay 11/12 meses válidos (`201901–201909`, `201911–201912`), con
+26,877,692 cotizaciones; `201910` está preservado, pero falla validación por
+una regresión de orden temporal y no se cuenta como válido. No existe todavía
+manifiesto anual de 2019 ni compuesto `2016–2019`. El piloto descriptivo
+documentado sigue siendo sólo marzo; el QA anual descriptivo de 2017 y 2018
+terminó sin red ni estrategia y conserva receipts JSON/HTML separados. El
+backtest anual V17 terminó en modo
 `COMPLETED_DEVELOPMENT_REVIEW_ONLY`: procesó 19,026,438 cotizaciones y conserva
 un receipt terminal; la auditoría de terminalidad quedó en
 `runtime/market-evidence/development-2016-v17-terminal-audit-20260917.json`;
@@ -36,7 +43,10 @@ cotizaciones sobre el manifiesto 2016; midió 45:42 de pared y RSS máximo de
 263,488 KiB con la cadencia durable de 65,536 cotizaciones, sin selección,
 promoción ni conclusión económica.
 La ingesta puede componer particiones mensuales de desarrollo 2016–2019
-sin mezclar bytes ni saltarse meses.
+sin mezclar bytes ni saltarse meses. La adquisición validada de 2017 y 2018 no
+abre WF 2020–2023: todavía no hay datos WF ni consumidor productivo habilitado.
+La partición inválida de 2019 se conserva sin corregir, ordenar artificialmente
+ni relabelar.
 Los costes y la cobertura aún no permiten una conclusión de ventaja neta;
 ningún resultado descriptivo habilita órdenes ni abre el holdout reservado.
 El backtest ya enlaza un guard de identidad y un plano compartido de datos;

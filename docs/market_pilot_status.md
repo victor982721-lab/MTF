@@ -1,6 +1,6 @@
 # Piloto histórico — estado y límites de la evidencia
 
-Verificado el 2026-09-17. Este registro distingue resultados descriptivos
+Verificado el 2026-09-18. Este registro distingue resultados descriptivos
 intermedios, implementación, validación de una release y operación externa.
 No hay todavía una estrategia seleccionada ni evidencia de ventaja neta.
 
@@ -12,11 +12,12 @@ gates descritos.
 
 ## Datos reales conservados
 
-HistData EUR/USD, Generic ASCII Tick Bid/Ask, enero–diciembre de 2016. Se conserva
-el timestamp EST fijo original y su transformación UTC (+5 horas), sin
-corregirlo para hacer coincidir un calendario. El piloto descriptivo documentado
-en este archivo sigue siendo sólo marzo: su contenedor mensual contiene
-1,979,243 ticks y la ventana del 7 al 14 de marzo UTC selecciona 499,804.
+HistData EUR/USD, Generic ASCII Tick Bid/Ask, con 2016 completo, 2017 y 2018
+completos, y 11 de 12 meses válidos de 2019. Se conserva el timestamp EST fijo
+original y su transformación UTC (+5 horas), sin corregirlo para hacer coincidir
+un calendario. El piloto descriptivo documentado en este archivo sigue siendo
+sólo marzo de 2016: su contenedor mensual contiene 1,979,243 ticks y la ventana
+del 7 al 14 de marzo UTC selecciona 499,804.
 
 - Manifiesto: `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-201603.json`.
 - Raw: 10,160,571 bytes; SHA-256 `8357ef823ac27d9c53da9acff6f79b6e8fc058cea9fdf8f32be08bf06dbe3e1b`.
@@ -58,16 +59,42 @@ en este archivo sigue siendo sólo marzo: su contenedor mensual contiene
   La auditoría de terminalidad, offsets, artefactos y registry está en
   `runtime/market-evidence/development-2016-v17-terminal-audit-20260917.json`,
   SHA-256 `920c18ced374bb4dee8ec4d53f1f84083de6946510dc156bee76b240cd2d6122`.
-- No se han adquirido años 2017–2019 ni abierto la reserva 2024–2025.
+- 2017 está completo y validado: 12/12 meses, 14,125,996 cotizaciones. Su
+  manifiesto anual es
+  `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-2017.json`.
+- 2018 está completo y validado: 12/12 meses, 18,393,327 cotizaciones. Su
+  manifiesto anual es
+  `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-2018.json`.
+- 2019 tiene 11/12 meses válidos (`201901–201909`, `201911–201912`), con
+  26,877,692 cotizaciones. `201910` no se cuenta como válido.
+- El raw de `201910` se conserva sin sobrescribir ni corregir en
+  `/home/winterboss/.local/share/mtf-lab/market-data/raw/HISTDATA_COM_ASCII_EURUSD_T_201910.zip`
+  (SHA-256
+  `fd4d1765b95b592ebee9e2c3e03a2a8bf973796257bb20ea327a3dad63bde5f1`), pero
+  falla por `source order violation at sequence 1929387`.
+- No existe manifiesto anual de 2019 ni manifiesto compuesto `2016–2019`.
+- El holdout 2024–2025 permanece cerrado.
+- El inventario físico agregado actual de HistData/Dukascopy cuenta 49 archivos y
+  435,790,724 bytes, con proyección dentro de 40 GiB y reserva libre superior al
+  20%. Receipt vigente:
+  `runtime/market-evidence/storage-budget-live-20260919T013007Z.json`.
+- El QA descriptivo estricto de 2017 y 2018 terminó sin incidencias, sin red ni
+  estrategia: 14,125,996 y 18,393,327 cotizaciones, respectivamente. El receipt
+  consolidado es
+  `runtime/market-evidence/qa-descriptive-2017-2018-20260919T034200Z.json`; los
+  reportes JSON/HTML y sus hashes están bajo
+  `/home/winterboss/.local/state/mtf-lab/research/market-structure/`.
+- La anomalía de `201910` quedó documentada sin alterar bytes en
+  `runtime/market-evidence/histdata-201910-source-order-block-20260919T034708Z.json`:
+  el ZIP tiene 2,275,024 filas y el bloque repetido contiene 1,236 filas idénticas.
 
-El contrato de lectura ya acepta una composición explícita de particiones
+El contrato de lectura acepta una composición explícita de particiones
 mensuales contiguas 2016–2019 (`manifest_from_histdata_archives`), con identidad
 por mes/ruta/hash, orden global y rechazo de gaps, colisiones y meses de
-holdout. Las páginas oficiales de HistData listan los 12 meses de 2016–2019 y
-el API de adquisición expone `acquire_month(year, month, terms_accepted=True)`;
-el formulario oficial fue enviado con `terms_accepted=True` para las 12
-particiones 2016 y cada ZIP quedó validado; no se han descargado años posteriores
-en esta fase.
+holdout. La composición anual de 2017 y 2018 quedó validada. La composición
+2019 y el compuesto `2016–2019` permanecen cerrados hasta resolver `201910`;
+no se desplazan timestamps, no se ordenan artificialmente los registros y no
+se relabela el raw inválido como válido.
 La FAQ no fija derechos de redistribución/retención: los futuros raw se
 mantienen locales y privados hasta aclaración escrita, sin FTP/SFTP de pago.
 
@@ -470,8 +497,10 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
    `development-2016-full-v17` quedó verificada en el receipt indicado arriba;
    no repetirla ni iniciar otra campaña pesada en paralelo. El gate global
    offline y la reconstrucción/promoción controlada del runtime ya quedaron
-   verificados en los receipts finales; sólo queda ampliar por meses contiguos
-   hacia 2017–2019 cuando sus gates lo permitan. WF 2020–2023
+   verificados en los receipts finales; 2017 y 2018 ya están ampliados,
+   validados y descritos, y 2019 permanece incompleto por la partición inválida
+   `201910`. El gate global actual sobre el árbol posterior todavía debe
+   ejecutarse antes de tratarlo como una release. WF 2020–2023
    necesita antes un contrato/fuente separado; el contrato y la fixture offline
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.
