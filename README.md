@@ -64,7 +64,12 @@ y receipts fail-closed; la fixture offline `WARMUP_ONLY → WF` con reanudación
 byte-equivalente ya está validada en
 `runtime/market-evidence/wf-warmup-resume-fixture-20260915.json`. Todavía no
 hay datos WF ni consumidor productivo ejecutable: el runner sólo enlaza el
-contrato en preflight y cierra antes de leer datos. La última referencia
+contrato en preflight y cierra antes de leer datos. El gate offline actual del
+árbol ejecutable `HEAD=d951ed5ab8391098e307eb13cdd42f59350d8e11` pasó 1,037/1,037
+pruebas, sin red, con 79.910% de líneas y 63.291% de ramas; su receipt
+consolidado es
+`runtime/market-evidence/quality-gate-current-tree-20260919T050125Z.json`.
+La última referencia
 global reproducible completa, previa a los cambios locales warmup/health y al
 refactor de reporting, pasó 990/990 pruebas sin omisiones, con
 líneas/ramas 79.871%/62.989%; su receipt está en

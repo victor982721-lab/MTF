@@ -17,7 +17,9 @@ completos, y 11 de 12 meses válidos de 2019. Se conserva el timestamp EST fijo
 original y su transformación UTC (+5 horas), sin corregirlo para hacer coincidir
 un calendario. El piloto descriptivo documentado en este archivo sigue siendo
 sólo marzo de 2016: su contenedor mensual contiene 1,979,243 ticks y la ventana
-del 7 al 14 de marzo UTC selecciona 499,804.
+del 7 al 14 de marzo UTC selecciona 499,804. Los timestamps de receipts se
+expresan en UTC (sufijo `Z`); la fecha de verificación del documento usa
+`America/Mexico_City`.
 
 - Manifiesto: `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-201603.json`.
 - Raw: 10,160,571 bytes; SHA-256 `8357ef823ac27d9c53da9acff6f79b6e8fc058cea9fdf8f32be08bf06dbe3e1b`.
@@ -61,10 +63,12 @@ del 7 al 14 de marzo UTC selecciona 499,804.
   SHA-256 `920c18ced374bb4dee8ec4d53f1f84083de6946510dc156bee76b240cd2d6122`.
 - 2017 está completo y validado: 12/12 meses, 14,125,996 cotizaciones. Su
   manifiesto anual es
-  `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-2017.json`.
+  `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-2017.json`,
+  SHA-256 `d750e8abda20d4a368f5df7342ea93a8ad48f6c27c420dcd2dc3c8260b08a56b`.
 - 2018 está completo y validado: 12/12 meses, 18,393,327 cotizaciones. Su
   manifiesto anual es
-  `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-2018.json`.
+  `/home/winterboss/.local/share/mtf-lab/market-data/manifests/histdata-eurusd-2018.json`,
+  SHA-256 `43d593a20cdbca5ca2e86b6f3ecda5bea83c47754f8faa86406cbca86c7350bd`.
 - 2019 tiene 11/12 meses válidos (`201901–201909`, `201911–201912`), con
   26,877,692 cotizaciones. `201910` no se cuenta como válido.
 - El raw de `201910` se conserva sin sobrescribir ni corregir en
@@ -77,16 +81,23 @@ del 7 al 14 de marzo UTC selecciona 499,804.
 - El inventario físico agregado actual de HistData/Dukascopy cuenta 49 archivos y
   435,790,724 bytes, con proyección dentro de 40 GiB y reserva libre superior al
   20%. Receipt vigente:
-  `runtime/market-evidence/storage-budget-live-20260919T013007Z.json`.
+  `runtime/market-evidence/storage-budget-live-20260919T013007Z.json`, SHA-256
+  `2afb1ffc036ba48c76cb143702c4022e79624d7c99158d4571e561b6d4aabf70`.
 - El QA descriptivo estricto de 2017 y 2018 terminó sin incidencias, sin red ni
   estrategia: 14,125,996 y 18,393,327 cotizaciones, respectivamente. El receipt
   consolidado es
-  `runtime/market-evidence/qa-descriptive-2017-2018-20260919T034200Z.json`; los
+  `runtime/market-evidence/qa-descriptive-2017-2018-20260919T034200Z.json`, SHA-256
+  `c39e49ac3fca03a782157c5e01d9970d68014929092137f3e2cca03873d16be5`; los
   reportes JSON/HTML y sus hashes están bajo
   `/home/winterboss/.local/state/mtf-lab/research/market-structure/`.
 - La anomalía de `201910` quedó documentada sin alterar bytes en
-  `runtime/market-evidence/histdata-201910-source-order-block-20260919T034708Z.json`:
+  `runtime/market-evidence/histdata-201910-source-order-block-20260919T034708Z.json`,
+  SHA-256 `5f9fdf370dc58138612409f5ba9f3c146abb60fc31b452f781a631d5f869a99f`:
   el ZIP tiene 2,275,024 filas y el bloque repetido contiene 1,236 filas idénticas.
+  El QA anual y este receipt de anomalía se generaron contra `HEAD`
+  `423cdc731d6789deb8bc9105d12ed0fc01101fa2`; el código/documentación actual
+  está en `HEAD` `d951ed5ab8391098e307eb13cdd42f59350d8e11` y no se deben confundir
+  sus procedencias.
 
 El contrato de lectura acepta una composición explícita de particiones
 mensuales contiguas 2016–2019 (`manifest_from_histdata_archives`), con identidad
@@ -228,8 +239,15 @@ pruebas, con 79.871% de líneas y 62.989% de ramas. Receipt versionado:
 (SHA-256 `5d572ea09264914ffc95fef5318aa4f252a165ec25e7c749e22be7080339d2b4`).
 Este resultado valida el checkout y el runtime de QA de aquella referencia; no
 valida los bytes posteriores del commit `58a2fdd`. No publica ni instala una
-release, no abre el holdout y no acredita ventaja económica. El gate completo del
-árbol actual permanece pendiente después de la terminalidad de V17.
+release, no abre el holdout y no acredita ventaja económica. El gate offline
+completo del árbol ejecutable `HEAD=d951ed5ab8391098e307eb13cdd42f59350d8e11`
+terminó `PASS`: 1,037/1,037 pruebas atendidas, sin red, con 79.910% de líneas y
+63.291% de ramas. Receipt consolidado:
+`runtime/market-evidence/quality-gate-current-tree-20260919T050125Z.json`, SHA-256
+`f1d86b6fe1d05e312ca1a150456eade96a9a86c9c24c5fed5f92f1a2abdd2e62`.
+La actualización documental posterior conserva el vínculo al árbol ejecutable
+validado; no convierte este gate en release, validación económica ni habilitación
+de WF/holdout.
 
 El servicio de campaña conserva además un permiso de holdout no secreto,
 ligado a candidatos, intentos, dataset, escenarios y la ventana fija
@@ -457,9 +475,11 @@ a esta auditoría está en
 `runtime/market-evidence/docs-static-20260916-post-independent-audit.json`
 (receipt local; la suma vigente se conserva en el propio archivo). El receipt V19
 parcial y su gate fail-closed se conservan como antecedentes.
-El smoke de presupuesto agregado del inventario canónico está en
-`runtime/market-evidence/storage-budget-live-20260914T2355Z.json`, SHA-256
-`0576b2673358d3b0d0207759c493c300e5b369d740d55fa52f78bab63489a09b`.
+El receipt vigente del presupuesto agregado del inventario canónico está en
+`runtime/market-evidence/storage-budget-live-20260919T013007Z.json`, SHA-256
+`2afb1ffc036ba48c76cb143702c4022e79624d7c99158d4571e561b6d4aabf70`. El
+`storage-budget-live-20260914T2355Z.json` se conserva como antecedente histórico
+del inventario de 2016, no como estado actual.
 La compatibilidad V17→V20 (módulos históricos sin cambios) está en
 `runtime/market-evidence/runtime-v17-v20-compatibility-audit.json`, SHA-256
 `f8d32e937173ff445f106c6fd6762c5785df5473e3c37450bbf399f192db24a1`.
@@ -499,8 +519,10 @@ source hash `440210d823742e848efdae1a231be1c75248d13aedd1a290874832925b529f0a`.
    offline y la reconstrucción/promoción controlada del runtime ya quedaron
    verificados en los receipts finales; 2017 y 2018 ya están ampliados,
    validados y descritos, y 2019 permanece incompleto por la partición inválida
-   `201910`. El gate global actual sobre el árbol posterior todavía debe
-   ejecutarse antes de tratarlo como una release. WF 2020–2023
+   `201910`. Gate actual sobre el árbol ejecutable `HEAD`
+   `d951ed5ab8391098e307eb13cdd42f59350d8e11`: `PASS`, enlazado por
+   `runtime/market-evidence/quality-gate-current-tree-20260919T050125Z.json`;
+   sigue sin ser una release. WF 2020–2023
    necesita antes un contrato/fuente separado; el contrato y la fixture offline
    `WARMUP_ONLY → WF` con resume están implementados/validados, pero no hay
    datos WF ni consumidor productivo habilitado. No usar 2024–2025.
@@ -515,8 +537,9 @@ queda en:
 `runtime/market-evidence/next-phase-gate-audit-20260914T2205Z.json`, SHA-256
 `b3130d1076f3227588df087aad11967a4184a624611f911401644a0cf3fe1bfa`.
 La implementación y su medición canónica del inventario están en
-`runtime/market-evidence/storage-budget-live-20260914T2355Z.json`, SHA-256
-`0576b2673358d3b0d0207759c493c300e5b369d740d55fa52f78bab63489a09b`.
+`runtime/market-evidence/storage-budget-live-20260919T013007Z.json`, SHA-256
+`2afb1ffc036ba48c76cb143702c4022e79624d7c99158d4571e561b6d4aabf70`; el
+receipt de 20260914 queda sólo como antecedente histórico.
 Los diseños no habilitantes para cerrar ambos contratos están en
 [`storage_budget_contract.md`](storage_budget_contract.md) y
 [`walk_forward_contract.md`](walk_forward_contract.md).
