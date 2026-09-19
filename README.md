@@ -21,20 +21,33 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 El [estado operativo y preservación](docs/operational_status.md) y su
 [receipt compacto versionado](reports/quality/mtf-operational-status-20260919.json)
 conservan los resultados actuales sin subir secretos, capturas ni corpus.
-Los 30 commits locales pendientes se publicaron por fast-forward en el remoto
-privado. El runtime instalado coincide con el paquete fuente validado y pasó
-1,037/1,037 pruebas, con cobertura de 79.912% de líneas y 63.297% de ramas.
+El código validado y publicado por fast-forward es
+`48ef12a687f74f7050147e3ea71d704b3ce8b358`; la referencia remota fue verificada.
+El gate terminal está en
+`runtime/market-evidence/operational-closure-20260919T183148Z/quality-gate.json`
+(SHA-256 `fd28831daef25d61311ffed6c15febb2455752c629b4a63a42f2ff8ae9707636`):
+`ok=true`, 1,057/1,057 pruebas, 0 `failed`/`skipped`, 79.906% de líneas,
+63.307% de ramas, 0 red/escrituras externas y `source_integrity=PASS`.
+El runtime canónico está `ACTIVE_CANONICAL`, el process scan terminó en
+`COMPLETE`, fue promovido a las 19:05 UTC y su paquete de código conserva 126
+archivos byte-equivalentes (`run_id=20260919T183150Z-b74d267e`).
+Los launchers de usuario quedaron instalados en
+`~/.local/bin/mtf-lab` y `~/.local/bin/mtf-lab-ctrader-query`; ambos `--help`
+se probaron desde un cwd ajeno, con HOME/XDG/TMP aislados. El segundo usa sólo una referencia
+privada de credenciales: ningún valor secreto está en el repositorio.
 El portal de Spotware muestra **MTF Lab: Active**, con callback local configurado;
-la lectura DEMO usa la autorización `accounts` existente. No hay autorización de
-trading ni órdenes. El histórico `201910` sigue rechazado: una nueva descarga
-oficial devolvió exactamente los mismos bytes inválidos. La prueba del sábado
-recibió precios del viernes; no prueba una avería del feed ni ausencia de
-credenciales. La frescura debe observarse en una sesión de mercado abierta.
+esto es un estado administrativo y no autorización de trading. La lectura DEMO
+usa la autorización `accounts` existente. No hay autorización de trading ni
+órdenes. El histórico `201910` sigue rechazado: una nueva descarga oficial
+devolvió exactamente los mismos bytes inválidos. La prueba del sábado recibió
+precios del viernes; no prueba una avería del feed ni ausencia de credenciales.
+La frescura debe observarse en una sesión de mercado abierta.
 
 **La campaña fue reanudada por Víctor el 2026-09-13 mediante una instrucción
 humana explícita.** El [handoff de pausa](docs/handoffs/2026-09-13-market-evidence-pause.md)
-conserva el punto anterior, los cambios sin commit, los artefactos y la ruta crítica;
-no se deben tratar como una release hasta completar sus gates.
+conserva el punto anterior, los cambios sin commit, los artefactos y la ruta crítica.
+La promoción técnica actual no equivale a una release de trading, aceptación
+contractual ni conclusión de rentabilidad.
 
 La nueva [campaña histórica de evidencia](docs/market_evidence_plan.md) está en
 integración. Su [piloto real y límites](docs/market_pilot_status.md) registra
@@ -68,7 +81,9 @@ sin mezclar bytes ni saltarse meses. La adquisición validada de 2017 y 2018 no
 abre WF 2020–2023: todavía no hay datos WF ni consumidor productivo habilitado.
 La partición inválida de 2019 se conserva sin corregir, ordenar artificialmente
 ni relabelar.
-Los costes y la cobertura aún no permiten una conclusión de ventaja neta;
+Los costes desconocidos se conservan como `UNKNOWN_NOT_ZERO`; una especificación
+de costes no equivale a cargos observados y la cobertura aún no permite una
+conclusión de ventaja neta;
 ningún resultado descriptivo habilita órdenes ni abre el holdout reservado.
 El backtest ya enlaza un guard de identidad y un plano compartido de datos;
 ambos tienen pruebas focales, y ahora el checkpoint parcial/resume continuable
@@ -85,11 +100,11 @@ y receipts fail-closed; la fixture offline `WARMUP_ONLY → WF` con reanudación
 byte-equivalente ya está validada en
 `runtime/market-evidence/wf-warmup-resume-fixture-20260915.json`. Todavía no
 hay datos WF ni consumidor productivo ejecutable: el runner sólo enlaza el
-contrato en preflight y cierra antes de leer datos. El gate offline actual del
-árbol ejecutable `HEAD=d951ed5ab8391098e307eb13cdd42f59350d8e11` pasó 1,037/1,037
-pruebas, sin red, con 79.910% de líneas y 63.291% de ramas; su receipt
-consolidado es
-`runtime/market-evidence/quality-gate-current-tree-20260919T050125Z.json`.
+contrato en preflight y cierra antes de leer datos. El gate offline terminal del
+código validado `HEAD=48ef12a687f74f7050147e3ea71d704b3ce8b358` pasó 1,057/1,057
+pruebas, sin red ni escrituras externas, con 79.906% de líneas y 63.307% de
+ramas; su receipt es
+`runtime/market-evidence/operational-closure-20260919T183148Z/quality-gate.json`.
 La última referencia
 global reproducible completa, previa a los cambios locales warmup/health y al
 refactor de reporting, pasó 990/990 pruebas sin omisiones, con
@@ -98,10 +113,10 @@ líneas/ramas 79.871%/62.989%; su receipt está en
 histórico bounded previo pasó 964/964 pruebas, con líneas/ramas
 79.732%/62.750%; su receipt se conserva en
 `runtime/market-evidence/quality-gate-20260915-historical-paper-gate-v3.json`.
-La ruta económica
-ya conserva costes desconocidos como `UNKNOWN_NOT_ZERO` y sólo acepta una
-especificación explícita para calcular neto; aún faltan desarrollo multiaño,
-holdout, resistencia y validación DEMO.
+La ruta económica conserva costes desconocidos como `UNKNOWN_NOT_ZERO` y sólo
+acepta una especificación explícita para calcular neto; esa especificación no es
+evidencia de cargos observados. Aún faltan desarrollo multiaño, holdout,
+resistencia y validación DEMO de ejecución/forward.
 
 El lifecycle del runtime privado está definido en
 [`docs/runtime_lifecycle.md`](docs/runtime_lifecycle.md). El único runtime
@@ -181,7 +196,25 @@ comisiones, conversiones, fills, posiciones, historia ni respuestas de un
 servidor cTrader real. Un timeout ambiguo permanece `UNKNOWN` y exige
 reconciliación; no autoriza reintentar una orden.
 
-### Validación conectada DEMO de sólo lectura — 2026-09-14
+### Estado vigente de lectura DEMO — 2026-09-19
+
+La aplicación figura **Active** y la lectura DEMO conserva la autorización
+`accounts`, la cuenta DEMO seleccionada y un catálogo observado de 1,940
+símbolos. La consulta histórica del launcher conservó 10,000 barras M1 en 20
+páginas, pero la fuente indicó `has_more=true`: es `PARTIAL`, no una serie
+completa, y no contiene bid/ask ni fills. No se inició OAuth nuevo ni se enviaron
+órdenes.
+
+La ventana bounded vigente cubre 60/60 barras M1 nativas, `COMPLETE`/`CONTINUOUS`
+y cero gaps. Esa cobertura sólo cierra la ventana solicitada: el `has_more=true`
+de la consulta fuente no se convierte en histórico completo y la captura no
+acredita frescura live, BBO, ejecución ni rentabilidad. Los launchers instalados
+usan una referencia privada de credenciales y no habilitan trading.
+
+### Antecedente: validación conectada DEMO de sólo lectura — 2026-09-14
+
+Este bloque conserva la evidencia histórica de esa captura; el estado vigente es
+el de la sección anterior.
 
 La evidencia privada, fuera del repositorio (SHA-256
 `a2d6af011fa43b05187c2aace05f6b5c51e592dc9a5e506f872b4cf1f43ac72e`; no se
@@ -214,7 +247,7 @@ trades PAPER cerrados), en
 Es evidencia de integración local, no de mercado, frescura, costes, fills o
 rentabilidad reales.
 
-#### Diagnóstico de lectura acotado — 2026-09-15
+#### Antecedente: diagnóstico de lectura acotado — 2026-09-15
 
 Se reutilizó el OAuth DEMO existente (`accounts`, `SCOPE_VIEW`) sin repetir
 OAuth, sin órdenes y sin abrir SQLite. La captura de 12 `SpotEvent` está en
@@ -239,7 +272,7 @@ desfase local sigue sin desambiguar. No se aplicó corrección, clamping,
 reordenamiento ni relajación del gate; las regresiones de igualdad y timestamp
 futuro quedan en `tests/test_ctrader_quote_quality.py`.
 
-#### Captura histórica DEMO bounded V22 — 2026-09-15
+#### Antecedente: captura histórica DEMO bounded V22 — 2026-09-15
 
 La captura acotada existente se conserva en
 `/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260915-m1-bounded-v22/window-receipt.json`;
@@ -273,16 +306,15 @@ La lista queda limitada a hechos, decisiones y autorizaciones externas:
 
 1. La observación administrativa del 2026-09-19 muestra `Active` y el callback
    local correcto, sustituyendo `Submitted` como estado vigente. Esto no
-   autoriza trading. La ruta OAuth DEMO de sólo lectura ya está verificada.
-2. La ventana bounded V22 satisface su cobertura acotada, pero la consulta
-   fuente conserva `source_has_more=true`. El pipeline/reanudación local ya fue
-   verificado sobre el raw existente; no presentar la consulta fuente como serie
-   completa ni inferir ventaja.
-3. Integrar las referencias privadas de credenciales en el launcher/runtime
-   final autorizado, sin copiar secretos, sustituir el runtime operativo ni
-   habilitar órdenes.
+   autoriza trading. La ruta DEMO de sólo lectura `accounts` ya está verificada.
+2. Verificar frescura, continuidad y calentamiento en una sesión de mercado
+   abierta; la ventana bounded 60/60 y la consulta fuente `has_more=true` no
+   acreditan por sí mismas una serie completa ni frescura live.
+3. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo;
+   la lectura administrativa y de catálogo no constituye permiso de ejecución.
 4. Resolver las condiciones contractuales de Pepperstone relevantes para
-   México, almacenamiento/redistribución de datos y costes.
+   México, almacenamiento/redistribución de datos y costes. Una especificación
+   de costes no equivale a cargos observados.
 5. Sólo después evaluar resistencia, shadow/72 horas y cualquier canary DEMO
    con autorización separada de cuenta, símbolo, volumen, ventana y límites.
 

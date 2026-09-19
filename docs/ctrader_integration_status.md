@@ -18,16 +18,30 @@ La comprobación fue sólo lectura: no se modificó la aplicación, no se abrier
 sus credenciales y no se amplió el scope. `Submitted` queda como antecedente
 del 12 de septiembre, no como bloqueo vigente de consulta.
 
-La canaria del 19 de septiembre autenticó DEMO con `SCOPE_VIEW`, seleccionó
-EUR/USD y consultó el catálogo. La ausencia de variables de entorno en un
-doctor lanzado sin inyección no significa que falten credenciales privadas.
-El watch del sábado recibió cuatro eventos cuya última marca era del viernes
-`2026-09-18T20:54:52.956Z`; se rechazaron como obsoletos y no hubo fills.
-Esta ventana no acredita frescura en mercado abierto ni una avería del servidor.
+La lectura vigente autenticó DEMO con `SCOPE_VIEW`/`accounts`, seleccionó
+EUR/USD y consultó un catálogo de 1,940 símbolos. La consulta del launcher
+conservó 10,000 barras M1 en 20 páginas, pero la fuente indicó `has_more=true`:
+la captura es `PARTIAL`, no una cobertura histórica completa; no contiene bid/ask
+ni fills. La ventana bounded separada cubre 60/60 barras M1 nativas,
+`COMPLETE`/`CONTINUOUS` y cero gaps. Ninguno de estos hechos acredita frescura
+live, BBO ni autorización de trading.
+La ausencia de variables de entorno en un doctor lanzado sin inyección no
+significa que falten credenciales privadas. El watch del sábado recibió cuatro
+eventos cuya última marca era del viernes `2026-09-18T20:54:52.956Z`; se
+rechazaron como obsoletos y no hubo fills. Esta ventana no acredita frescura en
+mercado abierto ni una avería del servidor.
+Los launchers de usuario están instalados en `~/.local/bin/mtf-lab` y
+`~/.local/bin/mtf-lab-ctrader-query`; sus `--help` se probaron desde un cwd ajeno,
+con HOME/XDG/TMP aislados. El launcher de consulta usa sólo una referencia privada de
+credenciales; ningún valor secreto está en el repositorio y no inicia OAuth ni
+acepta scopes de trading.
 El [estado operativo](operational_status.md) separa los subgates administrativos,
 de datos, económicos y de autorización.
 
-### Validación DEMO conectada de sólo lectura — 2026-09-14
+### Antecedente: validación DEMO conectada de sólo lectura — 2026-09-14
+
+Este bloque conserva la evidencia histórica de esa captura; el estado vigente es
+el de la verificación administrativa y lectura del 2026-09-19.
 
 El receipt privado, fuera del repositorio (SHA-256
 `a2d6af011fa43b05187c2aace05f6b5c51e592dc9a5e506f872b4cf1f43ac72e`; no se
@@ -98,7 +112,7 @@ pendientes son antecedentes históricos; el estado vigente es el de esta
 sección. La lectura real sigue siendo un gate separado de operación y no abre
 la ejecución DEMO.
 
-### Captura histórica DEMO bounded V22 — 2026-09-15
+### Antecedente: captura histórica DEMO bounded V22 — 2026-09-15
 
 El receipt privado de la ventana acotada existente es
 `/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260915-m1-bounded-v22/window-receipt.json`.
@@ -195,7 +209,7 @@ trendbars nativas con sus indicadores y deben calentar con SpotEvents válidos.
 El lector proyecta EOF/backpressure en la barrera de reconciliación y
 desconecta el sink PAPER; ninguna de estas rutas envía órdenes.
 
-### Evolución H0–H6 local — 2026-09-13
+### Antecedente: evolución H0–H6 local — 2026-09-13
 
 La [matriz de implementación y aceptación](demo_reliability_plan.md) describe
 los cambios posteriores: economía CFD v2, investigación causal, codec generado,
@@ -208,7 +222,7 @@ La presencia del SDK anterior en `.venv` no prueba utilidad: Protobuf 3.20.1
 queda rechazado. La reparación SQLite WAL-reset, la resistencia real de 72
 horas y las 30 sesiones DEMO son gates separados de la implementación local.
 
-### Preparación externa DEMO — 2026-09-12
+### Antecedente: preparación externa DEMO — 2026-09-12
 
 Se verificó en el navegador una sesión cTrader ID autenticada y la cuenta
 Pepperstone DEMO vinculada. Esta observación de la interfaz no equivale a una
@@ -226,7 +240,7 @@ no se han exportado a almacenamiento local ni realizado OAuth para MTF. Cualquie
 no se habilitan órdenes ni se mueven fondos. La aceptación de Open API no se
 presenta como validación contractual general de Pepperstone.
 
-#### Preparación local verificada
+#### Antecedente: preparación local verificada
 
 La integración de consulta de lectura e importación del histórico nativo quedó
 validada con **422/422 pruebas**, sin fallos ni omisiones, Ruff/formato, mypy y
@@ -252,7 +266,7 @@ Esa preparación de 422 pruebas no incluía aún el runner continuo. La ejecuci�
 de MTF por Open API, los scopes de trading y la operación continua siguen
 pendientes; la lectura DEMO `accounts` ya observada no los acredita.
 
-### Runner y observabilidad offline — 2026-09-12
+### Antecedente: runner y observabilidad offline — 2026-09-12
 
 La base anterior se consolidó en el commit local `9d066c6`, sin publicarla ni
 instalar una release. El alcance posterior añade `ctrader watch`, composición
@@ -318,7 +332,28 @@ historia y respuestas de aceptación/rechazo. Un timeout ambiguo permanece
 La ejecución externa permanece deshabilitada y **REAL/LIVE se rechaza
 fail-closed**. Ningún fixture prueba que una orden haya llegado a un servidor.
 
-### ETAPAS EXTERNAS PENDIENTES
+### Pendientes externos vigentes — 2026-09-19
+
+La aplicación `Active`, la autorización `accounts`, la cuenta DEMO seleccionada,
+el discovery de 1,940 símbolos y la lectura bounded 60/60 ya fueron observados.
+Son permisos y hechos de lectura; no autorizan trading ni REAL/LIVE.
+
+1. Observar frescura, continuidad y calentamiento en una sesión de mercado
+   abierta; la consulta fuente mantiene `has_more=true` y la ventana bounded no
+   convierte el histórico completo en disponible.
+2. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo.
+3. Obtener cualquier autorización/scope separado que sea necesario para trading
+   DEMO y verificar ejecución, reconciliación, operación continua y forward. No
+   hay autorización de trading ni se inicia esa ruta en esta fase.
+4. Confirmar las condiciones contractuales de Pepperstone aplicables a México,
+   almacenamiento/redistribución de datos y costes; una especificación de costes
+   no equivale a cargos observados.
+
+### Antecedente: etapas externas pendientes — 2026-09-12
+
+La lista siguiente conserva el estado histórico previo a `Active`, OAuth,
+discovery, selección DEMO y la instalación de los launchers; no describe los
+bloqueos vigentes.
 
 Los únicos bloqueos externos de esta fase son:
 

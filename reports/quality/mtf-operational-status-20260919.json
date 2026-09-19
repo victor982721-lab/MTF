@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "verified_at": "2026-09-19T18:07:25.853418+00:00",
+  "verified_at": "2026-09-19T19:10:48.918728+00:00",
   "scope": "Redacted durable status; publication is not trading release or economic acceptance",
-  "validated_source_commit": "66506ad81ee58b773ff3f76016608d8a2bbb78b3",
+  "validated_source_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358",
   "published_baseline_commit": "66506ad81ee58b773ff3f76016608d8a2bbb78b3",
   "preservation": {
     "remote": "https://github.com/victor982721-lab/MTF",
@@ -29,41 +29,53 @@
       "market-data raw and captures",
       "SQLite and research state",
       "regenerable heavy QA"
-    ]
+    ],
+    "publication_evidence": {
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/final-publication.json",
+      "purpose": "Final documentation commit, executable equivalence and remote equality; recorded after publication to avoid self-referential hashes"
+    }
   },
   "runtime": {
     "state": "ACTIVE_RUNTIME",
     "promotion_state": "ACTIVE",
-    "run_id": "20260919T164603Z-f01ad659",
+    "run_id": "20260919T183150Z-b74d267e",
     "installed_package_matches_validated_source": true,
     "packaged_files_compared": 126,
     "excluded_unpackaged_doc": "mtf_lab/data/README.md",
     "evidence": {
       "local_path": "/home/winterboss/.local/share/mtf-lab/runtime/STAGED_RUNTIME.json",
-      "sha256": "d788a3b4423ae8469d1c1054db16a631a031c64c280ed73441cd20e48a08facb"
-    }
+      "sha256": "d2bf3b73b1e16107b9166d1abb1db4c8f62dbba41aad0de1edb6c654ff89d521"
+    },
+    "source_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358",
+    "process_scan": "COMPLETE",
+    "active_record": "ACTIVE_CANONICAL",
+    "lifecycle_evidence": {
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/runtime-inspect-promoted.json",
+      "sha256": "a04ac306225a16db5c074a1920c3859c7bf3e085e3305c1381ee45a97e257924"
+    },
+    "rollback": "/home/winterboss/.local/share/mtf-lab/runtime-rollback-20260919-190517-bb5f2ef2"
   },
   "quality": {
     "ok": true,
     "tests": {
       "consistent": true,
-      "discovered": 1037,
-      "executed": 1037,
+      "discovered": 1057,
+      "executed": 1057,
       "expected_failures": 0,
       "failed": 0,
-      "passed": 1037,
+      "passed": 1057,
       "skipped": 0,
-      "tests_run": 1037,
+      "tests_run": 1057,
       "unexpected_successes": 0
     },
     "coverage": {
-      "branch_percent": 63.297,
-      "covered_branches": 10820,
-      "covered_lines": 39717,
+      "branch_percent": 63.307,
+      "covered_branches": 10823,
+      "covered_lines": 39718,
       "error": null,
-      "line_percent": 79.912,
-      "num_branches": 17094,
-      "num_statements": 49701,
+      "line_percent": 79.906,
+      "num_branches": 17096,
+      "num_statements": 49706,
       "ok": true,
       "threshold_percent": 60.0
     },
@@ -71,10 +83,20 @@
     "outside_write_attempts": 0,
     "timeout_seconds": 1800,
     "evidence": {
-      "local_path": "/home/winterboss/MTF/runtime/market-evidence/quality-gate-runtime-head-66506ad81ee5-20260919-timeout1800.json",
-      "sha256": "d2355b3d3f42750b34314ed4f65bdfdc9029ac45b9b609da8f9738d2dd0c1bff"
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/quality-gate.json",
+      "sha256": "fd28831daef25d61311ffed6c15febb2455752c629b4a63a42f2ff8ae9707636"
     },
-    "prior_attempts": "coordinator interruption then insufficient 900s timeout; neither is current acceptance"
+    "prior_attempts": "coordinator interruption then insufficient 900s timeout; neither is current acceptance",
+    "offline_suite_duration_seconds": 1550.194,
+    "source_integrity": {
+      "added": [],
+      "after_content_sha256": "a83d218fcff3bdaff93228d0f92728910373bd93b33eb1cbc06d8a7004e97a6e",
+      "before_content_sha256": "a83d218fcff3bdaff93228d0f92728910373bd93b33eb1cbc06d8a7004e97a6e",
+      "changed": [],
+      "ok": true,
+      "removed": []
+    },
+    "validated_source_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358"
   },
   "history": {
     "development_valid_years": [
@@ -159,6 +181,48 @@
         "sha256": "2a361ff183a86e48172ce426b1832cb479e03253f6651c84230c55a9ea122c08"
       },
       "limitation": "Complete only for requested 60-minute native M1 window; no observed BBO, fill or live freshness claim"
+    },
+    "installed_launcher_query": {
+      "ok": true,
+      "authentication": "AUTHENTICATED",
+      "connection": "CONNECTED",
+      "environment": "DEMO",
+      "scope": "SCOPE_VIEW",
+      "catalog_symbols": 1940,
+      "history": {
+        "complete": false,
+        "count": 10000,
+        "has_more": true,
+        "pages": 20,
+        "raw_page_count": 20,
+        "timeframe": "M1"
+      },
+      "new_oauth": false,
+      "orders_sent": 0,
+      "evidence": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/installed-launcher-20260919T190734Z/summary-redacted.json",
+        "sha256": "7e847e550d5413030e85143a7c59f6ddf90799d39b5bd7453e0349bb944653bb"
+      },
+      "limitation": "Read-only query path verified; source history PARTIAL and no live-freshness or full-history claim"
+    },
+    "instrument_specification": {
+      "state": "SPEC_OBSERVED",
+      "source_schema": "schemas/ctrader/openapi-proto-messages/91/OpenApiModelMessages.proto",
+      "volume_unit": "centi-units",
+      "lot_size": 10000000,
+      "min_volume": 100000,
+      "step_volume": 100000,
+      "max_volume": 1000000000,
+      "base_asset": "EUR",
+      "minimum_base_units": 1000,
+      "minimum_relative_lots": "0.01",
+      "commission_fields": "LEGACY; precise effective rates not verified",
+      "costs_charged": "CHARGED_UNOBSERVED",
+      "historical_cost_inference": false,
+      "evidence": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260919-query-canary/catalog-costs-summary-redacted.json",
+        "sha256": "1349b6a43e119cb056f284f41aa26d3aa9fe5fd2fcbe0b10328f1c37ba6075fc"
+      }
     }
   },
   "external_gates": {
@@ -168,11 +232,27 @@
     "freshness_continuity_warmup": "PENDING_OPEN_MARKET_OBSERVATION",
     "shadow_72h": "NOT_STARTED",
     "forward_30_sessions": "NOT_STARTED",
-    "separate_execution_authorization": "NOT_GRANTED"
+    "separate_execution_authorization": "NOT_GRANTED",
+    "calendar_zero_zero_holiday_semantics": "PENDING_BROKER_CLARIFICATION; remains UNKNOWN"
   },
   "support_drafts": {
     "histdata": "docs/histdata_201910_issue.md",
     "pepperstone": "docs/pepperstone_ctrader_openapi_draft.md",
     "sent": false
+  },
+  "published_code_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358",
+  "launchers": {
+    "state": "INSTALLED",
+    "paths": [
+      "/home/winterboss/.local/bin/mtf-lab",
+      "/home/winterboss/.local/bin/mtf-lab-ctrader-query"
+    ],
+    "modes": "0700",
+    "private_reference_only": true,
+    "new_process_isolated_help_passed": true,
+    "evidence": {
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/installed-launchers.json",
+      "sha256": "6fa342303e1499feb38fe74527bc38b0568b79d0349aa7fc9391d665aa6f1afa"
+    }
   }
 }
