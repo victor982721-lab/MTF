@@ -5,10 +5,48 @@ release de trading, una aceptación contractual ni una conclusión de rentabilid
 El [receipt compacto](../reports/quality/mtf-operational-status-20260919.json)
 conserva identidades, resultados y referencias a la evidencia privada.
 
+## Próxima ejecución DEMO
+
+El código `b162e0f1a52e272268bf3bd9ae1631e5cae688a0` pasó el gate completo:
+1,125/1,125 pruebas, cero fallos/omisiones, 79.915% de líneas y 63.291% de ramas,
+sin intentos de red ni escrituras fuera del aislamiento. La fuente quedó intacta.
+Está publicado por fast-forward y el runtime canónico fue promovido con 128
+archivos byte-equivalentes, `run_id=20260919T225409Z-4d1675aa` y rollback conservado.
+La ayuda aislada, los imports instalados y el preflight de autenticación DEMO
+pasaron; este último no reúne todavía BBO/ATR de mercado abierto ni habilita órdenes.
+
+La canaria técnica autorizada tiene un heartbeat nativo de una sola oportunidad,
+`mtf-canaria-demo-autorizada-del-21-de-septiembre`: el lunes 21 de septiembre
+despierta a las 08:54 y prepara datos desde las 08:55; **las órdenes sólo pueden
+ocurrir de 09:00 a 09:20, America/Mexico_City**. Requiere equipo/Codex disponibles
+y todos los gates frescos. El alias instalado es
+`/home/winterboss/.local/bin/mtf-lab-demo-canary`; su configuración privada permanece
+deshabilitada en disco. Los límites y la separación de estrategia/REAL están en
+[fronteras de activación](activation_boundaries.md#c--canaria-demo-acotada-y-gates-externos).
+**Estado: programada, no ejecutada; cero órdenes.** No hay extensión ni reintento
+de un resultado ambiguo. El heartbeat anterior de QA permanece pausado.
+
+## Primer resultado histórico evaluable
+
+El piloto `tp_fast_v1` usó 499,804 cotizaciones por escenario de la semana
+2016-03-07→14, con costes de modelo explícitos, no cargos históricos observados.
+
+| Escenario | Operaciones cerradas | Ganadoras/perdedoras netas | Neto modelado, USD |
+|---|---:|---:|---:|
+| Base | 6 | 2/4 | -0.64 |
+| Adverso | 14 | 5/9 | -1.73 |
+| Extremo | 14 | 4/10 | -2.20 |
+
+Cada escenario conserva además un intent `UNKNOWN` por expiración de ventana de
+entrada, sin precio ni PnL. Por ello el agregado no está aceptado aunque los
+cierres individuales sean evaluables. No hubo recorte de trades retenidos, no se
+suman escenarios y no se acredita ventaja. El V17 anual anterior tuvo cero fills
+RiskExit evaluables; 2017–2019 sólo tienen QA descriptivo, no resultados de estrategia.
+
 ## Conservación
 
 - Los 30 commits pendientes hasta `66506ad`, la documentación y el código
-  validado `48ef12a687f74f7050147e3ea71d704b3ce8b358` se publicaron por
+  previo `48ef12a687f74f7050147e3ea71d704b3ce8b358` se publicaron por
   fast-forward en el remoto privado `victor982721-lab/MTF`, sin force push ni
   GitHub Actions. El cierre documental posterior conserva el mismo árbol
   ejecutable y su verificación de publicación se registra fuera de Git.
@@ -27,10 +65,10 @@ conserva identidades, resultados y referencias a la evidencia privada.
 |---|---|---|
 | 1. Cierre de 2019 | 11 meses válidos; el ZIP de octubre original y la nueva descarga oficial son byte-idénticos y fallan orden temporal. | Fuente corregida/versionada de HistData o respuesta oficial que permita resolver la procedencia sin inventar datos. |
 | 2. Desarrollo multianual | No se creó un año incompleto ni se ejecutó como si octubre fuera válido. | Manifiesto 2019 contiguo y válido antes de componer 2016–2019. Costos `UNKNOWN_COSTS`. |
-| 3. Runtime | Código `48ef12a` validado y promovido: 1,057/1,057 pruebas, cero fallos/omisiones, sin red ni escrituras fuera del aislamiento. Cobertura: 79.906% líneas / 63.307% ramas. Launchers instalados y consulta DEMO comprobada. | Las nuevas modificaciones ejecutables requieren validación propia; documentación sola conserva el gate por equivalencia comprobada. |
-| 4. App y contrato | Portal MTF Lab `Active` y callback local correcto; consulta `accounts` autenticada. | Entidad/condiciones aplicables a México, retención de datos y costos efectivos de la cuenta, no publicidad. |
-| 5. Canaria de lectura | Cuenta DEMO y catálogo observados. Ventana histórica M1 de 60/60 barras completa, sin gaps. Los precios live obsoletos se rechazaron. | Frescura, continuidad y calentamiento observados en mercado abierto, separados de historia bounded. |
-| 6. Shadow/forward | No iniciado, sin órdenes ni scopes nuevos. | Gates anteriores y autorización operativa separada; 72 horas/30 sesiones no se sustituyen por fixtures ni se acelera el reloj. |
+| 3. Runtime | Código `b162e0f` aceptado, instalado y publicado; gate 1,125/1,125 y launcher de canaria comprobado. | Sólo el cierre documental puede conservar este gate por equivalencia exacta. |
+| 4. App y contrato | App `Active`; VIEW original intacto y autorización separada `TRADING` observada sólo en la cuenta DEMO aprobada. | Condiciones de REAL/México y cargos realizados siguen separados; la especificación observada no prueba cargos ni costes históricos. |
+| 5. Canaria técnica | Autorizada, software aceptado y oportunidad del lunes programada; todavía cero órdenes. | BBO/ATR, calendario, cuenta plana, margen y riesgo frescos, dos ciclos y conciliación observada. |
+| 6. Shadow/forward | No iniciado. La excepción técnica acotada no lo habilita. | Autorización operativa separada; 72 horas/30 sesiones no se sustituyen por fixtures ni se acelera el reloj. |
 
 ## Correcciones de diagnóstico
 
@@ -74,6 +112,15 @@ MTF_LAB_CTRADER_CREDENTIALS_FILE=/ruta/privada/ctrader-app-ID.credentials.json \
 
 El lanzador admite sólo consulta. La referencia instalada y los secretos se
 mantienen fuera de Git.
+
+El primer gate de la canaria rechazó errores de tipos y una fixture que omitía
+el nuevo valor predeterminado; no se promovió ese candidato. La corrección pasó
+la suite íntegra en 1,567.154 segundos, sin reducir pruebas ni umbrales.
+La evidencia vigente está en
+`runtime/market-evidence/canary-preparation-20260919T215251Z/quality-gate-v2.json`
+(SHA-256 `fbcb473977577e5e76b73d8f4dc8c203184d7aba121b10350480644e072922eb`).
+Los receipts de instalación, publicación, preflight y programación se enlazan
+desde el resumen versionado; la ejecución contra el bróker sigue pendiente.
 
 En la validación de la base anterior, el primer quality gate se interrumpió por
 decisión del coordinador, no por una denegación del usuario. El segundo agotó
@@ -119,7 +166,10 @@ de símbolo, no autorización ni recomendación de tamaño de operación.
 
 La metadata de comisión, mínimos y swap tiene estado `SPEC_OBSERVED`, no
 `CHARGED_OBSERVED`. Los campos de comisión legados no sustituyen las tasas
-precisas del protocolo. No se observaron fills, conversiones ni cargos realizados;
+precisas del protocolo: el catálogo actual declara USD 3 por lote y lado,
+con mínimo de comisión cero. El resumen anterior omitía esos campos precisos;
+su ausencia en ese resumen no demostraba ausencia en el servidor.
+No se observaron fills, conversiones ni cargos realizados;
 `UNKNOWN_COSTS` permanece vigente y estas especificaciones actuales no se aplican
 retroactivamente a 2016–2019.
 
@@ -134,7 +184,8 @@ retroactivamente a 2016–2019.
   son referencias generales, no tarifas observadas de la cuenta.
 - Conservar `accounts` de sólo lectura según el
   [contrato OAuth de cTrader](https://help.ctrader.com/open-api/account-authentication/).
-  No convertir la aprobación administrativa en permiso para `trading` o REAL.
+  El token separado `TRADING` sólo cubre la canaria DEMO aprobada; no convertir
+  su concesión en permiso para operación continua o REAL.
 
 El histórico es el filtro principal de la estrategia. El holdout sigue cerrado,
 no hay ventaja neta acreditada y el bloqueo de una fuente no autoriza cambiar

@@ -59,9 +59,11 @@ no constituyen una sesión autorizada de cTrader.
 
 En el estado vigente, el servidor DEMO concedió el alcance `TRADING` únicamente
 para la cuenta aprobada (sufijo `5097`) y la ruta VIEW original permanece intacta.
-Esto prueba el alcance administrativo/técnico observado, no una ejecución: hay
-0 órdenes y la canaria de software sigue `STAGED`, sin instalación ni
-automatización creada.
+Esto prueba el alcance administrativo/técnico observado, no una ejecución: la
+canaria está instalada como `~/.local/bin/mtf-lab-demo-canary` con modo `0700`, su
+preflight readonly pasó identidad, `TRADING` y catálogo, y el resultado esperado
+es `NETWORK_PREFLIGHT_INPUTS_REQUIRED` sin recopilar aún mercado/riesgo operables. El estado
+canónico permanece `EMPTY`, sin mutación, y hay 0 órdenes.
 
 Lo no observado offline es el resultado que debe devolver el servidor real:
 permisos y entorno de la cuenta, símbolos habilitados, escalas, límites de volumen,
@@ -84,10 +86,13 @@ esa cuenta; no se repite OAuth ni se cambia la cuenta seleccionada, pero cada
 conexión exige discovery fresco de lectura y verificación de esa cuenta. Los
 gates que permanecen son:
 
-1. Promover e instalar el software de la canaria, que permanece `STAGED`, sólo
-   para la ventana y límites aprobados. La automatización aún no está creada; se
-   planifica un heartbeat nativo una vez que el software sea aceptado. No se
-   extiende la ventana ni se reintenta un resultado ambiguo.
+1. Satisfacer `NETWORK_PREFLIGHT_INPUTS_REQUIRED` con datos de mercado y riesgo frescos y ejecutar la
+   canaria dentro de la ventana y límites aprobados. El software ya está instalado
+   y el heartbeat nativo está `ACTIVE` con ID
+   `mtf-canaria-demo-autorizada-del-21-de-septiembre`: una oportunidad, despierta
+   a las 08:54, captura desde 08:55 y mantiene órdenes 09:00–09:20 hora de
+   México. La zona `America/Mexico_City` está verificada, `COUNT=1` y sin jitter;
+   no se repite ni se extiende y requiere host/app disponible y gates frescos.
 2. Verificar catálogo, límites y condiciones reales del bróker para la
    cuenta/símbolo, sin convertir una plantilla local en autorización.
 3. Ejecutar y reconciliar dos ciclos independientes contra el servidor **DEMO**:
@@ -111,9 +116,9 @@ secretos ni se inicia autenticación como parte de la reproducción offline.
 - Los eventos de ejecución de las fixtures son **sintéticos**, no operaciones.
 - La ruta **REAL/LIVE sigue rechazada fail-closed** y no forma parte de esta entrega.
 - La concesión técnica `TRADING` DEMO sólo cubre la cuenta y ventana aprobadas;
-  el software sigue `STAGED`; la automatización aún no está creada y se planifica
-  un heartbeat nativo sólo después de aceptar el software. No habilita extensión
-  o reintento.
+  el software está instalado en `~/.local/bin/mtf-lab-demo-canary` y el heartbeat
+  nativo está `ACTIVE` con ID `mtf-canaria-demo-autorizada-del-21-de-septiembre`.
+  No habilita extensión o reintento.
 - Una cuenta etiquetada localmente como DEMO no basta: la ruta externa exige
   evidencia de sesión, identidad, generación, entorno y permisos observados.
 - Los fixtures no demuestran rentabilidad, rendimiento futuro, tarifas vigentes

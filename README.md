@@ -22,19 +22,23 @@ El [estado operativo y preservación](docs/operational_status.md) y su
 [receipt compacto versionado](reports/quality/mtf-operational-status-20260919.json)
 conservan los resultados actuales sin subir secretos, capturas ni corpus.
 El código validado y publicado por fast-forward es
-`48ef12a687f74f7050147e3ea71d704b3ce8b358`; la referencia remota fue verificada.
-El gate terminal está en
-`runtime/market-evidence/operational-closure-20260919T183148Z/quality-gate.json`
-(SHA-256 `fd28831daef25d61311ffed6c15febb2455752c629b4a63a42f2ff8ae9707636`):
-`ok=true`, 1,057/1,057 pruebas, 0 `failed`/`skipped`, 79.906% de líneas,
-63.307% de ramas, 0 red/escrituras externas y `source_integrity=PASS`.
+`b162e0f1a52e272268bf3bd9ae1631e5cae688a0`; `main==origin/main` fue verificado.
+El gate terminal v2 está en
+`runtime/market-evidence/canary-preparation-20260919T215251Z/quality-gate-v2.json`
+(SHA-256 `fbcb473977577e5e76b73d8f4dc8c203184d7aba121b10350480644e072922eb`):
+`ok=true`, 1,125/1,125 pruebas, 0 `failed`/`skipped`, 79.915% de líneas,
+63.291% de ramas, 0 red/escrituras externas, `source_integrity=PASS` y suite de
+1,567.154 s.
 El runtime canónico está `ACTIVE_CANONICAL`, el process scan terminó en
-`COMPLETE`, fue promovido a las 19:05 UTC y su paquete de código conserva 126
-archivos byte-equivalentes (`run_id=20260919T183150Z-b74d267e`).
+`COMPLETE`, fue promovido con rollback conservado y su paquete de código conserva
+128 archivos byte-equivalentes (`run_id=20260919T225409Z-4d1675aa`).
 Los launchers de usuario quedaron instalados en
 `~/.local/bin/mtf-lab` y `~/.local/bin/mtf-lab-ctrader-query`; ambos `--help`
-se probaron desde un cwd ajeno, con HOME/XDG/TMP aislados. El segundo usa sólo una referencia
-privada de credenciales: ningún valor secreto está en el repositorio.
+se probaron desde un cwd ajeno, con HOME/XDG/TMP aislados. La canaria también
+instaló `~/.local/bin/mtf-lab-demo-canary` con modo `0700`; su `--help` aislado
+pasó y sus imports provienen del Python instalado (3.12.14, SQLite 3.53.1,
+Protobuf 7.36.1). Los launchers usan sólo referencias privadas de credenciales:
+ningún valor secreto está en el repositorio.
 El portal de Spotware muestra **MTF Lab: Active**, con callback local configurado;
 esto es un estado administrativo y no una autorización amplia de trading. La
 lectura DEMO usa la autorización `accounts` existente. El servidor DEMO concedió
@@ -50,6 +54,10 @@ humana explícita.** El [handoff de pausa](docs/handoffs/2026-09-13-market-evide
 conserva el punto anterior, los cambios sin commit, los artefactos y la ruta crítica.
 La promoción técnica actual no equivale a una release de trading, aceptación
 contractual ni conclusión de rentabilidad.
+
+El cierre anterior del código `48ef12a687f74f7050147e3ea71d704b3ce8b358`, con su
+gate de 1,057/1,057 pruebas, se conserva como antecedente; no representa el
+`HEAD` vigente.
 
 La nueva [campaña histórica de evidencia](docs/market_evidence_plan.md) está en
 integración. Su [piloto real y límites](docs/market_pilot_status.md) registra
@@ -75,7 +83,7 @@ conservó un intent `UNKNOWN`. El resultado no se acepta globalmente: los costes
 son de modelo explícito, no cargos históricos observados, y no demuestra
 rentabilidad ni selección. El V17 previo tuvo 0 `RiskExit` fills evaluables;
 2017–2019 conserva sólo QA descriptivo, sin estrategia.
-No abrió WF/holdout ni evaluó estrategia. El
+La QA descriptiva no abrió WF/holdout ni evaluó estrategia. El
 backtest anual V17 terminó en modo
 `COMPLETED_DEVELOPMENT_REVIEW_ONLY`: procesó 19,026,438 cotizaciones y conserva
 un receipt terminal; la auditoría de terminalidad quedó en
@@ -109,11 +117,14 @@ y receipts fail-closed; la fixture offline `WARMUP_ONLY → WF` con reanudación
 byte-equivalente ya está validada en
 `runtime/market-evidence/wf-warmup-resume-fixture-20260915.json`. Todavía no
 hay datos WF ni consumidor productivo ejecutable: el runner sólo enlaza el
-contrato en preflight y cierra antes de leer datos. El gate offline terminal del
-código validado `HEAD=48ef12a687f74f7050147e3ea71d704b3ce8b358` pasó 1,057/1,057
-pruebas, sin red ni escrituras externas, con 79.906% de líneas y 63.307% de
-ramas; su receipt es
+contrato en preflight y cierra antes de leer datos. El gate offline anterior del
+código `48ef12a687f74f7050147e3ea71d704b3ce8b358` pasó 1,057/1,057 pruebas, sin
+red ni escrituras externas, con 79.906% de líneas y 63.307% de ramas; su receipt
+se conserva como antecedente en
 `runtime/market-evidence/operational-closure-20260919T183148Z/quality-gate.json`.
+La validación vigente del código
+`b162e0f1a52e272268bf3bd9ae1631e5cae688a0` está enlazada arriba y en el estado
+operativo; no se duplica aquí su receipt.
 La última referencia
 global reproducible completa, previa a los cambios locales warmup/health y al
 refactor de reporting, pasó 990/990 pruebas sin omisiones, con
@@ -142,8 +153,8 @@ sesiones son estados distintos. Ningún comando nuevo activa trading por defecto
 
 El runtime privado canónico quedó reconstruido y promovido de forma explícita
 desde una review validada: `/home/winterboss/.local/share/mtf-lab/runtime`.
-Su manifiesto está en `state=ACTIVE_RUNTIME`, `promotion_state=ACTIVE` y
-`current_pointer` apunta al propio destino; Python 3.12.14, SQLite 3.53.1 y
+Su estado vigente es `ACTIVE_CANONICAL`, con process scan `COMPLETE`, rollback
+conservado y `run_id=20260919T225409Z-4d1675aa`; Python 3.12.14, SQLite 3.53.1 y
 Protobuf 7.36.1 pasan el smoke aislado y `pip check`. Las 28 reviews históricas
 se limpiaron con el GC seguro; sus manifests y logs acotados quedaron en
 `runtime/market-evidence/runtime-review-legacy-evidence-20260917/index.json`.
@@ -219,7 +230,11 @@ y cero gaps. Esa cobertura sólo cierra la ventana solicitada: el `has_more=true
 de la consulta fuente no se convierte en histórico completo y la captura no
 acredita frescura live, BBO, ejecución ni rentabilidad. Los launchers instalados
 usan una referencia privada de credenciales; el launcher de consulta no habilita
-trading y la canaria de software permanece `STAGED`.
+trading. La canaria de software está instalada como
+`~/.local/bin/mtf-lab-demo-canary`; su preflight de sólo lectura contra el servidor
+real pasó identidad, `TRADING` y catálogo, y cerró con el resultado esperado
+`NETWORK_PREFLIGHT_INPUTS_REQUIRED` sin recopilar aún mercado/riesgo operables. El estado canónico
+permanece `EMPTY`, sin mutación, y hay 0 órdenes.
 
 ### Autorización de canaria técnica DEMO — 2026-09-21
 
@@ -234,11 +249,16 @@ se repite OAuth ni se cambia la cuenta seleccionada, pero cada conexión exige
 discovery fresco de lectura y verificación de esa cuenta. Esto no autoriza REAL,
 estrategia, operación continua, extensión automática ni reintento de un resultado
 ambiguo. Es un gate técnico previo a cualquier histórico completo o ventana de 72
-horas, no una selección de estrategia. La canaria de software
-permanece `STAGED`, no instalada,
-y la automatización aún no está creada; se planifica un heartbeat nativo una vez
-que el software sea aceptado, sólo para esta ventana y sin extenderla. No se
-afirma ejecución hasta observarla.
+horas, no una selección de estrategia. La canaria de software está instalada y
+su preflight readonly pasó identidad, `TRADING` y catálogo, con
+`NETWORK_PREFLIGHT_INPUTS_REQUIRED` como resultado esperado sin recopilar aún mercado/riesgo operables; el estado canónico es `EMPTY`, sin mutación, y hay 0 órdenes. El
+heartbeat nativo está
+`ACTIVE`, con ID `mtf-canaria-demo-autorizada-del-21-de-septiembre`: una oportunidad
+para el lunes 21, despierta a las 08:54 hora de México, captura desde 08:55 y
+mantiene la ventana de órdenes 09:00–09:20. La zona `America/Mexico_City` está
+verificada, `COUNT=1` y sin jitter según el runtime; no repite ni extiende y
+requiere host/app disponible y gates frescos. No se afirma ejecución hasta
+observarla.
 
 ### Antecedente: validación conectada DEMO de sólo lectura — 2026-09-14
 
@@ -343,11 +363,11 @@ La lista queda limitada a hechos, decisiones y autorizaciones externas:
 3. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo;
    la lectura administrativa y de catálogo no sustituye la reconciliación de la
    canaria técnica.
-4. Promover e instalar el software de canaria `STAGED` sólo para la ventana y
-   límites aprobados, y ejecutar manualmente dos ciclos independientes: 1 BUY y
-   cierre, después 1 SELL y cierre. La automatización aún no está creada; se
-   planifica un heartbeat nativo una vez que el software sea aceptado. No se
-   extiende la ventana ni se reintenta un resultado ambiguo.
+4. Satisfacer `NETWORK_PREFLIGHT_INPUTS_REQUIRED` con datos de mercado y riesgo frescos y ejecutar
+   los dos ciclos técnicos independientes dentro de la ventana aprobada. El
+   software ya está instalado y el heartbeat nativo está `ACTIVE` con ID
+   `mtf-canaria-demo-autorizada-del-21-de-septiembre`; no se repite ni se extiende
+   la ventana ni se reintenta un resultado ambiguo.
 5. Resolver las condiciones contractuales de Pepperstone relevantes para
    México, almacenamiento/redistribución de datos y costes. Una especificación
    de costes no equivale a cargos observados.

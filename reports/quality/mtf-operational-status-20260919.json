@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
-  "verified_at": "2026-09-19T19:10:48.918728+00:00",
+  "verified_at": "2026-09-19T23:36:55.983814+00:00",
   "scope": "Redacted durable status; publication is not trading release or economic acceptance",
-  "validated_source_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358",
+  "validated_source_commit": "b162e0f1a52e272268bf3bd9ae1631e5cae688a0",
   "published_baseline_commit": "66506ad81ee58b773ff3f76016608d8a2bbb78b3",
   "preservation": {
     "remote": "https://github.com/victor982721-lab/MTF",
@@ -31,72 +31,80 @@
       "regenerable heavy QA"
     ],
     "publication_evidence": {
-      "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/final-publication.json",
-      "purpose": "Final documentation commit, executable equivalence and remote equality; recorded after publication to avoid self-referential hashes"
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/final-publication.json",
+      "purpose": "Final documentation commit and exact executable equivalence to validated b162e0f; actual remote equality recorded after publication"
     }
   },
   "runtime": {
     "state": "ACTIVE_RUNTIME",
     "promotion_state": "ACTIVE",
-    "run_id": "20260919T183150Z-b74d267e",
+    "run_id": "20260919T225409Z-4d1675aa",
     "installed_package_matches_validated_source": true,
-    "packaged_files_compared": 126,
+    "packaged_files_compared": 128,
     "excluded_unpackaged_doc": "mtf_lab/data/README.md",
     "evidence": {
       "local_path": "/home/winterboss/.local/share/mtf-lab/runtime/STAGED_RUNTIME.json",
-      "sha256": "d2bf3b73b1e16107b9166d1abb1db4c8f62dbba41aad0de1edb6c654ff89d521"
+      "sha256": "f0141e26c91fded8318e8399ea9ec8e47b71b83102c8fcdece24f54b1bb1d841"
     },
-    "source_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358",
+    "source_commit": "b162e0f1a52e272268bf3bd9ae1631e5cae688a0",
     "process_scan": "COMPLETE",
     "active_record": "ACTIVE_CANONICAL",
     "lifecycle_evidence": {
-      "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/runtime-inspect-promoted.json",
-      "sha256": "a04ac306225a16db5c074a1920c3859c7bf3e085e3305c1381ee45a97e257924"
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/runtime-inspect-promoted-v2.json",
+      "sha256": "5b229ee8025659be8633c1ee1bb9fd269acd6b446d164647f8f9786e2379f782"
     },
-    "rollback": "/home/winterboss/.local/share/mtf-lab/runtime-rollback-20260919-190517-bb5f2ef2"
+    "rollback": "/home/winterboss/.local/share/mtf-lab/runtime-rollback-20260919-232550-6e6f14b7"
   },
   "quality": {
     "ok": true,
     "tests": {
       "consistent": true,
-      "discovered": 1057,
-      "executed": 1057,
+      "discovered": 1125,
+      "executed": 1125,
       "expected_failures": 0,
       "failed": 0,
-      "passed": 1057,
+      "passed": 1125,
       "skipped": 0,
-      "tests_run": 1057,
+      "tests_run": 1125,
       "unexpected_successes": 0
     },
     "coverage": {
-      "branch_percent": 63.307,
-      "covered_branches": 10823,
-      "covered_lines": 39718,
+      "branch_percent": 63.291,
+      "covered_branches": 11276,
+      "covered_lines": 41125,
       "error": null,
-      "line_percent": 79.906,
-      "num_branches": 17096,
-      "num_statements": 49706,
+      "line_percent": 79.915,
+      "num_branches": 17816,
+      "num_statements": 51461,
       "ok": true,
       "threshold_percent": 60.0
     },
     "network_attempts": 0,
     "outside_write_attempts": 0,
-    "timeout_seconds": 1800,
+    "timeout_seconds": 2400,
     "evidence": {
-      "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/quality-gate.json",
-      "sha256": "fd28831daef25d61311ffed6c15febb2455752c629b4a63a42f2ff8ae9707636"
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/quality-gate-v2.json",
+      "sha256": "fbcb473977577e5e76b73d8f4dc8c203184d7aba121b10350480644e072922eb"
     },
-    "prior_attempts": "coordinator interruption then insufficient 900s timeout; neither is current acceptance",
-    "offline_suite_duration_seconds": 1550.194,
+    "prior_attempts": "Canary v1 rejected type errors and missing strict-default fixture field; preserved unchanged, not promoted. V2 reran the entire suite.",
+    "rejected_attempt_evidence": {
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/quality-gate.json",
+      "sha256": "b92a89e400ed7672cd704811a92ccfc7ce7199fa3917ed3ce1887806903d25cf"
+    },
+    "offline_suite_duration_seconds": 1567.154,
     "source_integrity": {
       "added": [],
-      "after_content_sha256": "a83d218fcff3bdaff93228d0f92728910373bd93b33eb1cbc06d8a7004e97a6e",
-      "before_content_sha256": "a83d218fcff3bdaff93228d0f92728910373bd93b33eb1cbc06d8a7004e97a6e",
+      "after_content_sha256": "7d3dd036cac5ed730224b330dc356437755cc7d885056abd220168c08e94dbce",
+      "before_content_sha256": "7d3dd036cac5ed730224b330dc356437755cc7d885056abd220168c08e94dbce",
       "changed": [],
       "ok": true,
       "removed": []
     },
-    "validated_source_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358"
+    "validated_source_commit": "b162e0f1a52e272268bf3bd9ae1631e5cae688a0",
+    "terminal_evidence": {
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/quality-terminal-v2.json",
+      "sha256": "c77ddc54ce0922614c58cda6521d164ebb5b8def3efc513983cc3d3b5401aa41"
+    }
   },
   "history": {
     "development_valid_years": [
@@ -124,7 +132,59 @@
       "local_path": "/home/winterboss/.local/share/mtf-lab/market-data/candidates/201910-20260919/acquisition-receipt-201910-20260919T173604Z.json",
       "sha256": "7e2cd0029925c161b6321674a637005712bb3645b514e25c211f08d4a1f174ee"
     },
-    "next_action": "Provider corrected/versioned Tick Bid/Ask source or authoritative resolution; no local sorting, dedupe or timestamp changes"
+    "next_action": "Provider corrected/versioned Tick Bid/Ask source or authoritative resolution; no local sorting, dedupe or timestamp changes",
+    "strategy_pilot": {
+      "candidate": "tp_fast_v1",
+      "window": [
+        "2016-03-07",
+        "2016-03-14"
+      ],
+      "quotes_per_scenario": 499804,
+      "execution": "MODELLED_LOCAL_ONLY",
+      "costs": "EXPLICIT_CURRENT_SPEC_HYPOTHESES_NOT_HISTORICAL_CHARGES",
+      "closed_subset": [
+        {
+          "scenario": "base",
+          "closed": 6,
+          "net_wins": 2,
+          "net_losses": 4,
+          "gross_usd": "-0.28",
+          "net_usd": "-0.64",
+          "commission_usd": "0.36"
+        },
+        {
+          "scenario": "adverse",
+          "closed": 14,
+          "net_wins": 5,
+          "net_losses": 9,
+          "gross_usd": "-0.47",
+          "net_usd": "-1.73",
+          "commission_usd": "1.26"
+        },
+        {
+          "scenario": "extreme",
+          "closed": 14,
+          "net_wins": 4,
+          "net_losses": 10,
+          "gross_usd": "-0.52",
+          "net_usd": "-2.20",
+          "commission_usd": "1.68"
+        }
+      ],
+      "unknown_intents_per_scenario": 1,
+      "unknown_reason": "ENTRY_QUOTE_WINDOW_EXPIRED",
+      "global_acceptance": false,
+      "global_net_status": "UNKNOWN_COSTS",
+      "terminal_evicted": 0,
+      "scenarios_additive": false,
+      "advantage_proven": false,
+      "evidence": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/research/strategy-pilot-20260919/run/output/849f3afa7619496ab51f718e6a7d78f2.json",
+        "sha256": "f98945e5aedc1776a08d5d1c3399ef2422c47bbc197b93f7dbf97dafbf563c6c"
+      }
+    },
+    "annual_V17_evaluable_riskexit_fills": 0,
+    "years_2017_2019_strategy_evaluated": false
   },
   "ctrader": {
     "portal": {
@@ -136,8 +196,8 @@
       "credentials_panel_opened": false,
       "configuration_changed": false
     },
-    "authentication": "DEMO_READ_ONLY_OBSERVED",
-    "scope": "accounts",
+    "authentication": "DEMO_VIEW_AND_SEPARATE_BOUNDED_TRADING_OBSERVED",
+    "scope": "original accounts VIEW retained; separate accounts+trading only approved DEMO",
     "catalog_symbols": 1940,
     "selected_symbol": "EURUSD",
     "watch": {
@@ -160,8 +220,8 @@
     },
     "orders_sent": 0,
     "execution_enabled": false,
-    "new_oauth": false,
-    "trading_scope_requested": false,
+    "new_oauth": true,
+    "trading_scope_requested": true,
     "bounded_history": {
       "requested_start": "2026-09-18T19:00:00Z",
       "requested_end": "2026-09-18T20:00:00Z",
@@ -216,36 +276,125 @@
       "base_asset": "EUR",
       "minimum_base_units": 1000,
       "minimum_relative_lots": "0.01",
-      "commission_fields": "LEGACY; precise effective rates not verified",
+      "commission_fields": "PRECISE_FIELDS_OBSERVED: USD3 per lot per side; minimum0; specification only, not charged",
       "costs_charged": "CHARGED_UNOBSERVED",
       "historical_cost_inference": false,
       "evidence": {
         "local_path": "/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/20260919-query-canary/catalog-costs-summary-redacted.json",
         "sha256": "1349b6a43e119cb056f284f41aa26d3aa9fe5fd2fcbe0b10328f1c37ba6075fc"
+      },
+      "precise_commission_source": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/research/ctrader-demo/installed-launcher-20260919T190734Z/report.json",
+        "sha256": "f8f956496ea0ebe333fdb870c3b4f96c366b19d9d367df5e717b855e1fe221eb"
+      }
+    },
+    "authorization_evidence": {
+      "local_path": "/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-0900-mx/authorization-receipt-redacted.json",
+      "sha256": "90da1fefc0e0003495caa6e4049e8a3986859c99a718cb1b42ae61c120e2d7cb"
+    },
+    "original_readonly_compatibility_evidence": {
+      "local_path": "/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-0900-mx/readonly-compatibility.json",
+      "sha256": "c9e8c37299f10d95128574eb4d38acef92294f5226970e7b7ef97b400857fee0"
+    },
+    "technical_canary": {
+      "state": "SCHEDULED_NOT_EXECUTED",
+      "human_approval": "GRANTED_BOUNDED_TECHNICAL_ONLY",
+      "broker_scope": "SCOPE_TRADE_DEMO_ONLY",
+      "account_suffix": "5097",
+      "symbol": "EURUSD",
+      "cycles": [
+        "BUY_THEN_CLOSE",
+        "SELL_THEN_CLOSE"
+      ],
+      "max_quantity_EUR": "1000",
+      "max_lots": "0.01",
+      "max_positions": 1,
+      "stop_loss_ATR": "1.5",
+      "take_profit_ATR": "3",
+      "ATR_period": 14,
+      "ATR_timeframe": "M1",
+      "max_planned_risk_fraction_per_cycle": "0.0005",
+      "max_trial_loss_fraction": "0.001",
+      "max_holding_seconds": 300,
+      "max_mutation_messages": 6,
+      "nominal_mutation_messages": 4,
+      "orders_sent": 0,
+      "strategy_ready": false,
+      "continuous_trading": false,
+      "REAL_enabled": false,
+      "automatic_extension": false,
+      "blind_retry": false,
+      "approval_evidence": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-0900-mx/approval.json",
+        "sha256": "19d4dda15f422511b10cf1f40a5743cc24ee5e8c98c43fadbfb8789547a4c5e1"
+      },
+      "private_config_evidence": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-0900-mx/canary-execution.toml",
+        "sha256": "551832975437ea49537ca7f86b59dde8bb5ec5eb4f893a1e3899615de025bd55"
+      },
+      "run_plan_evidence": {
+        "local_path": "/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-0900-mx/run-plan.json",
+        "sha256": "03d1a1bf4985112f774ee78b891f17c7b69daa0ed3efca958c174ee969ed249c"
+      },
+      "installed_preflight_evidence": {
+        "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/installed-preflight-summary-v2.json",
+        "sha256": "10d944fc2297c4bb27f20ce9cb2c245d206749afba0fdb51a9a35eba1b672bab"
+      },
+      "automation": {
+        "id": "mtf-canaria-demo-autorizada-del-21-de-septiembre",
+        "status": "ACTIVE",
+        "kind": "heartbeat",
+        "count": 1,
+        "wake": "2026-09-21T08:54:00-06:00",
+        "prep_start": "2026-09-21T08:55:00-06:00",
+        "orders_start": "2026-09-21T09:00:00-06:00",
+        "orders_end_exclusive": "2026-09-21T09:20:00-06:00",
+        "actual_trigger_observed": false,
+        "requires_host_and_codex_available": true,
+        "evidence": {
+          "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/automation-scheduled.json",
+          "sha256": "f66dae567bff5b758f3fe1e1ee2d409676a6858f5bd96b248052de6330f3e491"
+        }
+      },
+      "remaining_gates": [
+        "fresh server identity and scopes",
+        "flat reconciled account and existing risk baseline",
+        "observed full-window market schedule",
+        "causal valid MID BBO and ATR14 M1",
+        "observed margin/cost forecast and risk",
+        "two broker-confirmed cycles and post-close reconciliation"
+      ],
+      "slippage_forecast": {
+        "pips": "0.1",
+        "basis": "IMPLEMENTATION_HYPOTHESIS",
+        "source": "baseline-0.1pip",
+        "observed": false,
+        "risk_envelope_guarantee": false
       }
     }
   },
   "external_gates": {
     "source_correction": "PENDING_PROVIDER",
     "account_entity_mexico_and_retention": "PENDING_EFFECTIVE_TERMS",
-    "effective_costs": "UNKNOWN_COSTS",
+    "effective_costs": "SPEC_OBSERVED_FOR_CURRENT_ACCOUNT; CHARGES_UNOBSERVED; HISTORICAL_UNKNOWN_COSTS",
     "freshness_continuity_warmup": "PENDING_OPEN_MARKET_OBSERVATION",
     "shadow_72h": "NOT_STARTED",
     "forward_30_sessions": "NOT_STARTED",
-    "separate_execution_authorization": "NOT_GRANTED",
-    "calendar_zero_zero_holiday_semantics": "PENDING_BROKER_CLARIFICATION; remains UNKNOWN"
+    "separate_execution_authorization": "GRANTED_ONLY_FOR_BOUNDED_TECHNICAL_DEMO_20260921; continuous/forward/REAL not granted",
+    "calendar_zero_zero_holiday_semantics": "UNKNOWN_WHEN_RELEVANT; historical nonrecurring holidays outside approved window do not close an observed open window"
   },
   "support_drafts": {
     "histdata": "docs/histdata_201910_issue.md",
     "pepperstone": "docs/pepperstone_ctrader_openapi_draft.md",
     "sent": false
   },
-  "published_code_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358",
+  "published_code_commit": "b162e0f1a52e272268bf3bd9ae1631e5cae688a0",
   "launchers": {
     "state": "INSTALLED",
     "paths": [
       "/home/winterboss/.local/bin/mtf-lab",
-      "/home/winterboss/.local/bin/mtf-lab-ctrader-query"
+      "/home/winterboss/.local/bin/mtf-lab-ctrader-query",
+      "/home/winterboss/.local/bin/mtf-lab-demo-canary"
     ],
     "modes": "0700",
     "private_reference_only": true,
@@ -253,6 +402,12 @@
     "evidence": {
       "local_path": "/home/winterboss/MTF/runtime/market-evidence/operational-closure-20260919T183148Z/installed-launchers.json",
       "sha256": "6fa342303e1499feb38fe74527bc38b0568b79d0349aa7fc9391d665aa6f1afa"
-    }
-  }
+    },
+    "canary_evidence": {
+      "local_path": "/home/winterboss/MTF/runtime/market-evidence/canary-preparation-20260919T215251Z/installed-canary-v2.json",
+      "sha256": "8458fe880f50a5743113085f83838b199bc921da948bd7f2529f490bf909eb4e"
+    },
+    "original_launchers_unchanged": true
+  },
+  "prior_validated_source_commit": "48ef12a687f74f7050147e3ea71d704b3ce8b358"
 }

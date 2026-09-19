@@ -35,7 +35,9 @@ Los launchers de usuario están instalados en `~/.local/bin/mtf-lab` y
 `~/.local/bin/mtf-lab-ctrader-query`; sus `--help` se probaron desde un cwd ajeno,
 con HOME/XDG/TMP aislados. El launcher de consulta usa sólo una referencia privada de
 credenciales; ningún valor secreto está en el repositorio y no inicia OAuth ni
-acepta scopes de trading.
+acepta scopes de trading. La canaria instaló además
+`~/.local/bin/mtf-lab-demo-canary` con modo `0700`; su `--help` aislado pasó y sus
+imports provienen del Python instalado (3.12.14, SQLite 3.53.1, Protobuf 7.36.1).
 El [estado operativo](operational_status.md) separa los subgates administrativos,
 de datos, económicos y de autorización.
 
@@ -54,10 +56,17 @@ un gate previo a cualquier histórico completo o ventana de 72 horas, no una
 selección de estrategia. No se repite OAuth ni se cambia la cuenta seleccionada;
 cada conexión debe completar discovery fresco de lectura y verificar esa cuenta.
 
-El software de la canaria permanece `STAGED` y no está instalado; la automatización
-aún no está creada y se planifica un heartbeat nativo una vez que el software sea
-aceptado, sólo para esta ventana y sin extenderla. Todavía no hay órdenes ni
-resultado de ejecución observado.
+La canaria está instalada como `~/.local/bin/mtf-lab-demo-canary` con modo `0700`;
+su preflight readonly contra el servidor real pasó identidad, `TRADING` y
+catálogo, con el resultado esperado `NETWORK_PREFLIGHT_INPUTS_REQUIRED` sin recopilar aún
+mercado/riesgo operables. El estado canónico permanece `EMPTY`, sin mutación, y todavía
+hay 0 órdenes.
+El heartbeat nativo está `ACTIVE`, con ID
+`mtf-canaria-demo-autorizada-del-21-de-septiembre`: una oportunidad para el lunes
+21, despierta a las 08:54 hora de México, captura desde 08:55 y mantiene la
+ventana de órdenes 09:00–09:20. La zona `America/Mexico_City` está verificada,
+`COUNT=1` y sin jitter según el runtime; no repite ni extiende y requiere host/app
+disponible y gates frescos. No hay resultado de ejecución observado.
 
 ### Antecedente: validación DEMO conectada de sólo lectura — 2026-09-14
 
@@ -351,10 +360,12 @@ posiciones, historia y respuestas de aceptación/rechazo efectivos. Un timeout
 ambiguo permanece `UNKNOWN` y exige reconciliación; no autoriza reintentar una
 orden.
 
-El alcance `TRADING` DEMO está concedido sólo para la cuenta aprobada, pero la
-ejecución de la canaria aún no se observa: el software permanece `STAGED` y no
-instalado. **REAL/LIVE se rechaza fail-closed** y ningún fixture prueba que una
-orden haya llegado a un servidor.
+El alcance `TRADING` DEMO está concedido sólo para la cuenta aprobada y la
+canaria está instalada en `~/.local/bin/mtf-lab-demo-canary`; el preflight readonly
+pasó identidad, `TRADING` y catálogo, con
+`NETWORK_PREFLIGHT_INPUTS_REQUIRED` sin recopilar aún mercado/riesgo operables. El estado canónico
+es `EMPTY`, sin mutación, y hay 0 órdenes. **REAL/LIVE se rechaza fail-closed** y ningún fixture
+prueba que una orden haya llegado a un servidor.
 
 ### Pendientes externos vigentes — 2026-09-19
 
@@ -367,11 +378,11 @@ no hay órdenes y esa autorización no se extiende a REAL/LIVE.
    abierta; la consulta fuente mantiene `has_more=true` y la ventana bounded no
    convierte el histórico completo en disponible.
 2. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo.
-3. Promover e instalar el software de canaria `STAGED` sólo para la ventana y
-   límites aprobados, y ejecutar manualmente dos ciclos independientes: 1 BUY y
-   cierre, después 1 SELL y cierre. La automatización aún no está creada; se
-   planifica un heartbeat nativo una vez que el software sea aceptado. No se
-   extiende la ventana ni se reintenta un resultado ambiguo.
+3. Satisfacer `NETWORK_PREFLIGHT_INPUTS_REQUIRED` con datos de mercado y riesgo frescos y ejecutar
+   los dos ciclos técnicos independientes dentro de la ventana aprobada. La
+   canaria ya está instalada y el heartbeat nativo está `ACTIVE` con ID
+   `mtf-canaria-demo-autorizada-del-21-de-septiembre`; no se repite ni se extiende
+   la ventana ni se reintenta un resultado ambiguo.
 4. Verificar ejecución y reconciliación de esa canaria sin convertirla en
    estrategia, operación continua ni forward.
 5. Confirmar las condiciones contractuales de Pepperstone aplicables a México,
