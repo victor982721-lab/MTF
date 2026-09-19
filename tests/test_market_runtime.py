@@ -123,6 +123,10 @@ def _make_active(root: Path) -> Path:
 
 
 class MarketRuntimePreparationTests(unittest.TestCase):
+    def test_proc_owner_uid_reads_procfs_status(self) -> None:
+        process = Path(f"/proc/{os.getpid()}")
+        self.assertEqual(os.getuid(), runtime_lifecycle._proc_owner_uid(process))
+
     def test_archive_provenance_preserves_license_bytes_and_hash(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

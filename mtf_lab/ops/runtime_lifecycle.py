@@ -392,12 +392,34 @@ def _pid_alive(pid: int) -> bool:
 
 
 def _proc_owner_uid(process: Path) -> int | None:
+    """Return the real UID recorded by procfs for *process*.
+
+    ``lstat(/proc/<pid>)`` reports the owner of the procfs directory as seen
+    by the caller, not the owner of the process.  Reading the ``Uid:`` record
+    is therefore required before deciding whether a process belongs to this
+    user; an unreadable or malformed record remains a hard, fail-closed
+    lifecycle error.
+    """
+
     try:
-        return os.lstat(process).st_uid
+        lines = (process / "status").read_text(encoding="ascii").splitlines()
     except OSError as exc:
         if exc.errno in {errno.ENOENT, errno.ESRCH}:
             return None
         raise RuntimeLifecycleError(f"process owner scan unavailable: {process}") from exc
+    except UnicodeError as exc:
+        raise RuntimeLifecycleError(f"process owner scan unreadable: {process}") from exc
+    for line in lines:
+        if not line.startswith("Uid:"):
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            break
+        try:
+            return int(fields[1])
+        except ValueError:
+            break
+    raise RuntimeLifecycleError(f"process owner record unavailable: {process}")
 
 
 def _proc_is_current_user(process: Path) -> bool:
@@ -436,6 +458,7 @@ def _proc_is_non_mtf(process: Path, roots: Sequence[Path]) -> bool:
             "(sd-pam)",
             "/usr/bin/ssh-agent",
             "kwin_wayland",
+            "kscreenlocker_greet",
             "polkit-kde-authentication-agent",
             "org_kde_powerdevil",
         )
