@@ -1,5 +1,60 @@
 # Calidad global de MTF Lab
 
+## Segunda iteración offline — 2026-09-20
+
+Código validado `ca3ebaa6806106465a3a4662df4ed71c541b913d` en
+`codex/mtf-offline-hardening-20260920`, separado de `main` y del runtime instalado.
+Los 13 hallazgos confirmados quedaron corregidos, con revisión independiente y
+regresiones sintéticas:
+
+- **Riesgo y recuperación:** `PARTIAL` bloquea nuevas entradas no conciliadas;
+  `moneyDigits=0` conserva su escala. Recovery restaura el contador de barra y
+  las protecciones, valida identidad, plan de riesgo y ledger acumulado de fills,
+  y rechaza actualizaciones contradictorias sin reenviar órdenes.
+- **Causalidad y checkpoints:** la disponibilidad efectiva incluye los lags de
+  contexto/preparación y se consume en orden, sin barridos completos por trigger.
+  Tres fixtures nominales conservan JSON público idéntico al baseline. El
+  checkpoint continuo standalone recupera su acumulador; un checkpoint legado
+  incompleto falla cerrado, mientras strict/shared conserva compatibilidad.
+- **Archivos y protocolo:** preservación confinada con preflight, snapshot de
+  fuente, padres anclados por descriptor y publicación exclusiva. Se cubren
+  carreras, colisiones y múltiples licencias ZIP/TAR. Auth exige la respuesta
+  esperada antes de acreditar sesión y la redacción incluye Protobuf anidado.
+- **Economía y reportes:** la retención no elimina incertidumbre global. El
+  puente de costes consume todas las páginas del ledger y valida los bytes
+  leídos, hash y conteo al EOF antes de publicar. Los resúmenes se acotan sin
+  confundir un sufijo con el conjunto completo. Los descriptores paginados de
+  equity/funnel permanecen explícitamente `NOT_ASSESSED`, no se inventan filas.
+- **Supervisión y UI:** el monotónico se compara sólo dentro del mismo boot,
+  conservando riesgo y la guardia UTC. El deadline se comprueba tras preparar y
+  capturar. Las consultas de UI fijan sesión/filtros; las páginas se pintan y
+  conservan hasta una actualización explícita, sin aceptar respuestas obsoletas.
+
+La suite completa terminó el **2026-09-20T07:23:51Z**, exit 0 y cgroup vacío:
+**1,217/1,217 pruebas**, 68 nuevas, cero fallos, omisiones o resultados esperados
+fallidos. Ruff, formato, mypy, Pyright, empaquetado y arquitectura aprobaron.
+Cobertura: **80.268% de líneas / 63.881% de ramas**; ejecución de suite y wrapper:
+1,566.796 s. La identidad de fuentes permaneció idéntica antes/después.
+
+HOME/XDG/TMP estuvieron aislados y no hubo intentos de red externa. La nueva
+auditoría bloquea escrituras Python fuera de los destinos temporales autorizados;
+los smokes conservan su bloqueo estricto. Los tests de cercas usan repositorios
+sintéticos y ya no modifican el checkout. **No es un sandbox del sistema
+operativo:** I/O nativo de C/SQLite, Node o shell no está instrumentado y los
+diagnósticos de hijos son por proceso, no un contador global agregado.
+
+Evidencia local: directorio
+`/home/winterboss/MTF/runtime/market-evidence/implementation-iteration2-20260920T054423Z`.
+Su `quality-gate.json` tiene SHA-256
+`b616412e1f8416039efb9ca6a9e06e81ae2459361509e3933bc78a417e17481c`;
+`quality-terminal.json` verifica la terminalidad y `acceptance-map.json` enlaza
+los hallazgos con sus regresiones. El wheel offline conserva 130 archivos
+byte-equivalentes, SHA-256
+`1f752ea25fc0c6d8672f2db86c873acd1177c6351a5cf3c6cb1e3b24fe93486c`.
+Se probó en un venv efímero desde otro cwd, sin índice ni nuevas dependencias;
+no se promocionó el runtime. No hubo bróker, credenciales reales, corpus,
+SQLite productiva ni órdenes. La canaria original continúa sin modificaciones.
+
 ## Mejoras offline aisladas — 2026-09-20
 
 Código validado `f3b187fdc76af70fe280bf9ecbd11313a02eebd6`, publicado en la rama

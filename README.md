@@ -18,12 +18,13 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 
 ### Desarrollo aislado — 2026-09-20
 
-La rama `codex/mtf-offline-hardening-20260920` contiene las correcciones de
-conciliación, validación de entradas y modularidad del código
-`f3b187fdc76af70fe280bf9ecbd11313a02eebd6`, validado y publicado en el remoto
-privado. El [cierre de calidad](docs/refactor_quality.md#mejoras-offline-aisladas--2026-09-20)
-describe los cambios y sus pruebas. **No está integrado en `main` ni instalado
-como runtime operativo.** La canaria programada conserva `main=93491b5`, código
+La segunda iteración de `codex/mtf-offline-hardening-20260920` corrigió los
+13 hallazgos de riesgo, causalidad, recuperación, archivos, autenticación y UI,
+además de reforzar la auditoría Python de escrituras y los reportes paginados.
+El código `ca3ebaa6806106465a3a4662df4ed71c541b913d` pasó **1,217/1,217 pruebas**,
+incluidas 68 nuevas, sin fallos ni omisiones. El [cierre de calidad](docs/refactor_quality.md)
+detalla resultados y límites. **No está integrado en `main` ni instalado como
+runtime operativo.** La canaria programada conserva `main=93491b5`, código
 operativo `b162e0f` y sus entradas originales; el estado operativo siguiente
 corresponde a esa versión, no a esta rama de desarrollo.
 
