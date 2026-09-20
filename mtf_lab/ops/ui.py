@@ -50,7 +50,11 @@ const json=x=>{let value=scrub(x);return typeof value==='object'?JSON.stringify(
 async function get(path){let r=await fetch(path);if(!r.ok)throw Error('HTTP '+String(r.status||'error'));return r.json()}
 function rows(value){return Array.isArray(value)?value:(value&&Array.isArray(value.items)?value.items:[])}
 function table(items, cols){if(!items.length)return '<p>Sin registros persistidos.</p>';return '<table><thead><tr>'+cols.map(c=>'<th>'+esc(c[1])+'</th>').join('')+'</tr></thead><tbody>'+items.map(x=>'<tr>'+cols.map(c=>'<td>'+esc(json(x[c[0]]))+'</td>').join('')+'</tr>').join('')+'</tbody></table>'}
-function qs(extra={}){let sid=document.getElementById('session').value, q={session:sid,timeframe:document.getElementById('timeframe').value,start_ts:document.getElementById('start').value,end_ts:document.getElementById('end').value,revisions:document.getElementById('revisions').value,...extra};return Object.entries(q).filter(([,v])=>v!==''&&v!=null).map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&')}
+function querySnapshot(){return Object.freeze({session:document.getElementById('session').value,timeframe:document.getElementById('timeframe').value,start_ts:document.getElementById('start').value,end_ts:document.getElementById('end').value,revisions:document.getElementById('revisions').value})}
+function qs(extra={},query=querySnapshot()){return Object.entries({...query,...extra}).filter(([,v])=>v!==''&&v!=null).map(([k,v])=>encodeURIComponent(k)+'='+encodeURIComponent(v)).join('&')}
+let refreshEpoch=0, refreshPending=null, requestedQuery=null, committedQuery=null, candleView=null;
+function currentRefresh(query,epoch){return epoch===refreshEpoch&&qs({},query)===qs()}
+function clearQueryView(){['summary','observability','indicatorCharts','candles','candlePager','gaps','signals','conditions','discards','sims','cfdTrades'].forEach(id=>{document.getElementById(id).innerHTML='';});document.getElementById('mode').textContent='Consulta en curso…';candleView=null;committedQuery=null;}
 const refreshBySession={};
 function refreshState(sid){return refreshBySession[sid]??(refreshBySession[sid]={lastGoodAt:null,lastAttemptAt:null,error:null,status:null,partial:false})}
 function shortError(){return 'No se pudo actualizar la consulta local; se conserva el último estado bueno.'}
@@ -126,7 +130,7 @@ function pathFor(points,key,w=520,h=150){
   });
   return segments.join(' ');
 }
-async function drawCharts(){let root=document.getElementById('indicatorCharts');let tfs=['M1','M5','M15'];let data=await Promise.all(tfs.map(async tf=>[tf,rows(await get('/api/indicators?'+qs({timeframe:tf,limit:200})))]));root.innerHTML=data.map(([tf,p])=>{let q=p.slice(-120),svg='<svg class="chart" viewBox="0 0 520 150" role="img" aria-label="'+esc(tf)+' EMA RSI ATR">';[['close','close'],['ema_fast','emaFast'],['ema_slow','emaSlow']].forEach(([k,c])=>{let d=pathFor(q,k);if(d)svg+='<path class="line '+c+'" d="'+d+'"/>'});svg+='</svg>';let osc='<svg class="chart" viewBox="0 0 520 90" role="img" aria-label="'+esc(tf)+' RSI ATR persistidos">';[['rsi','rsi'],['atr','atr']].forEach(([k,c])=>{let d=pathFor(q,k,520,80);if(d)osc+='<path class="line '+c+'" d="'+d+'"/>'});osc+='</svg><p class="muted">'+esc(tf)+' · precio/EMA y RSI/ATR persistidos</p>';return '<div class="card">'+svg+osc+'</div>'}).join('')||'<p>Sin indicadores persistidos.</p>'}
+async function chartMarkup(query){let tfs=['M1','M5','M15'];let data=await Promise.all(tfs.map(async tf=>[tf,rows(await get('/api/indicators?'+qs({timeframe:tf,limit:200},query)))]));return data.map(([tf,p])=>{let q=p.slice(-120),svg='<svg class="chart" viewBox="0 0 520 150" role="img" aria-label="'+esc(tf)+' EMA RSI ATR">';[['close','close'],['ema_fast','emaFast'],['ema_slow','emaSlow']].forEach(([k,c])=>{let d=pathFor(q,k);if(d)svg+='<path class="line '+c+'" d="'+d+'"/>'});svg+='</svg>';let osc='<svg class="chart" viewBox="0 0 520 90" role="img" aria-label="'+esc(tf)+' RSI ATR persistidos">';[['rsi','rsi'],['atr','atr']].forEach(([k,c])=>{let d=pathFor(q,k,520,80);if(d)osc+='<path class="line '+c+'" d="'+d+'"/>'});osc+='</svg><p class="muted">'+esc(tf)+' · precio/EMA y RSI/ATR persistidos</p>';return '<div class="card">'+svg+osc+'</div>'}).join('')||'<p>Sin indicadores persistidos.</p>'}
 
 function uiSnapshot(){
   const ids=['mode','summary','observability','indicatorCharts','candles','candlePager','gaps','signals','conditions','discards','sims','cfdTrades'];
@@ -136,51 +140,85 @@ function uiSnapshot(){
 }
 function restoreUiSnapshot(snapshot){Object.entries(snapshot).forEach(([id,value])=>{document.getElementById(id).innerHTML=value.html;});}
 async function load(){
-  const sid=document.getElementById('session').value;
-  if(!sid)return;
-  const state=refreshState(sid), prior=uiSnapshot();
+  const query=querySnapshot(), sid=query.session, epoch=++refreshEpoch;
+  requestedQuery=qs({},query);
+  if(!sid){refreshPending=null;clearQueryView();return;}
+  refreshPending=epoch;
+  if(committedQuery!==qs({},query))clearQueryView();
+  const state=refreshState(sid), prior=uiSnapshot(), priorCandles=candleView;
   state.lastAttemptAt=new Date().toISOString();
   let pollError=null;
   try{
     let poll=null;
-    try{poll=await get('/api/poll?'+qs({limit:100}));}catch(error){pollError=error;}
+    try{poll=await get('/api/poll?'+qs({limit:100},query));}catch(error){pollError=error;}
     const s=(poll&&poll.status)||await get('/api/status?session='+encodeURIComponent(sid));
-    const cp=await get('/api/candles?'+qs({limit:200}));
-    const candles=rows(cp), groups={};
-    candles.forEach(x=>(groups[x.timeframe]??=[]).push(x));
-    const gaps=await get('/api/gaps?'+qs({}));
-    const signals=await get('/api/signals?'+qs({limit:500}));
-    const conditions=await get('/api/conditions?'+qs({limit:1000}));
-    const discards=await get('/api/discards?'+qs({limit:500}));
-    const sims=await get('/api/simulations?'+qs({limit:1000}));
-    const cfd=await get('/api/cfd-trades?'+qs({limit:1000}));
+    const cp=await get('/api/candles?'+qs({limit:200},query));
+    const gaps=await get('/api/gaps?'+qs({},query));
+    const signals=await get('/api/signals?'+qs({limit:500},query));
+    const conditions=await get('/api/conditions?'+qs({limit:1000},query));
+    const discards=await get('/api/discards?'+qs({limit:500},query));
+    const sims=await get('/api/simulations?'+qs({limit:1000},query));
+    const cfd=await get('/api/cfd-trades?'+qs({limit:1000},query));
+    const charts=await chartMarkup(query);
+    if(!currentRefresh(query,epoch))return;
     document.getElementById('mode').textContent=(s.mode_label||s.mode||'?')+' · '+(s.provider||'?')+' · '+(s.instrument||'?');
     const c=s.counts||{};
     document.getElementById('summary').innerHTML=Object.entries(c).map(([k,v])=>'<div class="card"><div>'+esc(k)+'</div><div class="value">'+esc(v)+'</div></div>').join('')+'<div class="card"><div>Conexión</div><div class="value">'+esc(s.connection||'—')+'</div></div><div class="card"><div>Proveedor/entorno</div><div>'+esc((s.provider||'—')+' / '+(s.provider_environment||'—'))+'</div><div>Cuenta: '+esc(s.provider_account_id||'—')+'</div><div>Símbolo: '+esc(s.provider_symbol||'—')+'</div></div><div class="card"><div>Destino ejecución</div><div>'+esc((s.execution_environment||'—')+' / '+(s.execution_destination||'—'))+'</div><div>Permisos: '+esc(JSON.stringify(s.permissions||{}))+'</div></div><div class="card"><div>Análisis</div><div>'+esc(s.analysis_enabled?'habilitado':'bloqueado')+'</div><div>'+esc((s.analysis_blocked_reasons||[]).join(', ')||'—')+'</div></div><div class="card"><div>Calentamiento</div><div>'+esc(JSON.stringify(s.warmup_pending||{}))+'</div></div><div class="card"><div>Pendientes</div><div class="value">'+esc(s.pending_simulations||0)+'</div></div><div class="card"><div>Último evento</div><div>'+esc(s.last_event_ts||'—')+'</div></div><div class="card"><div>Gaps/revisiones</div><div class="value">'+esc((s.gaps||[]).length)+' / '+esc(s.revisions_count||0)+'</div></div>';
-    document.getElementById('candles').innerHTML=Object.entries(groups).map(([tf,a])=>'<div class="card"><h3>'+esc(tf)+'</h3>'+table(a.slice(-30),[['start_ts','Inicio'],['end_ts','Fin'],['close','Cierre'],['closed','Cerrada'],['revision','Rev.'],['is_latest_revision','Última'],['quality','Calidad'],['indicator_values','EMA/RSI/ATR']])+'</div>').join('')||'<p>Sin velas.</p>';
-    document.getElementById('candlePager').innerHTML=cp.next_cursor?'<button id="moreCandles">Cargar más</button>':'<span class="muted">Fin de velas</span>';
-    if(cp.next_cursor)document.getElementById('moreCandles').onclick=()=>loadMoreCandles(cp.next_cursor);
-    await drawCharts();
+    candleView={query,epoch,items:rows(cp).slice(),nextCursor:cp.next_cursor,loading:false,paginated:false};
+    renderCandleView(candleView);
+    document.getElementById('indicatorCharts').innerHTML=charts;
     document.getElementById('gaps').innerHTML=table(rows(gaps),[['timeframe','Temporalidad'],['gap_start','Inicio hueco'],['gap_end','Fin hueco'],['duration_seconds','Duración s'],['filled','Rellenado'],['quality','Calidad']]);
     document.getElementById('signals').innerHTML=table(rows(signals), [['detected_ts','Detectada'],['direction','Dirección'],['status','Estado'],['episode_id','Episodio'],['payload','Detalle']]);
     document.getElementById('conditions').innerHTML='<h3>Condiciones</h3>'+table(rows(conditions), [['observed_ts','Observada'],['decision','Decisión'],['name','Condición'],['state','Estado'],['observed','Observado'],['expected','Esperado'],['reason','Razón'],['mandatory','Obligatoria']]);
     document.getElementById('discards').innerHTML=table(rows(discards), [['observed_ts','Observada'],['reason_code','Razón'],['required','Obligatoria'],['condition_status','Condición'],['payload','Detalle']]);
     document.getElementById('sims').innerHTML=table(rows(sims), [['detected_ts','Detectada'],['horizon_seconds','Horizonte s'],['direction','Dirección'],['outcome','Resultado'],['net_result','Neto virtual'],['quality','Calidad'],['dimensions','Análisis/variante/contrato']]);
     document.getElementById('cfdTrades').innerHTML=table(rows(cfd), [['detected_at','Detectada'],['horizon_seconds','Horizonte s'],['variant','Variante'],['economics_version','Economía versionada'],['trade_id','Operación'],['signal_id','Señal'],['direction','Dirección'],['units','Unidades'],['state','Estado'],['economic_state','Estado económico'],['economic_status','Economía'],['close_observed','Cierre observado'],['entry_price','Entrada'],['close_price','Cierre'],['gross_pnl_quote','Bruto ejecutado'],['slippage_quote','Slippage (desglose v2)'],['costs_account','Costes registrados'],['net_pnl','Neto'],['reason','Razón'] ]);
+    committedQuery=qs({},query);
     state.lastGoodAt=new Date().toISOString();
     state.error=null;
     state.partial=Boolean(pollError);
     state.status=s;
     renderObservability(s,sid);
   }catch(error){
+    if(!currentRefresh(query,epoch))return;
     restoreUiSnapshot(prior);
+    if(priorCandles){candleView={...priorCandles,epoch,loading:false};renderCandlePager(candleView);}
     state.error=true;
     state.partial=false;
     renderObservability(state.status||{},sid);
-  }
+  }finally{if(refreshPending===epoch)refreshPending=null;}
 }
-async function loadMoreCandles(cursor){let p=await get('/api/candles?'+qs({limit:200,cursor}));let old=window._candleItems||[];window._candleItems=old.concat(rows(p));document.getElementById('candlePager').innerHTML=p.next_cursor?'<button id="moreCandles">Cargar más</button>':'<span class="muted">Fin de velas</span>';if(p.next_cursor)document.getElementById('moreCandles').onclick=()=>loadMoreCandles(p.next_cursor);}
-(async()=>{await loadReadiness();setInterval(()=>loadReadiness(),5000);let a=await get('/api/sessions');let list=rows(a);let s=document.getElementById('session');s.innerHTML=list.map(x=>'<option value="'+esc(x.session_id)+'">'+esc(x.session_id.slice(0,12)+' · '+x.mode+' · '+x.instrument)+'</option>').join('');s.onchange=load;document.getElementById('apply').onclick=load;await load();setInterval(()=>load(),5000)})().catch(()=>document.body.insertAdjacentHTML('beforeend','<pre class="bad">No se pudo cargar la UI local.</pre>'));
+function renderCandleView(view){
+  const groups={};
+  view.items.forEach(x=>(groups[x.timeframe]??=[]).push(x));
+  document.getElementById('candles').innerHTML=Object.entries(groups).map(([tf,items])=>'<div class="card"><h3>'+esc(tf)+'</h3>'+table(items,[['start_ts','Inicio'],['end_ts','Fin'],['close','Cierre'],['closed','Cerrada'],['revision','Rev.'],['is_latest_revision','Última'],['quality','Calidad'],['indicator_values','EMA/RSI/ATR']])+'</div>').join('')||'<p>Sin velas.</p>';
+  renderCandlePager(view);
+}
+function renderCandlePager(view,error=false){
+  document.getElementById('candlePager').innerHTML=(view.paginated?'<p class="muted">Exploración paginada: actualización automática en pausa. «Actualizar» vuelve al inicio.</p>':'')+(error?'<span class="bad">No se pudo cargar la página; los datos previos se conservan. </span>':'')+(view.nextCursor?'<button id="moreCandles"'+(view.loading?' disabled':'')+'>'+ (view.loading?'Cargando…':'Cargar más')+'</button>':'<span class="muted">Fin de velas</span>');
+  if(view.nextCursor)document.getElementById('moreCandles').onclick=()=>loadMoreCandles(view.nextCursor,view);
+}
+async function loadMoreCandles(cursor,view=candleView){
+  if(!view||view!==candleView||view.loading||cursor!==view.nextCursor||!currentRefresh(view.query,view.epoch))return;
+  view.loading=true;
+  view.paginated=true;
+  renderCandlePager(view);
+  try{
+    const page=await get('/api/candles?'+qs({limit:200,cursor},view.query));
+    if(view!==candleView||!currentRefresh(view.query,view.epoch))return;
+    view.items=view.items.concat(rows(page));
+    view.nextCursor=page.next_cursor;
+    view.loading=false;
+    renderCandleView(view);
+  }catch(error){
+    if(view===candleView&&currentRefresh(view.query,view.epoch)){
+      view.loading=false;
+      renderCandlePager(view,true);
+    }
+  }finally{view.loading=false;}
+}
+function autoRefresh(){if(refreshPending!==null||(requestedQuery!==null&&requestedQuery!==qs())||(candleView&&(candleView.loading||candleView.paginated)))return;return load();}
+(async()=>{await loadReadiness();setInterval(()=>loadReadiness(),5000);let a=await get('/api/sessions');let list=rows(a);let s=document.getElementById('session');s.innerHTML=list.map(x=>'<option value="'+esc(x.session_id)+'">'+esc(x.session_id.slice(0,12)+' · '+x.mode+' · '+x.instrument)+'</option>').join('');s.onchange=load;document.getElementById('apply').onclick=load;await load();setInterval(()=>autoRefresh(),5000)})().catch(()=>document.body.insertAdjacentHTML('beforeend','<pre class="bad">No se pudo cargar la UI local.</pre>'));
 </script></body></html>"""
 
 

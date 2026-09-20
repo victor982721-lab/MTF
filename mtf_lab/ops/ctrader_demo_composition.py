@@ -83,6 +83,7 @@ DEFAULT_ACCOUNT_ID = 123
 DEFAULT_SYMBOL_ID = 99
 DEFAULT_COUNT = 1_020
 DEFAULT_START = datetime(2026, 1, 1, tzinfo=UTC)
+_MISSING = object()
 
 _OFFICIAL_REQUEST_NAMES = {
     2100: "ProtoOAApplicationAuthReq",
@@ -1376,8 +1377,9 @@ def recover_execution_intents(
     recovered: list[ExecutionIntent] = []
     for intent_id, intent in intents.items():
         result = _result_from_journal_update(intent, updates.get(intent_id))
-        executor.restore_intent(intent, result=result)
-        recovered.append(intent)
+        restored_intent = result.intent
+        executor.restore_intent(restored_intent, result=result)
+        recovered.append(restored_intent)
     executor.complete_recovery()
     return tuple(recovered)
 
@@ -1393,6 +1395,7 @@ def _read_intent_journal(
     intents: dict[str, ExecutionIntent] = {}
     intent_payloads: dict[str, dict[str, Any]] = {}
     updates: dict[str, Mapping[str, Any]] = {}
+    last_filled: dict[str, DecimalValue] = {}
     for line_number, line in enumerate(lines, 1):
         record = _decode_journal_line(line, line_number)
         if record is None:
@@ -1411,11 +1414,28 @@ def _read_intent_journal(
             raw_id = str(record.get("intent_id", "")).strip()
             if not raw_id:
                 raise OfflineCompositionError(f"update without intent_id at journal line {line_number}")
+            _validate_journal_filled_progress(last_filled, raw_id, record, line_number)
             updates[raw_id] = dict(record)
     unknown_updates = set(updates) - set(intents)
     if unknown_updates:
         raise OfflineCompositionError(f"journal update references unknown intent: {sorted(unknown_updates)}")
     return intents, updates
+
+
+def _validate_journal_filled_progress(
+    last_filled: dict[str, DecimalValue],
+    intent_id: str,
+    record: Mapping[str, Any],
+    line_number: int,
+) -> None:
+    filled = _journal_nonnegative_decimal(
+        record.get("filled_quantity", "0"),
+        f"filled_quantity at journal line {line_number}",
+    )
+    previous_filled = last_filled.get(intent_id)
+    if previous_filled is not None and filled < previous_filled:
+        raise OfflineCompositionError(f"journal filled quantity regressed for intent {intent_id}")
+    last_filled[intent_id] = filled
 
 
 def _decode_journal_line(
@@ -1455,6 +1475,190 @@ def _intent_from_journal_record(
         raise OfflineCompositionError(f"invalid intent journal line {line_number}") from exc
 
 
+_RECOVERY_MUTABLE_INTENT_METADATA = frozenset(
+    {
+        "risk_entry_bar_count",
+        "risk_trigger_bar_count",
+        "risk_entry_bar_count_frozen",
+        "risk_entry_bar_count_source",
+    }
+)
+_RECOVERY_BAR_SOURCES = frozenset(
+    {
+        "RUNTIME_UTC_ORDINAL_AT_INTENT",
+        "RUNTIME_UTC_ORDINAL_AT_FILL",
+    }
+)
+
+
+def _journal_nonnegative_decimal(value: Any, name: str) -> DecimalValue:
+    if isinstance(value, bool):
+        raise OfflineCompositionError(f"journal {name} must be a finite non-negative decimal")
+    try:
+        parsed = DecimalValue(value)
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise OfflineCompositionError(f"journal {name} must be a finite non-negative decimal") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise OfflineCompositionError(f"journal {name} must be a finite non-negative decimal")
+    return parsed
+
+
+def _validate_recovery_bar_metadata(metadata: Mapping[str, Any], intent_id: str) -> None:
+    entry = metadata.get("risk_entry_bar_count")
+    trigger = metadata.get("risk_trigger_bar_count")
+    frozen = metadata.get("risk_entry_bar_count_frozen")
+    source = metadata.get("risk_entry_bar_count_source")
+    if entry is not None and (isinstance(entry, bool) or not isinstance(entry, int) or entry < 0):
+        raise OfflineCompositionError(f"journal risk_entry_bar_count invalid for {intent_id}")
+    if trigger is not None and (isinstance(trigger, bool) or not isinstance(trigger, int) or trigger < 0):
+        raise OfflineCompositionError(f"journal risk_trigger_bar_count invalid for {intent_id}")
+    if entry is not None and trigger is not None and entry != trigger:
+        raise OfflineCompositionError(f"journal risk bar counters disagree for {intent_id}")
+    if frozen is not None and not isinstance(frozen, bool):
+        raise OfflineCompositionError(f"journal risk_entry_bar_count_frozen invalid for {intent_id}")
+    if source is not None and source not in _RECOVERY_BAR_SOURCES:
+        raise OfflineCompositionError(f"journal risk_entry_bar_count_source invalid for {intent_id}")
+    if frozen is True and source != "RUNTIME_UTC_ORDINAL_AT_FILL":
+        raise OfflineCompositionError(f"journal frozen risk bar lacks fill provenance for {intent_id}")
+    if source == "RUNTIME_UTC_ORDINAL_AT_FILL" and frozen is not True:
+        raise OfflineCompositionError(f"journal fill risk bar is not frozen for {intent_id}")
+
+
+def _validate_recovery_intent_metadata(original: ExecutionIntent, candidate: ExecutionIntent) -> None:
+    """Allow only the fill-time bar fields to mutate during journal recovery."""
+
+    original_metadata = dict(original.metadata)
+    candidate_metadata = dict(candidate.metadata)
+    for key in set(original_metadata).union(candidate_metadata) - _RECOVERY_MUTABLE_INTENT_METADATA:
+        if original_metadata.get(key, _MISSING) != candidate_metadata.get(key, _MISSING):
+            raise OfflineCompositionError(f"journal immutable intent metadata changed: {key}")
+    _validate_recovery_bar_metadata(original_metadata, original.intent_id)
+    _validate_recovery_bar_metadata(candidate_metadata, original.intent_id)
+
+
+def _journal_decimal(value: Any, name: str) -> DecimalValue:
+    """Parse one persisted positive protection level without trusting its text."""
+
+    if isinstance(value, bool):
+        raise OfflineCompositionError(f"journal {name} must be a finite positive decimal")
+    try:
+        parsed = DecimalValue(value)
+    except (ArithmeticError, TypeError, ValueError) as exc:
+        raise OfflineCompositionError(f"journal {name} must be a finite positive decimal") from exc
+    if not parsed.is_finite() or parsed <= 0:
+        raise OfflineCompositionError(f"journal {name} must be a finite positive decimal")
+    return parsed
+
+
+def _journal_intent_protection(intent: ExecutionIntent) -> tuple[DecimalValue | None, DecimalValue | None]:
+    """Read immutable SL/TP expectations from the original intent metadata."""
+
+    metadata = intent.metadata
+    sources: list[tuple[str, tuple[DecimalValue, DecimalValue]]] = []
+    for source_name, source_value, stop_key, take_key in (
+        ("order_options", metadata.get("order_options"), "stop_loss", "take_profit"),
+        ("risk_exit_plan", metadata.get("risk_exit_plan"), "initial_stop", "take_profit"),
+    ):
+        if source_value is None:
+            continue
+        if not isinstance(source_value, Mapping):
+            raise OfflineCompositionError(f"journal {source_name} must be a mapping")
+        raw_stop = source_value.get(stop_key)
+        raw_take = source_value.get(take_key)
+        if raw_stop is None and raw_take is None:
+            continue
+        if raw_stop is None or raw_take is None:
+            raise OfflineCompositionError(f"journal {source_name} has incomplete SL/TP")
+        sources.append(
+            (
+                source_name,
+                (
+                    _journal_decimal(raw_stop, f"{source_name}.{stop_key}"),
+                    _journal_decimal(raw_take, f"{source_name}.{take_key}"),
+                ),
+            )
+        )
+    if not sources:
+        return None, None
+    expected = sources[0][1]
+    if any(pair != expected for _name, pair in sources[1:]):
+        raise OfflineCompositionError("journal SL/TP sources disagree")
+    return expected
+
+
+def _restore_journal_intent(original: ExecutionIntent, update: Mapping[str, Any]) -> ExecutionIntent:
+    """Restore mutable intent metadata while binding immutable identity to the intent row."""
+
+    update_id = update.get("intent_id")
+    if update_id is not None and str(update_id) != original.intent_id:
+        raise OfflineCompositionError(f"journal update correlation mismatch for intent {original.intent_id}")
+    raw_intent = update.get("intent")
+    if raw_intent is None:
+        return original
+    if not isinstance(raw_intent, Mapping):
+        raise OfflineCompositionError(f"journal intent update is not a mapping for {original.intent_id}")
+    client_order_id = raw_intent.get("client_order_id")
+    if client_order_id is not None and str(client_order_id) != original.intent_id:
+        raise OfflineCompositionError(f"journal client correlation mismatch for intent {original.intent_id}")
+    try:
+        candidate = _intent_from_journal_record(raw_intent, 0)
+    except OfflineCompositionError:
+        raise
+    except (TypeError, ValueError) as exc:
+        raise OfflineCompositionError(f"invalid mutable intent update for {original.intent_id}") from exc
+    immutable = (
+        ("intent_id", original.intent_id, candidate.intent_id),
+        ("signal_id", original.signal_id, candidate.signal_id),
+        ("account_id", original.account_id, candidate.account_id),
+        ("symbol", original.symbol, candidate.symbol),
+        ("side", original.side, candidate.side),
+        ("kind", original.kind, candidate.kind),
+        ("position_id", original.position_id, candidate.position_id),
+        ("quantity", original.quantity, candidate.quantity),
+        ("requested_price", original.requested_price, candidate.requested_price),
+        ("created_at", original.created_at, candidate.created_at),
+    )
+    for name, expected, observed in immutable:
+        if expected != observed:
+            raise OfflineCompositionError(f"journal immutable intent field changed: {name}")
+    _validate_recovery_intent_metadata(original, candidate)
+    original_protection = _journal_intent_protection(original)
+    candidate_protection = _journal_intent_protection(candidate)
+    if candidate_protection != original_protection:
+        raise OfflineCompositionError("journal mutable intent changed SL/TP")
+    return candidate
+
+
+def _restore_journal_protection(
+    intent: ExecutionIntent,
+    update: Mapping[str, Any],
+) -> tuple[DecimalValue | None, DecimalValue | None]:
+    """Validate persisted result SL/TP before restoring protection evidence."""
+
+    raw_stop = update.get("stop_loss")
+    raw_take = update.get("take_profit")
+    if raw_stop is None and raw_take is None:
+        return None, None
+    if raw_stop is None or raw_take is None:
+        raise OfflineCompositionError(f"journal result has incomplete SL/TP for {intent.intent_id}")
+    observed = (
+        _journal_decimal(raw_stop, "result.stop_loss"),
+        _journal_decimal(raw_take, "result.take_profit"),
+    )
+    expected = _journal_intent_protection(intent)
+    if expected[0] is not None and observed != expected:
+        raise OfflineCompositionError(f"journal result SL/TP mismatch for {intent.intent_id}")
+    if intent.requested_price is None:
+        raise OfflineCompositionError(f"journal result SL/TP lacks an opening price for {intent.intent_id}")
+    if intent.side is Side.BUY:
+        coherent = observed[0] < intent.requested_price < observed[1]
+    else:
+        coherent = observed[1] < intent.requested_price < observed[0]
+    if not coherent:
+        raise OfflineCompositionError(f"journal result SL/TP is incoherent for {intent.intent_id}")
+    return observed
+
+
 def _result_from_journal_update(
     intent: ExecutionIntent,
     update: Mapping[str, Any] | None,
@@ -1466,6 +1670,8 @@ def _result_from_journal_update(
             unknown_reason="RECOVERY_NO_OBSERVED_OUTCOME",
             uncertainty_reason="RECOVERY",
         )
+    intent = _restore_journal_intent(intent, update)
+    stop_loss, take_profit = _restore_journal_protection(intent, update)
     try:
         raw_state = str(update.get("state", "UNKNOWN")).upper()
         state = OrderState(raw_state)
@@ -1501,10 +1707,14 @@ def _result_from_journal_update(
             str(update["unknown_reason"]) if update.get("unknown_reason") is not None else None,
             bool(update.get("reconciled", False)),
             str(update["uncertainty_reason"]) if update.get("uncertainty_reason") is not None else None,
+            stop_loss=stop_loss,
+            take_profit=take_profit,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise OfflineCompositionError(f"invalid outcome update for intent {intent.intent_id}") from exc
-    if state in {OrderState.FILLED, OrderState.CLOSED} and result.order_id is None and not result.fills:
+    if state in {OrderState.FILLED, OrderState.CLOSED} and (
+        result.filled_quantity <= 0 or (result.order_id is None and not result.fills)
+    ):
         result.state = OrderState.UNKNOWN
         result.unknown_reason = "RECOVERY_TERMINAL_EVIDENCE_INCOMPLETE"
         result.uncertainty_reason = "RECOVERY"

@@ -1235,6 +1235,10 @@ class CTraderSupervisor:
             instrument=context.config.instrument,
         )
         self._provider: Any | None = context.provider
+        # In-memory clock baseline identity.  It is intentionally separate
+        # from ``state.runtime_identity``: the latter is persisted process
+        # proof and must not be rewritten before the next durable publish.
+        self._clock_boot_id: str | None = None
         self._lock_held = False
         self._primary_error: str | None = None
         self._reconciled_before_summary = False
@@ -1280,6 +1284,7 @@ class CTraderSupervisor:
             self._network_attempted = False
 
     def _load_state(self) -> None:
+        self._clock_boot_id = None
         existing = self.state_store.load(
             mode=cast(SupervisorMode, self.options.mode),
             instrument=self.context.config.instrument,
@@ -1327,20 +1332,45 @@ class CTraderSupervisor:
         mono = self._monotonic()
         previous_wall = _parse_datetime(self.state.previous_wall_at)
         previous_mono = self.state.previous_mono
-        if previous_wall is not None and previous_mono is not None:
+        previous_identity = self.state.runtime_identity
+        previous_boot = previous_identity.get("boot_id") if isinstance(previous_identity, Mapping) else None
+        if not isinstance(previous_boot, str) or not previous_boot.strip():
+            previous_boot = None
+        current_boot = _boot_id()
+        baseline_boot = self._clock_boot_id or previous_boot
+        boot_changed = (
+            isinstance(baseline_boot, str)
+            and bool(baseline_boot.strip())
+            and isinstance(current_boot, str)
+            and bool(current_boot.strip())
+            and baseline_boot != current_boot
+        )
+        if isinstance(current_boot, str) and current_boot.strip():
+            # Bind the in-memory monotonic baseline immediately.  Do not
+            # alter persisted runtime_identity until _persist() publishes a
+            # new process proof.
+            self._clock_boot_id = current_boot
+        # ``time.monotonic()`` is only comparable within one kernel boot.  A
+        # persisted baseline from a verified different boot is discarded as a
+        # clock baseline only; risk/account/journal/latch state is untouched.
+        wall_backwards = False
+        wall_delta: float | None = None
+        if previous_wall is not None:
             wall_delta = (now - previous_wall).total_seconds()
-            mono_delta = mono - previous_mono
-            if wall_delta < -self.options.clock_backwards_tolerance_seconds:
+            wall_backwards = wall_delta < -self.options.clock_backwards_tolerance_seconds
+            if wall_backwards:
                 self.state.clock_anomaly = True
                 self.state.stop_requested = True
                 self._stop_event.set()
                 self._latch_in_memory("clock_went_backwards", ValueError("reloj de pared retrocedió"))
-            elif mono_delta < -self.options.clock_backwards_tolerance_seconds:
+        if previous_wall is not None and previous_mono is not None and not wall_backwards and not boot_changed:
+            mono_delta = mono - previous_mono
+            if mono_delta < -self.options.clock_backwards_tolerance_seconds:
                 self.state.clock_anomaly = True
                 self.state.stop_requested = True
                 self._stop_event.set()
                 self._latch_in_memory("monotonic_went_backwards", ValueError("reloj monotónico retrocedió"))
-            elif wall_delta - mono_delta > self.options.suspension_threshold_seconds:
+            elif wall_delta is not None and wall_delta - mono_delta > self.options.suspension_threshold_seconds:
                 self.state.suspension_detected = True
                 self.state.lifecycle = SupervisorLifecycle.PAUSED.value
                 self.state.reconciliation_state = "NEEDS_RECONCILIATION"

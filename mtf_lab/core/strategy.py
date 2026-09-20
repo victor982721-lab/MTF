@@ -473,6 +473,11 @@ class _ContextSnapshot:
     direction: str | None
     known: bool
     values: Mapping[str, Any]
+    # The context may become usable later than the selected point when one of
+    # its lookback points arrives late.  Keep that effective availability
+    # separate from ``point.available_at`` so preparation/trigger evidence
+    # cannot claim an earlier causal timestamp.
+    effective_available_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -578,8 +583,16 @@ class TrendPullbackStrategy:
     def _point_quality_ok(self, point: IndicatorPoint, stream_quality: DataQuality) -> bool:
         return stream_quality.valid and point.quality.valid and point.closed
 
-    def _context_snapshot(self, stream: _PreparedStream, index: int) -> _ContextSnapshot:
+    def _context_snapshot(
+        self,
+        stream: _PreparedStream,
+        index: int,
+        *,
+        as_of: datetime | None = None,
+    ) -> _ContextSnapshot:
         point = stream.points[index]
+        point_available = _point_available(point)
+        watermark = as_of or point_available
         values = {
             "close": point.close,
             "ema_fast": point.ema_fast,
@@ -588,14 +601,52 @@ class TrendPullbackStrategy:
             "ema_slow_name": f"EMA{self.config.indicators.ema_slow}",
         }
         required_reason = ""
+        if point_available is None or (watermark is not None and point_available > watermark):
+            required_reason = "context_not_available"
+            return _ContextSnapshot(
+                point,
+                None,
+                False,
+                {**values, "reason": required_reason},
+                point_available,
+            )
         lag_index = index - self.config.context_lookback
         if not self._point_quality_ok(point, stream.quality):
             required_reason = "context_quality_blocked"
-            return _ContextSnapshot(point, None, False, {**values, "reason": required_reason})
+            return _ContextSnapshot(
+                point,
+                None,
+                False,
+                {**values, "reason": required_reason},
+                point_available,
+            )
         if lag_index < 0:
             required_reason = "context_lookback_insufficient"
-            return _ContextSnapshot(point, None, False, {**values, "reason": required_reason})
+            return _ContextSnapshot(
+                point,
+                None,
+                False,
+                {**values, "reason": required_reason},
+                point_available,
+            )
         lag = stream.points[lag_index]
+        lag_available = _point_available(lag)
+        if lag_available is None or (watermark is not None and lag_available > watermark):
+            required_reason = "context_lag_not_available"
+            return _ContextSnapshot(
+                point,
+                None,
+                False,
+                {
+                    **values,
+                    "ema_slow_lag": getattr(lag, "ema_slow", None),
+                    "reason": required_reason,
+                },
+                max(
+                    (candidate for candidate in (point_available, lag_available) if candidate is not None),
+                    default=point_available,
+                ),
+            )
         if (
             not self._point_quality_ok(lag, stream.quality)
             or lag.ema_slow is None
@@ -608,6 +659,10 @@ class TrendPullbackStrategy:
                 None,
                 False,
                 {**values, "ema_slow_lag": getattr(lag, "ema_slow", None), "reason": required_reason},
+                max(
+                    (candidate for candidate in (point_available, lag_available) if candidate is not None),
+                    default=point_available,
+                ),
             )
         values["ema_slow_lag"] = lag.ema_slow
         bullish = point.ema_fast > point.ema_slow and point.ema_slow > lag.ema_slow
@@ -615,7 +670,16 @@ class TrendPullbackStrategy:
         direction = "UP" if bullish else "DOWN" if bearish else None
         values["bullish"] = bullish
         values["bearish"] = bearish
-        return _ContextSnapshot(point, direction, True, values)
+        return _ContextSnapshot(
+            point,
+            direction,
+            True,
+            values,
+            max(
+                (candidate for candidate in (point_available, lag_available) if candidate is not None),
+                default=point_available,
+            ),
+        )
 
     def _episode_id(self, instrument: str, direction: str, prep: IndicatorPoint, context: _ContextSnapshot) -> str:
         payload = {
@@ -633,6 +697,131 @@ class TrendPullbackStrategy:
             },
         }
         return "ep_" + hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:32]
+
+    def _preparation_price_conditions(
+        self,
+        *,
+        point: IndicatorPoint,
+        lag: IndicatorPoint | None,
+        stream_quality: DataQuality,
+        direction: str | None,
+        watermark: datetime | None,
+    ) -> tuple[list[ConditionResult], dict[str, Any], datetime | None]:
+        """Evaluate preparation price inputs only when every lag is causal."""
+
+        values: dict[str, Any] = {}
+        point_available = _point_available(point)
+        if (
+            point_available is None
+            or (watermark is not None and point_available > watermark)
+            or not self._point_quality_ok(point, stream_quality)
+            or point.close is None
+        ):
+            return (
+                [
+                    self._condition(
+                        "pullback",
+                        ConditionState.UNKNOWN,
+                        point.close,
+                        "directional_close_change",
+                        "preparation_quality_blocked",
+                    ),
+                    self._condition(
+                        "distance_to_ema",
+                        ConditionState.UNKNOWN,
+                        None,
+                        f"<= {self.config.max_distance_atr} ATR",
+                        "preparation_quality_blocked",
+                    ),
+                ],
+                values,
+                None,
+            )
+        if lag is None or not self._point_quality_ok(lag, stream_quality) or lag.close is None:
+            return (
+                [
+                    self._condition(
+                        "pullback",
+                        ConditionState.UNKNOWN,
+                        None,
+                        "directional_close_change",
+                        "preparation_lookback_insufficient",
+                    ),
+                    self._condition(
+                        "distance_to_ema",
+                        ConditionState.UNKNOWN,
+                        None,
+                        f"<= {self.config.max_distance_atr} ATR",
+                        "preparation_lookback_insufficient",
+                    ),
+                ],
+                values,
+                None,
+            )
+        lag_available = _point_available(lag)
+        if lag_available is None or (watermark is not None and lag_available > watermark):
+            return (
+                [
+                    self._condition(
+                        "pullback",
+                        ConditionState.UNKNOWN,
+                        None,
+                        "directional_close_change",
+                        "preparation_lag_not_available",
+                    ),
+                    self._condition(
+                        "distance_to_ema",
+                        ConditionState.UNKNOWN,
+                        None,
+                        f"<= {self.config.max_distance_atr} ATR",
+                        "preparation_lag_not_available",
+                    ),
+                ],
+                values,
+                None,
+            )
+
+        values["close_lag"] = lag.close
+        if direction == "UP":
+            pullback = point.close < lag.close
+        elif direction == "DOWN":
+            pullback = point.close > lag.close
+        else:
+            pullback = False
+        conditions = [
+            self._condition(
+                "pullback",
+                ConditionState.FULFILLED if pullback else ConditionState.FAILED,
+                point.close - lag.close,
+                "< 0 (UP) or > 0 (DOWN)",
+                "" if pullback else "directional_pullback_failed",
+            )
+        ]
+        if point.ema_fast is None or point.atr is None:
+            conditions.append(
+                self._condition(
+                    "distance_to_ema",
+                    ConditionState.UNKNOWN,
+                    None,
+                    f"<= {self.config.max_distance_atr} ATR",
+                    "ema_or_atr_not_ready",
+                )
+            )
+            return conditions, values, lag_available
+        distance = abs(point.close - point.ema_fast)
+        limit = self.config.max_distance_atr * point.atr
+        values.update({"distance_to_ema": distance, "distance_limit": limit})
+        within = distance <= limit if math_is_finite(limit) else False
+        conditions.append(
+            self._condition(
+                "distance_to_ema",
+                ConditionState.FULFILLED if within else ConditionState.FAILED,
+                distance,
+                f"<= {limit}",
+                "" if within else "distance_exceeded",
+            )
+        )
+        return conditions, values, lag_available
 
     def _condition(
         self,
@@ -666,9 +855,13 @@ class TrendPullbackStrategy:
         index: int,
         context: _ContextSnapshot | None,
         instrument: str,
+        *,
+        as_of: datetime | None = None,
     ) -> tuple[Evaluation, PreparationEpisode | None]:
         point = stream.points[index]
-        available = _point_available(point) or point.end
+        point_available = _point_available(point)
+        watermark = as_of or point_available
+        available = point_available or point.end
         direction = context.direction if context and context.direction in {"UP", "DOWN"} else None
         conditions: list[ConditionResult] = []
         values: dict[str, Any] = {
@@ -699,85 +892,19 @@ class TrendPullbackStrategy:
             )
         lag_index = index - self.config.preparation_lookback
         lag = stream.points[lag_index] if lag_index >= 0 else None
-        if not self._point_quality_ok(point, stream.quality) or point.close is None:
-            conditions.append(
-                self._condition(
-                    "pullback",
-                    ConditionState.UNKNOWN,
-                    point.close,
-                    "directional_close_change",
-                    "preparation_quality_blocked",
-                )
-            )
-            conditions.append(
-                self._condition(
-                    "distance_to_ema",
-                    ConditionState.UNKNOWN,
-                    None,
-                    f"<= {self.config.max_distance_atr} ATR",
-                    "preparation_quality_blocked",
-                )
-            )
-        elif lag is None or not self._point_quality_ok(lag, stream.quality) or lag.close is None:
-            conditions.append(
-                self._condition(
-                    "pullback",
-                    ConditionState.UNKNOWN,
-                    None,
-                    "directional_close_change",
-                    "preparation_lookback_insufficient",
-                )
-            )
-            conditions.append(
-                self._condition(
-                    "distance_to_ema",
-                    ConditionState.UNKNOWN,
-                    None,
-                    f"<= {self.config.max_distance_atr} ATR",
-                    "preparation_lookback_insufficient",
-                )
-            )
-        else:
-            values["close_lag"] = lag.close
-            if direction == "UP":
-                pullback = point.close < lag.close
-            elif direction == "DOWN":
-                pullback = point.close > lag.close
-            else:
-                pullback = False
-            conditions.append(
-                self._condition(
-                    "pullback",
-                    ConditionState.FULFILLED if pullback else ConditionState.FAILED,
-                    point.close - lag.close,
-                    "< 0 (UP) or > 0 (DOWN)",
-                    "" if pullback else "directional_pullback_failed",
-                )
-            )
-            if point.ema_fast is None or point.atr is None:
-                conditions.append(
-                    self._condition(
-                        "distance_to_ema",
-                        ConditionState.UNKNOWN,
-                        None,
-                        f"<= {self.config.max_distance_atr} ATR",
-                        "ema_or_atr_not_ready",
-                    )
-                )
-            else:
-                distance = abs(point.close - point.ema_fast)
-                limit = self.config.max_distance_atr * point.atr
-                values.update({"distance_to_ema": distance, "distance_limit": limit})
-                within = distance <= limit if math_is_finite(limit) else False
-                conditions.append(
-                    self._condition(
-                        "distance_to_ema",
-                        ConditionState.FULFILLED if within else ConditionState.FAILED,
-                        distance,
-                        f"<= {limit}",
-                        "" if within else "distance_exceeded",
-                    )
-                )
+        price_conditions, price_values, lag_available = self._preparation_price_conditions(
+            point=point,
+            lag=lag,
+            stream_quality=stream.quality,
+            direction=direction,
+            watermark=watermark,
+        )
+        conditions.extend(price_conditions)
+        values.update(price_values)
+        if lag_available is not None:
+            available = max(available, lag_available)
+            if context is not None and context.effective_available_at is not None:
+                available = max(available, context.effective_available_at)
         quality_condition = (
             ConditionState.FULFILLED if self._point_quality_ok(point, stream.quality) else ConditionState.UNKNOWN
         )
@@ -1081,17 +1208,34 @@ class TrendPullbackStrategy:
         return context_stream, preparation_stream, trigger_stream, next(iter(instruments), "unknown")
 
     @staticmethod
+    def _effective_auxiliary_available(
+        stream: _PreparedStream,
+        index: int,
+        lookback: int,
+    ) -> datetime | None:
+        available = _point_available(stream.points[index])
+        if available is None:
+            return None
+        lag_index = index - lookback
+        if lag_index < 0:
+            return available
+        lag_available = _point_available(stream.points[lag_index])
+        if lag_available is None:
+            return None
+        return max(available, lag_available)
+
     def _ordered_auxiliary(
+        self,
         context_stream: _PreparedStream,
         preparation_stream: _PreparedStream,
     ) -> list[tuple[datetime, int, int, str]]:
         auxiliary: list[tuple[datetime, int, int, str]] = []
-        for index, point in enumerate(context_stream.points):
-            available = _point_available(point)
+        for index in range(len(context_stream.points)):
+            available = self._effective_auxiliary_available(context_stream, index, self.config.context_lookback)
             if available is not None:
                 auxiliary.append((available, 0, index, "context"))
-        for index, point in enumerate(preparation_stream.points):
-            available = _point_available(point)
+        for index in range(len(preparation_stream.points)):
+            available = self._effective_auxiliary_available(preparation_stream, index, self.config.preparation_lookback)
             if available is not None:
                 auxiliary.append((available, 1, index, "preparation"))
         auxiliary.sort(key=lambda item: (item[0], item[1], item[2]))
@@ -1117,9 +1261,9 @@ class TrendPullbackStrategy:
         if watermark is None:
             return
         while state.auxiliary_index < len(auxiliary) and auxiliary[state.auxiliary_index][0] <= watermark:
-            _available, _priority, item_index, kind = auxiliary[state.auxiliary_index]
+            available, _priority, item_index, kind = auxiliary[state.auxiliary_index]
             if kind == "context":
-                state.context = self._context_snapshot(context_stream, item_index)
+                state.context = self._context_snapshot(context_stream, item_index, as_of=available)
                 if state.active is not None and (
                     state.context.direction != state.active.direction or not state.context.known
                 ):
@@ -1134,6 +1278,7 @@ class TrendPullbackStrategy:
                     item_index,
                     state.context,
                     instrument,
+                    as_of=available,
                 )
                 evaluations.append(prep_evaluation)
                 if episode is not None:

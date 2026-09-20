@@ -1241,43 +1241,105 @@ def _parse_snapshot_line(line: str, line_number: int) -> Mapping[str, Any] | Non
     return value
 
 
-def _snapshot_pages(target: Path, page_size: int) -> Iterator[tuple[Mapping[str, Any], ...]]:
-    page: list[Mapping[str, Any]] = []
+def _open_snapshot_fd(target: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = -1
     try:
-        with target.open("r", encoding="utf-8") as stream:
-            for line_number, line in enumerate(stream, start=1):
-                value = _parse_snapshot_line(line, line_number)
-                if value is None:
-                    continue
-                page.append(value)
-                if len(page) >= page_size:
-                    yield tuple(page)
-                    page.clear()
-    except UnicodeDecodeError as exc:
-        raise MarketResearchError("snapshot no es UTF-8") from exc
+        fd = os.open(target, flags)
+        info = os.fstat(fd)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise MarketResearchError("snapshot artifact must remain a regular file")
+        if info.st_uid != os.getuid() or info.st_nlink != 1:
+            raise MarketResearchError("snapshot artifact ownership/link contract changed")
+        return fd
+    except BaseException:
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
+        raise
+
+
+def _snapshot_pages_from_fd(
+    target: Path,
+    page_size: int,
+    *,
+    expected_sha256: str,
+    expected_row_count: int,
+) -> Iterator[tuple[Mapping[str, Any], ...]]:
+    """Read, hash and parse one open descriptor; verification completes at EOF."""
+
+    fd = _open_snapshot_fd(target)
+    digest = hashlib.sha256()
+    rows_seen = 0
+    page: list[Mapping[str, Any]] = []
+    with os.fdopen(fd, "rb", closefd=True) as stream:
+        for line_number, raw_line in enumerate(stream, start=1):
+            digest.update(raw_line)
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise MarketResearchError("snapshot no es UTF-8") from exc
+            value = _parse_snapshot_line(line, line_number)
+            if value is None:
+                continue
+            rows_seen += 1
+            page.append(value)
+            if len(page) >= page_size:
+                yield tuple(page)
+                page.clear()
     if page:
         yield tuple(page)
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise MarketResearchError("snapshot hash mismatch after consumption")
+    if rows_seen != expected_row_count:
+        raise MarketResearchError("snapshot row_count mismatch after consumption")
 
 
 def iter_snapshot_pages(
     reference: Mapping[str, Any], *, page_size: int = 256
 ) -> Iterator[tuple[Mapping[str, Any], ...]]:
-    """Page a hashed complete JSONL snapshot without retaining the stream."""
+    """Page one complete JSONL snapshot with hash verification at EOF.
+
+    The artifact is opened exactly once and the digest covers the bytes that
+    produce the yielded rows.  Callers must drain the iterator to obtain the
+    final hash/count verification; consumers that publish a summary do so only
+    after the generator reaches EOF.
+    """
 
     if not isinstance(reference, Mapping) or reference.get("status") != "ASSESSED":
         raise MarketResearchError("snapshot no está verificado")
+    if reference.get("complete") is not True:
+        raise MarketResearchError("snapshot no está marcado como completo")
+    kind = reference.get("kind")
+    if not isinstance(kind, str) or not kind.strip():
+        raise MarketResearchError("snapshot kind es obligatorio")
+    pager = reference.get("pager")
+    if not isinstance(pager, Mapping) or pager.get("source") != "complete_jsonl_artifact":
+        raise MarketResearchError("snapshot pager source no está verificado")
     raw_path = reference.get("path_reference")
     if raw_path is None:
         raise MarketResearchError("snapshot carece de path_reference")
     if isinstance(page_size, bool) or not isinstance(page_size, int) or page_size <= 0:
         raise MarketResearchError("page_size debe ser entero positivo")
+    expected_sha256 = reference.get("sha256")
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in expected_sha256)
+    ):
+        raise MarketResearchError("snapshot sha256 no está verificado")
+    expected_sha256 = expected_sha256.lower()
+    expected_row_count = reference.get("row_count")
+    if isinstance(expected_row_count, bool) or not isinstance(expected_row_count, int) or expected_row_count < 0:
+        raise MarketResearchError("snapshot row_count no está verificado")
     target = _safe_input_file(raw_path, name="snapshot artifact")
-    actual_hash, actual_count = _artifact_sha256(target)
-    if reference.get("sha256") != actual_hash:
-        raise MarketResearchError("snapshot hash mismatch")
-    if reference.get("row_count") is not None and str(reference["row_count"]) != str(actual_count):
-        raise MarketResearchError("snapshot row_count mismatch")
-    yield from _snapshot_pages(target, page_size)
+    yield from _snapshot_pages_from_fd(
+        target,
+        page_size,
+        expected_sha256=expected_sha256,
+        expected_row_count=expected_row_count,
+    )
 
 
 def _variant_rows(payload: Mapping[str, Any], candidate_ids: Sequence[str]) -> dict[str, dict[str, Any]]:

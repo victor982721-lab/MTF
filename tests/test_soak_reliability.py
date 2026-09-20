@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from datetime import UTC, datetime, timedelta
@@ -86,6 +87,35 @@ def _config(root: Path, *, duration: float = 3.0, **kwargs: Any) -> SoakConfig:
     return SoakConfig(**values)
 
 
+def _fence_fixture() -> tuple[tempfile.TemporaryDirectory[str], Path, Path]:
+    temporary = tempfile.TemporaryDirectory(prefix="mtf-soak-fence-repo-")
+    root = Path(temporary.name)
+    source = root / "mtf_lab" / "core" / "cfd_simulation.py"
+    source.parent.mkdir(parents=True)
+    (root / "mtf_lab" / "data" / "protobuf_generated").mkdir(parents=True)
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(["git", "init", "--quiet", str(root)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(root), "add", "mtf_lab/core/cfd_simulation.py"], check=True, capture_output=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=MTF fixture",
+            "-c",
+            "user.email=mtf-fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return temporary, root, source
+
+
 class SoakReliabilityTests(unittest.TestCase):
     def test_default_code_fence_covers_sources_generated_codec_metadata_and_excludes_derivatives(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -105,72 +135,85 @@ class SoakReliabilityTests(unittest.TestCase):
         )
 
     def test_dirty_cfd_source_changes_default_code_fence(self) -> None:
-        source = Path(__file__).resolve().parents[1] / "mtf_lab" / "core" / "cfd_simulation.py"
+        temporary, root, source = _fence_fixture()
+        self.addCleanup(temporary.cleanup)
         original = source.read_bytes()
         mode = source.stat().st_mode & 0o777
-        before = compute_code_hash()
+        before = compute_code_hash(repo_root=root)
         try:
             source.write_bytes(original + b"\n# temporary soak fence probe\n")
-            changed = compute_code_hash()
+            changed = compute_code_hash(repo_root=root)
         finally:
             source.write_bytes(original)
             os.chmod(source, mode)
+        restored = compute_code_hash(repo_root=root)
+        temporary.cleanup()
         self.assertNotEqual(before, changed)
-        self.assertEqual(before, compute_code_hash())
+        self.assertEqual(before, restored)
 
     def test_deleted_tracked_source_changes_default_code_fence(self) -> None:
-        source = Path(__file__).resolve().parents[1] / "mtf_lab" / "core" / "cfd_simulation.py"
+        temporary, root, source = _fence_fixture()
+        self.addCleanup(temporary.cleanup)
         original = source.read_bytes()
         mode = source.stat().st_mode & 0o777
-        before = compute_code_hash()
+        before = compute_code_hash(repo_root=root)
         try:
             source.unlink()
-            deleted = compute_code_hash()
+            deleted = compute_code_hash(repo_root=root)
         finally:
             source.write_bytes(original)
             os.chmod(source, mode)
+        restored = compute_code_hash(repo_root=root)
+        temporary.cleanup()
         self.assertNotEqual(before, deleted)
-        self.assertEqual(before, compute_code_hash())
+        self.assertEqual(before, restored)
 
     def test_added_generated_source_changes_default_code_fence(self) -> None:
-        root = Path(__file__).resolve().parents[1]
+        temporary, root, _source = _fence_fixture()
         generated = root / "mtf_lab" / "data" / "protobuf_generated" / "newgenerated.py"
-        self.assertFalse(generated.exists())
-        before = compute_code_hash()
         try:
+            self.assertFalse(generated.exists())
+            before = compute_code_hash(repo_root=root)
             generated.write_text("# temporary generated codec probe\n", encoding="utf-8")
-            added = compute_code_hash()
+            added = compute_code_hash(repo_root=root)
         finally:
             generated.unlink(missing_ok=True)
+        restored = compute_code_hash(repo_root=root)
+        temporary.cleanup()
         self.assertNotEqual(before, added)
-        self.assertEqual(before, compute_code_hash())
+        self.assertEqual(before, restored)
 
     def test_default_code_fence_rejects_directory_alias(self) -> None:
-        root = Path(__file__).resolve().parents[1]
+        temporary, root, _source = _fence_fixture()
         target = Path(tempfile.mkdtemp(prefix="soak-fence-target-"))
         alias = root / "mtf_lab" / "diralias"
         self.assertFalse(alias.exists())
         try:
             alias.symlink_to(target, target_is_directory=True)
             with self.assertRaises(ValueError):
-                compute_code_hash()
+                compute_code_hash(repo_root=root)
         finally:
             alias.unlink(missing_ok=True)
             target.rmdir()
+            temporary.cleanup()
 
     def test_explicit_code_fence_rejects_file_alias_and_path_alias(self) -> None:
-        root = Path(__file__).resolve().parents[1]
-        target = root / "mtf_lab" / "core" / "cfd_simulation.py"
+        temporary, root, target = _fence_fixture()
         alias = root / "mtf_lab" / "filealias.py"
         self.assertFalse(alias.exists())
         try:
             alias.symlink_to(target)
             with self.assertRaises(ValueError):
-                compute_code_hash(paths=("mtf_lab/filealias.py",))
+                compute_code_hash(repo_root=root, paths=("mtf_lab/filealias.py",))
         finally:
             alias.unlink(missing_ok=True)
-        with self.assertRaises(ValueError):
-            compute_code_hash(paths=("mtf_lab/../mtf_lab/core/cfd_simulation.py",))
+            temporary.cleanup()
+        temporary, root, _source = _fence_fixture()
+        try:
+            with self.assertRaises(ValueError):
+                compute_code_hash(repo_root=root, paths=("mtf_lab/../mtf_lab/core/cfd_simulation.py",))
+        finally:
+            temporary.cleanup()
 
     def test_reduced_code_fence_can_run_but_never_accepts_72_hour_soak(self) -> None:
         config = SoakConfig(duration_seconds=MIN_SOAK_SECONDS, code_paths=("mtf_lab/core/cfd_simulation.py",))

@@ -2768,12 +2768,21 @@ def _historical_economic_metrics(states: Mapping[str, _ProfileState]) -> dict[st
 
     simulators = tuple(simulator for state in states.values() for simulator in (state.legacy, state.risk))
     configured = bool(simulators) and all(_simulator_costs_known(simulator) for simulator in simulators)
+    # ``CFDSimulator.trades`` is intentionally bounded.  Once a terminal
+    # trade leaves that in-memory suffix, the historical result no longer has
+    # complete evidence for an aggregate net statement.  The simulator
+    # persists both ``archive_required`` and the monotonic ``terminal_evicted``
+    # counter in its snapshot; fail closed on either signal rather than
+    # allowing a retained suffix to upgrade the whole run to KNOWN.
+    retention_incomplete = any(
+        simulator.archive_required or int(simulator.counters.get("terminal_evicted", 0)) > 0 for simulator in simulators
+    )
     unknown_terminal = any(
         trade.state.value == "UNKNOWN" or (trade.state.value == "CLOSED" and trade.net_pnl is None)
         for state in states.values()
         for trade in state.risk.trades
     )
-    if not configured or unknown_terminal:
+    if not configured or unknown_terminal or retention_incomplete:
         return {
             "costs_applied": False,
             "costs_status": "UNKNOWN_NOT_ZERO",

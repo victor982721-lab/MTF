@@ -154,21 +154,28 @@ def strategy_checkpoint_payload(
 
 def _standalone_aggregator_state(processor: IncrementalProcessor, name: str, aggregator: Any) -> dict[str, Any]:
     bucket = getattr(aggregator, "_bucket", None)
+    if getattr(aggregator, "coverage_mode", "strict") == "continuous_quotes":
+        export = getattr(aggregator, "export_bucket_state", None)
+        if not callable(export):
+            raise ValueError(f"agregador {name} continuo sin exportador de bucket")
+        bucket_state = cast(dict[str, Any] | None, export())
+    else:
+        bucket_state = (
+            {
+                "start": iso(bucket.start),
+                "end": iso(bucket.end),
+                "events": [event_dict(event) for event in bucket.events],
+            }
+            if bucket is not None
+            else None
+        )
     state: dict[str, Any] = {
         "closed_through": iso(getattr(aggregator, "_closed_through", None)),
         "seen_event_ids": sorted(getattr(aggregator, "_seen_event_ids", set())),
         "seen_event_order": list(getattr(aggregator, "_seen_event_order", ())),
         "last_event_time": iso(getattr(aggregator, "_last_event_time", None)),
-        "bucket": {
-            "start": iso(bucket.start),
-            "end": iso(bucket.end),
-            "events": [event_dict(event) for event in bucket.events],
-        }
-        if bucket is not None
-        else None,
+        "bucket": bucket_state,
     }
-    if bucket is not None and processor.quote_coverage_mode != "strict":
-        state["bucket"]["partial"] = bucket.partial
     return state
 
 
@@ -394,7 +401,7 @@ def _restore_aggregators(processor: IncrementalProcessor, snapshot: Mapping[str,
         _restore_aggregator(processor.aggregators[name], raw)
 
 
-def _restore_aggregator(aggregator: Any, raw: Mapping[str, Any]) -> None:
+def _restore_aggregator_metadata(aggregator: Any, raw: Mapping[str, Any]) -> None:
     aggregator._closed_through = utc(raw.get("closed_through"))
     aggregator._seen_event_ids = set(str(item) for item in raw.get("seen_event_ids", ()))
     aggregator._seen_event_order.clear()
@@ -403,6 +410,27 @@ def _restore_aggregator(aggregator: Any, raw: Mapping[str, Any]) -> None:
         if event_id in aggregator._seen_event_ids:
             aggregator._seen_event_order.append(event_id)
     aggregator._last_event_time = utc(raw.get("last_event_time"))
+
+
+def _restore_aggregator(aggregator: Any, raw: Mapping[str, Any]) -> None:
+    if not isinstance(raw, Mapping):
+        raise ValueError("estado de agregador de checkpoint debe ser mapping")
+    if getattr(aggregator, "coverage_mode", "strict") == "continuous_quotes":
+        restore = getattr(aggregator, "restore_bucket_state", None)
+        if not callable(restore):
+            raise ValueError("agregador continuo sin restaurador de bucket")
+        bucket_raw = raw.get("bucket")
+        if bucket_raw is not None:
+            if not isinstance(bucket_raw, Mapping):
+                raise ValueError("bucket continuo de checkpoint debe ser mapping o None")
+            if "stats" not in bucket_raw:
+                raise ValueError(
+                    "checkpoint continuo legado sin acumulador; se rechaza para evitar restauración corrupta"
+                )
+        restore(bucket_raw)
+        _restore_aggregator_metadata(aggregator, raw)
+        return
+    _restore_aggregator_metadata(aggregator, raw)
     bucket_raw = raw.get("bucket")
     if not bucket_raw:
         return

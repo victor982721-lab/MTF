@@ -25,7 +25,7 @@ import stat
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, ClassVar, cast
 
@@ -38,9 +38,11 @@ from .research_reporting_metrics import (
     closed_trade,
     confidence_for_result,
     cost_bridge,
+    cost_bridge_from_rows,
     dimensions,
     drawdown_equity,
     funnel_report,
+    is_artifact_descriptor,
     ledger_rows,
     market_structure_svgs,
     mfe_mae,
@@ -103,6 +105,8 @@ class ResearchReportPaths(Mapping[str, Path]):
 
 def _rows(value: Any) -> list[Mapping[str, Any]]:
     if isinstance(value, Mapping):
+        if is_artifact_descriptor(value):
+            return []
         return [value]
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return []
@@ -131,6 +135,25 @@ def _preserved_list(value: Any) -> list[Any]:
     return [safe_value(value)]
 
 
+def _retention_metadata(descriptor: Any, retained_count: int) -> dict[str, Any]:
+    declared: int | None = None
+    if is_artifact_descriptor(descriptor):
+        raw_count = descriptor.get("count", descriptor.get("row_count"))
+        if isinstance(raw_count, int) and not isinstance(raw_count, bool) and raw_count >= 0:
+            declared = raw_count
+    else:
+        declared = retained_count
+    complete = declared is not None and declared == retained_count
+    return {
+        "status": "ASSESSED" if complete else "INSUFFICIENT",
+        "complete": complete,
+        "row_count": declared,
+        "display_count": retained_count,
+        "truncated": declared is None or retained_count < declared,
+        "reason": None if complete else "retained_suffix_incomplete",
+    }
+
+
 def _as_payload(value: Any) -> Mapping[str, Any]:
     payload = dict(as_mapping(value))
     # HistoricalBacktestResult exposes bounded ``ArtifactRows.retained`` data
@@ -141,6 +164,7 @@ def _as_payload(value: Any) -> Mapping[str, Any]:
         retained = getattr(getattr(value, name, None), "retained", None)
         if isinstance(retained, Sequence) and not isinstance(retained, (str, bytes, bytearray)):
             payload[f"_{name}_retained"] = list(retained)
+            payload[f"_{name}_retention"] = _retention_metadata(payload.get(name), len(retained))
     if not payload:
         raise TypeError("evidence report debe ser mapping-compatible")
     return payload
@@ -156,7 +180,7 @@ def _has_result_content(payload: Mapping[str, Any]) -> bool:
     return False
 
 
-def _results(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _raw_results(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     raw = payload.get(
         "results",
         payload.get("result", payload.get("reports", payload.get("evidence_results"))),
@@ -173,15 +197,41 @@ def _results(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
             result = [raw]
     else:
         result = _rows(raw)
-    inherited = {
-        name: payload.get(f"_{name}_retained", payload.get(name))
-        for name in ("ledger", "equity", "funnel")
-        if isinstance(payload.get(f"_{name}_retained", payload.get(name)), Sequence)
-        and not isinstance(payload.get(f"_{name}_retained", payload.get(name)), (str, bytes, bytearray))
-    }
+    return result
+
+
+def _inherited_artifacts(payload: Mapping[str, Any]) -> dict[str, Any]:
+    inherited: dict[str, Any] = {}
+    for name in ("ledger", "equity", "funnel"):
+        retained = payload.get(f"_{name}_retained")
+        if isinstance(retained, Sequence) and not isinstance(retained, (str, bytes, bytearray)):
+            inherited[name] = list(retained)
+            retention = payload.get(f"_{name}_retention")
+            if isinstance(retention, Mapping):
+                inherited[f"_{name}_retention"] = dict(retention)
+    return inherited
+
+
+def _apply_inherited(item: Mapping[str, Any], inherited: Mapping[str, Any]) -> dict[str, Any]:
+    merged = dict(item)
+    for name in ("ledger", "equity", "funnel"):
+        if name not in inherited:
+            continue
+        if name not in merged or is_artifact_descriptor(merged.get(name)):
+            merged[name] = inherited[name]
+            retention_key = f"_{name}_retention"
+            if retention_key in inherited:
+                merged[retention_key] = inherited[retention_key]
+    return merged
+
+
+def _results(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    result = _raw_results(payload)
+    inherited = _inherited_artifacts(payload)
+
     if result:
         if inherited:
-            result = [{**dict(item), **inherited} for item in result]
+            result = [cast(Mapping[str, Any], _apply_inherited(item, inherited)) for item in result]
         return result
     decisions = payload.get("decisions")
     if isinstance(decisions, Mapping):
@@ -193,11 +243,114 @@ def _results(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     variants = _rows(payload.get("variants"))
     if variants:
         if inherited:
-            return [{**dict(item), **inherited} for item in variants]
+            return [_apply_inherited(item, inherited) for item in variants]
         return [dict(item) for item in variants]
     if _has_result_content(payload):
-        return [payload]
+        return [_apply_inherited(payload, inherited) if inherited else payload]
     return []
+
+
+def _descriptor_count(value: Any) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("ledger descriptor count must be a non-negative integer")
+    return value
+
+
+def _validate_ledger_reference(descriptor: Mapping[str, Any], reference: Mapping[str, Any]) -> int:
+    expected_count = _descriptor_count(descriptor.get("count", descriptor.get("row_count")))
+    path_reference = reference.get("path_reference")
+    if path_reference is None or str(path_reference) != str(descriptor.get("path")):
+        raise ValueError("ledger descriptor/reference path mismatch")
+    if reference.get("kind") != "ledger":
+        raise ValueError("ledger snapshot kind mismatch")
+    if reference.get("complete") is not True:
+        raise ValueError("ledger snapshot is not complete")
+    pager = as_mapping(reference.get("pager"))
+    if pager.get("source") != "complete_jsonl_artifact":
+        raise ValueError("ledger snapshot pager source is not verified")
+    return expected_count
+
+
+def _prepare_ledger_snapshot(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Load one hashed JSONL ledger through the bounded market-research seam.
+
+    Serialized historical results intentionally contain only an artifact
+    descriptor.  The renderer may consume that descriptor, but only through
+    ``iter_snapshot_pages`` so path, owner, hash and row-count checks remain
+    centralized.  Rows kept for display are bounded; economic aggregation is
+    streamed over every page.
+    """
+
+    descriptor = result.get("ledger")
+    if not isinstance(descriptor, Mapping) or descriptor.get("path") is None:
+        return result
+    prepared = dict(result)
+    reference = as_mapping(as_mapping(result.get("snapshot")).get("ledger"))
+    expected_count: int | None = None
+    display_rows: list[Mapping[str, Any]] = []
+    stream_meta: dict[str, Any] = {
+        "status": "NOT_ASSESSED",
+        "complete": False,
+        "row_count": None,
+        "display_count": 0,
+        "truncated": False,
+    }
+    try:
+        expected_count = _validate_ledger_reference(descriptor, reference)
+
+        # Import locally to keep the renderer's pure inline-data path free of
+        # campaign-service initialization and to use the existing verified
+        # paging seam as the sole file-backed entry point.
+        from .market_research import iter_snapshot_pages
+
+        observed = 0
+
+        def stream_rows() -> Iterator[Mapping[str, Any]]:
+            nonlocal observed
+            for page in iter_snapshot_pages(reference, page_size=256):
+                for row in page:
+                    observed += 1
+                    if len(display_rows) < MAX_TRADE_SUMMARIES:
+                        display_rows.append(dict(row))
+                    yield row
+
+        bridge = cost_bridge_from_rows(
+            result,
+            stream_rows(),
+            expected_source_count=expected_count,
+        )
+        prepared["ledger"] = display_rows
+        stream_meta.update(
+            {
+                "status": "ASSESSED" if bridge.get("source_complete") is True else "INSUFFICIENT",
+                "complete": bridge.get("source_complete") is True,
+                "row_count": observed,
+                "display_count": len(display_rows),
+                "truncated": observed > len(display_rows),
+                "kind": "ledger",
+                "source": "complete_jsonl_artifact",
+                "sha256": reference.get("sha256"),
+            }
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        # Do not expose paths or exception text in the public report.  The
+        # bridge remains fail-closed and never becomes an empty/known ledger.
+        bridge = cost_bridge_from_rows(
+            result,
+            (),
+            expected_source_count=expected_count,
+            source_error=f"ledger_snapshot_invalid:{type(exc).__name__}",
+        )
+        prepared["ledger"] = []
+        stream_meta.update(
+            {
+                "status": "INVALID",
+                "error": f"ledger_snapshot_invalid:{type(exc).__name__}",
+            }
+        )
+    prepared["_verified_ledger_cost_bridge"] = bridge
+    prepared["_ledger_stream"] = stream_meta
+    return prepared
 
 
 def _first(mapping: Mapping[str, Any], *keys: str) -> Any:
@@ -366,18 +519,24 @@ def _result_projection(payload: Mapping[str, Any], result: Mapping[str, Any], in
     trades = ledger_rows(result)
     known_closed = [row for row in trades if closed_trade(row)]
     display_trades = [_trade_summary(row) for row in known_closed[:MAX_TRADE_SUMMARIES]]
+    ledger_stream = as_mapping(result.get("_ledger_stream")) or as_mapping(result.get("_ledger_retention"))
+    full_trade_count = ledger_stream.get("row_count", len(trades))
+    full_closed_count = bridge.get("closed_trade_count")
+    if full_closed_count is None and not ledger_stream:
+        full_closed_count = len(known_closed)
     result_provenance = _raw_provenance(payload, result)
     return {
         "result_id": result_id,
         "dimensions": dims,
         "provenance": result_provenance,
-        "trade_count": len(trades),
-        "closed_trade_count": len(known_closed),
+        "trade_count": full_trade_count,
+        "closed_trade_count": full_closed_count,
         "signal_count": sessions["signals"],
         "episode_count": sessions["episodes"],
         "session_count": sessions["sessions"],
         "trade_summaries": display_trades,
-        "trade_summary_truncated": len(known_closed) > len(display_trades),
+        "trade_summary_truncated": bool(ledger_stream.get("truncated")) or len(known_closed) > len(display_trades),
+        "ledger_source": safe_value(ledger_stream) if ledger_stream else {"status": "INLINE"},
         "cost_bridge": bridge,
         "gross_pnl": bridge.get("gross"),
         "costs": bridge.get("costs"),
@@ -515,7 +674,7 @@ def build_research_report(
     """Build the bounded machine-readable projection without writing files."""
 
     payload = _as_payload(evidence)
-    results = _results(payload)
+    results = [_prepare_ledger_snapshot(result) for result in _results(payload)]
     projections = [_result_projection(payload, result, index) for index, result in enumerate(results)]
     if max_visual_points != MAX_VISUAL_POINTS:
         # Rebuild only the visual series with the requested bound.  The source
@@ -536,14 +695,32 @@ def build_research_report(
         }
         for item in projections
     ]
-    all_trades = sum((ledger_rows(result) for result in results), [])
-    known_net: list[Decimal] = []
-    for row in all_trades:
-        if not closed_trade(row):
-            continue
-        value = trade_amounts(row)["net"]
-        if value is not None:
-            known_net.append(value)
+    total_trade_rows: int | None = 0
+    total_closed_rows: int | None = 0
+    known_net_trades = 0
+    known_net_subtotal = Decimal("0")
+    known_net_seen = False
+    for projection in projections:
+        trade_count = projection.get("trade_count")
+        closed_count = projection.get("closed_trade_count")
+        if isinstance(trade_count, int) and not isinstance(trade_count, bool) and total_trade_rows is not None:
+            total_trade_rows += trade_count
+        else:
+            total_trade_rows = None
+        if isinstance(closed_count, int) and not isinstance(closed_count, bool) and total_closed_rows is not None:
+            total_closed_rows += closed_count
+        else:
+            total_closed_rows = None
+        bridge_value = projection["cost_bridge"].get("known_net_count")
+        if isinstance(bridge_value, int) and not isinstance(bridge_value, bool):
+            known_net_trades += bridge_value
+        subtotal = projection["cost_bridge"].get("net_known_subtotal")
+        if subtotal is not None:
+            try:
+                known_net_subtotal += Decimal(str(subtotal))
+                known_net_seen = True
+            except (InvalidOperation, TypeError, ValueError):
+                pass
     decision_counts = Counter(_text(as_mapping(item.get("decision")).get("status")) for item in projections)
     source = _select_public_identity(payload)
     generated_at = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -642,16 +819,16 @@ def build_research_report(
         },
         "counts": {
             "results": len(results),
-            "trades": len(all_trades),
-            "closed_trades": sum(1 for row in all_trades if closed_trade(row)),
-            "known_net_trades": len(known_net),
+            "trades": total_trade_rows,
+            "closed_trades": total_closed_rows,
+            "known_net_trades": known_net_trades,
             "signals": sum(int(item.get("signal_count", 0) or 0) for item in projections),
             "episodes_known": sum(
                 int(item.get("episode_count", 0) or 0) for item in projections if item.get("episode_count") is not None
             ),
         },
         "metrics": {
-            "known_net_subtotal": number(sum(known_net, Decimal("0"))) if known_net else None,
+            "known_net_subtotal": number(known_net_subtotal) if known_net_seen else None,
             "status": "ASSESSED"
             if projections and all(item.get("status") == "ASSESSED" for item in projections)
             else "INSUFFICIENT",
@@ -737,7 +914,9 @@ def build_research_report(
         ],
         "cautions": cautions_output,
     }
-    return cast(dict[str, Any], safe_value(report))
+    # Keep the published trade-summary cap aligned with the declared report
+    # contract while retaining the same redaction/unsafe-value handling.
+    return cast(dict[str, Any], safe_value(report, max_items=MAX_TRADE_SUMMARIES))
 
 
 def _json_text(report: Mapping[str, Any]) -> str:

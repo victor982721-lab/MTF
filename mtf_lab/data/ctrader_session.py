@@ -54,6 +54,15 @@ from .ctrader_transport import (
     TcpTlsTransport,
 )
 
+# Authentication responses are an explicit protocol allowlist.  Do not infer
+# these pairs arithmetically: cTrader has unrelated payloads with nearby ids,
+# and the response type is part of the authentication proof boundary.
+_AUTH_RESPONSE_TYPES = {
+    PAYLOAD["PROTO_OA_APPLICATION_AUTH_REQ"]: PAYLOAD["PROTO_OA_APPLICATION_AUTH_RES"],
+    PAYLOAD["PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ"]: PAYLOAD["PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RES"],
+    PAYLOAD["PROTO_OA_ACCOUNT_AUTH_REQ"]: PAYLOAD["PROTO_OA_ACCOUNT_AUTH_RES"],
+}
+
 
 class Clock(Protocol):
     """Monotonic clock used for I/O deadlines and heartbeat scheduling."""
@@ -963,6 +972,11 @@ class CTraderClient:
             "PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ",
             {"accessToken": token},
         )
+        self._require_auth_response(
+            response,
+            request_type=PAYLOAD["PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ"],
+            operation="account discovery",
+        )
         self._account_discovery = normalize_account_payload(response.payload)
         # Keep the server echo in memory for explicit token-binding checks.
         # Ordinary discovery snapshots remain redacted by default.
@@ -1060,9 +1074,14 @@ class CTraderClient:
             self._set_status(auth=AuthState.INVALID, action="La referencia de secreto no devolvió un valor")
             raise CTraderAuthError("secret_provider vacío", action=self._status.action)
         try:
-            self.request(
+            response = self.request(
                 "PROTO_OA_APPLICATION_AUTH_REQ",
                 {"clientId": self.config.client_id, "clientSecret": secret},
+            )
+            self._require_auth_response(
+                response,
+                request_type=PAYLOAD["PROTO_OA_APPLICATION_AUTH_REQ"],
+                operation="application auth",
             )
             self._application_authenticated = True
         finally:
@@ -1096,8 +1115,13 @@ class CTraderClient:
                 "PROTO_OA_ACCOUNT_AUTH_REQ",
                 {"ctidTraderAccountId": self.config.account_id, "accessToken": token},
             )
-            self._authenticated_account_id = self.config.account_id
+            self._require_auth_response(
+                response,
+                request_type=PAYLOAD["PROTO_OA_ACCOUNT_AUTH_REQ"],
+                operation="account auth",
+            )
             self._mint_session_evidence(selected_record, response)
+            self._authenticated_account_id = self.config.account_id
         finally:
             token = ""
         self._set_status(auth=AuthState.AUTHENTICATED, action="")
@@ -1179,12 +1203,33 @@ class CTraderClient:
                 "PROTO_OA_ACCOUNT_AUTH_REQ",
                 {"ctidTraderAccountId": selected, "accessToken": token},
             )
+            self._require_auth_response(
+                response,
+                request_type=PAYLOAD["PROTO_OA_ACCOUNT_AUTH_REQ"],
+                operation="account auth",
+            )
         finally:
             token = ""
-        self._authenticated_account_id = selected
         self._mint_session_evidence(selected_record, response)
+        self._authenticated_account_id = selected
         self._set_status(auth=AuthState.AUTHENTICATED, action="")
         return self._status.auth
+
+    def _require_auth_response(self, response: WireMessage, *, request_type: int, operation: str) -> None:
+        expected = _AUTH_RESPONSE_TYPES[request_type]
+        observed = response.payload_type_id
+        payload_type = message_payload_type(response.payload)
+        if observed != expected or (payload_type is not None and payload_type != expected):
+            if request_type == PAYLOAD["PROTO_OA_APPLICATION_AUTH_REQ"]:
+                self._application_authenticated = False
+            self._account_discovery = None
+            self._authenticated_account_id = None
+            self._session_evidence = None
+            self._set_status(
+                auth=AuthState.INVALID,
+                action=f"respuesta {operation} con tipo Protobuf inesperado; no se acreditó la sesión",
+            )
+            raise CTraderAuthError("respuesta de autenticación con tipo inesperado", action=self._status.action)
 
     def _mint_session_evidence(self, account_record: Mapping[str, Any], response: WireMessage) -> None:
         if str(account_record.get("environment", "")).upper() != "DEMO":

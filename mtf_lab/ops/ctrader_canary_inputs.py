@@ -1147,9 +1147,15 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
             observer = getattr(executor, "observe_runtime", None)
         if not callable(observer):
             return _blocked("RUNTIME_OBSERVER_REQUIRED", gates=gates)
-        remaining = (bounds.deadline - start_now).total_seconds()
+        preparation_now = _aware(clock_fn(), "clock")
+        if preparation_now >= bounds.deadline:
+            return _blocked(
+                "DEADLINE_EXPIRED_AFTER_PREPARATION",
+                gates={**gates, "capture_now": _iso(preparation_now)},
+            )
+        remaining = (bounds.deadline - preparation_now).total_seconds()
         if remaining <= 0:
-            return _blocked("DEADLINE_EXPIRED", gates=gates)
+            return _blocked("DEADLINE_EXPIRED_AFTER_PREPARATION", gates=gates)
         provenance = evidence.runner_provenance()
         provenance["manual_technical"] = technical_only
         technical_gap = min(Decimal("30"), max_age) if technical_only else None
@@ -1184,6 +1190,18 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
                     clock=clock_fn,
                     monotonic=monotonic,
                 )
+                capture_now = _aware(clock_fn(), "clock")
+                if capture_now >= bounds.deadline:
+                    return _blocked(
+                        "DEADLINE_EXPIRED_BEFORE_CAPTURE",
+                        gates={**gates, "capture_now": _iso(capture_now)},
+                    )
+                remaining = (bounds.deadline - capture_now).total_seconds()
+                if remaining <= 0:
+                    return _blocked(
+                        "DEADLINE_EXPIRED_BEFORE_CAPTURE",
+                        gates={**gates, "capture_now": _iso(capture_now)},
+                    )
                 runner = _InputWatchRunner(
                     watch_context,
                     # A technical stream may legitimately be quiet up to its
@@ -1227,6 +1245,11 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
                     return _blocked(f"WATCH_BLOCKED:{type(exc).__name__}", gates=gates)
                 try:
                     final_now = _aware(clock_fn(), "clock")
+                    if final_now >= bounds.deadline:
+                        return _blocked(
+                            "DEADLINE_EXPIRED_DURING_CAPTURE",
+                            gates={**gates, "capture_now": _iso(final_now)},
+                        )
                     evidence.validate_current(provider, final_now)
                     final_state = market_window_state(provider, bounds.window_start, bounds.window_end)
                     if str(getattr(final_state, "value", final_state)).strip().upper() != "OPEN":

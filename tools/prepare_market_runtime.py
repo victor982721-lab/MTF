@@ -20,6 +20,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tarfile
@@ -27,9 +28,9 @@ import tempfile
 import time
 import uuid
 import zipfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 if __package__ in (None, ""):
@@ -68,6 +69,22 @@ class CommandResult:
             "elapsed_seconds": round(self.elapsed_seconds, 3),
             "log": self.log,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchiveSource:
+    path: Path
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class _ArchiveRoot:
+    path: Path
+    components: tuple[tuple[str, tuple[int, int] | None], ...]
 
 
 def _now() -> str:
@@ -570,52 +587,416 @@ def patch_entrypoints(venv: Path, *, root: Path, venv_name: str) -> list[str]:
     return moved
 
 
-def _archive_metadata(path: Path) -> tuple[dict[str, Any], list[tuple[str, bytes]]]:
-    if path.suffix == ".whl" or path.suffix == ".zip":
+def _validate_non_symlink_ancestors(path: Path) -> None:
+    """Reject symlinks in a source or destination path before any write."""
+
+    current = path
+    while True:
+        if os.path.lexists(current):
+            try:
+                info = os.lstat(current)
+            except OSError as exc:
+                raise PreparationError(f"archive path is unavailable: {current}") from exc
+            if stat.S_ISLNK(info.st_mode):
+                raise PreparationError(f"archive path contains a symlink: {current}")
+        parent = current.parent
+        if parent == current:
+            return
+        current = parent
+
+
+def _archive_root(root: Path) -> _ArchiveRoot:
+    """Snapshot an absolute root path for later descriptor-anchored writes."""
+
+    selected = Path(os.path.abspath(Path(root).expanduser()))
+    if selected == Path(selected.anchor):
+        raise PreparationError("archive preservation root must not be the filesystem root")
+    _validate_non_symlink_ancestors(selected)
+    components: list[tuple[str, tuple[int, int] | None]] = []
+    current = Path(selected.anchor)
+    for component in selected.parts[1:]:
+        current /= component
+        if os.path.lexists(current):
+            info = os.lstat(current)
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                raise PreparationError(f"archive preservation root component is unsafe: {current}")
+            components.append((component, (info.st_dev, info.st_ino)))
+        else:
+            components.append((component, None))
+    return _ArchiveRoot(selected, tuple(components))
+
+
+def _directory_flags() -> int:
+    return os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+
+
+def _open_archive_root(root: _ArchiveRoot) -> int:
+    """Open/create root components without re-resolving a pathname race."""
+
+    descriptor = os.open(root.path.anchor, _directory_flags())
+    try:
+        for component, expected in root.components:
+            if expected is None:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=descriptor)
+                except FileExistsError as exc:
+                    raise PreparationError(f"archive root appeared during secure open: {root.path}") from exc
+            child = os.open(component, _directory_flags(), dir_fd=descriptor)
+            info = os.fstat(child)
+            if expected is not None and (info.st_dev, info.st_ino) != expected:
+                os.close(child)
+                raise PreparationError(f"archive root changed during secure open: {root.path}")
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _safe_archive_parts(value: str, *, label: str) -> tuple[str, ...]:
+    """Validate a root-relative archive path on both POSIX and Windows syntax."""
+
+    if not isinstance(value, str) or not value or "\x00" in value:
+        raise PreparationError(f"{label} must be a non-empty relative path")
+    windows = PureWindowsPath(value)
+    if "\\" in value or windows.drive or windows.root or windows.is_absolute():
+        raise PreparationError(f"{label} must not be an absolute or Windows path: {value!r}")
+    parts = tuple(value.split("/"))
+    if any(part in {"", ".", ".."} for part in parts):
+        raise PreparationError(f"{label} contains an unsafe path component: {value!r}")
+    return parts
+
+
+def _validate_destination_parents(
+    root: Path,
+    destination: Path,
+    *,
+    label: str,
+    identities: dict[tuple[str, ...], tuple[int, int] | None],
+) -> bool:
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as exc:
+        raise PreparationError(f"{label} escapes archive root: {destination}") from exc
+    if not relative.parts:
+        raise PreparationError(f"{label} cannot be the archive root")
+    current = root
+    prefix: list[str] = []
+    for part in relative.parts[:-1]:
+        prefix.append(part)
+        current = current / part
+        if not os.path.lexists(current):
+            for missing in relative.parts[len(prefix) : -1]:
+                prefix.append(missing)
+                identities[tuple(prefix)] = None
+            return False
+        info = os.lstat(current)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise PreparationError(f"{label} parent is unsafe: {current}")
+        identity = (info.st_dev, info.st_ino)
+        previous = identities.setdefault(tuple(prefix), identity)
+        if previous != identity:
+            raise PreparationError(f"{label} parent changed during preflight: {current}")
+    return True
+
+
+def _destination_state(
+    root: _ArchiveRoot,
+    destination: Path,
+    *,
+    label: str,
+    source: Path | None = None,
+    payload: bytes | None = None,
+    identities: dict[tuple[str, ...], tuple[int, int] | None],
+) -> bool:
+    """Validate one destination and return whether an identical file exists."""
+
+    if not _validate_destination_parents(root.path, destination, label=label, identities=identities):
+        return False
+    if not os.path.lexists(destination):
+        return False
+    info = os.lstat(destination)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise PreparationError(f"{label} collision is not a private regular file: {destination}")
+    if source is not None:
+        identical = _files_equal(destination, source)
+    else:
+        identical = payload is not None and _file_matches_payload(destination, payload)
+    if not identical:
+        raise PreparationError(f"{label} collision has divergent bytes: {destination}")
+    return True
+
+
+def _files_equal(left: Path, right: Path) -> bool:
+    try:
+        left_info = os.stat(left, follow_symlinks=False)
+        right_info = os.stat(right, follow_symlinks=False)
+    except OSError:
+        return False
+    if left_info.st_size != right_info.st_size:
+        return False
+    with left.open("rb") as left_handle, right.open("rb") as right_handle:
+        while True:
+            left_chunk = left_handle.read(1024 * 1024)
+            right_chunk = right_handle.read(1024 * 1024)
+            if left_chunk != right_chunk:
+                return False
+            if not left_chunk:
+                return True
+
+
+def _file_matches_payload(path: Path, payload: bytes) -> bool:
+    try:
+        if os.stat(path, follow_symlinks=False).st_size != len(payload):
+            return False
+        with path.open("rb") as handle:
+            return handle.read() == payload
+    except OSError:
+        return False
+
+
+def _open_archive_parent(
+    root_fd: int,
+    parts: tuple[str, ...],
+    identities: Mapping[tuple[str, ...], tuple[int, int] | None],
+    created_identities: dict[tuple[str, ...], tuple[int, int]],
+) -> int:
+    """Open/create a destination parent below an already anchored root fd."""
+
+    current_fd = os.dup(root_fd)
+    prefix: list[str] = []
+    try:
+        for part in parts:
+            prefix.append(part)
+            key = tuple(prefix)
+            expected = identities.get(key)
+            created = created_identities.get(key)
+            if created is not None:
+                expected = created
+            elif expected is None:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                except FileExistsError as exc:
+                    raise PreparationError(f"archive destination parent appeared during publication: {part}") from exc
+            child_fd = os.open(part, _directory_flags(), dir_fd=current_fd)
+            info = os.fstat(child_fd)
+            if expected is not None and (info.st_dev, info.st_ino) != expected:
+                os.close(child_fd)
+                raise PreparationError(f"archive destination parent changed during publication: {part}")
+            if created is None and identities.get(key) is None:
+                created_identities[key] = (info.st_dev, info.st_ino)
+            os.close(current_fd)
+            current_fd = child_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+def _new_temp_at(parent_fd: int, name: str) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    for _ in range(8):
+        temporary = f".{name}.{uuid.uuid4().hex}.tmp"
         try:
-            with zipfile.ZipFile(path) as archive:
-                names = archive.namelist()
-                metadata_names = sorted(name for name in names if name.endswith(".dist-info/METADATA"))
-                if not metadata_names:
-                    raise PreparationError(f"archive metadata missing: {path}")
-                metadata_name = metadata_names[0]
-                headers = email.parser.Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
-                dist_info = metadata_name.rsplit("/", 1)[0]
-                license_names = sorted(
-                    {
-                        name
-                        for name in names
-                        if not name.endswith("/")
-                        and (name.startswith(dist_info + "/licenses/") or _is_license_name(Path(name).name))
-                    }
-                )
-                metadata = {
-                    "name": headers.get("Name", ""),
-                    "version": headers.get("Version", ""),
-                    "license_declared": headers.get("License-Expression") or headers.get("License"),
-                }
-                return metadata, [(name, archive.read(name)) for name in license_names]
-        except zipfile.BadZipFile as exc:
-            raise PreparationError(f"invalid wheel/archive: {path}") from exc
-    if path.name.endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")):
-        with tarfile.open(path, "r:*") as archive:
-            pkg_info = next((item for item in archive.getmembers() if item.name.endswith("/PKG-INFO")), None)
-            if pkg_info is None:
-                return {"name": path.name, "version": "", "license_declared": None}, []
-            stream = archive.extractfile(pkg_info)
-            headers = email.parser.Parser().parsestr("" if stream is None else stream.read().decode("utf-8", "replace"))
-            licenses: list[tuple[str, bytes]] = []
-            for member in archive.getmembers():
-                if not member.isfile() or not _is_license_name(Path(member.name).name):
-                    continue
-                stream = archive.extractfile(member)
-                if stream is not None:
-                    licenses.append((member.name, stream.read()))
-            return {
-                "name": headers.get("Name", path.name),
+            return os.open(temporary, flags, 0o600, dir_fd=parent_fd), temporary
+        except FileExistsError:
+            continue
+    raise PreparationError(f"could not allocate archive temporary file: {name}")
+
+
+def _publish_new_bytes(parent_fd: int, name: str, payload: bytes) -> None:
+    """Publish bytes below an anchored directory without replacing a collision."""
+
+    fd, temporary = _new_temp_at(parent_fd, name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        fd = -1
+        try:
+            os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise PreparationError(f"archive destination appeared during publication: {name}") from exc
+        os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent_fd)
+
+
+def _publish_new_copy(parent_fd: int, name: str, source: Path) -> None:
+    """Stream a pinned source archive below an anchored directory."""
+
+    fd, temporary = _new_temp_at(parent_fd, name)
+    try:
+        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0))
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(source_fd, "rb") as source_handle, os.fdopen(fd, "wb") as target_handle:
+                source_fd = -1
+                shutil.copyfileobj(source_handle, target_handle, length=1024 * 1024)
+                target_handle.flush()
+                os.fsync(target_handle.fileno())
+            fd = -1
+        finally:
+            if source_fd >= 0:
+                os.close(source_fd)
+        try:
+            os.link(temporary, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd, follow_symlinks=False)
+        except FileExistsError as exc:
+            raise PreparationError(f"archive destination appeared during publication: {name}") from exc
+        os.unlink(temporary, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(temporary, dir_fd=parent_fd)
+
+
+def _zipinfo_is_symlink(info: zipfile.ZipInfo) -> bool:
+    mode = (info.external_attr >> 16) & 0o170000
+    return info.create_system == 3 and stat.S_ISLNK(mode)
+
+
+def _archive_source(path: Path) -> _ArchiveSource:
+    source = Path(os.path.abspath(Path(path).expanduser()))
+    _validate_non_symlink_ancestors(source)
+    try:
+        info = os.lstat(source)
+    except OSError as exc:
+        raise PreparationError(f"archive source is unavailable: {source}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise PreparationError(f"archive source must be a regular file: {source}")
+    return _ArchiveSource(source, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+@contextlib.contextmanager
+def _snapshot_archive(source: _ArchiveSource) -> Iterator[Path]:
+    """Pin archive bytes once so metadata and publication share one source."""
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    source_fd = os.open(source.path, flags)
+    source_handle = None
+    try:
+        source_info = os.fstat(source_fd)
+        if (
+            not stat.S_ISREG(source_info.st_mode)
+            or (source_info.st_dev, source_info.st_ino) != (source.device, source.inode)
+            or source_info.st_size != source.size
+            or source_info.st_mtime_ns != source.mtime_ns
+            or source_info.st_ctime_ns != source.ctime_ns
+        ):
+            raise PreparationError(f"archive source changed during preflight: {source.path}")
+        source_handle = os.fdopen(source_fd, "rb")
+        source_fd = -1
+        with tempfile.TemporaryDirectory(prefix="mtf-archive-source-") as temporary_name:
+            snapshot = Path(temporary_name) / source.path.name
+            snapshot_fd = os.open(
+                snapshot,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+            )
+            try:
+                with os.fdopen(snapshot_fd, "wb") as snapshot_handle:
+                    snapshot_fd = -1
+                    shutil.copyfileobj(source_handle, snapshot_handle, length=1024 * 1024)
+                    snapshot_handle.flush()
+                    os.fsync(snapshot_handle.fileno())
+                final_info = os.fstat(source_handle.fileno())
+                if (
+                    final_info.st_size != source.size
+                    or final_info.st_mtime_ns != source.mtime_ns
+                    or final_info.st_ctime_ns != source.ctime_ns
+                    or snapshot.stat().st_size != source.size
+                ):
+                    raise PreparationError(f"archive source changed while being pinned: {source.path}")
+                yield snapshot
+            finally:
+                if snapshot_fd >= 0:
+                    os.close(snapshot_fd)
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+        if source_handle is not None:
+            source_handle.close()
+
+
+def _zip_license_members(
+    archive: zipfile.ZipFile, infos: list[zipfile.ZipInfo], dist_info: str
+) -> list[tuple[str, bytes]]:
+    licenses: list[tuple[str, bytes]] = []
+    seen_names: set[str] = set()
+    for info in infos:
+        name = info.filename
+        if name.endswith("/") or not (name.startswith(dist_info + "/licenses/") or _is_license_name(Path(name).name)):
+            continue
+        if name in seen_names or _zipinfo_is_symlink(info):
+            raise PreparationError(f"archive license member is duplicated or symlinked: {name}")
+        seen_names.add(name)
+        licenses.append((name, archive.read(info)))
+    return sorted(licenses, key=lambda item: item[0])
+
+
+def _zip_archive_metadata(path: Path) -> tuple[dict[str, Any], list[tuple[str, bytes]]]:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            metadata_infos = [info for info in infos if info.filename.endswith(".dist-info/METADATA")]
+            if len(metadata_infos) != 1 or _zipinfo_is_symlink(metadata_infos[0]):
+                raise PreparationError(f"archive metadata missing: {path}")
+            metadata_info = metadata_infos[0]
+            headers = email.parser.Parser().parsestr(archive.read(metadata_info).decode("utf-8"))
+            dist_info = metadata_info.filename.rsplit("/", 1)[0]
+            metadata = {
+                "name": headers.get("Name", ""),
                 "version": headers.get("Version", ""),
                 "license_declared": headers.get("License-Expression") or headers.get("License"),
-            }, licenses
+            }
+            return metadata, _zip_license_members(archive, infos, dist_info)
+    except zipfile.BadZipFile as exc:
+        raise PreparationError(f"invalid wheel/archive: {path}") from exc
+
+
+def _tar_archive_metadata(path: Path) -> tuple[dict[str, Any], list[tuple[str, bytes]]]:
+    with tarfile.open(path, "r:*") as archive:
+        members = archive.getmembers()
+        pkg_infos = [item for item in members if item.name.endswith("/PKG-INFO")]
+        if len(pkg_infos) > 1 or (pkg_infos and (pkg_infos[0].issym() or pkg_infos[0].islnk())):
+            raise PreparationError(f"archive metadata is duplicated or symlinked: {path}")
+        pkg_info = pkg_infos[0] if pkg_infos else None
+        if pkg_info is None:
+            return {"name": path.name, "version": "", "license_declared": None}, []
+        stream = archive.extractfile(pkg_info)
+        headers = email.parser.Parser().parsestr("" if stream is None else stream.read().decode("utf-8", "replace"))
+        licenses: list[tuple[str, bytes]] = []
+        seen_names: set[str] = set()
+        for member in members:
+            if not _is_license_name(Path(member.name).name):
+                continue
+            if member.name in seen_names or member.issym() or member.islnk() or not member.isfile():
+                raise PreparationError(f"archive license member is duplicated or symlinked: {member.name}")
+            seen_names.add(member.name)
+            stream = archive.extractfile(member)
+            if stream is not None:
+                licenses.append((member.name, stream.read()))
+        return {
+            "name": headers.get("Name", path.name),
+            "version": headers.get("Version", ""),
+            "license_declared": headers.get("License-Expression") or headers.get("License"),
+        }, licenses
+
+
+def _archive_metadata(path: Path) -> tuple[dict[str, Any], list[tuple[str, bytes]]]:
+    if path.suffix == ".whl" or path.suffix == ".zip":
+        return _zip_archive_metadata(path)
+    if path.name.endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")):
+        return _tar_archive_metadata(path)
     return {"name": path.name, "version": "", "license_declared": None}, []
 
 
@@ -636,30 +1017,78 @@ def preserve_archive(
     origin: str,
     kind: str,
 ) -> dict[str, Any]:
-    metadata, licenses = _archive_metadata(archive)
-    target = root / relative_path
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if archive.resolve() != target.resolve():
-        shutil.copy2(archive, target)
-    os.chmod(target, 0o600)
-    label = _archive_label(metadata, archive.stem)
-    license_paths: list[str] = []
-    for member_name, payload in licenses:
-        member = Path(member_name)
-        if any(part in {"", ".", ".."} for part in member.parts):
-            raise PreparationError(f"unsafe license member: {member_name}")
-        license_target = root / "licenses" / label / member
-        _atomic_write(license_target, payload)
-        license_paths.append(str(license_target.relative_to(root)))
-    return {
-        **metadata,
-        "kind": kind,
-        "path": str(target.relative_to(root)),
-        "sha256": sha256_file(target),
-        "size": target.stat().st_size,
-        "origin": origin,
-        "license_files": sorted(license_paths),
-    }
+    source = _archive_source(archive)
+    preservation_root = _archive_root(root)
+    with _snapshot_archive(source) as pinned_source:
+        metadata, licenses = _archive_metadata(pinned_source)
+        target_parts = _safe_archive_parts(relative_path, label="archive destination")
+        target = preservation_root.path.joinpath(*target_parts)
+        label = _archive_label(metadata, source.path.stem)
+        label_parts = _safe_archive_parts(label, label="archive label")
+        license_plan: list[tuple[tuple[str, ...], Path, str, bytes]] = []
+        planned_paths: set[Path] = {target}
+        for member_name, payload in licenses:
+            member_parts = _safe_archive_parts(member_name, label="archive license member")
+            license_parts = ("licenses", *label_parts, *member_parts)
+            license_target = preservation_root.path.joinpath(*license_parts)
+            if license_target in planned_paths:
+                raise PreparationError(f"archive destinations collide: {license_target}")
+            planned_paths.add(license_target)
+            license_plan.append((license_parts, license_target, "/".join(license_parts), payload))
+        parent_identities: dict[tuple[str, ...], tuple[int, int] | None] = {}
+        target_exists = _destination_state(
+            preservation_root,
+            target,
+            label="archive destination",
+            source=pinned_source,
+            identities=parent_identities,
+        )
+        license_exists: list[bool] = []
+        for _parts, license_target, _relative, payload in license_plan:
+            license_exists.append(
+                _destination_state(
+                    preservation_root,
+                    license_target,
+                    label="archive license",
+                    payload=payload,
+                    identities=parent_identities,
+                )
+            )
+        created_identities: dict[tuple[str, ...], tuple[int, int]] = {}
+        root_fd = _open_archive_root(preservation_root)
+        try:
+            if not target_exists:
+                target_parent_fd = _open_archive_parent(
+                    root_fd, target_parts[:-1], parent_identities, created_identities
+                )
+                try:
+                    _publish_new_copy(target_parent_fd, target_parts[-1], pinned_source)
+                finally:
+                    os.close(target_parent_fd)
+            license_paths: list[str] = []
+            for (license_parts, _license_target, relative, payload), exists in zip(
+                license_plan, license_exists, strict=True
+            ):
+                if not exists:
+                    license_parent_fd = _open_archive_parent(
+                        root_fd, license_parts[:-1], parent_identities, created_identities
+                    )
+                    try:
+                        _publish_new_bytes(license_parent_fd, license_parts[-1], payload)
+                    finally:
+                        os.close(license_parent_fd)
+                license_paths.append(relative)
+        finally:
+            os.close(root_fd)
+        return {
+            **metadata,
+            "kind": kind,
+            "path": "/".join(target_parts),
+            "sha256": sha256_file(pinned_source),
+            "size": source.size,
+            "origin": origin,
+            "license_files": sorted(license_paths),
+        }
 
 
 def _copy_source_license(source_root: Path, root: Path, python_version: str) -> dict[str, Any]:
@@ -680,7 +1109,16 @@ def _copy_source_license(source_root: Path, root: Path, python_version: str) -> 
 
 
 def _repo_file(repo_root: Path, value: Path, label: str) -> Path:
+    repo_root = Path(os.path.abspath(repo_root.expanduser()))
     candidate = value if value.is_absolute() else repo_root / value
+    candidate = Path(os.path.abspath(candidate.expanduser()))
+    _validate_non_symlink_ancestors(candidate)
+    try:
+        candidate_info = os.lstat(candidate)
+    except OSError as exc:
+        raise PreparationError(f"{label} is unavailable: {candidate}") from exc
+    if stat.S_ISLNK(candidate_info.st_mode):
+        raise PreparationError(f"{label} must not be a symlink: {candidate}")
     resolved = candidate.resolve(strict=True)
     if not resolved.is_file() or resolved.is_symlink() or not resolved.is_relative_to(repo_root):
         raise PreparationError(f"{label} must be a regular file under the repository: {resolved}")

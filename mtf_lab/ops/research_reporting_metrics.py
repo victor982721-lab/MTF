@@ -82,10 +82,20 @@ def as_mapping(value: Any) -> Mapping[str, Any]:
     return {}
 
 
+def is_artifact_descriptor(value: Any) -> bool:
+    """Identify a path/count descriptor, never a row of evidence."""
+
+    return bool(
+        isinstance(value, Mapping) and value.get("path") is not None and ("count" in value or "row_count" in value)
+    )
+
+
 def rows(value: Any) -> list[Mapping[str, Any]]:
     """Return mapping rows without copying or mutating the source sequence."""
 
     if isinstance(value, Mapping):
+        if is_artifact_descriptor(value):
+            return []
         return [value]
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
         return []
@@ -778,45 +788,124 @@ def _component(row: Mapping[str, Any], *keys: str) -> Decimal | None:
     return value
 
 
-def cost_bridge(result: Mapping[str, Any]) -> dict[str, Any]:
-    trades = [row for row in ledger_rows(result) if closed_trade(row)]
+def _invalid_cost_bridge(
+    reason: str,
+    *,
+    source_count: int | None = None,
+    expected_source_count: int | None = None,
+) -> dict[str, Any]:
+    """Return a fail-closed bridge when a complete ledger cannot be read."""
+
+    unknown_components = {
+        name: {"known_subtotal": None, "known_count": None, "unknown_count": None}
+        for name in ("spread", "slippage", "commission", "financing", "other")
+    }
+    return {
+        "status": "INSUFFICIENT",
+        "reason": reason,
+        "closed_trade_count": None,
+        "gross": None,
+        "costs": None,
+        "net": None,
+        "gross_known_subtotal": None,
+        "costs_known_subtotal": None,
+        "net_known_subtotal": None,
+        "known_gross_count": None,
+        "known_cost_count": None,
+        "known_net_count": None,
+        "unknown_gross_count": None,
+        "unknown_cost_count": None,
+        "unknown_net_count": None,
+        "components": unknown_components,
+        "accounting_equation": "net = gross - total_costs_once",
+        "spread_and_slippage_not_subtracted_twice": True,
+        "gross_basis": "executed_bid_ask_when_fill_sides_are_present_else_recorded_gross",
+        "conditional_on_costs": True,
+        "source_complete": False,
+        "source_count": source_count,
+        "expected_source_count": expected_source_count,
+    }
+
+
+def _accumulate_cost_row(
+    row: Mapping[str, Any],
+    *,
+    totals: dict[str, Decimal],
+    known_counts: dict[str, int],
+    components: Mapping[str, OnlineStats],
+) -> None:
+    amounts = trade_amounts(row)
+    for name, value in amounts.items():
+        if value is not None:
+            totals[name] += value
+            known_counts[name] += 1
+    component_values = {
+        "spread": _component(row, "spread_cost_account", "spread_account", "spread_cost"),
+        "slippage": _component(row, "slippage_account", "slippage_cost_account", "slippage"),
+        "commission": _component(row, "commission_account", "commission_cost_account", "commission"),
+        "financing": _component(row, "financing_account", "financing_cost_account", "swap", "financing"),
+    }
+    total_cost = amounts["cost"]
+    explicit = sum((item for item in component_values.values() if item is not None), _D0)
+    if total_cost is not None:
+        component_values["other"] = (
+            total_cost - explicit if any(item is not None for item in component_values.values()) else None
+        )
+    for name, value in component_values.items():
+        components[name].add(value)
+
+
+def _cost_bridge_from_rows(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    declared_costs: Mapping[str, Any] | None = None,
+    expected_source_count: int | None = None,
+    source_error: str | None = None,
+) -> dict[str, Any]:
+    """Aggregate a complete or paged ledger without retaining all rows."""
+
+    if source_error is not None:
+        return _invalid_cost_bridge(
+            source_error,
+            expected_source_count=expected_source_count,
+        )
     totals = {name: _D0 for name in ("gross", "cost", "net")}
     known_counts = {name: 0 for name in totals}
     components: dict[str, OnlineStats] = {
         name: OnlineStats() for name in ("spread", "slippage", "commission", "financing", "other")
     }
-    for row in trades:
-        amounts = trade_amounts(row)
-        for name, value in amounts.items():
-            if value is not None:
-                totals[name] += value
-                known_counts[name] += 1
-        component_values = {
-            "spread": _component(row, "spread_cost_account", "spread_account", "spread_cost"),
-            "slippage": _component(row, "slippage_account", "slippage_cost_account", "slippage"),
-            "commission": _component(row, "commission_account", "commission_cost_account", "commission"),
-            "financing": _component(row, "financing_account", "financing_cost_account", "swap", "financing"),
-        }
-        total_cost = amounts["cost"]
-        explicit = sum((item for item in component_values.values() if item is not None), _D0)
-        if total_cost is not None:
-            component_values["other"] = (
-                total_cost - explicit if any(item is not None for item in component_values.values()) else None
-            )
-        for name, value in component_values.items():
-            components[name].add(value)
-    count = len(trades)
-    declared_costs = as_mapping(result.get("costs"))
+    source_count = 0
+    count = 0
+    for row in rows:
+        source_count += 1
+        if not closed_trade(row):
+            continue
+        count += 1
+        _accumulate_cost_row(row, totals=totals, known_counts=known_counts, components=components)
+    declared_costs = declared_costs or {}
     declared_unknown = _number(declared_costs.get("unknown_count"))
     declared_unknown_count = int(declared_unknown) if declared_unknown is not None and declared_unknown >= 0 else 0
     if str(declared_costs.get("state", "KNOWN")).upper() not in {"KNOWN", ""}:
         declared_unknown_count = max(1, declared_unknown_count)
     unknown_cost_count = max(count - known_counts["cost"], declared_unknown_count)
-    complete = count > 0 and all(known_counts[name] == count for name in totals) and unknown_cost_count == 0
+    source_complete = expected_source_count is None or source_count == expected_source_count
+    complete = (
+        source_complete
+        and count > 0
+        and all(known_counts[name] == count for name in totals)
+        and unknown_cost_count == 0
+    )
     status = "ASSESSED" if complete else ("INSUFFICIENT" if count else "NOT_ASSESSED")
+    if not source_complete:
+        status = "INSUFFICIENT"
+    reason = None
+    if not source_complete:
+        reason = "ledger_row_count_mismatch"
+    elif not complete:
+        reason = "closed_trade_gross_net_or_cost_unknown" if count else "no_closed_trades"
     return {
         "status": status,
-        "reason": None if complete else ("closed_trade_gross_net_or_cost_unknown" if count else "no_closed_trades"),
+        "reason": reason,
         "closed_trade_count": count,
         "gross": number(totals["gross"]) if known_counts["gross"] == count and count else None,
         "costs": number(totals["cost"]) if known_counts["cost"] == count and count else None,
@@ -824,6 +913,9 @@ def cost_bridge(result: Mapping[str, Any]) -> dict[str, Any]:
         "gross_known_subtotal": number(totals["gross"]) if known_counts["gross"] else None,
         "costs_known_subtotal": number(totals["cost"]) if known_counts["cost"] else None,
         "net_known_subtotal": number(totals["net"]) if known_counts["net"] else None,
+        "known_gross_count": known_counts["gross"],
+        "known_cost_count": known_counts["cost"],
+        "known_net_count": known_counts["net"],
         "unknown_gross_count": count - known_counts["gross"],
         "unknown_cost_count": unknown_cost_count,
         "unknown_net_count": count - known_counts["net"],
@@ -839,7 +931,41 @@ def cost_bridge(result: Mapping[str, Any]) -> dict[str, Any]:
         "spread_and_slippage_not_subtracted_twice": True,
         "gross_basis": "executed_bid_ask_when_fill_sides_are_present_else_recorded_gross",
         "conditional_on_costs": not complete,
+        "source_complete": source_complete,
+        "source_count": source_count,
+        "expected_source_count": expected_source_count,
     }
+
+
+def cost_bridge_from_rows(
+    result: Mapping[str, Any],
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    expected_source_count: int | None = None,
+    source_error: str | None = None,
+) -> dict[str, Any]:
+    """Build a cost bridge from an already verified inline or paged ledger."""
+
+    return _cost_bridge_from_rows(
+        rows,
+        declared_costs=as_mapping(result.get("costs")),
+        expected_source_count=expected_source_count,
+        source_error=source_error,
+    )
+
+
+def cost_bridge(result: Mapping[str, Any]) -> dict[str, Any]:
+    verified = result.get("_verified_ledger_cost_bridge")
+    if isinstance(verified, Mapping):
+        return dict(verified)
+    retention = as_mapping(result.get("_ledger_retention"))
+    if retention and retention.get("complete") is not True:
+        return _invalid_cost_bridge(
+            "ledger_retention_incomplete",
+            source_count=retention.get("display_count") if isinstance(retention.get("display_count"), int) else None,
+            expected_source_count=retention.get("row_count") if isinstance(retention.get("row_count"), int) else None,
+        )
+    return cost_bridge_from_rows(result, ledger_rows(result))
 
 
 def break_even_metrics(result: Mapping[str, Any], bridge: Mapping[str, Any]) -> dict[str, Any]:
@@ -872,8 +998,27 @@ def break_even_metrics(result: Mapping[str, Any], bridge: Mapping[str, Any]) -> 
     }
 
 
+def _artifact_source_reason(result: Mapping[str, Any], key: str) -> str | None:
+    raw = (
+        result.get("equity_mark_to_market", result.get("equity_marks", result.get("equity")))
+        if key == "equity"
+        else result.get(key)
+    )
+    if is_artifact_descriptor(raw):
+        return f"{key}_snapshot_not_paged"
+    retention = as_mapping(result.get(f"_{key}_retention"))
+    if retention and retention.get("complete") is not True:
+        return f"{key}_retention_incomplete"
+    return None
+
+
 def _marks(result: Mapping[str, Any]) -> tuple[list[dict[str, Any]], int]:
     raw = result.get("equity_mark_to_market", result.get("equity_marks", result.get("equity")))
+    if is_artifact_descriptor(raw) or (
+        as_mapping(result.get("_equity_retention"))
+        and as_mapping(result.get("_equity_retention")).get("complete") is not True
+    ):
+        return [], 1
     known: list[dict[str, Any]] = []
     unknown = 0
     for ordinal, item in enumerate(rows(raw)):
@@ -909,6 +1054,22 @@ def _marks(result: Mapping[str, Any]) -> tuple[list[dict[str, Any]], int]:
 
 
 def drawdown_equity(result: Mapping[str, Any], *, max_points: int = MAX_VISUAL_POINTS) -> dict[str, Any]:
+    source_reason = _artifact_source_reason(result, "equity")
+    if source_reason is not None:
+        return {
+            "status": "NOT_ASSESSED",
+            "reason": source_reason,
+            "unknown_mark_count": 1,
+            "max_drawdown": None,
+            "max_drawdown_peak_at": None,
+            "max_drawdown_trough_at": None,
+            "recovery_duration_seconds": None,
+            "unrecovered_duration_seconds": None,
+            "unrecovered_state": "NOT_ASSESSED",
+            "mark_to_market": bounded_series([], value_key="equity", max_points=max_points),
+            "realized": bounded_series([], value_key="realized", max_points=max_points),
+            "unrealized": bounded_series([], value_key="unrealized", max_points=max_points),
+        }
     marks, unknown = _marks(result)
     series = [{key: value for key, value in item.items() if not key.startswith("_")} for item in marks]
     mtm = bounded_series(series, value_key="equity", max_points=max_points)
@@ -972,6 +1133,14 @@ def drawdown_equity(result: Mapping[str, Any], *, max_points: int = MAX_VISUAL_P
 
 
 def exposure_metrics(result: Mapping[str, Any], marks: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    source_reason = _artifact_source_reason(result, "equity")
+    if source_reason is not None:
+        return {
+            "status": "NOT_ASSESSED",
+            "reason": source_reason,
+            "peak": None,
+            "unknown_mark_count": 1,
+        }
     parsed_marks, unknown = _marks(result)
     observations = [item for item in parsed_marks if item.get("exposure") is not None]
     if not observations:
@@ -1157,6 +1326,8 @@ def _funnel_source_rows(
 ) -> Iterable[Mapping[str, Any]]:
     for key in ("funnel", "stages", "pipeline", "evaluations", "evaluation_funnel"):
         raw = source.get(key)
+        if is_artifact_descriptor(raw):
+            continue
         if isinstance(raw, Mapping):
             for stage, count in raw.items():
                 if _number(count) is not None:
@@ -1174,7 +1345,19 @@ def funnel_report(payload: Mapping[str, Any], results: Sequence[Mapping[str, Any
     groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     seen: set[tuple[str, str, str, str, str]] = set()
     raw_count = 0
+    funnel_keys = ("funnel", "stages", "pipeline", "evaluations", "evaluation_funnel")
+    descriptor_blocked = any(is_artifact_descriptor(payload.get(key)) for key in funnel_keys)
     for result in results:
+        if any(
+            is_artifact_descriptor(result.get(key))
+            or (
+                as_mapping(result.get(f"_{key}_retention"))
+                and as_mapping(result.get(f"_{key}_retention")).get("complete") is not True
+            )
+            for key in funnel_keys
+        ):
+            descriptor_blocked = True
+            continue
         for row in _funnel_source_rows(result, payload, result):
             raw_count += 1
             dims = dimensions(row, result, payload)
@@ -1215,7 +1398,8 @@ def funnel_report(payload: Mapping[str, Any], results: Sequence[Mapping[str, Any
             }
         )
     return {
-        "status": "ASSESSED" if output else "NOT_ASSESSED",
+        "status": "ASSESSED" if output and not descriptor_blocked else "NOT_ASSESSED",
+        "reason": "funnel_snapshot_not_paged" if descriptor_blocked else None,
         "rows": output,
         "raw_row_count": raw_count,
         "deduplicated_row_count": len(seen),
@@ -1814,11 +1998,13 @@ __all__ = [
     "closed_trade",
     "confidence_for_result",
     "cost_bridge",
+    "cost_bridge_from_rows",
     "dimensions",
     "drawdown_equity",
     "funnel_report",
     "iso",
     "iter_observations",
+    "is_artifact_descriptor",
     "ledger_rows",
     "mfe_mae",
     "number",

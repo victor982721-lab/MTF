@@ -1035,6 +1035,7 @@ class OrderResult:
             raise ValueError("result filled_quantity must be between zero and the requested quantity")
         self.filled_quantity = min(self.intent.quantity, self.filled_quantity)
         self.fills = tuple(self.fills)
+        _validate_result_fill_ledger(self.intent, self.filled_quantity, self.fills)
         self.state = self.state if isinstance(self.state, OrderState) else OrderState(str(self.state).upper())
         self.stop_loss = _optional_decimal(self.stop_loss, "result stop_loss")
         self.take_profit = _optional_decimal(self.take_profit, "result take_profit")
@@ -1065,6 +1066,46 @@ class OrderResult:
             "protection_state": self.protection_state,
             "reconciled": self.reconciled,
         }
+
+
+def _validate_result_fill_ledger(
+    intent: ExecutionIntent,
+    filled_quantity: DecimalValue,
+    fills: Iterable[Fill],
+) -> None:
+    """Validate the cumulative fill ledger carried by a result or recovery."""
+
+    seen: set[str] = set()
+    total = DecimalValue("0")
+    for fill in fills:
+        if not isinstance(fill, Fill):
+            raise ValueError(f"result fills must be Fill instances for {intent.intent_id}")
+        if fill.fill_id in seen:
+            raise ValueError(f"duplicate fill_id in result for {intent.intent_id}: {fill.fill_id}")
+        seen.add(fill.fill_id)
+        total += fill.quantity
+    if total > filled_quantity + _DECIMAL_TOLERANCE:
+        raise ValueError(
+            f"result fills exceed cumulative filled quantity for {intent.intent_id}: "
+            f"fills={total}, filled={filled_quantity}"
+        )
+
+
+def _validate_restored_result_identity(intent: ExecutionIntent, result: OrderResult) -> None:
+    _validate_result_fill_ledger(result.intent, result.filled_quantity, result.fills)
+    if (
+        result.intent.intent_id != intent.intent_id
+        or str(result.intent.account_id) != str(intent.account_id)
+        or result.intent.signal_id != intent.signal_id
+        or result.intent.symbol != intent.symbol
+        or result.intent.side is not intent.side
+        or result.intent.kind != intent.kind
+        or result.intent.position_id != intent.position_id
+        or result.intent.quantity != intent.quantity
+        or result.intent.requested_price != intent.requested_price
+        or result.intent.created_at != intent.created_at
+    ):
+        raise CorrelationError("recovered result intent identity does not match intent/account")
 
 
 def _validate_snapshot_contract(
@@ -3346,7 +3387,7 @@ class CTraderDemoExecutor:
         unresolved = [
             result
             for result in self._results.values()
-            if result.state in {OrderState.UNKNOWN, OrderState.SUBMITTED, OrderState.CLOSE_PARTIAL}
+            if result.state in {OrderState.UNKNOWN, OrderState.SUBMITTED, OrderState.PARTIAL, OrderState.CLOSE_PARTIAL}
         ]
         if len(self._inflight_ids) >= self.policy.max_inflight_intents or unresolved or self._inflight_ids:
             raise RiskLimitRejected("unresolved order must be reconciled before opening another intent")
@@ -4153,6 +4194,8 @@ class CTraderDemoExecutor:
             raise TypeError("restore_intent requires ExecutionIntent")
         if str(intent.account_id) != self.account.account_id:
             raise CorrelationError("recovered intent belongs to another demo account")
+        if result is not None:
+            _validate_restored_result_identity(intent, result)
         with self._lock:
             existing = self._intents.get(intent.intent_id)
             if existing is not None and existing != intent:
@@ -4168,11 +4211,6 @@ class CTraderDemoExecutor:
                     raise CorrelationError(f"signal already mapped to another intent: {intent.signal_id}")
                 self._signal_intents[intent.signal_id] = intent.intent_id
             if result is not None:
-                if (
-                    result.intent.intent_id != intent.intent_id
-                    or str(result.intent.account_id) != self.account.account_id
-                ):
-                    raise CorrelationError("recovered result does not match intent/account")
                 self._results[intent.intent_id] = result
 
     def clear_risk_halt(self) -> dict[str, Any]:

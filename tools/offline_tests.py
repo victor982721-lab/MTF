@@ -31,6 +31,11 @@ from tools.engineering_audit import analyze_repository
 SUMMARY_MARKER = "__MTF_SUMMARY__"
 RUNTIME_LOG_ENV = "MTF_OFFLINE_RUNTIME_LOG"
 WRITE_LOG_ENV = "MTF_OFFLINE_WRITE_LOG"
+WRITE_AUDIT_ENV = "MTF_OFFLINE_WRITE_AUDIT"
+WRITE_ROOTS_ENV = "MTF_OFFLINE_WRITE_ROOTS"
+WRITE_PATHS_ENV = "MTF_OFFLINE_WRITE_PATHS"
+WRITE_DIRS_ENV = "MTF_OFFLINE_WRITE_DIRS"
+EXECUTION_ROOT_ENV = "MTF_OFFLINE_EXECUTION_ROOT"
 
 _SAFE_INHERITED_ENV = frozenset(
     {
@@ -77,6 +82,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
@@ -84,19 +91,223 @@ import urllib.request
 _ORIGINAL_OPEN = builtins.open
 _ORIGINAL_IO_OPEN = io.open
 _ORIGINAL_OS_OPEN = os.open
+_ORIGINAL_OS_FSTAT = os.fstat
+_ORIGINAL_OS_SYSTEM = os.system
+_ORIGINAL_SUBPROCESS_POPEN = subprocess.Popen
 _ORIGINAL_SOCKET = socket.socket
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection
 _RUNTIME_LOG = os.environ.get("MTF_OFFLINE_RUNTIME_LOG")
 _WRITE_LOG = os.environ.get("MTF_OFFLINE_WRITE_LOG")
 _BLOCK_WRITES = os.environ.get("MTF_OFFLINE_BLOCK_WRITES", "0") == "1"
+_WRITE_AUDIT = os.environ.get("MTF_OFFLINE_WRITE_AUDIT", "0") == "1"
 _network_attempts = []
 _write_attempts = []
+_write_events = []
+_subprocess_events = []
+_allowed_write_count = 0
+_blocked_write_count = 0
+_read_only_probe_count = 0
+_device_open_count = 0
+_non_filesystem_fd_count = 0
+_write_event_count = 0
+_write_events_truncated = False
+_WRITE_EVENT_LIMIT = 512
+_child_log_counter = 0
+
+
+def _paths_from_environment(name):
+    raw = os.environ.get(name, "[]")
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError):
+        values = []
+    if not isinstance(values, list):
+        return []
+    result = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            result.append(Path(value).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return result
+
+
+_WRITE_ROOTS = _paths_from_environment("MTF_OFFLINE_WRITE_ROOTS")
+_WRITE_PATHS = _paths_from_environment("MTF_OFFLINE_WRITE_PATHS")
+_WRITE_DIRS = _paths_from_environment("MTF_OFFLINE_WRITE_DIRS")
+_EXECUTION_ROOT = None
+_execution_root_value = os.environ.get("MTF_OFFLINE_EXECUTION_ROOT")
+if _execution_root_value:
+    try:
+        _EXECUTION_ROOT = Path(_execution_root_value).expanduser().resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
+        _EXECUTION_ROOT = None
 
 
 def _record(path, collection, kind):
     item = {"kind": kind, "target": str(path)}
     collection.append(item)
     return item
+
+
+def _path_text(value):
+    if isinstance(value, bytes):
+        return os.fsdecode(value)
+    if isinstance(value, int):
+        return _fd_path(value) or "<fd:%d>" % value
+    try:
+        return os.fspath(value)
+    except TypeError:
+        return str(value)
+
+
+def _fd_path(value):
+    target = _fd_target(value)
+    return target if target is not None and target.startswith("/") else None
+
+
+def _fd_target(value):
+    if not isinstance(value, int) or value < 0:
+        return None
+    try:
+        return os.readlink("/proc/self/fd/%d" % value)
+    except OSError:
+        return None
+
+
+def _anonymous_pipe_fd(value):
+    target = _fd_target(value)
+    if target is None or not target.startswith("pipe:["):
+        return False
+    try:
+        return stat.S_ISFIFO(_ORIGINAL_OS_FSTAT(value).st_mode)
+    except OSError:
+        return False
+
+
+def _base_for_dir_fd(dir_fd):
+    if dir_fd is None or dir_fd == getattr(os, "AT_FDCWD", -100):
+        return Path.cwd()
+    target = _fd_path(dir_fd)
+    return Path(target) if target is not None else None
+
+
+def _resolved_path(value, dir_fd=None, *, follow_final=True):
+    raw = _path_text(value)
+    if isinstance(raw, bytes):
+        raw = os.fsdecode(raw)
+    if not isinstance(raw, str):
+        raw = str(raw)
+    if raw.startswith("<fd:"):
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        base = _base_for_dir_fd(dir_fd)
+        if base is None:
+            return None
+        path = base / path
+    try:
+        if follow_final:
+            return path.resolve(strict=False)
+        return path.parent.resolve(strict=False) / path.name
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _within(path, root):
+    if path is None:
+        return False
+    return path == root or root in path.parents
+
+
+def _write_allowed(path, kind):
+    if path is None:
+        return False
+    if any(_within(path, root) for root in _WRITE_ROOTS) or any(path == item for item in _WRITE_PATHS):
+        return True
+    return kind in {"os.mkdir", "os.makedirs"} and any(path == item for item in _WRITE_DIRS)
+
+
+def _record_write_event(kind, target, resolved, allowed, action):
+    global _allowed_write_count, _blocked_write_count, _read_only_probe_count, _device_open_count
+    global _non_filesystem_fd_count
+    global _write_event_count, _write_events_truncated
+    _write_event_count += 1
+    if action == "allow":
+        _allowed_write_count += 1
+    elif action == "probe_allow":
+        _read_only_probe_count += 1
+    elif action == "device_allow":
+        _device_open_count += 1
+    elif action == "nonfilesystem_allow":
+        _non_filesystem_fd_count += 1
+    else:
+        _blocked_write_count += 1
+    if not _WRITE_AUDIT:
+        return
+    if len(_write_events) >= _WRITE_EVENT_LIMIT:
+        _write_events_truncated = True
+        return
+    _write_events.append(
+        {
+            "action": action,
+            "allowed": allowed,
+            "kind": kind,
+            "resolved": str(resolved) if resolved is not None else None,
+            "target": str(target),
+        }
+    )
+
+
+def _allow_existing_directory_probe(kind, target, resolved, *, dir_fd=None):
+    if kind not in {"os.mkdir", "os.makedirs"} or resolved is None or _write_allowed(resolved, kind):
+        return False
+    try:
+        if not resolved.is_dir():
+            return False
+    except OSError:
+        return False
+    _record_write_event(kind + ".existing_directory_probe", target, resolved, False, "probe_allow")
+    return True
+
+
+def _audit_write(kind, target, *, dir_fd=None, follow_final=True):
+    if isinstance(target, int) and _anonymous_pipe_fd(target):
+        _record_write_event(kind + ".anonymous_pipe", target, None, True, "nonfilesystem_allow")
+        return None
+    resolved = _resolved_path(target, dir_fd, follow_final=follow_final)
+    if isinstance(target, int) and resolved == Path(os.devnull).resolve():
+        _record_write_event(kind + ".device", target, resolved, False, "device_allow")
+        return resolved
+    allowed = _write_allowed(resolved, kind)
+    action = "allow" if allowed and not _BLOCK_WRITES else "block"
+    _record_write_event(kind, target, resolved, allowed, action)
+    if action == "block":
+        item = {
+            "action": "block",
+            "allowed": allowed,
+            "kind": kind,
+            "resolved": str(resolved) if resolved is not None else None,
+            "target": str(target),
+        }
+        _write_attempts.append(item)
+        reason = "strict smoke" if _BLOCK_WRITES else "outside authorized temporary roots"
+        raise RuntimeError("offline write audit blocked %s (%s): %s" % (kind, reason, target))
+    return resolved
+
+
+def _record_subprocess(command, cwd, instrumented):
+    if not _WRITE_AUDIT:
+        return
+    _subprocess_events.append(
+        {
+            "command": str(command),
+            "cwd": str(cwd) if cwd is not None else None,
+            "instrumented": instrumented,
+        }
+    )
 
 
 def _host(address):
@@ -171,16 +382,14 @@ def _write_mode(mode):
 
 
 def _guarded_open(file, mode="r", *args, **kwargs):
-    if _BLOCK_WRITES and _write_mode(mode):
-        _record(file, _write_attempts, "filesystem_write_blocked")
-        raise RuntimeError("offline import smoke blocked filesystem write: " + str(file))
+    if _write_mode(mode):
+        _audit_write("builtins.open", file)
     return _ORIGINAL_OPEN(file, mode, *args, **kwargs)
 
 
 def _guarded_io_open(file, mode="r", *args, **kwargs):
-    if _BLOCK_WRITES and _write_mode(mode):
-        _record(file, _write_attempts, "filesystem_write_blocked")
-        raise RuntimeError("offline import smoke blocked filesystem write: " + str(file))
+    if _write_mode(mode):
+        _audit_write("io.open", file)
     return _ORIGINAL_IO_OPEN(file, mode, *args, **kwargs)
 
 
@@ -190,30 +399,240 @@ io.open = _guarded_io_open
 
 def _guarded_os_open(file, flags, *args, **kwargs):
     write_flags = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC
-    if _BLOCK_WRITES and flags & write_flags:
-        _record(file, _write_attempts, "filesystem_write_blocked")
-        raise RuntimeError("offline import smoke blocked os.open: " + str(file))
+    if flags & write_flags:
+        resolved = _resolved_path(file, kwargs.get("dir_fd"))
+        if resolved == Path(os.devnull).resolve():
+            _record_write_event("os.open.device", file, resolved, False, "device_allow")
+        else:
+            _audit_write("os.open", file, dir_fd=kwargs.get("dir_fd"))
     return _ORIGINAL_OS_OPEN(file, flags, *args, **kwargs)
 
 
 os.open = _guarded_os_open
 
 
-def _blocked_fs_call(name):
+def _guarded_single_path_call(name):
     def call(*args, **kwargs):
-        if _BLOCK_WRITES:
-            target = args[0] if args else name
-            _record(target, _write_attempts, "filesystem_write_blocked")
-            raise RuntimeError("offline import smoke blocked " + name)
+        target = args[0] if args else name
+        directory_fd = kwargs.get("dir_fd")
+        if name in {"mkdir", "makedirs"}:
+            resolved = _resolved_path(target, directory_fd)
+            if _allow_existing_directory_probe("os." + name, target, resolved, dir_fd=directory_fd):
+                return _ORIGINAL_FS[name](*args, **kwargs)
+        _audit_write(
+            "os." + name,
+            target,
+            dir_fd=kwargs.get("dir_fd"),
+            follow_final=name not in {"remove", "unlink", "rmdir"},
+        )
         return _ORIGINAL_FS[name](*args, **kwargs)
     return call
 
 
+def _guarded_move_call(name):
+    def call(*args, **kwargs):
+        source = args[0] if args else name
+        destination = args[1] if len(args) > 1 else name
+        _audit_write(
+            "os." + name + ".source",
+            source,
+            dir_fd=kwargs.get("src_dir_fd"),
+            follow_final=False,
+        )
+        _audit_write(
+            "os." + name + ".destination",
+            destination,
+            dir_fd=kwargs.get("dst_dir_fd"),
+            follow_final=False,
+        )
+        return _ORIGINAL_FS[name](*args, **kwargs)
+    return call
+
+
+def _guarded_link_call(name):
+    def call(*args, **kwargs):
+        destination = args[1] if len(args) > 1 else name
+        directory_fd = kwargs.get("dir_fd") if name == "symlink" else kwargs.get("dst_dir_fd")
+        _audit_write("os." + name + ".destination", destination, dir_fd=directory_fd, follow_final=False)
+        return _ORIGINAL_FS[name](*args, **kwargs)
+    return call
+
+
+def _child_path_values(raw, name):
+    try:
+        values = json.loads(raw)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("offline child policy is not valid JSON: " + name) from exc
+    if not isinstance(values, list):
+        raise RuntimeError("offline child policy must be a JSON list: " + name)
+    result = []
+    for value in values:
+        if not isinstance(value, str) or not value:
+            raise RuntimeError("offline child policy contains an invalid path: " + name)
+        try:
+            result.append(Path(value).expanduser().resolve(strict=False))
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise RuntimeError("offline child policy path cannot be resolved: " + name) from exc
+    return result
+
+
+def _child_path_policy(name, raw, parent_values):
+    values = _child_path_values(raw, name)
+    for value in values:
+        in_root = any(_within(value, root) for root in _WRITE_ROOTS)
+        in_exact = any(value == path for path in parent_values)
+        if not in_root and not in_exact:
+            raise RuntimeError("offline child policy broadens " + name)
+    return values
+
+
+def _child_log_path(base, label):
+    global _child_log_counter
+    if not base:
+        return ""
+    path = Path(base)
+    parent = path.parent.resolve(strict=False)
+    if not any(_within(parent, root) for root in _WRITE_ROOTS):
+        return ""
+    _child_log_counter += 1
+    return str(parent / (path.name + ".child-%d-%d-%s" % (os.getpid(), _child_log_counter, label)))
+
+
+def _explicit_child_log_path(value, parent_value):
+    if not value:
+        return None
+    path = Path(value)
+    resolved = path.resolve(strict=False)
+    if not any(_within(resolved.parent, root) for root in _WRITE_ROOTS):
+        return None
+    if parent_value:
+        parent = Path(parent_value).resolve(strict=False)
+        if resolved == parent:
+            return None
+    return str(path)
+
+
+def _guarded_popen(*args, **kwargs):
+    command = args[0] if args else kwargs.get("args")
+    executable = kwargs.get("executable")
+    command_text = command if command is not None else executable
+    if isinstance(command, (list, tuple)) and command:
+        command_text = command[0]
+    command_value = _path_text(command_text) if command_text is not None else "<unknown>"
+    cwd = kwargs.get("cwd")
+    resolved_cwd = _resolved_path(cwd if cwd is not None else Path.cwd())
+    cwd_allowed = _within(resolved_cwd, _EXECUTION_ROOT) if _EXECUTION_ROOT is not None else False
+    cwd_allowed = cwd_allowed or any(_within(resolved_cwd, root) for root in _WRITE_ROOTS)
+    if not cwd_allowed:
+        _record_subprocess(command_value, resolved_cwd, False)
+        raise RuntimeError("offline subprocess cwd outside authorized roots: " + str(cwd))
+    command_name = str(command_value).lower().rsplit("/", 1)[-1]
+    instrumented = command_name.startswith("python") or command_value == sys.executable
+    _record_subprocess(command_value, resolved_cwd, instrumented)
+    child_environment = kwargs.get("env")
+    if child_environment is None:
+        child_environment = dict(os.environ)
+    else:
+        child_environment = dict(child_environment)
+    if child_environment is not None:
+        child_environment.pop("PYTHONHOME", None)
+        child_environment.pop("PYTHONUSERBASE", None)
+        child_environment.pop("PYTHONSTARTUP", None)
+        child_environment["MTF_OFFLINE_WRITE_ROOTS"] = json.dumps(
+            [str(path) for path in _child_path_policy(
+                "MTF_OFFLINE_WRITE_ROOTS",
+                child_environment.get("MTF_OFFLINE_WRITE_ROOTS", os.environ.get("MTF_OFFLINE_WRITE_ROOTS", "[]")),
+                _WRITE_ROOTS,
+            )]
+        )
+        child_environment["MTF_OFFLINE_WRITE_PATHS"] = json.dumps(
+            [str(path) for path in _child_path_policy(
+                "MTF_OFFLINE_WRITE_PATHS",
+                child_environment.get("MTF_OFFLINE_WRITE_PATHS", os.environ.get("MTF_OFFLINE_WRITE_PATHS", "[]")),
+                _WRITE_PATHS,
+            )]
+        )
+        child_environment["MTF_OFFLINE_WRITE_DIRS"] = json.dumps(
+            [str(path) for path in _child_path_policy(
+                "MTF_OFFLINE_WRITE_DIRS",
+                child_environment.get("MTF_OFFLINE_WRITE_DIRS", os.environ.get("MTF_OFFLINE_WRITE_DIRS", "[]")),
+                _WRITE_DIRS,
+            )]
+        )
+        requested_audit = child_environment.get("MTF_OFFLINE_WRITE_AUDIT", "")
+        child_environment["MTF_OFFLINE_WRITE_AUDIT"] = "1" if _WRITE_AUDIT or requested_audit == "1" else "0"
+        requested_block = child_environment.get("MTF_OFFLINE_BLOCK_WRITES", "")
+        if requested_block not in {"", "0", "1"}:
+            raise RuntimeError("offline child policy has invalid block mode")
+        child_environment["MTF_OFFLINE_BLOCK_WRITES"] = "1" if _BLOCK_WRITES or requested_block == "1" else "0"
+        parent_execution = os.environ.get("MTF_OFFLINE_EXECUTION_ROOT", "")
+        child_execution = child_environment.get("MTF_OFFLINE_EXECUTION_ROOT", parent_execution)
+        if parent_execution and child_execution:
+            child_execution_path = _resolved_path(child_execution)
+            under_execution_root = _within(child_execution_path, _EXECUTION_ROOT)
+            under_write_root = any(_within(child_execution_path, root) for root in _WRITE_ROOTS)
+            if not under_execution_root and not under_write_root:
+                raise RuntimeError("offline child policy broadens execution root")
+            child_environment["MTF_OFFLINE_EXECUTION_ROOT"] = str(child_execution_path)
+        else:
+            child_environment["MTF_OFFLINE_EXECUTION_ROOT"] = parent_execution
+        runtime_log = _explicit_child_log_path(
+            child_environment.get("MTF_OFFLINE_RUNTIME_LOG", ""), _RUNTIME_LOG
+        )
+        write_log = _explicit_child_log_path(child_environment.get("MTF_OFFLINE_WRITE_LOG", ""), _WRITE_LOG)
+        child_environment["MTF_OFFLINE_RUNTIME_LOG"] = runtime_log or _child_log_path(_RUNTIME_LOG, command_name)
+        child_environment["MTF_OFFLINE_WRITE_LOG"] = write_log or _child_log_path(_WRITE_LOG, command_name)
+        requested_pythonpath = child_environment.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+        if instrumented:
+            guard_path = os.environ.get("PYTHONPATH", "").split(os.pathsep)[0]
+            child_environment["PYTHONPATH"] = (
+                guard_path + os.pathsep + requested_pythonpath
+                if guard_path and requested_pythonpath
+                else guard_path or requested_pythonpath
+            )
+        else:
+            child_environment["PYTHONPATH"] = requested_pythonpath
+        kwargs["env"] = child_environment
+    return _ORIGINAL_SUBPROCESS_POPEN(*args, **kwargs)
+
+
+def _guarded_system(command):
+    _record_subprocess("os.system", Path.cwd(), False)
+    return _ORIGINAL_OS_SYSTEM(command)
+
+
 _ORIGINAL_FS = {}
-for _name in ("mkdir", "makedirs", "remove", "unlink", "rename", "replace", "rmdir"):
+for _name in (
+    "mkdir",
+    "makedirs",
+    "remove",
+    "unlink",
+    "rmdir",
+    "mkfifo",
+    "mknod",
+    "truncate",
+    "chmod",
+    "utime",
+    "chown",
+):
     if hasattr(os, _name):
         _ORIGINAL_FS[_name] = getattr(os, _name)
-        setattr(os, _name, _blocked_fs_call(_name))
+        setattr(os, _name, _guarded_single_path_call(_name))
+for _name in ("rename", "replace"):
+    if hasattr(os, _name):
+        _ORIGINAL_FS[_name] = getattr(os, _name)
+        setattr(os, _name, _guarded_move_call(_name))
+for _name in ("link", "symlink"):
+    if hasattr(os, _name):
+        _ORIGINAL_FS[_name] = getattr(os, _name)
+        setattr(os, _name, _guarded_link_call(_name))
+for _name in ("ftruncate", "fchmod", "fchown"):
+    if hasattr(os, _name):
+        _ORIGINAL_FS[_name] = getattr(os, _name)
+        setattr(os, _name, _guarded_single_path_call(_name))
+
+subprocess.Popen = _guarded_popen
+os.system = _guarded_system
 
 
 def _write_diagnostics():
@@ -226,6 +645,40 @@ def _write_diagnostics():
         ),
         "network_attempts": _network_attempts,
         "write_attempts": _write_attempts,
+        "write_audit": {
+            "allowed_roots": [str(path) for path in _WRITE_ROOTS],
+            "authorized_directories": [str(path) for path in _WRITE_DIRS],
+            "authorized_paths": [str(path) for path in _WRITE_PATHS],
+            "allowed_writes": _allowed_write_count,
+            "blocked_writes": _blocked_write_count,
+            "device_opens": _device_open_count,
+            "anonymous_pipe_fds": _non_filesystem_fd_count,
+            "read_only_probes": _read_only_probe_count,
+            "enabled": _WRITE_AUDIT,
+            "event_count": _write_event_count,
+            "events": _write_events,
+            "events_truncated": _write_events_truncated,
+            "scope": "Python filesystem hooks only; native filesystem I/O and child diagnostics are not aggregated",
+            "hook_scope": [
+                "builtins.open",
+                "io.open",
+                "os.open",
+                "os.open /dev/null device handles (not filesystem writes)",
+                "anonymous pipe file descriptors (fstat+procfd; regular/named FIFO remain fenced)",
+                "os.mkdir/makedirs/remove/unlink/rmdir/mkfifo/mknod",
+                "os.rename/replace",
+                "os.link/symlink",
+                "os.truncate/chmod/utime/chown",
+                "os.ftruncate/fchmod/fchown",
+                "subprocess.Popen cwd and Python-child propagation",
+                "os.system (recorded as native/unverified)",
+            ],
+            "native_subprocesses_unverified": [
+                event for event in _subprocess_events if not event["instrumented"]
+            ],
+            "subprocesses": _subprocess_events,
+            "enforcement": "block_all_writes" if _BLOCK_WRITES else "block_outside_authorized_paths",
+        },
     }
     if _RUNTIME_LOG:
         try:
@@ -354,6 +807,8 @@ def _isolated_env(
     pythonpath_entries: Iterable[Path] = (),
     coverage_file: Path | None = None,
     coverage_source: Path | None = None,
+    write_paths: Iterable[Path] = (),
+    write_dirs: Iterable[Path] = (),
 ) -> dict[str, str]:
     env = _safe_parent_environment()
     # The launcher honours PYTHON; remove an ambient override so the recorded
@@ -373,6 +828,11 @@ def _isolated_env(
             "PYTHONPYCACHEPREFIX": str(temp_root / "pycache"),
             "MTF_LAB_OFFLINE": "1",
             "MTF_OFFLINE_BLOCK_WRITES": "1" if block_writes else "0",
+            WRITE_AUDIT_ENV: "1",
+            WRITE_ROOTS_ENV: json.dumps([str(temp_root.resolve())]),
+            WRITE_PATHS_ENV: json.dumps([str(path.resolve(strict=False)) for path in write_paths]),
+            WRITE_DIRS_ENV: json.dumps([str(path.resolve(strict=False)) for path in write_dirs]),
+            EXECUTION_ROOT_ENV: str(root.resolve()),
             "PYTHONNOUSERSITE": "1",
         }
     )
@@ -402,6 +862,8 @@ def _child_command(
     pythonpath_entries: Iterable[Path] = (),
     coverage_file: Path | None = None,
     coverage_source: Path | None = None,
+    write_paths: Iterable[Path] = (),
+    write_dirs: Iterable[Path] = (),
 ) -> dict[str, Any]:
     guard = temp_root / "guard"
     guard.mkdir(parents=True, exist_ok=True)
@@ -416,6 +878,8 @@ def _child_command(
         pythonpath_entries=pythonpath_entries,
         coverage_file=coverage_file,
         coverage_source=coverage_source,
+        write_paths=write_paths,
+        write_dirs=write_dirs,
     )
     env[RUNTIME_LOG_ENV] = str(runtime_log)
     env[WRITE_LOG_ENV] = str(write_log)
@@ -459,8 +923,15 @@ def _child_command(
     write_log_ok = isinstance(writes, list)
     result["runtime"] = runtime if isinstance(runtime, dict) else None
     result["write_attempts"] = writes if isinstance(writes, list) else []
-    result["guard_evidence"] = {"runtime_log": runtime_log_ok, "write_log": write_log_ok}
-    if not runtime_log_ok or not write_log_ok:
+    write_audit = runtime.get("write_audit") if isinstance(runtime, dict) else None
+    audit_log_ok = isinstance(write_audit, dict) and write_audit.get("enabled") is True
+    result["write_audit"] = write_audit if isinstance(write_audit, dict) else None
+    result["guard_evidence"] = {
+        "runtime_log": runtime_log_ok,
+        "write_log": write_log_ok,
+        "write_audit": audit_log_ok,
+    }
+    if not runtime_log_ok or not write_log_ok or not audit_log_ok:
         result["guard_error"] = "offline guard did not produce complete diagnostic logs"
     if isinstance(runtime, dict):
         result["network_attempts"] = runtime.get("network_attempts", [])
@@ -482,6 +953,36 @@ def _parse_summary(stdout: str) -> dict[str, Any] | None:
     return None
 
 
+def _reject_symlink_components(path: Path) -> None:
+    """Reject a coverage output path that could escape through a symlink."""
+
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        try:
+            if current.is_symlink():
+                raise ValueError(f"coverage output path contains symlink: {path}")
+        except OSError as exc:
+            raise ValueError(f"coverage output path cannot be inspected: {path}") from exc
+
+
+def _coverage_write_paths(root: Path, coverage_file: Path) -> tuple[Path, ...]:
+    """Return the exact coverage file and SQLite sidecars the child may write."""
+
+    candidate = coverage_file if coverage_file.is_absolute() else root / coverage_file
+    candidate = candidate.absolute()
+    _reject_symlink_components(candidate.parent)
+    _reject_symlink_components(candidate)
+    candidate.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_components(candidate.parent)
+    _reject_symlink_components(candidate)
+    sidecars = tuple(candidate.with_name(candidate.name + suffix) for suffix in ("-wal", "-shm", "-journal"))
+    for sidecar in sidecars:
+        _reject_symlink_components(sidecar)
+    return (candidate, *sidecars)
+
+
 def run_suite(
     root: Path,
     *,
@@ -493,6 +994,8 @@ def run_suite(
 ) -> dict[str, Any]:
     if (coverage_file is None) != (coverage_site is None):
         raise ValueError("coverage_file y coverage_site deben proporcionarse juntos")
+    coverage_paths = _coverage_write_paths(root, coverage_file) if coverage_file is not None else ()
+    coverage_target = coverage_paths[0] if coverage_paths else None
     with tempfile.TemporaryDirectory(prefix="mtf-offline-suite-") as name:
         temp_root = Path(name)
         command = [sys.executable, "-c", _TEST_DRIVER, start_directory, pattern]
@@ -503,8 +1006,10 @@ def run_suite(
             block_writes=False,
             timeout=timeout,
             pythonpath_entries=(coverage_site,) if coverage_site is not None else (),
-            coverage_file=coverage_file,
-            coverage_source=root / "mtf_lab" if coverage_file is not None else None,
+            coverage_file=coverage_target,
+            coverage_source=root / "mtf_lab" if coverage_target is not None else None,
+            write_paths=coverage_paths,
+            write_dirs=(coverage_target.parent,) if coverage_target is not None else (),
         )
     summary = _parse_summary(str(result.get("stdout", "")))
     result["summary"] = summary
@@ -513,8 +1018,8 @@ def run_suite(
     if coverage_file is not None:
         result["coverage"] = {
             "enabled": True,
-            "data_file": str(coverage_file),
-            "data_file_exists": coverage_file.is_file(),
+            "data_file": str(coverage_target),
+            "data_file_exists": bool(coverage_target and coverage_target.is_file()),
             "site": str(coverage_site),
             "error": next(
                 (
@@ -551,6 +1056,7 @@ def run_smoke(root: Path, *, timeout: float = 30.0) -> dict[str, Any]:
     core_policy_ok = (
         import_result.get("guard_evidence", {}).get("runtime_log")
         and import_result.get("guard_evidence", {}).get("write_log")
+        and import_result.get("guard_evidence", {}).get("write_audit")
         and not import_result.get("loaded_optional")
         and not import_result.get("network_attempts")
         and not import_result.get("write_attempts")
@@ -558,6 +1064,7 @@ def run_smoke(root: Path, *, timeout: float = 30.0) -> dict[str, Any]:
     help_policy_ok = (
         help_result.get("guard_evidence", {}).get("runtime_log")
         and help_result.get("guard_evidence", {}).get("write_log")
+        and help_result.get("guard_evidence", {}).get("write_audit")
         and not help_result.get("loaded_optional")
         and not help_result.get("network_attempts")
         and not help_result.get("write_attempts")
@@ -572,6 +1079,7 @@ def run_smoke(root: Path, *, timeout: float = 30.0) -> dict[str, Any]:
             "loaded_optional": import_result.get("loaded_optional", []),
             "network_attempts": import_result.get("network_attempts", []),
             "write_attempts": import_result.get("write_attempts", []),
+            "write_audit": import_result.get("write_audit"),
             "guard_evidence": import_result.get("guard_evidence"),
             "guard_error": import_result.get("guard_error"),
             "stderr": import_result.get("stderr", ""),
@@ -584,6 +1092,7 @@ def run_smoke(root: Path, *, timeout: float = 30.0) -> dict[str, Any]:
             "loaded_optional": help_result.get("loaded_optional", []),
             "network_attempts": help_result.get("network_attempts", []),
             "write_attempts": help_result.get("write_attempts", []),
+            "write_audit": help_result.get("write_audit"),
             "guard_evidence": help_result.get("guard_evidence"),
             "guard_error": help_result.get("guard_error"),
             "stdout": help_result.get("stdout", ""),
@@ -606,10 +1115,15 @@ def run_pip_check(root: Path, *, timeout: float = 30.0) -> dict[str, Any]:
         "returncode": result["returncode"],
         "ok": result["returncode"] == 0
         and bool(result.get("guard_evidence", {}).get("runtime_log"))
-        and bool(result.get("guard_evidence", {}).get("write_log")),
+        and bool(result.get("guard_evidence", {}).get("write_log"))
+        and bool(result.get("guard_evidence", {}).get("write_audit"))
+        and isinstance(result.get("write_audit"), dict)
+        and result["write_audit"].get("blocked_writes") == 0
+        and not result.get("write_attempts"),
         "stdout": result.get("stdout", ""),
         "stderr": result.get("stderr", ""),
         "network_attempts": result.get("network_attempts", []),
+        "write_audit": result.get("write_audit"),
         "guard_evidence": result.get("guard_evidence"),
         "guard_error": result.get("guard_error"),
     }
@@ -671,8 +1185,12 @@ def run(
         isinstance(suite_summary, dict)
         and suite_summary.get("successful")
         and not result["suite"].get("network_attempts")
+        and not result["suite"].get("write_attempts")
         and result["suite"].get("guard_evidence", {}).get("runtime_log")
         and result["suite"].get("guard_evidence", {}).get("write_log")
+        and result["suite"].get("guard_evidence", {}).get("write_audit")
+        and isinstance(result["suite"].get("write_audit"), dict)
+        and result["suite"]["write_audit"].get("blocked_writes") == 0
     )
     smoke_ok = bool(result["smoke"].get("skipped")) or all(
         bool(value.get("ok")) for value in result["smoke"].values() if isinstance(value, dict) and "ok" in value

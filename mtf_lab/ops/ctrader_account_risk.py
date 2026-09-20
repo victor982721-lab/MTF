@@ -1900,7 +1900,9 @@ class AccountRiskObserver:
         timestamp = _cashflow_timestamp(timestamp_ms, day_start, now, reasons)
         if timestamp is None:
             return None, None, None, reasons
-        digits = _optional_money_digits(raw, "moneyDigits") or trader_digits
+        digits = _optional_money_digits(raw, "moneyDigits")
+        if digits is None:
+            digits = trader_digits
         if digits is None:
             reasons.append("cashflow_money_digits_unobserved")
             return None, None, None, reasons

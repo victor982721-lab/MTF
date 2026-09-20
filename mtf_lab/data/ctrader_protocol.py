@@ -987,6 +987,12 @@ def redact_value(value: Any) -> Any:
         }
     if isinstance(value, (list, tuple)):
         return [redact_value(item) for item in value]
+    if hasattr(value, "DESCRIPTOR") and hasattr(value, "SerializeToString"):
+        # Convert generated Protobuf messages before redacting so nested
+        # scalar/repeated fields keep the same mapping contract as fixtures.
+        return redact_value(message_to_mapping(value))
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return redact_value(value.to_dict())
     return jsonable(value)
 
 
