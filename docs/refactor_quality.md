@@ -1,5 +1,47 @@
 # Calidad global de MTF Lab
 
+## Mejoras offline aisladas — 2026-09-20
+
+Código validado `f3b187fdc76af70fe280bf9ecbd11313a02eebd6`, publicado en la rama
+privada `codex/mtf-offline-hardening-20260920`, sin merge ni promoción operativa.
+La versión y programación de la canaria DEMO permanecen separadas e intactas.
+
+- Una confirmación de cierre que contradice la posición residual queda
+  `UNKNOWN`: conserva cantidades y fills observados, sin fabricar un cierre
+  parcial ni reenviar automáticamente.
+- La cancelación conserva el registro acumulado de fills, incluso si la
+  respuesta los omite. Repeticiones, conflictos y exceso de cantidad tienen
+  regresiones de recuperación y rechazo sin reenvío ciego.
+- Los identificadores de cuenta rechazan booleanos, decimales, aliases
+  conflictivos y valores fuera de int64. OAuth exige strings no vacíos y
+  preserva los bytes opacos de los parámetros válidos.
+- El contrato puro de cotizaciones CFD está separado con 42 definiciones
+  AST-equivalentes. El codec de checkpoints comparte los campos mutables,
+  conserva el formato/orden v1 y su equivalencia con la versión anterior.
+- El controlador y los codecs usan tipos más precisos; los 17 argumentos del
+  recolector son explícitos. Se verifica que el riesgo posterior use el
+  observador del binding, no la observación inicial.
+
+El gate completo pasó **1,149/1,149 pruebas**, incluidas 24 regresiones nuevas,
+sin fallos ni omisiones. Ruff, formato, mypy, Pyright y arquitectura aprobaron.
+Cobertura: **80.063% de líneas y 63.488% de ramas**. La suite usó Python 3.12.14,
+HOME/XDG/TMP aislados y bloqueo de red externa; la cerca de fuentes quedó intacta.
+El bloqueo total de escritura corresponde a los smokes de importación/ayuda:
+el contador de escritura de la suite no es una auditoría de todo el filesystem.
+
+Receipt local:
+`/home/winterboss/MTF/runtime/market-evidence/offline-hardening-20260920/quality-gate.json`,
+SHA-256 `39089e13c0d1ba084eb9b2e4f2885412d6db35beea401ae4b1a4d47010fa3b16`.
+El wheel se construyó sin índice ni nuevas dependencias y cargó desde un venv
+efímero independiente con Python 3.14.4; sus 130 archivos empaquetados coinciden
+con las fuentes. Su SHA-256 es
+`4540a4533599d9a5dafe187ba2dd87f9a1daf16b7de20b993620a889cd0934b0` y los bytes
+se conservan en el subdirectorio `wheels/` de la misma evidencia local.
+Ese smoke no sustituye ni promociona el runtime instalado, y ninguna prueba
+de esta fase contactó al bróker ni envió órdenes.
+
+## Antecedente de alcance y metodología
+
 Alcance autorizado el 2026-09-12: terminar la limpieza Ruff/mypy heredada y
 mejorar el código sin auth, OAuth, cuentas ni conexiones al bróker. La validación
 es local; los fixtures siguen siendo sintéticos y no acreditan rentabilidad,

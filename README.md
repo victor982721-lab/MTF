@@ -16,6 +16,17 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 
 ## Estado actual
 
+### Desarrollo aislado — 2026-09-20
+
+La rama `codex/mtf-offline-hardening-20260920` contiene las correcciones de
+conciliación, validación de entradas y modularidad del código
+`f3b187fdc76af70fe280bf9ecbd11313a02eebd6`, validado y publicado en el remoto
+privado. El [cierre de calidad](docs/refactor_quality.md#mejoras-offline-aisladas--2026-09-20)
+describe los cambios y sus pruebas. **No está integrado en `main` ni instalado
+como runtime operativo.** La canaria programada conserva `main=93491b5`, código
+operativo `b162e0f` y sus entradas originales; el estado operativo siguiente
+corresponde a esa versión, no a esta rama de desarrollo.
+
 ### Actualización operativa — 2026-09-19
 
 El [estado operativo y preservación](docs/operational_status.md) y su
