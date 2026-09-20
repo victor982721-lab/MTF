@@ -34,7 +34,6 @@ mtf-lab runtime inspect
 mtf-lab runtime gc --dry-run
 mtf-lab runtime gc --keep-reviews 0   # sólo después de revisar el plan
 mtf-lab runtime gc --keep-reviews 0 --purge-review-evidence  # migración explícita de legacy
-mtf-lab runtime promote --path <review>/runtime
 ```
 
 Los `runtime-review-*` históricos que no tienen este marcador se aceptan para
@@ -43,6 +42,30 @@ eliminación únicamente cuando su manifiesto `STAGED_RUNTIME.json` demuestra
 destino exacto, árbol propio sin symlinks externos y ausencia de procesos. Los
 directorios desconocidos, `market-data`, `runtime-preparation-*`, `soak` y
 `~/.local/state/mtf-lab/research` se preservan.
+
+## Intérprete de administración para promover
+
+La promoción no se ejecuta con el Python del runtime activo ni del candidato:
+el guard de procesos los considera en uso, incluido el propio proceso de
+administración. Un rechazo `canonical runtime is in use` no autoriza excluir
+PIDs, omitir el scan ni retirar el guard. Usa un intérprete externo a ambos
+runtimes y el checkout del SHA validado. La CLI externa de administración se
+comprobó con este patrón:
+
+```bash
+cd /home/winterboss/MTF
+env -u PYTHONHOME -u PYTHONPATH \
+  /home/winterboss/MTF/.venv-dev/bin/python -B -m mtf_lab runtime inspect
+env -u PYTHONHOME -u PYTHONPATH \
+  /home/winterboss/MTF/.venv-dev/bin/python -B -m mtf_lab runtime promote \
+  --path <review>/runtime --keep-rollback 1
+```
+
+El entorno externo sólo administra el lifecycle; no acredita la instalación.
+Los smokes de entrega usan los launchers y Python del runtime canónico desde
+un cwd ajeno y con HOME/XDG/TMP aislados. La API pública `RuntimeLifecycle.promote`
+aplica los mismos guards y admite ese mismo intérprete externo. El preparador
+con `--promote` también se ejecuta desde fuera de los runtimes gestionados.
 
 ## Causa de la acumulación histórica
 

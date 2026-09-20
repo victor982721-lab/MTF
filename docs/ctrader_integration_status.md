@@ -10,7 +10,20 @@ producir un servidor autenticado.
 
 ## Estado actual
 
+### Entrega técnica vigente — 2026-09-20
+
+El runtime `run_id=20260920T162153Z-f4c62495` corresponde al código validado
+`968bf0e`, publicado en `main` e instalado con 130 archivos byte-equivalentes.
+El [estado operativo](operational_status.md) conserva receipts de calidad,
+instalación, rollback y actualización del plan/heartbeat. La aprobación, cuenta,
+símbolo, ciclos y límites de la canaria no cambian. No hubo OAuth nuevo,
+conexión al bróker ni órdenes durante esta promoción; se mantiene la exigencia
+de gates frescos para la sesión del 21 de septiembre.
+
 ### Verificación administrativa — 2026-09-19
+
+Este apartado conserva los hechos observados y el cierre de instalación de
+esa fecha; la identidad del runtime promovido después se registra arriba.
 
 El portal `https://openapi.ctrader.com/apps` muestra **MTF Lab: Active**.
 La vista de configuración conserva `http://127.0.0.1:8767/oauth/callback`.

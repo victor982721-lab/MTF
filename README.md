@@ -23,16 +23,35 @@ La segunda iteración de `codex/mtf-offline-hardening-20260920` corrigió los
 además de reforzar la auditoría Python de escrituras y los reportes paginados.
 El código `ca3ebaa6806106465a3a4662df4ed71c541b913d` pasó **1,217/1,217 pruebas**,
 incluidas 68 nuevas, sin fallos ni omisiones. El [cierre de calidad](docs/refactor_quality.md)
-detalla resultados y límites. **No está integrado en `main` ni instalado como
-runtime operativo.** La canaria programada conserva `main=93491b5`, código
-operativo `b162e0f` y sus entradas originales; el estado operativo siguiente
-corresponde a esa versión, no a esta rama de desarrollo.
+conserva los resultados y límites de aquella etapa, que se cerró sin integrar
+ni instalar. La promoción posterior se distingue en el bloque siguiente; no
+convierte la validación DEV en evidencia de ejecución DEMO.
+
+### Actualización operativa — 2026-09-20
+
+El código `968bf0e7439b878e4b2d403d9b00bba9c7186223` pasó **1,219/1,219 pruebas**,
+sin fallos ni omisiones, y quedó integrado y publicado en `main`. El runtime
+canónico está `ACTIVE_CANONICAL`, con `run_id=20260920T162153Z-f4c62495`,
+130 archivos del paquete byte-equivalentes y rollback inmediato conservado.
+Python 3.12.14, SQLite 3.53.1 y Protobuf 7.36.1 permanecen sin cambios; los tres
+launchers de usuario y los imports instalados pasaron el smoke aislado desde
+un cwd ajeno. La identidad de esta entrega es el SHA y el `run_id`, no un
+cambio del número de paquete `0.1.0`.
+
+El [estado operativo](docs/operational_status.md) conserva los hashes y receipts
+de calidad, instalación, rollback, publicación y actualización nativa del
+plan/heartbeat. La canaria del **lunes 21 de septiembre, 09:00–09:20
+America/Mexico_City**, mantiene aprobación, configuración, cuenta, límites y
+una sola oportunidad. **Cero órdenes durante esta preparación**, sin OAuth
+nuevo ni activación de operación continua/REAL.
 
 ### Actualización operativa — 2026-09-19
 
+**Antecedente del runtime anterior; no describe la instalación vigente.**
+
 El [estado operativo y preservación](docs/operational_status.md) y su
 [receipt compacto versionado](reports/quality/mtf-operational-status-20260919.json)
-conservan los resultados actuales sin subir secretos, capturas ni corpus.
+conservan los resultados de ese cierre sin subir secretos, capturas ni corpus.
 El código validado y publicado por fast-forward es
 `b162e0f1a52e272268bf3bd9ae1631e5cae688a0`; `main==origin/main` fue verificado.
 El gate terminal v2 está en
@@ -134,9 +153,9 @@ código `48ef12a687f74f7050147e3ea71d704b3ce8b358` pasó 1,057/1,057 pruebas, si
 red ni escrituras externas, con 79.906% de líneas y 63.307% de ramas; su receipt
 se conserva como antecedente en
 `runtime/market-evidence/operational-closure-20260919T183148Z/quality-gate.json`.
-La validación vigente del código
-`b162e0f1a52e272268bf3bd9ae1631e5cae688a0` está enlazada arriba y en el estado
-operativo; no se duplica aquí su receipt.
+La validación del código `b162e0f1a52e272268bf3bd9ae1631e5cae688a0` se
+conserva como antecedente del cierre del 19 de septiembre; no se duplica aquí
+su receipt.
 La última referencia
 global reproducible completa, previa a los cambios locales warmup/health y al
 refactor de reporting, pasó 990/990 pruebas sin omisiones, con
@@ -165,7 +184,7 @@ sesiones son estados distintos. Ningún comando nuevo activa trading por defecto
 
 El runtime privado canónico quedó reconstruido y promovido de forma explícita
 desde una review validada: `/home/winterboss/.local/share/mtf-lab/runtime`.
-Su estado vigente es `ACTIVE_CANONICAL`, con process scan `COMPLETE`, rollback
+En ese cierre quedó `ACTIVE_CANONICAL`, con process scan `COMPLETE`, rollback
 conservado y `run_id=20260919T225409Z-4d1675aa`; Python 3.12.14, SQLite 3.53.1 y
 Protobuf 7.36.1 pasan el smoke aislado y `pip check`. Las 28 reviews históricas
 se limpiaron con el GC seguro; sus manifests y logs acotados quedaron en

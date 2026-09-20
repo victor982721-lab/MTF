@@ -1,19 +1,56 @@
 # Estado operativo y preservación
 
-Verificación del 19 de septiembre de 2026. La publicación de código no es una
+Verificación del 20 de septiembre de 2026. La publicación de código no es una
 release de trading, una aceptación contractual ni una conclusión de rentabilidad.
-El [receipt compacto](../reports/quality/mtf-operational-status-20260919.json)
-conserva identidades, resultados y referencias a la evidencia privada.
+El [receipt versionado del 19 de septiembre](../reports/quality/mtf-operational-status-20260919.json)
+se conserva como antecedente; la evidencia vigente de esta promoción se enlaza
+abajo y permanece fuera de Git.
 
 ## Próxima ejecución DEMO
 
-El código `b162e0f1a52e272268bf3bd9ae1631e5cae688a0` pasó el gate completo:
-1,125/1,125 pruebas, cero fallos/omisiones, 79.915% de líneas y 63.291% de ramas,
-sin intentos de red ni escrituras fuera del aislamiento. La fuente quedó intacta.
-Está publicado por fast-forward y el runtime canónico fue promovido con 128
-archivos byte-equivalentes, `run_id=20260919T225409Z-4d1675aa` y rollback conservado.
-La ayuda aislada, los imports instalados y el preflight de autenticación DEMO
-pasaron; este último no reúne todavía BBO/ATR de mercado abierto ni habilita órdenes.
+### Runtime promovido — 2026-09-20
+
+Código validado `968bf0e7439b878e4b2d403d9b00bba9c7186223`: **1,219/1,219 pruebas**,
+cero fallos/omisiones, 80.272% de líneas y 63.875% de ramas. El gate
+terminó el 20 de septiembre a las 16:50:16 UTC con exit 0, PID 0, cgroup vacío
+y fuente idéntica antes/después. No hubo intentos de red externa ni escrituras
+Python bloqueadas. La auditoría no cubre todo I/O nativo ni agrega todos los
+diagnósticos de procesos hijos; no se afirma auditoría global del filesystem.
+
+El código quedó publicado por fast-forward y el runtime canónico fue promovido
+con `run_id=20260920T162153Z-f4c62495`: **130 archivos** del paquete y sus
+entradas RECORD son byte-equivalentes al SHA validado en ambos entornos
+instalados. Imports, `pip check`, los tres launchers de usuario y el controlador
+con Python instalado pasaron smokes desde un cwd ajeno, con HOME/XDG/TMP
+aislados, sin `PYTHONPATH` del checkout ni credenciales. El paquete conserva
+`0.1.0`; su procedencia se distingue por SHA y `run_id`. Python 3.12.14, SQLite
+3.53.1, Protobuf 7.36.1, los 17 artefactos no-proyecto y el binario base son
+idénticos al runtime anterior. Las 15 descargas fijadas desde PyPI fueron
+autorizadas expresamente y no subieron código, datos ni secretos.
+
+El rollback inmediato conserva código `b162e0f`, 128 archivos verificados,
+imports y `pip check` tras su reubicación. Restaurar un runtime no restaura por
+sí solo el código del controlador ni los bindings: deben conciliarse antes
+de cualquier uso. La [promoción del runtime](runtime_lifecycle.md) exige
+un intérprete externo al activo y al candidato, sin retirar el guard de uso.
+
+Evidencia canónica de esta entrega:
+
+- Gate `/home/winterboss/MTF/runtime/market-evidence/canary-version-promotion-20260920T155156Z/quality-gate.json`,
+  SHA-256 `913eebefffdc72127503ba4458cbb0cb18e88d21155707ebe8391280c8faafc7`;
+  terminalidad en `/home/winterboss/MTF/runtime/market-evidence/canary-version-promotion-20260920T155156Z/quality-terminal.json`.
+- Instalación `/home/winterboss/MTF/runtime/market-evidence/canary-version-promotion-20260920T155156Z/installed-canary.json`,
+  SHA-256 `c5bc43e88554b53322ebf89db4feb62cd6986da2c613e378ec2c09561fa78262`;
+  manifest activo SHA-256 `c6638c1e9e2286d89b8054d7ced30ca4c95dbf5c81a045c5f07b3245d7004031`.
+- Rollback `/home/winterboss/MTF/runtime/market-evidence/canary-version-promotion-20260920T155156Z/rollback-verification.json` y promoción
+  `/home/winterboss/MTF/runtime/market-evidence/canary-version-promotion-20260920T155156Z/runtime-promotion-v2.json`.
+- Publicación final `/home/winterboss/MTF/runtime/market-evidence/canary-version-promotion-20260920T155156Z/final-publication.json` y
+  coherencia del plan/heartbeat `/home/winterboss/MTF/runtime/market-evidence/canary-version-promotion-20260920T155156Z/automation-updated.json`.
+
+La configuración y aprobación privadas mantienen sus bytes originales. No se
+repitió OAuth, no se tocó corpus/SQLite productiva y **no se enviaron órdenes**
+durante esta preparación. La publicación técnica no abre estrategia, 72 horas,
+forward, REAL ni fondeo.
 
 La canaria técnica autorizada tiene un heartbeat nativo de una sola oportunidad,
 `mtf-canaria-demo-autorizada-del-21-de-septiembre`: el lunes 21 de septiembre
@@ -25,6 +62,17 @@ deshabilitada en disco. Los límites y la separación de estrategia/REAL están 
 [fronteras de activación](activation_boundaries.md#c--canaria-demo-acotada-y-gates-externos).
 **Estado: programada, no ejecutada; cero órdenes.** No hay extensión ni reintento
 de un resultado ambiguo. El heartbeat anterior de QA permanece pausado.
+
+### Antecedente de instalación — 2026-09-19
+
+El código `b162e0f1a52e272268bf3bd9ae1631e5cae688a0` pasó el gate completo:
+1,125/1,125 pruebas, cero fallos/omisiones, 79.915% de líneas y 63.291% de ramas,
+sin intentos de red ni escrituras fuera del aislamiento. La fuente quedó intacta.
+Está publicado por fast-forward y el runtime canónico fue promovido con 128
+archivos byte-equivalentes, `run_id=20260919T225409Z-4d1675aa` y rollback conservado.
+La ayuda aislada, los imports instalados y el preflight de autenticación DEMO
+pasaron; este último no reúne todavía BBO/ATR de mercado abierto ni habilita órdenes.
+
 
 ## Primer resultado histórico evaluable
 
@@ -65,7 +113,7 @@ RiskExit evaluables; 2017–2019 sólo tienen QA descriptivo, no resultados de e
 |---|---|---|
 | 1. Cierre de 2019 | 11 meses válidos; el ZIP de octubre original y la nueva descarga oficial son byte-idénticos y fallan orden temporal. | Fuente corregida/versionada de HistData o respuesta oficial que permita resolver la procedencia sin inventar datos. |
 | 2. Desarrollo multianual | No se creó un año incompleto ni se ejecutó como si octubre fuera válido. | Manifiesto 2019 contiguo y válido antes de componer 2016–2019. Costos `UNKNOWN_COSTS`. |
-| 3. Runtime | Código `b162e0f` aceptado, instalado y publicado; gate 1,125/1,125 y launcher de canaria comprobado. | Sólo el cierre documental puede conservar este gate por equivalencia exacta. |
+| 3. Runtime | Código `968bf0e` aceptado, instalado y publicado; gate 1,219/1,219, 130 archivos equivalentes y rollback comprobado. | Los cambios ejecutables requieren nuevo gate; el cierre documental conserva el anterior sólo con igualdad exacta de los demás blobs y modos. |
 | 4. App y contrato | App `Active`; VIEW original intacto y autorización separada `TRADING` observada sólo en la cuenta DEMO aprobada. | Condiciones de REAL/México y cargos realizados siguen separados; la especificación observada no prueba cargos ni costes históricos. |
 | 5. Canaria técnica | Autorizada, software aceptado y oportunidad del lunes programada; todavía cero órdenes. | BBO/ATR, calendario, cuenta plana, margen y riesgo frescos, dos ciclos y conciliación observada. |
 | 6. Shadow/forward | No iniciado. La excepción técnica acotada no lo habilita. | Autorización operativa separada; 72 horas/30 sesiones no se sustituyen por fixtures ni se acelera el reloj. |
@@ -116,7 +164,7 @@ mantienen fuera de Git.
 El primer gate de la canaria rechazó errores de tipos y una fixture que omitía
 el nuevo valor predeterminado; no se promovió ese candidato. La corrección pasó
 la suite íntegra en 1,567.154 segundos, sin reducir pruebas ni umbrales.
-La evidencia vigente está en
+La evidencia del cierre del 19 de septiembre se conserva en
 `runtime/market-evidence/canary-preparation-20260919T215251Z/quality-gate-v2.json`
 (SHA-256 `fbcb473977577e5e76b73d8f4dc8c203184d7aba121b10350480644e072922eb`).
 Los receipts de instalación, publicación, preflight y programación se enlazan

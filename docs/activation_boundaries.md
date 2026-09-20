@@ -2,6 +2,14 @@
 
 ## Estado actual
 
+### Entrega técnica vigente — 2026-09-20
+
+El código `968bf0e` y el runtime `run_id=20260920T162153Z-f4c62495` están
+validados, publicados e instalados; el [estado operativo](operational_status.md)
+conserva calidad, 130 archivos equivalentes, rollback y bindings verificados.
+Esta entrega no modifica las fronteras A/B/C, la aprobación ni la ventana de la
+canaria técnica manual. No se enviaron órdenes durante la preparación.
+
 Este documento separa **implementación local** de **evidencia del servidor**.
 El [informe de ingeniería](../reports/engineering/latest/engineering_consolidation.md)
 y los [resultados reproducibles](../reports/engineering/latest/engineering_results.json)
@@ -61,7 +69,8 @@ En el estado vigente, el servidor DEMO concedió el alcance `TRADING` únicament
 para la cuenta aprobada (sufijo `5097`) y la ruta VIEW original permanece intacta.
 Esto prueba el alcance administrativo/técnico observado, no una ejecución: la
 canaria está instalada como `~/.local/bin/mtf-lab-demo-canary` con modo `0700`, su
-preflight readonly pasó identidad, `TRADING` y catálogo, y el resultado esperado
+preflight readonly observado el 19 de septiembre pasó identidad, `TRADING` y
+catálogo, y el resultado esperado
 es `NETWORK_PREFLIGHT_INPUTS_REQUIRED` sin recopilar aún mercado/riesgo operables. El estado
 canónico permanece `EMPTY`, sin mutación, y hay 0 órdenes.
 
