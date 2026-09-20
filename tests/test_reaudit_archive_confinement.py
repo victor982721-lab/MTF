@@ -54,6 +54,71 @@ class ArchiveConfinementReauditTests(unittest.TestCase):
             self.assertTrue(all((root / item).is_file() for item in record["license_files"]))
             self.assertTrue((root / record["path"]).resolve().is_relative_to(root.resolve()))
 
+    def test_root_metadata_ignores_vendored_dist_info_metadata(self) -> None:
+        """A setuptools-like wheel has one root metadata and many vendored ones."""
+
+        with tempfile.TemporaryDirectory(prefix="mtf-archive-vendored-") as raw:
+            base = Path(raw)
+            root = base / "stage"
+            archive = base / "setuptools-84.0.0-py3-none-any.whl"
+            with zipfile.ZipFile(archive, "w") as wheel:
+                wheel.writestr(
+                    "setuptools-84.0.0.dist-info/METADATA",
+                    "Metadata-Version: 2.1\nName: setuptools\nVersion: 84.0.0\nLicense: MIT\n",
+                )
+                wheel.writestr("setuptools-84.0.0.dist-info/WHEEL", "Wheel-Version: 1.0\n")
+                wheel.writestr("setuptools-84.0.0.dist-info/licenses/LICENSE", b"root license\n")
+                wheel.writestr(
+                    "setuptools/_vendor/packaging-26.0.dist-info/METADATA",
+                    "Metadata-Version: 2.1\nName: packaging\nVersion: 26.0\n",
+                )
+                wheel.writestr("setuptools/_vendor/packaging-26.0.dist-info/LICENSE", b"vendored license\n")
+
+            record = preparer.preserve_archive(
+                archive,
+                root=root,
+                relative_path=self._canonical_path(archive),
+                origin="test-local-vendored",
+                kind="development",
+            )
+
+            self.assertEqual("setuptools", record["name"])
+            self.assertEqual("84.0.0", record["version"])
+            self.assertEqual(2, len(record["license_files"]))
+            self.assertTrue((root / record["path"]).is_file())
+
+    def test_root_dist_info_metadata_ambiguity_is_rejected(self) -> None:
+        cases = {
+            "nested-only": (("pkg/_vendor/dep-1.0.dist-info/METADATA", "Name: dep\nVersion: 1.0\n"),),
+            "two-root-metadata": (
+                ("pkg-1.0.dist-info/METADATA", "Name: pkg\nVersion: 1.0\n"),
+                ("other-1.0.dist-info/METADATA", "Name: other\nVersion: 1.0\n"),
+            ),
+            "second-root-dist-info": (
+                ("pkg-1.0.dist-info/METADATA", "Name: pkg\nVersion: 1.0\n"),
+                ("other-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\n"),
+            ),
+        }
+
+        for label, members in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix="mtf-archive-ambiguous-") as raw:
+                base = Path(raw)
+                root = base / "stage"
+                archive = base / f"{label}.whl"
+                with zipfile.ZipFile(archive, "w") as wheel:
+                    for name, payload in members:
+                        wheel.writestr(name, payload)
+
+                with self.assertRaises(preparer.PreparationError):
+                    preparer.preserve_archive(
+                        archive,
+                        root=root,
+                        relative_path=self._canonical_path(archive),
+                        origin="test-local-ambiguous",
+                        kind="development",
+                    )
+                self.assertFalse(root.exists())
+
     def test_absolute_license_is_rejected_before_any_write(self) -> None:
         with tempfile.TemporaryDirectory(prefix="mtf-archive-absolute-") as raw:
             base = Path(raw)
@@ -179,7 +244,7 @@ class ArchiveConfinementReauditTests(unittest.TestCase):
             root = base / "stage"
             archive = self._wheel(
                 base / "fake_collision-1.0-py3-none-any.whl",
-                (("fake_collision-1.0.dist-info/LICENSE", b"new-license\n"),),
+                (("fake_pypi-1.0.dist-info/LICENSE", b"new-license\n"),),
             )
             target = root / self._canonical_path(archive)
             target.parent.mkdir(parents=True)
@@ -227,7 +292,7 @@ class ArchiveConfinementReauditTests(unittest.TestCase):
             root = base / "stage"
             archive = self._wheel(
                 base / "fake_idempotent-1.0-py3-none-any.whl",
-                (("fake_idempotent-1.0.dist-info/LICENSE", b"license\n"),),
+                (("fake_pypi-1.0.dist-info/LICENSE", b"license\n"),),
             )
             first = preparer.preserve_archive(
                 archive,

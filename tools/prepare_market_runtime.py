@@ -864,6 +864,39 @@ def _zipinfo_is_symlink(info: zipfile.ZipInfo) -> bool:
     return info.create_system == 3 and stat.S_ISLNK(mode)
 
 
+def _zip_root_dist_info_metadata(infos: Sequence[zipfile.ZipInfo], path: Path) -> tuple[zipfile.ZipInfo, str]:
+    """Select the wheel's root ``.dist-info/METADATA`` unambiguously.
+
+    Vendored distributions (for example setuptools' bundled dependencies)
+    legitimately carry their own ``.dist-info/METADATA`` files below a
+    package directory.  A suffix-only search therefore rejects valid wheels
+    as ambiguous.  Wheel metadata itself is required directly below exactly
+    one top-level ``*.dist-info`` directory; any other root dist-info layout
+    remains fail-closed.
+    """
+
+    root_dist_info_dirs = {
+        parts[0]
+        for info in infos
+        if (parts := info.filename.split("/")) and parts[0].endswith(".dist-info") and len(parts[0]) > len(".dist-info")
+    }
+    metadata_infos = [
+        info
+        for info in infos
+        if (parts := info.filename.split("/"))
+        and len(parts) == 2
+        and parts[0].endswith(".dist-info")
+        and len(parts[0]) > len(".dist-info")
+        and parts[1] == "METADATA"
+    ]
+    if len(root_dist_info_dirs) != 1 or len(metadata_infos) != 1:
+        raise PreparationError(f"archive metadata missing or ambiguous: {path}")
+    metadata_info = metadata_infos[0]
+    if _zipinfo_is_symlink(metadata_info):
+        raise PreparationError(f"archive metadata is symlinked: {path}")
+    return metadata_info, next(iter(root_dist_info_dirs))
+
+
 def _archive_source(path: Path) -> _ArchiveSource:
     source = Path(os.path.abspath(Path(path).expanduser()))
     _validate_non_symlink_ancestors(source)
@@ -947,12 +980,8 @@ def _zip_archive_metadata(path: Path) -> tuple[dict[str, Any], list[tuple[str, b
     try:
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
-            metadata_infos = [info for info in infos if info.filename.endswith(".dist-info/METADATA")]
-            if len(metadata_infos) != 1 or _zipinfo_is_symlink(metadata_infos[0]):
-                raise PreparationError(f"archive metadata missing: {path}")
-            metadata_info = metadata_infos[0]
+            metadata_info, dist_info = _zip_root_dist_info_metadata(infos, path)
             headers = email.parser.Parser().parsestr(archive.read(metadata_info).decode("utf-8"))
-            dist_info = metadata_info.filename.rsplit("/", 1)[0]
             metadata = {
                 "name": headers.get("Name", ""),
                 "version": headers.get("Version", ""),
