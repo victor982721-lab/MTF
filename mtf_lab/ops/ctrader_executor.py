@@ -916,16 +916,31 @@ def _snapshot_quantities(requested_value: Any, filled_value: Any) -> tuple[Decim
 
 def _snapshot_fills(values: Iterable[Fill | Mapping[str, Any]]) -> tuple[Fill, ...]:
     result: list[Fill] = []
+    seen_ids: set[str] = set()
     for value in values:
         if isinstance(value, Fill):
-            result.append(value)
-            continue
-        result.append(Fill(str(value["fill_id"]), value["quantity"], value["price"], _parse_time(value["timestamp"])))
+            fill = value
+        else:
+            fill = Fill(str(value["fill_id"]), value["quantity"], value["price"], _parse_time(value["timestamp"]))
+        if fill.fill_id in seen_ids:
+            raise ValueError(f"duplicate fill_id in order snapshot: {fill.fill_id}")
+        seen_ids.add(fill.fill_id)
+        result.append(fill)
     return tuple(result)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class OrderSnapshot:
+    """Cumulative observation for one client-order correlation.
+
+    ``filled_quantity`` is the server's cumulative quantity.  When fill
+    details are present, ``fills`` is also a cumulative, unique ledger for
+    this correlation; an adapter that receives deltas must merge them before
+    constructing this snapshot.  The executor deliberately rejects a later
+    snapshot that drops an already observed fill instead of guessing whether
+    the transport returned a delta or lost evidence.
+    """
+
     order_id: str | None
     client_order_id: str
     status: OrderState
@@ -1050,6 +1065,71 @@ class OrderResult:
             "protection_state": self.protection_state,
             "reconciled": self.reconciled,
         }
+
+
+def _validate_snapshot_contract(
+    intent: ExecutionIntent,
+    snapshot: OrderSnapshot,
+    previous: OrderResult | None,
+    *,
+    allow_fill_omission: bool,
+) -> None:
+    """Reject non-cumulative or contradictory transport observations."""
+
+    snapshot_fill_total = sum((fill.quantity for fill in snapshot.fills), DecimalValue("0"))
+    if snapshot_fill_total > snapshot.filled_quantity + _DECIMAL_TOLERANCE:
+        raise CorrelationError(
+            f"transport fills exceed cumulative filled quantity for {intent.intent_id}: "
+            f"fills={snapshot_fill_total}, filled={snapshot.filled_quantity}"
+        )
+    if previous is None:
+        return
+    previous_fills = {fill.fill_id: fill for fill in previous.fills}
+    current_fills = {fill.fill_id: fill for fill in snapshot.fills}
+    if not allow_fill_omission:
+        omitted = sorted(set(previous_fills) - set(current_fills))
+        if omitted:
+            raise CorrelationError(
+                f"transport snapshot omitted previously observed fills for {intent.intent_id}: {omitted}"
+            )
+    changed = sorted(
+        fill_id
+        for fill_id in set(previous_fills).intersection(current_fills)
+        if previous_fills[fill_id] != current_fills[fill_id]
+    )
+    if changed:
+        raise CorrelationError(
+            f"transport snapshot changed previously observed fills for {intent.intent_id}: {changed}"
+        )
+    if not allow_fill_omission and snapshot.filled_quantity + _DECIMAL_TOLERANCE < previous.filled_quantity:
+        raise CorrelationError(f"transport fill quantity regressed for {intent.intent_id}")
+
+
+def _merge_cumulative_cancel_fills(
+    intent_id: str,
+    previous: Iterable[Fill],
+    observed: Iterable[Fill],
+) -> tuple[Fill, ...]:
+    """Union a cancellation response with the executor's prior fill ledger.
+
+    Cancellation responses are allowed to omit fill details, but an adapter is
+    never allowed to rewrite an already observed fill.  Existing and newly
+    observed fills are returned in a deterministic timestamp/id order.
+    """
+
+    merged: dict[str, Fill] = {}
+    for source, values in (("previous", previous), ("cancellation", observed)):
+        seen: set[str] = set()
+        for fill in values:
+            fill_id = str(fill.fill_id)
+            if fill_id in seen:
+                raise CorrelationError(f"duplicate {source} fill id for {intent_id}: {fill_id}")
+            seen.add(fill_id)
+            prior = merged.get(fill_id)
+            if prior is not None and prior != fill:
+                raise CorrelationError(f"cancellation changed fill data for {intent_id}: {fill_id}")
+            merged[fill_id] = fill
+    return tuple(sorted(merged.values(), key=lambda fill: (fill.timestamp, str(fill.fill_id))))
 
 
 # ---------------------------------------------------------------------------
@@ -3554,7 +3634,12 @@ class CTraderDemoExecutor:
             return result
 
     def _result_from_snapshot(
-        self, intent: ExecutionIntent, snapshot: OrderSnapshot, *, reconciled: bool = False
+        self,
+        intent: ExecutionIntent,
+        snapshot: OrderSnapshot,
+        *,
+        reconciled: bool = False,
+        allow_fill_omission: bool = False,
     ) -> OrderResult:
         if not isinstance(snapshot, OrderSnapshot):
             raise CorrelationError("transport returned an invalid order snapshot")
@@ -3568,8 +3653,12 @@ class CTraderDemoExecutor:
                 f"got {snapshot.requested_quantity}"
             )
         previous = self._results.get(intent.intent_id)
-        if previous is not None and snapshot.filled_quantity + _DECIMAL_TOLERANCE < previous.filled_quantity:
-            raise CorrelationError(f"transport fill quantity regressed for {intent.intent_id}")
+        _validate_snapshot_contract(
+            intent,
+            snapshot,
+            previous,
+            allow_fill_omission=allow_fill_omission,
+        )
         if (
             previous is not None
             and previous.order_id is not None
@@ -3640,6 +3729,13 @@ class CTraderDemoExecutor:
         uncertain = bool(getattr(failure, "uncertain", True))
         if existing is not None:
             if uncertain:
+                # A response that violates the cumulative snapshot contract
+                # is not evidence that the previous PARTIAL/SUBMITTED state
+                # remains usable. Preserve its observed quantity/fills, but
+                # fail closed as UNKNOWN so risk gates cannot advance it.
+                if isinstance(failure, CorrelationError):
+                    existing.state = OrderState.UNKNOWN
+                    existing.reconciled = False
                 existing.unknown_reason = f"reconcile_outcome_unknown:{phase.value}: {failure}"
                 existing.uncertainty_reason = phase.value
                 self._update(intent, existing)
@@ -3792,17 +3888,27 @@ class CTraderDemoExecutor:
                 result.uncertainty_reason = "CLOSE_CONFIRMATION"
             return result
         if result.state is OrderState.CLOSED:
-            result.state = OrderState.CLOSE_PARTIAL
-            result.filled_quantity = max(DecimalValue("0"), intent.quantity - residual.quantity)
-            result.position_ids = (target_id,)
+            # The close acknowledgement says CLOSED, while the fresh account
+            # snapshot still proves a residual position.  These are
+            # contradictory observations: do not synthesize a partial fill or
+            # rewrite the server's fills to match the residual.  Preserve the
+            # acknowledged quantity/fill ledger and latch UNKNOWN until a
+            # later reconciliation resolves the contradiction.
+            result.state = OrderState.UNKNOWN
             result.unknown_reason = "residual_position_after_close"
-            result.uncertainty_reason = "RESIDUAL_POSITION"
+            result.uncertainty_reason = "CLOSE_CONFIRMATION_CONTRADICTION"
             result.reconciled = False
             self._emit(
                 "CLOSE_RESIDUAL_POSITION",
                 result.state,
                 intent.intent_id,
-                {"position_id": target_id, "remaining_quantity": residual.quantity, "no_blind_retry": True},
+                {
+                    "position_id": target_id,
+                    "remaining_quantity": residual.quantity,
+                    "server_state": OrderState.CLOSED.value,
+                    "server_filled_quantity": result.filled_quantity,
+                    "no_blind_retry": True,
+                },
             )
         return result
 
@@ -3945,12 +4051,30 @@ class CTraderDemoExecutor:
                     )
                     if not isinstance(snapshot, OrderSnapshot):
                         raise CorrelationError("transport returned an invalid cancellation snapshot")
-                    result = self._result_from_snapshot(intent, snapshot, reconciled=True)
+                    result = self._result_from_snapshot(
+                        intent,
+                        snapshot,
+                        reconciled=True,
+                        allow_fill_omission=True,
+                    )
                     # A cancellation response may omit previously observed
-                    # fills; preserve the monotone local fill ledger.
-                    if result.filled_quantity < current.filled_quantity:
-                        result.filled_quantity = current.filled_quantity
-                        result.fills = current.fills
+                    # fills.  Preserve/union the cumulative ledger even when
+                    # the response reports the same quantity; never truncate
+                    # or reprice an observed fill to make the response fit.
+                    observed_quantity = max(current.filled_quantity, result.filled_quantity)
+                    merged_fills = _merge_cumulative_cancel_fills(
+                        intent.intent_id,
+                        current.fills,
+                        result.fills,
+                    )
+                    merged_quantity = sum((fill.quantity for fill in merged_fills), DecimalValue("0"))
+                    if merged_quantity > observed_quantity + _DECIMAL_TOLERANCE:
+                        raise CorrelationError(
+                            f"cancellation fills exceed monotone observed quantity for {intent.intent_id}: "
+                            f"fills={merged_quantity}, quantity={observed_quantity}"
+                        )
+                    result.filled_quantity = observed_quantity
+                    result.fills = merged_fills
                     self._results[intent.intent_id] = result
                     self._update(intent, result)
                 except BaseException as exc:

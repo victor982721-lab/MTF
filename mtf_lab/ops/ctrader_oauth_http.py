@@ -46,11 +46,21 @@ def _validate_endpoint(url: str) -> urllib.parse.SplitResult:
     return parsed
 
 
-def _validate_params(grant_type: str, params: Mapping[str, str]) -> dict[str, str]:
-    grant = str(grant_type).strip()
+def _validate_params(grant_type: Any, params: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(params, Mapping):
+        raise OAuthHTTPError("parámetros OAuth deben ser un objeto")
+    if not isinstance(grant_type, str):
+        raise OAuthHTTPError("parámetros OAuth deben ser texto")
+    grant = grant_type.strip()
     if grant not in _GRANT_TYPES:
         raise OAuthHTTPError("grant_type OAuth no soportado")
-    values = {str(key): str(value) for key, value in params.items()}
+    values: dict[str, str] = {}
+    for key, value in params.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise OAuthHTTPError("parámetros OAuth deben ser texto")
+        values[key] = value
+    if values.get("grant_type", "").strip() != grant:
+        raise OAuthHTTPError("grant_type OAuth no soportado")
     values["grant_type"] = grant
     required = {
         "authorization_code": {"grant_type", "code", "redirect_uri", "client_id", "client_secret"},
@@ -58,7 +68,7 @@ def _validate_params(grant_type: str, params: Mapping[str, str]) -> dict[str, st
     }[grant]
     if set(values) - required:
         raise OAuthHTTPError("parámetros OAuth no soportados")
-    if any(not values.get(key, "") for key in required):
+    if any(not values.get(key, "").strip() for key in required):
         raise OAuthHTTPError("parámetros OAuth incompletos")
     return values
 
@@ -76,7 +86,9 @@ def build_token_request(
     """
 
     parsed = _validate_endpoint(url)
-    values = _validate_params(str(params.get("grant_type", "")), params)
+    if not isinstance(params, Mapping):
+        raise OAuthHTTPError("parámetros OAuth deben ser un objeto")
+    values = _validate_params(params.get("grant_type", ""), params)
     query = urllib.parse.urlencode(values)
     request_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, query, ""))
     grant_type = values["grant_type"]

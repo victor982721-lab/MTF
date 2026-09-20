@@ -31,20 +31,26 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from mtf_lab.configuration import ConfigError, load_config
+from mtf_lab.configuration import ConfigError, EffectiveConfig, load_config
 from mtf_lab.core.numeric import decimal_context
 from mtf_lab.core.risk_exit import RiskExitPolicy
-from mtf_lab.ops.ctrader_executor import OrderResult, OrderState, Quote, _as_mapping
+from mtf_lab.ops.ctrader_executor import CTraderDemoExecutor, OrderResult, OrderState, Quote, _as_mapping
 from mtf_lab.ops.supervision_demo import (
+    DemoExecutionBinding,
     _quote_from_provider,
     build_demo_execution_binding,
 )
 from mtf_lab.ops.volume_rules import VolumeGrid, VolumeRuleError
+
+if TYPE_CHECKING:
+    from mtf_lab.ops.ctrader_account_risk import AccountRiskSnapshot
+    from mtf_lab.ops.ctrader_canary_economics import CanaryEconomicsProjection
+    from mtf_lab.ops.supervision import SupervisorStateStore
 
 SCHEMA = "mtf-lab.demo-canary.v1"
 MAX_APPROVED_BASE_QUANTITY = Decimal("1000")
@@ -462,11 +468,11 @@ class PreparedCanarySession:
     """One live provider/binding prepared by the canonical CLI composition."""
 
     provider: Any
-    config: Any
+    config: EffectiveConfig
     provenance: Mapping[str, Any]
-    binding: Any | None
+    binding: DemoExecutionBinding | None
     preparation: Any
-    writer_store: Any
+    writer_store: SupervisorStateStore
 
     def close(self) -> None:
         if self.binding is not None:
@@ -477,7 +483,7 @@ class PreparedCanarySession:
         if callable(close):
             close()
 
-    def _arm_unlocked(self, canary_economics: Any) -> None:
+    def _arm_unlocked(self, canary_economics: CanaryEconomicsProjection) -> None:
         """Build/activate the binding only after projection and account lock."""
 
         if self.binding is not None:
@@ -492,16 +498,16 @@ class PreparedCanarySession:
             account_key=None,
         )
 
-    def arm(self, canary_economics: Any) -> None:
+    def arm(self, canary_economics: CanaryEconomicsProjection) -> None:
         with self.writer_store.lock():
             self._arm_unlocked(canary_economics)
 
     def observe_and_arm(
         self,
-        projection_factory: Callable[[], Any],
+        projection_factory: Callable[[], CanaryEconomicsProjection],
         *,
-        config_factory: Callable[[Any], Any] | None = None,
-    ) -> Any:
+        config_factory: Callable[[CanaryEconomicsProjection], EffectiveConfig] | None = None,
+    ) -> CanaryEconomicsProjection:
         """Observe, derive effective config, and arm under one account lock."""
 
         with self.writer_store.lock():
@@ -558,7 +564,7 @@ def _raw_execution(config: Any) -> Mapping[str, Any]:
     return raw
 
 
-def _preactivation_config(config: Any) -> Any:
+def _preactivation_config(config: EffectiveConfig) -> EffectiveConfig:
     """Return an in-memory static validation view without enabling execution."""
 
     return replace(
@@ -567,7 +573,7 @@ def _preactivation_config(config: Any) -> Any:
     )
 
 
-def _effective_canary_config(config: Any, projection: Any) -> Any:
+def _effective_canary_config(config: EffectiveConfig, projection: CanaryEconomicsProjection) -> EffectiveConfig:
     """Promote only observed canary execution fields in memory.
 
     The persisted profile remains execution-disabled.  The effective calendar
@@ -1784,7 +1790,7 @@ def network_cli_preflight(  # noqa: C901
                     ):
                         del _record
 
-            def _projection_from_snapshot(snapshot: Any) -> Any:
+            def _projection_from_snapshot(snapshot: AccountRiskSnapshot | None) -> CanaryEconomicsProjection:
                 if snapshot is None:
                     raise CanaryGateError("account risk snapshot no está disponible")
                 if not snapshot.fresh or not snapshot.complete:
@@ -1816,13 +1822,13 @@ def network_cli_preflight(  # noqa: C901
                     ),
                 )
 
-            def make_projection() -> Any:
+            def make_projection() -> CanaryEconomicsProjection:
                 # Omit explicit ``now``: AccountRiskObserver takes its
                 # terminal clock sample after the bounded request sequence.
                 refresh_quotes_from_same_reader()
                 return _projection_from_snapshot(observer.observe())
 
-            def activate_effective_config(projection: Any) -> Any:
+            def activate_effective_config(projection: CanaryEconomicsProjection) -> EffectiveConfig:
                 effective = _effective_canary_config(session.config, projection)
                 validate_static_config(effective, approved, observed_economics=True)
                 return effective
@@ -1863,9 +1869,9 @@ def network_cli_preflight(  # noqa: C901
             # binding.  Switch the closure to that exact instance; using the
             # pre-arm observer here would re-project the initial snapshot
             # after every fresh risk callback.
-            observer = session.binding.risk_observer
-            observer_callback = getattr(observer, "update_executor", None)
-            if not callable(observer_callback):
+            bound_observer = session.binding.risk_observer
+            observer_callback = getattr(bound_observer, "update_executor", None)
+            if bound_observer is None or not callable(observer_callback):
                 return {
                     "schema": SCHEMA,
                     "ok": False,
@@ -1874,19 +1880,22 @@ def network_cli_preflight(  # noqa: C901
                     "network_performed": True,
                     "orders_attempted": False,
                 }
+            observer = bound_observer
 
-            def risk_refresh(executor: Any) -> Mapping[str, Any]:
+            def risk_refresh(executor: CTraderDemoExecutor) -> Mapping[str, Any]:
                 refresh_quotes_from_same_reader()
                 observed = observer_callback(executor)
                 return cast(Mapping[str, Any], observed)
 
-            def post_close_risk_refresh(executor: Any) -> Mapping[str, Any]:
+            def post_close_risk_refresh(executor: CTraderDemoExecutor) -> Mapping[str, Any]:
                 # After a confirmed close, account/cashflow observation is
                 # sufficient for the trial budget.  Do not spend another
                 # five-second quote poll or rebuild forecast economics here.
                 return cast(Mapping[str, Any], observer_callback(executor))
 
-            def economics_refresh(executor: Any, observed: Mapping[str, Any]) -> Any:
+            def economics_refresh(
+                executor: CTraderDemoExecutor, observed: Mapping[str, Any]
+            ) -> CanaryEconomicsProjection:
                 del executor, observed
                 snapshot = observer.last_observation
                 refreshed = _projection_from_snapshot(snapshot)
@@ -1910,29 +1919,30 @@ def network_cli_preflight(  # noqa: C901
                     "orders_attempted": False,
                 }
 
-            collector_kwargs: dict[str, Any] = {
-                "network": True,
-                "deadline": approved.window_end,
-                "max_events": event_limit,
-                "window_start": approved.window_start,
-                "window_end": approved.window_end,
-                "preparation_start": preparation_start,
-                "session_evidence": evidence,
-                "runtime_observer": session.binding.executor.observe_runtime,
+            input_result = collect_canary_inputs(
+                session.provider,
+                session.config,
+                network=True,
+                deadline=approved.window_end,
+                max_events=event_limit,
+                window_start=approved.window_start,
+                window_end=approved.window_end,
+                preparation_start=preparation_start,
+                session_evidence=evidence,
+                runtime_observer=session.binding.executor.observe_runtime,
                 # Do not pass executor: the collector's compatibility
                 # fallback would otherwise re-enable risk_entry_plan before
                 # the post-collection financial refresh.
-                "executor": None,
-                "risk_planner": None,
-                "requested_quantity": approved.max_quantity,
-                "fetch_warmup": False,
-                "technical_only": True,
-                "minimum_execution_margin_seconds": Decimal("300"),
-                "market_window_state": observed_market_window_state,
-                "isolated_state_dir": state_dir,
-                "close_provider": False,
-            }
-            input_result = collect_canary_inputs(session.provider, session.config, **collector_kwargs)
+                executor=None,
+                risk_planner=None,
+                requested_quantity=approved.max_quantity,
+                fetch_warmup=False,
+                technical_only=True,
+                minimum_execution_margin_seconds=Decimal("300"),
+                market_window_state=observed_market_window_state,
+                isolated_state_dir=state_dir,
+                close_provider=False,
+            )
             if not input_result.ok or input_result.context is None:
                 return {
                     "schema": SCHEMA,

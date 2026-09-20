@@ -13,6 +13,14 @@ from typing import Any
 from .ctrader_errors import CTraderDataError
 from .ctrader_protocol import enum_name, read_field
 
+_ACCOUNT_ID_FIELDS = (
+    "ctidTraderAccountId",
+    "ctid_trader_account_id",
+    "account_id",
+    "id",
+)
+_MAX_ACCOUNT_ID = (1 << 63) - 1
+
 
 def normalize_account_payload(payload: Any) -> dict[str, Any]:
     raw_records = read_field(
@@ -41,20 +49,7 @@ def normalize_account_payload(payload: Any) -> dict[str, Any]:
 
 
 def _normalize_account_record(item: Any) -> dict[str, Any]:
-    value = read_field(
-        item,
-        "ctidTraderAccountId",
-        "ctid_trader_account_id",
-        "account_id",
-        "id",
-        default=item if isinstance(item, (int, str)) else None,
-    )
-    try:
-        account_id = int(value)
-    except (TypeError, ValueError) as exc:
-        raise CTraderDataError("respuesta OAuth contiene una cuenta sin account_id válido") from exc
-    if account_id <= 0:
-        raise CTraderDataError("respuesta OAuth contiene un account_id no positivo")
+    account_id = _read_account_id(item)
     is_live = read_field(item, "isLive", "is_live", default=None)
     environment = _account_environment(is_live)
     record: dict[str, Any] = {"account_id": account_id, "environment": environment}
@@ -72,6 +67,52 @@ def _normalize_account_record(item: Any) -> dict[str, Any]:
         except (TypeError, ValueError):
             continue
     return record
+
+
+def _read_account_id(item: Any) -> int:
+    """Read one positive account id without lossy coercion.
+
+    Mapping payloads may expose compatibility aliases, so every populated
+    alias is checked for the same identity.  Generated Protobuf messages do
+    not expose those aliases; ``read_field`` retains its presence-aware
+    behavior for their repeated/default fields.
+    """
+
+    if isinstance(item, Mapping):
+        values = [item[name] for name in _ACCOUNT_ID_FIELDS if name in item and item[name] is not None]
+        if not values:
+            raise CTraderDataError("respuesta OAuth contiene una cuenta sin account_id válido")
+        account_ids = tuple(_coerce_account_id(value) for value in values)
+        if len(set(account_ids)) != 1:
+            raise CTraderDataError("respuesta OAuth contiene aliases de account_id conflictivos")
+        return account_ids[0]
+    value = read_field(
+        item,
+        *_ACCOUNT_ID_FIELDS,
+        default=item if isinstance(item, (int, str)) else None,
+    )
+    return _coerce_account_id(value)
+
+
+def _coerce_account_id(value: Any) -> int:
+    """Accept only integer account ids or decimal strings."""
+
+    if isinstance(value, bool):
+        raise CTraderDataError("respuesta OAuth contiene una cuenta sin account_id válido")
+    if isinstance(value, int):
+        account_id = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text or not text.isascii() or not text.isdecimal():
+            raise CTraderDataError("respuesta OAuth contiene una cuenta sin account_id válido")
+        account_id = int(text)
+    else:
+        raise CTraderDataError("respuesta OAuth contiene una cuenta sin account_id válido")
+    if account_id <= 0:
+        raise CTraderDataError("respuesta OAuth contiene un account_id no positivo")
+    if account_id > _MAX_ACCOUNT_ID:
+        raise CTraderDataError("respuesta OAuth contiene un account_id fuera de rango int64")
+    return account_id
 
 
 def _account_environment(is_live: Any) -> str:
