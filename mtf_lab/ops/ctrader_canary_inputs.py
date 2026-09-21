@@ -1494,6 +1494,12 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
                         {
                             "watch_stop_reason": watch_result.stop_reason,
                             "watch_reconciliation_state": watch_result.status.get("reconciliation_state"),
+                            "watch_freshness_state": watch_result.status.get("freshness_state"),
+                            "watch_continuity_state": watch_result.status.get("continuity_state"),
+                            "watch_analysis_blocked_reasons": watch_result.status.get("analysis_blocked_reasons", []),
+                            "watch_block_details": watch_result.status.get("block_details", {}),
+                            "watch_event_count": watch_result.events,
+                            "watch_bbo_rejections": list(runner.bbo_rejections[-16:]),
                         }
                     )
                 except (CTraderWatchError, RuntimeError) as exc:

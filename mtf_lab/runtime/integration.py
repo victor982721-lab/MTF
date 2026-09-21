@@ -912,7 +912,19 @@ class RuntimeCoordinator:
             watermark = watermark + timedelta(
                 seconds=max(self.config.simulation.horizons_seconds) + self.config.simulation.max_price_age_seconds
             )
-        result = self.processor.finalize(watermark, evaluate_strategy=allow_signals, capture_complete=complete)
+        if self.technical_canary_quote_gap_seconds is None:
+            result = self.processor.finalize(watermark, evaluate_strategy=allow_signals, capture_complete=complete)
+        else:
+            # Keep the observed previous quote until the next quote can prove
+            # bounded-gap continuity across a candle boundary. Idle wall time
+            # still advances consumers/checkpoints, but cannot certify market
+            # coverage or reset every new interval to a fresh partial bucket.
+            result = self.processor.finalize(
+                watermark,
+                evaluate_strategy=allow_signals,
+                capture_complete=complete,
+                close_event_buckets=False,
+            )
         self._runtime_block_from_result(result, aggregated_input=True)
         self._persist_result({}, result, allow_signals=allow_signals)
         self.last_processed_at = _clock_value(self._clock)

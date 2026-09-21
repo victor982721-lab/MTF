@@ -2391,9 +2391,19 @@ class IncrementalProcessor:
     feed_bar = process_bar
 
     def finalize(
-        self, watermark: datetime | None = None, *, evaluate_strategy: bool = True, capture_complete: bool = True
+        self,
+        watermark: datetime | None = None,
+        *,
+        evaluate_strategy: bool = True,
+        capture_complete: bool = True,
+        close_event_buckets: bool = True,
     ) -> ProcessResult:
-        """Close active buckets at an explicit watermark; no empty candle is made."""
+        """Advance consumers and optionally close observed event buckets.
+
+        A wall-clock tick is not a new quote. Callers that require observed
+        quote-to-quote coverage can retain buckets while consumers still expire.
+        No empty candle or replacement market observation is made.
+        """
         self._begin_transition()
 
         if watermark is None:
@@ -2406,7 +2416,8 @@ class IncrementalProcessor:
         evaluations: list[Any] = []
         signals: list[Signal] = []
         issues: list[RuntimeIssue] = []
-        for tf in sorted(self.timeframes, key=lambda item: item.seconds, reverse=True):
+        timeframes = sorted(self.timeframes, key=lambda item: item.seconds, reverse=True) if close_event_buckets else ()
+        for tf in timeframes:
             result = self.aggregators[tf.name].close_until(watermark)
             for candle in result.emitted:
                 accepted = self._accept_candle(candle, native=False, evaluate_strategy=evaluate_strategy)
