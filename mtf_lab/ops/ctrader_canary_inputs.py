@@ -23,7 +23,7 @@ import contextlib
 import hashlib
 import tempfile
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -45,6 +45,7 @@ from ..ops.ctrader_watch import (
     CTraderWatchResult,
     CTraderWatchRunner,
     WatchStopReason,
+    _decorate_record,
 )
 from ..ops.persistence import SQLiteStore
 
@@ -1058,7 +1059,84 @@ class _InputWatchRunner(CTraderWatchRunner):
         self.technical_runtime_provenance: Mapping[str, Any] = {}
         self.technical_ready = False
 
+    def _validated_book_leg(self, leg: Any, record: Event, side: str, now: datetime) -> datetime:
+        if not isinstance(leg, Mapping):
+            raise CanaryInputError("composición BBO sin ambas piernas observadas")
+        if leg.get("timestamp_missing") is True or leg.get("synthetic") is True or leg.get("reasons", ()):
+            raise CanaryInputError("pierna BBO sin evidencia utilizable")
+        state = leg.get("state")
+        if state is not None and str(state).upper() != "VALID":
+            raise CanaryInputError("pierna BBO con calidad bloqueante")
+        if str(leg.get("generation", "")) != self.input_evidence.connection_generation:
+            raise CanaryInputError("pierna BBO de otra generación")
+        observed = _decimal(leg.get("price"), f"book {side}", positive=True)
+        if observed != _decimal(getattr(record, side), f"event {side}", positive=True):
+            raise CanaryInputError("evento BBO no coincide con el libro del provider")
+        source_time = _parse_time(leg.get("event_time"), f"{side} event_time")
+        available = _parse_time(leg.get("available_at"), f"{side} available_at")
+        if not source_time <= available <= now or record.event_time < source_time:
+            raise CanaryInputError("pierna BBO sin causalidad verificable")
+        if (now - available).total_seconds() > float(self.input_max_age):
+            raise CanaryInputError("pierna BBO stale")
+        metadata = record.metadata
+        if _parse_time(metadata.get(f"{side}_available_at"), f"{side} metadata availability") != available:
+            raise CanaryInputError("disponibilidad BBO no coincide con el libro observado")
+        return available
+
+    def _complete_technical_book_event(self, record: Event | Bar, raw_synthetic: bool) -> Event | Bar:
+        """Distinguish a partial wire update from an observed complete book.
+
+        Only the manual technical collector receives this effective view.
+        Raw capture, default watch/PAPER and all leg timestamps stay intact.
+        """
+
+        if not self.technical_only or not isinstance(record, Event):
+            return record
+        if record.metadata.get("partial_update") is not True or record.metadata.get("quote_state_retained") is not True:
+            return record
+        decorated = _decorate_record(record, self.metadata, raw_synthetic, technical_quote_mode=True)
+        if not isinstance(decorated, Event):
+            return record
+        try:
+            now = _aware(self._clock(), "clock")
+            self.input_evidence.validate_current(self.context.provider, now)
+            snapshotter = getattr(self.context.provider, "snapshot_quote_state", None)
+            snapshot = snapshotter() if callable(snapshotter) else None
+            symbols = snapshot.get("symbols") if isinstance(snapshot, Mapping) else None
+            symbol_id = getattr(getattr(self.context.provider, "spec", None), "symbol_id", None)
+            book = symbols.get(str(symbol_id), symbols.get(symbol_id)) if isinstance(symbols, Mapping) else None
+            if not isinstance(book, Mapping):
+                raise CanaryInputError("provider sin libro BBO observado")
+            times = [self._validated_book_leg(book.get(side), decorated, side, now) for side in ("bid", "ask")]
+            if decorated.available_at != max(times):
+                raise CanaryInputError("BBO no conserva disponibilidad conjunta observada")
+            effective = replace(
+                decorated,
+                metadata={
+                    **dict(decorated.metadata),
+                    "raw_partial_update": True,
+                    "partial_update": False,
+                    "canary_complete_bbo_from_partial": True,
+                },
+            )
+            # Validate the preparation view before publishing it to runtime.
+            # The separate order-window BBO check below remains unchanged.
+            ObservedBBO.from_provider_event(
+                effective,
+                provider=self.context.provider,
+                evidence=self.input_evidence,
+                now=now,
+                window_start=self.input_bounds.window_start,
+                window_end=self.input_bounds.window_end,
+                max_age_seconds=self.input_max_age,
+                zero_spread_authorization=self.zero_spread_authorization,
+            )
+        except (CanaryInputError, TypeError, ValueError):
+            return record
+        return effective
+
     def _process_record(self, record: Event | Bar, raw_synthetic: bool) -> bool:
+        record = self._complete_technical_book_event(record, raw_synthetic)
         accepted = super()._process_record(record, raw_synthetic)
         if isinstance(self._last_decorated_record, Event):
             try:

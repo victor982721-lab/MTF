@@ -1938,8 +1938,11 @@ def _select_quote_price(
     *,
     digits: int,
 ) -> float | None:
+    # Instrument digits constrain the executable legs, not their analytical
+    # midpoint. An odd spread legitimately produces half a price quantum.
+    del digits
     if basis == "mid" and bid is not None and ask is not None:
-        return round((bid + ask) / 2.0, digits)
+        return (bid + ask) / 2.0
     if basis == "bid":
         return bid
     if basis == "ask":
