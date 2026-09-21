@@ -16,6 +16,26 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 
 ## Estado actual
 
+### Canaria técnica DEMO — 2026-09-21
+
+El código `ccd5563` está publicado e instalado: **1,244/1,244 pruebas**, sin
+fallos ni omisiones, y 130 archivos del paquete byte-equivalentes. El runtime
+`20260921T174132Z-b0e0306e` conserva rollback verificado. El
+[estado operativo](docs/operational_status.md) reúne la evidencia vigente;
+los apartados del 19 y 20 de septiembre son antecedentes.
+
+**Canaria: `CURRENT_REVIEW`, cero ciclos y cero órdenes intentadas.** La última
+preparación terminó `ECONOMICS_BLOCKED` antes de reservar la aprobación.
+La lectura posterior confirmó `bid == ask`, todavía rechazado por el control
+de spread. Aceptar igualdad sólo en esta canaria fue consultado y no está
+autorizado ni implementado. No se creó otra automatización ni se programó otro día.
+
+La referencia de pérdida de 0.1% desde el equity inicial del trial sí fue
+autorizada; el ancla diaria sigue desconocida. También quedaron corregidos
+el alias EURUSD/EUR/USD y la disponibilidad conjunta del BBO, conservando
+la frescura de ambas piernas. No se habilitó estrategia, operación continua,
+REAL ni fondeo.
+
 ### Desarrollo aislado — 2026-09-20
 
 La segunda iteración de `codex/mtf-offline-hardening-20260920` corrigió los
@@ -29,21 +49,24 @@ convierte la validación DEV en evidencia de ejecución DEMO.
 
 ### Actualización operativa — 2026-09-20
 
+**Antecedente fechado; no describe la instalación ni una programación vigente.**
+
 El código `968bf0e7439b878e4b2d403d9b00bba9c7186223` pasó **1,219/1,219 pruebas**,
 sin fallos ni omisiones, y quedó integrado y publicado en `main`. El runtime
-canónico está `ACTIVE_CANONICAL`, con `run_id=20260920T162153Z-f4c62495`,
+canónico quedó entonces `ACTIVE_CANONICAL`, con `run_id=20260920T162153Z-f4c62495`,
 130 archivos del paquete byte-equivalentes y rollback inmediato conservado.
 Python 3.12.14, SQLite 3.53.1 y Protobuf 7.36.1 permanecen sin cambios; los tres
 launchers de usuario y los imports instalados pasaron el smoke aislado desde
 un cwd ajeno. La identidad de esta entrega es el SHA y el `run_id`, no un
 cambio del número de paquete `0.1.0`.
 
-El [estado operativo](docs/operational_status.md) conserva los hashes y receipts
-de calidad, instalación, rollback, publicación y actualización nativa del
-plan/heartbeat. La canaria del **lunes 21 de septiembre, 09:00–09:20
-America/Mexico_City**, mantiene aprobación, configuración, cuenta, límites y
-una sola oportunidad. **Cero órdenes durante esta preparación**, sin OAuth
-nuevo ni activación de operación continua/REAL.
+El [estado operativo](docs/operational_status.md) conserva los receipts de
+esa entrega y los distingue del estado actual. El plan original preveía una
+oportunidad el lunes 21, 09:00–09:20 America/Mexico_City, que no se lanzó.
+Su heartbeat fue eliminado y la continuación del mismo día procede de la
+petición posterior de Víctor, no de una extensión automática de ese plan.
+Durante la preparación del 20 no hubo órdenes, OAuth nuevo ni activación
+de operación continua/REAL.
 
 ### Actualización operativa — 2026-09-19
 
@@ -263,11 +286,15 @@ acredita frescura live, BBO, ejecución ni rentabilidad. Los launchers instalado
 usan una referencia privada de credenciales; el launcher de consulta no habilita
 trading. La canaria de software está instalada como
 `~/.local/bin/mtf-lab-demo-canary`; su preflight de sólo lectura contra el servidor
-real pasó identidad, `TRADING` y catálogo, y cerró con el resultado esperado
-`NETWORK_PREFLIGHT_INPUTS_REQUIRED` sin recopilar aún mercado/riesgo operables. El estado canónico
-permanece `EMPTY`, sin mutación, y hay 0 órdenes.
+real del 19 de septiembre pasó identidad, `TRADING` y catálogo, y cerró con
+`NETWORK_PREFLIGHT_INPUTS_REQUIRED`. Las preparaciones del 21 de septiembre
+ya observaron riesgo y mercado, pero se detuvieron antes de órdenes; conservan
+high-water y ancla diaria no verificada, con journal vacío.
 
 ### Autorización de canaria técnica DEMO — 2026-09-21
+
+La ventana siguiente fue la oportunidad original, que no se lanzó. La
+continuación autorizada del mismo día se distingue en el estado actual de arriba.
 
 Víctor aprobó una canaria manual acotada para EUR/USD en la cuenta DEMO de sufijo
 `5097`, el lunes 2026-09-21 de 09:00 a 09:20 hora de México (inicio 15:00 UTC):
@@ -280,16 +307,15 @@ se repite OAuth ni se cambia la cuenta seleccionada, pero cada conexión exige
 discovery fresco de lectura y verificación de esa cuenta. Esto no autoriza REAL,
 estrategia, operación continua, extensión automática ni reintento de un resultado
 ambiguo. Es un gate técnico previo a cualquier histórico completo o ventana de 72
-horas, no una selección de estrategia. La canaria de software está instalada y
-su preflight readonly pasó identidad, `TRADING` y catálogo, con
-`NETWORK_PREFLIGHT_INPUTS_REQUIRED` como resultado esperado sin recopilar aún mercado/riesgo operables; el estado canónico es `EMPTY`, sin mutación, y hay 0 órdenes. El
-heartbeat nativo está
-`ACTIVE`, con ID `mtf-canaria-demo-autorizada-del-21-de-septiembre`: una oportunidad
-para el lunes 21, despierta a las 08:54 hora de México, captura desde 08:55 y
-mantiene la ventana de órdenes 09:00–09:20. La zona `America/Mexico_City` está
-verificada, `COUNT=1` y sin jitter según el runtime; no repite ni extiende y
-requiere host/app disponible y gates frescos. No se afirma ejecución hasta
-observarla.
+horas, no una selección de estrategia. El software está instalado. El
+preflight readonly del 19 de septiembre verificó identidad, `TRADING` y
+catálogo; las preparaciones del 21 ya observaron riesgo y mercado, sin llegar
+a órdenes. El heartbeat de la oportunidad original fue eliminado.
+La continuación autorizada del mismo día mantiene los límites anteriores y
+permite la referencia inicial de pérdida sólo para el trial. El ancla diaria
+sigue desconocida, el journal está vacío y la aprobación no está reservada.
+Aceptar spread cero es una excepción distinta, consultada pero no autorizada
+ni implementada. No hay otra programación ni afirmación de ejecución.
 
 ### Antecedente: validación conectada DEMO de sólo lectura — 2026-09-14
 
@@ -394,18 +420,19 @@ La lista queda limitada a hechos, decisiones y autorizaciones externas:
 3. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo;
    la lectura administrativa y de catálogo no sustituye la reconciliación de la
    canaria técnica.
-4. Satisfacer `NETWORK_PREFLIGHT_INPUTS_REQUIRED` con datos de mercado y riesgo frescos y ejecutar
-   los dos ciclos técnicos independientes dentro de la ventana aprobada. El
-   software ya está instalado y el heartbeat nativo está `ACTIVE` con ID
-   `mtf-canaria-demo-autorizada-del-21-de-septiembre`; no se repite ni se extiende
-   la ventana ni se reintenta un resultado ambiguo.
+4. Satisfacer los gates de mercado y riesgo frescos y ejecutar los dos ciclos
+   técnicos dentro de una ventana aprobada. El software está instalado; la
+   oportunidad 09:00–09:20 terminó sin lanzamiento y su heartbeat fue eliminado.
+   Spread cero sigue bloqueado y su excepción acotada requiere respuesta expresa.
+   No se extiende un trial reservado ni se reintenta una orden ambigua.
 5. Resolver las condiciones contractuales de Pepperstone relevantes para
    México, almacenamiento/redistribución de datos y costes. Una especificación
    de costes no equivale a cargos observados.
 6. Sólo después evaluar resistencia, shadow/72 horas y cualquier canary DEMO
    con autorización separada de cuenta, símbolo, volumen, ventana y límites.
 
-La validación conectada actual no autoriza ejecución. Pepperstone no está
+La validación conectada no es una autorización general de ejecución; la canaria
+tiene su autorización acotada y sus gates propios. Pepperstone no está
 validado contractualmente y ninguna simulación/fixture demuestra rentabilidad ni
 condiciones comerciales reales.
 

@@ -1,12 +1,59 @@
 # Estado operativo y preservación
 
-Verificación del 20 de septiembre de 2026. La publicación de código no es una
+Verificación del 21 de septiembre de 2026. La publicación de código no es una
 release de trading, una aceptación contractual ni una conclusión de rentabilidad.
 El [receipt versionado del 19 de septiembre](../reports/quality/mtf-operational-status-20260919.json)
 se conserva como antecedente; la evidencia vigente de esta promoción se enlaza
 abajo y permanece fuera de Git.
 
+## Estado vigente — 2026-09-21
+
+**Software publicado e instalado; canaria `CURRENT_REVIEW`.** El código
+`ccd55631d7872ab027f3773b9a497fd31b110302` pasó **1,244/1,244 pruebas**, cero
+fallos/omisiones, 80.388% de líneas y 64.118% de ramas. El gate terminó a las
+17:52:11 UTC con proceso/cgroup terminales y fuentes intactas.
+
+El runtime `20260921T174132Z-b0e0306e` fue promovido a las 17:53:52 UTC.
+Los 130 archivos del paquete y sus RECORD coinciden con el SHA validado en
+ambos entornos. Imports, pip check y los tres launchers pasaron smokes
+aislados desde la release, no desde un import editable. El rollback inmediato
+conserva `c270c8b`, también con 130 archivos verificados; las dependencias no cambiaron.
+
+La oportunidad original 09:00–09:20 no se lanzó por demora de coordinación.
+Su heartbeat fue eliminado; no se programó otro día. Víctor pidió continuar
+ese mismo día y autorizó a las 16:11 UTC medir sólo este trial desde su equity
+inicial observado, con el mismo límite de pérdida de 0.1%. No se convirtió
+el ancla diaria desconocida en cero ni se reiniciaron high-water o journal.
+
+Las preparaciones terminaron a las 17:19:13 y 17:56:16 UTC como
+`ECONOMICS_BLOCKED`, antes de órdenes: **cero ciclos, journal vacío y aprobación
+sin reserva**. Los fixes publicados corrigieron el alias observado `EURUSD`
+y la falsa incompatibilidad causal de actualizaciones asíncronas: disponibilidad
+conjunta máxima y frescura de la pierna más antigua, sin alterar precios ni
+timestamps de origen.
+
+La muestra de las 17:31–17:32 UTC tuvo 49/49 pares `bid == ask`, con piernas
+causales. Otra lectura a las 17:57 UTC confirmó el rechazo por spread cero.
+El host estaba sincronizado por NTP, sin ajustes de reloj o red. La excepción
+acotada para aceptar igualdad fue consultada a las 17:36:37 UTC y sigue sin
+respuesta; **no está autorizada ni implementada**. Precios cruzados, frescura,
+causalidad, comisiones, margen, ATR, stops y límites siguen siendo gates.
+
+Evidencia privada vigente, sin credenciales ni corpus en Git:
+
+- [Estado y trazabilidad de la canaria](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/current-review.json).
+- [Gate completo](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/quality/20260921T174326Z/quality-gate.json)
+  y [terminalidad del host](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/quality-v2-unit-terminal.json).
+- [Instalación](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/installed-canary-v2.json),
+  [rollback](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/rollback-verification-v2.json)
+  y [publicación del código](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/code-publication-v2.json).
+
+No acredita ejecución DEMO, rentabilidad, validación económica, 72 h/30 sesiones,
+apertura de WF/holdout, operación continua ni REAL.
+
 ## Próxima ejecución DEMO
+
+**Antecedente de la planificación del 20 de septiembre, no una cita vigente.**
 
 ### Runtime promovido — 2026-09-20
 
@@ -52,16 +99,14 @@ repitió OAuth, no se tocó corpus/SQLite productiva y **no se enviaron órdenes
 durante esta preparación. La publicación técnica no abre estrategia, 72 horas,
 forward, REAL ni fondeo.
 
-La canaria técnica autorizada tiene un heartbeat nativo de una sola oportunidad,
-`mtf-canaria-demo-autorizada-del-21-de-septiembre`: el lunes 21 de septiembre
-despierta a las 08:54 y prepara datos desde las 08:55; **las órdenes sólo pueden
-ocurrir de 09:00 a 09:20, America/Mexico_City**. Requiere equipo/Codex disponibles
-y todos los gates frescos. El alias instalado es
-`/home/winterboss/.local/bin/mtf-lab-demo-canary`; su configuración privada permanece
-deshabilitada en disco. Los límites y la separación de estrategia/REAL están en
-[fronteras de activación](activation_boundaries.md#c--canaria-demo-acotada-y-gates-externos).
-**Estado: programada, no ejecutada; cero órdenes.** No hay extensión ni reintento
-de un resultado ambiguo. El heartbeat anterior de QA permanece pausado.
+La planificación original tuvo un heartbeat de una sola oportunidad,
+`mtf-canaria-demo-autorizada-del-21-de-septiembre`, con preparación desde las
+08:55 y órdenes previstas 09:00–09:20, America/Mexico_City. Esa oportunidad
+terminó sin lanzamiento y el heartbeat fue eliminado. No se programó otro día.
+El alias `/home/winterboss/.local/bin/mtf-lab-demo-canary` permanece instalado
+y la configuración persistente sigue deshabilitada. Los límites de las nuevas
+preparaciones autorizadas del mismo día constan en sus aprobaciones privadas,
+sin extensión de un trial reservado ni reintento de órdenes ambiguas.
 
 ### Antecedente de instalación — 2026-09-19
 
@@ -113,9 +158,9 @@ RiskExit evaluables; 2017–2019 sólo tienen QA descriptivo, no resultados de e
 |---|---|---|
 | 1. Cierre de 2019 | 11 meses válidos; el ZIP de octubre original y la nueva descarga oficial son byte-idénticos y fallan orden temporal. | Fuente corregida/versionada de HistData o respuesta oficial que permita resolver la procedencia sin inventar datos. |
 | 2. Desarrollo multianual | No se creó un año incompleto ni se ejecutó como si octubre fuera válido. | Manifiesto 2019 contiguo y válido antes de componer 2016–2019. Costos `UNKNOWN_COSTS`. |
-| 3. Runtime | Código `968bf0e` aceptado, instalado y publicado; gate 1,219/1,219, 130 archivos equivalentes y rollback comprobado. | Los cambios ejecutables requieren nuevo gate; el cierre documental conserva el anterior sólo con igualdad exacta de los demás blobs y modos. |
+| 3. Runtime | Código `ccd5563` aceptado, instalado y publicado; gate 1,244/1,244, 130 archivos equivalentes y rollback comprobado. | Los cambios ejecutables requieren nuevo gate; el cierre documental conserva el anterior sólo con igualdad exacta de los demás blobs y modos. |
 | 4. App y contrato | App `Active`; VIEW original intacto y autorización separada `TRADING` observada sólo en la cuenta DEMO aprobada. | Condiciones de REAL/México y cargos realizados siguen separados; la especificación observada no prueba cargos ni costes históricos. |
-| 5. Canaria técnica | Autorizada, software aceptado y oportunidad del lunes programada; todavía cero órdenes. | BBO/ATR, calendario, cuenta plana, margen y riesgo frescos, dos ciclos y conciliación observada. |
+| 5. Canaria técnica | Software instalado, referencia inicial de pérdida autorizada y preparaciones detenidas antes de órdenes. Oportunidad original sin lanzamiento; sin otra programación. | Spread cero bloqueado y excepción acotada sin respuesta; además BBO/ATR, calendario, cuenta plana, margen, riesgo, dos ciclos y conciliación observada. |
 | 6. Shadow/forward | No iniciado. La excepción técnica acotada no lo habilita. | Autorización operativa separada; 72 horas/30 sesiones no se sustituyen por fixtures ni se acelera el reloj. |
 
 ## Correcciones de diagnóstico
