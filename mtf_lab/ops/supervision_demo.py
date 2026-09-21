@@ -27,6 +27,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, cast
 
+from ..core.canary_quote import CanaryZeroSpreadAuthorization
 from ..core.canonical import canonical_json
 from .ctrader_account_risk import AccountRiskObserver
 from .ctrader_demo_transport import (
@@ -71,6 +72,7 @@ class DemoExecutionBinding:
     callbacks: Any
     risk_observer: AccountRiskObserver | None = None
     canary_economics: Any | None = None
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
 
     def close(self) -> None:
         """Close only the local journal; the provider owns the shared client."""
@@ -93,6 +95,7 @@ def build_demo_execution_binding(  # noqa: C901
     proto: Any | None = None,
     clock: Callable[[], datetime] | None = None,
     defer_activation: bool = False,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
 ) -> DemoExecutionBinding:
     """Build callbacks on top of one already authenticated DEMO provider.
 
@@ -177,6 +180,8 @@ def build_demo_execution_binding(  # noqa: C901
         )
         if canary_economics is not None:
             _update_executor_from_canary_economics(executor, canary_economics, "BUY")
+        if zero_spread_authorization is not None:
+            executor.set_canary_zero_spread_authorization(zero_spread_authorization)
         # Recovery is registration-only: it hydrates durable identities and
         # never resubmits.  With --no-resume, an existing journal remains a
         # hard gate rather than being silently discarded.
@@ -204,9 +209,18 @@ def build_demo_execution_binding(  # noqa: C901
             observation,
             risk_observer=observer,
             canary_economics=canary_economics,
+            zero_spread_authorization=zero_spread_authorization,
         )
         return DemoExecutionBinding(
-            gateway, observation, transport, executor, intent_store, callbacks, observer, canary_economics
+            gateway,
+            observation,
+            transport,
+            executor,
+            intent_store,
+            callbacks,
+            observer,
+            canary_economics,
+            zero_spread_authorization,
         )
     except BaseException:
         with contextlib.suppress(Exception):
@@ -827,13 +841,20 @@ def _management_quote(
     executor: CTraderDemoExecutor,
     provider: Any,
     observation: ServerAccountObservation,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
 ) -> Quote | None:
     if not bool(getattr(executor, "risk_exit_enabled", False)):
         return None
     try:
         # The quote book is already held by this provider.  This read does not
         # refresh a session or issue a market request.
-        return _quote_from_provider(provider, observation, {})
+        return _quote_from_provider(
+            provider,
+            observation,
+            {},
+            zero_spread_authorization=zero_spread_authorization,
+            now=executor.clock(),
+        )
     except (RiskLimitRejected, TypeError, ValueError):
         # Missing/stale BBO is an UNKNOWN exit input; do not invent a close
         # price or fall back to the legacy holding deadline.
@@ -844,8 +865,9 @@ def _manage_callbacks(
     executor: CTraderDemoExecutor,
     provider: Any,
     observation: ServerAccountObservation,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
 ) -> tuple[OrderResult, ...]:
-    quote = _management_quote(executor, provider, observation)
+    quote = _management_quote(executor, provider, observation, zero_spread_authorization)
     if bool(getattr(executor, "risk_exit_enabled", False)):
         return tuple(executor.manage(quote))
     return tuple(executor.manage())
@@ -866,11 +888,22 @@ def _callbacks_for(
     *,
     risk_observer: AccountRiskObserver | None = None,
     canary_economics: Any | None = None,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
 ) -> Any:
     from .supervision_contracts import ExecutionCallbacks
 
     def on_signal(signal: Any, quote: Any | None = None) -> OrderResult:
-        selected_quote = quote if isinstance(quote, Quote) else _quote_from_provider(provider, observation, signal)
+        selected_quote = (
+            quote
+            if isinstance(quote, Quote)
+            else _quote_from_provider(
+                provider,
+                observation,
+                signal,
+                zero_spread_authorization=zero_spread_authorization,
+                now=executor.clock(),
+            )
+        )
         data = _as_mapping(signal)
         explicit_account = data.get("account_environment", data.get("account_mode"))
         if explicit_account is not None and str(explicit_account).upper() != "DEMO":
@@ -890,7 +923,7 @@ def _callbacks_for(
         # Account metrics never substitute for the execution journal's own
         # typed, account-scoped position/ownership reconciliation.
         executor.reconcile_positions()
-        return _manage_callbacks(executor, provider, observation)
+        return _manage_callbacks(executor, provider, observation, zero_spread_authorization)
 
     def reconcile() -> Mapping[str, Any]:
         managed = manage()
@@ -925,7 +958,14 @@ def _callbacks_for(
     )
 
 
-def _quote_from_provider(provider: Any, observation: ServerAccountObservation, signal: Any) -> Quote:
+def _quote_from_provider(
+    provider: Any,
+    observation: ServerAccountObservation,
+    signal: Any,
+    *,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
+    now: datetime | None = None,
+) -> Quote:
     """Turn the latest complete provider quote-book observation into a Quote."""
 
     snapshotter = getattr(provider, "snapshot_quote_state", None)
@@ -935,8 +975,20 @@ def _quote_from_provider(provider: Any, observation: ServerAccountObservation, s
     spec = getattr(provider, "spec", None)
     symbol = str(getattr(spec, "symbol", "")).strip().upper()
     symbol_id = getattr(spec, "symbol_id", None)
-    bid, ask = _book_legs(raw_snapshot, symbol_id)
-    event_time, available_at, generation, sequence = _book_timing(bid, ask, observation)
+    bid, ask = _book_legs(
+        raw_snapshot,
+        symbol_id,
+        symbol=symbol,
+        observation=observation,
+        zero_spread_authorization=zero_spread_authorization,
+        now=now,
+    )
+    event_time, available_at, generation, sequence, earliest_available_at = _book_timing(
+        bid,
+        ask,
+        observation,
+        zero_spread_authorization=zero_spread_authorization,
+    )
     instrument = _signal_instrument(signal) or symbol
     if instrument != symbol:
         raise RiskLimitRejected("la señal y la cotización DEMO tienen instrumentos distintos")
@@ -955,10 +1007,20 @@ def _quote_from_provider(provider: Any, observation: ServerAccountObservation, s
         connection_generation=observation.connection_generation,
         data_mode="LIVE",
         synthetic=False,
+        zero_spread_authorization=zero_spread_authorization,
+        earliest_available_at=earliest_available_at,
     )
 
 
-def _book_legs(raw_snapshot: Any, symbol_id: Any) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
+def _book_legs(
+    raw_snapshot: Any,
+    symbol_id: Any,
+    *,
+    symbol: str,
+    observation: ServerAccountObservation,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
+    now: datetime | None = None,
+) -> tuple[Mapping[str, Any], Mapping[str, Any]]:
     if not isinstance(raw_snapshot, Mapping):
         raise RiskLimitRejected("snapshot de cotización inválido")
     symbols = raw_snapshot.get("symbols")
@@ -971,11 +1033,26 @@ def _book_legs(raw_snapshot: Any, symbol_id: Any) -> tuple[Mapping[str, Any], Ma
     ask = book.get("ask")
     if not isinstance(bid, Mapping) or not isinstance(ask, Mapping):
         raise RiskLimitRejected("no se observó una pareja bid/ask completa")
-    _validate_book_pair(bid, ask)
+    _validate_book_pair(
+        bid,
+        ask,
+        symbol=symbol,
+        observation=observation,
+        zero_spread_authorization=zero_spread_authorization,
+        now=now,
+    )
     return bid, ask
 
 
-def _validate_book_pair(bid: Mapping[str, Any], ask: Mapping[str, Any]) -> None:
+def _validate_book_pair(  # noqa: C901
+    bid: Mapping[str, Any],
+    ask: Mapping[str, Any],
+    *,
+    symbol: str,
+    observation: ServerAccountObservation,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
+    now: datetime | None = None,
+) -> None:
     if bid.get("timestamp_missing") is True or ask.get("timestamp_missing") is True:
         raise RiskLimitRejected("la cotización DEMO carece de timestamp de origen")
     for side, leg in (("bid", bid), ("ask", ask)):
@@ -984,6 +1061,11 @@ def _validate_book_pair(bid: Mapping[str, Any], ask: Mapping[str, Any]) -> None:
             raise RiskLimitRejected(f"la pierna {side} no tiene calidad VALID observada")
         if leg.get("reasons", ()):
             raise RiskLimitRejected(f"la pierna {side} conserva razones de calidad bloqueantes")
+        if zero_spread_authorization is not None:
+            leg_event = _quote_time(leg.get("event_time"), f"{side} event_time")
+            leg_available = _quote_time(leg.get("available_at"), f"{side} available_at")
+            if leg_available < leg_event:
+                raise RiskLimitRejected(f"la pierna {side} no es causal")
     try:
         bid_price = _decimal_value(bid.get("price"), "bid", positive=True)
         ask_price = _decimal_value(ask.get("price"), "ask", positive=True)
@@ -991,7 +1073,21 @@ def _validate_book_pair(bid: Mapping[str, Any], ask: Mapping[str, Any]) -> None:
         raise RiskLimitRejected("la pareja bid/ask observada es inválida") from exc
     # Equality is not an executable zero-spread quote.  Treat it as the same
     # crossed class as bid > ask; never repair or reorder provider prices.
-    if bid_price >= ask_price:
+    if bid_price > ask_price:
+        raise RiskLimitRejected("la pareja bid/ask observada está cruzada")
+    if bid_price == ask_price and (
+        zero_spread_authorization is None
+        or now is None
+        or not zero_spread_authorization.matches(
+            account_id=observation.account_id,
+            symbol=symbol,
+            session_id=observation.session_id,
+            connection_generation=observation.connection_generation,
+            endpoint=observation.endpoint,
+            now=now,
+            require_order_window=True,
+        )
+    ):
         raise RiskLimitRejected("la pareja bid/ask observada está cruzada")
 
 
@@ -999,13 +1095,20 @@ def _book_timing(
     bid: Mapping[str, Any],
     ask: Mapping[str, Any],
     observation: ServerAccountObservation,
-) -> tuple[datetime, datetime, Any, Any]:
+    *,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
+) -> tuple[datetime, datetime, Any, Any, datetime]:
     bid_time = _quote_time(bid.get("event_time"), "bid event_time")
     ask_time = _quote_time(ask.get("event_time"), "ask event_time")
     bid_available = _quote_time(bid.get("available_at"), "bid available_at")
     ask_available = _quote_time(ask.get("available_at"), "ask available_at")
     event_time = max(bid_time, ask_time)
-    available_at = min(bid_available, ask_available)
+    earliest_available_at = min(bid_available, ask_available)
+    available_at = (
+        max(bid_available, ask_available)
+        if zero_spread_authorization is not None
+        else min(bid_available, ask_available)
+    )
     if available_at < event_time:
         raise RiskLimitRejected("las piernas bid/ask no comparten disponibilidad causal")
     generation = bid.get("generation")
@@ -1014,7 +1117,7 @@ def _book_timing(
     if str(generation) != str(observation.connection_generation):
         raise RiskLimitRejected("la cotización pertenece a otra generación de conexión")
     sequence = bid.get("sequence") if bid.get("sequence") is not None else ask.get("sequence")
-    return event_time, available_at, generation, sequence
+    return event_time, available_at, generation, sequence, earliest_available_at
 
 
 def _quote_time(value: Any, name: str) -> datetime:

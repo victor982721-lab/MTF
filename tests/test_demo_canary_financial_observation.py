@@ -290,6 +290,7 @@ class DemoCanaryFinancialObservationTests(unittest.TestCase):
                 "requested_quantity",
                 "fetch_warmup",
                 "technical_only",
+                "zero_spread_authorization",
                 "minimum_execution_margin_seconds",
                 "market_window_state",
                 "isolated_state_dir",
@@ -297,6 +298,7 @@ class DemoCanaryFinancialObservationTests(unittest.TestCase):
             ),
         )
         self.assertTrue(collector_kwargs["technical_only"])
+        self.assertIsNone(collector_kwargs["zero_spread_authorization"])
         self.assertFalse(collector_kwargs["fetch_warmup"])
         self.assertIsNone(collector_kwargs["executor"])
         self.assertIsNone(collector_kwargs["risk_planner"])

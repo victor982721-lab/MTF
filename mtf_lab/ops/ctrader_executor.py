@@ -35,6 +35,7 @@ from pathlib import Path
 from types import NotImplementedType
 from typing import Any, Protocol, cast, runtime_checkable
 
+from ..core.canary_quote import CanaryZeroSpreadAuthorization
 from ..core.models import parse_timeframe
 from ..core.risk_exit import (
     EXIT_NONE,
@@ -699,6 +700,8 @@ class Quote:
     connection_generation: str | int | None = None
     data_mode: str | None = None
     synthetic: bool = False
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
+    earliest_available_at: datetime | None = None
 
     def __post_init__(self) -> None:
         symbol = str(self.symbol).strip().upper()
@@ -710,6 +713,9 @@ class Quote:
         available = _parse_time(self.available_at) if self.available_at is not None else ts
         if available < ts:
             raise ValueError("quote available_at cannot precede timestamp")
+        earliest = _parse_time(self.earliest_available_at) if self.earliest_available_at is not None else None
+        if earliest is not None and earliest > available:
+            raise ValueError("quote earliest_available_at cannot follow available_at")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "bid", bid)
         object.__setattr__(self, "ask", ask)
@@ -727,6 +733,7 @@ class Quote:
         object.__setattr__(self, "session_id", session_id)
         object.__setattr__(self, "connection_generation", generation)
         object.__setattr__(self, "data_mode", data_mode)
+        object.__setattr__(self, "earliest_available_at", earliest)
 
     @property
     def spread(self) -> DecimalValue:
@@ -754,6 +761,8 @@ class Quote:
             "connection_generation": self.connection_generation,
             "data_mode": self.data_mode,
             "synthetic": self.synthetic,
+            "zero_spread_authorized": self.zero_spread_authorization is not None,
+            "earliest_available_at": _iso(self.earliest_available_at),
             "spread": _decimal_text(self.spread),
         }
 
@@ -775,6 +784,9 @@ class Quote:
             connection_generation=value.get("connection_generation", value.get("generation")),
             data_mode=value.get("data_mode", value.get("market_data_mode")),
             synthetic=_bool_value(value.get("synthetic", value.get("synthetic_fixture", False))),
+            earliest_available_at=(
+                _parse_time(value["earliest_available_at"]) if value.get("earliest_available_at") is not None else None
+            ),
         )
 
 
@@ -2064,6 +2076,7 @@ class CTraderDemoExecutor:
         self._risk_calendar = _copy_optional_mapping(risk_calendar, "risk_calendar")
         self._market_candidate_id = _optional_text(market_candidate_id)
         self._canary_trial: CanaryTrialRiskBoundary | None = None
+        self._zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
         self._active = False
         self._paused = False
         self._pause_reason: str | None = None
@@ -2171,6 +2184,34 @@ class CTraderDemoExecutor:
                 raise RiskLimitRejected("canary trial boundary requiere RiskExit configurado")
             self._canary_trial = boundary
             self._risk_halt_reason = None
+
+    @property
+    def canary_zero_spread_authorization(self) -> CanaryZeroSpreadAuthorization | None:
+        return self._zero_spread_authorization
+
+    def set_canary_zero_spread_authorization(self, authorization: CanaryZeroSpreadAuthorization) -> None:
+        """Bind zero-spread permission to this inactive DEMO executor."""
+
+        if not isinstance(authorization, CanaryZeroSpreadAuthorization):
+            raise RiskLimitRejected("zero-spread authorization debe ser tipada")
+        with self._lock:
+            if self._active:
+                raise RiskLimitRejected("zero-spread authorization debe fijarse antes de activar")
+            observation = self.server_observation
+            if not authorization.matches(
+                account_id=self.account.account_id,
+                symbol=authorization.symbol,
+                session_id=getattr(observation, "session_id", None),
+                connection_generation=getattr(observation, "connection_generation", None),
+                endpoint=getattr(observation, "endpoint", None),
+                now=self.clock(),
+                require_order_window=False,
+            ):
+                raise RiskLimitRejected("zero-spread authorization no coincide con server observation")
+            allowed_symbols = {str(item).upper().replace("-", "/") for item in self.policy.allowed_symbols}
+            if allowed_symbols and authorization.symbol not in allowed_symbols:
+                raise RiskLimitRejected("zero-spread authorization usa símbolo no allowlisted")
+            self._zero_spread_authorization = authorization
 
     def update_canary_trial_loss(
         self,
@@ -3372,7 +3413,7 @@ class CTraderDemoExecutor:
         _store_call(self.intent_store, "record_event", event.to_dict())
         return event
 
-    def _check_quote(self, symbol: str, quote: Quote, side: Side) -> None:
+    def _check_quote(self, symbol: str, quote: Quote, side: Side) -> None:  # noqa: C901
         if quote.symbol != symbol.upper():
             raise RiskLimitRejected("quote symbol differs from signal")
         if self.policy.allowed_symbols and symbol.upper() not in self.policy.allowed_symbols:
@@ -3394,6 +3435,32 @@ class CTraderDemoExecutor:
             self._fixture_mode and quote.quality.upper() == "SYNTHETIC"
         ):
             raise RiskLimitRejected(f"quote quality blocks execution: {quote.quality}")
+        if quote.spread == 0 and not self._fixture_mode:
+            authorization = self._zero_spread_authorization
+            if authorization is None or quote.zero_spread_authorization is None:
+                raise RiskLimitRejected("spread cero requiere autorización canaria tipada")
+            if quote.zero_spread_authorization is not authorization:
+                raise RiskLimitRejected("quote zero-spread authorization no coincide con executor")
+            observation = self.server_observation
+            if not authorization.matches(
+                account_id=self.account.account_id,
+                symbol=quote.symbol,
+                session_id=getattr(observation, "session_id", None),
+                connection_generation=getattr(observation, "connection_generation", None),
+                endpoint=getattr(observation, "endpoint", None),
+                now=self.clock(),
+                require_order_window=True,
+            ):
+                raise RiskLimitRejected("spread cero fuera de autorización/ventana canaria")
+            oldest = quote.earliest_available_at
+            if oldest is None:
+                raise RiskLimitRejected("spread cero carece de timestamp de la pierna más antigua")
+            latest_age = (_parse_time(self.clock()) - (quote.available_at or quote.timestamp)).total_seconds()
+            oldest_age = (_parse_time(self.clock()) - oldest).total_seconds()
+            if oldest > (quote.available_at or quote.timestamp):
+                raise RiskLimitRejected("timestamp oldest de spread cero no es anterior a available_at")
+            if latest_age < 0 or oldest_age < 0 or oldest_age > self.policy.max_price_age_seconds:
+                raise RiskLimitRejected("spread cero tiene una pierna futura o stale")
         observation_source = str(getattr(self.server_observation, "source", "")).strip().lower()
         if not self._fixture_mode and observation_source not in {"fixture-server", "test"}:
             proof = self.server_observation

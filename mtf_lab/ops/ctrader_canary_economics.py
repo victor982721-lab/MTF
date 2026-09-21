@@ -25,6 +25,7 @@ from types import MappingProxyType
 from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ..core.canary_quote import CanaryZeroSpreadAuthorization
 from ..core.numeric import decimal_context
 from ..data.ctrader_config import normalize_symbol_name
 from ..data.ctrader_protocol import WireMessage, message_to_mapping, read_field, read_repeated
@@ -104,6 +105,7 @@ class CanaryQuoteEvidence:
     connection_generation: str
     sequence: str | None
     earliest_available_at: datetime | None = None
+    zero_spread_authorized: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -116,6 +118,7 @@ class CanaryQuoteEvidence:
             "event_time": _iso(self.event_time),
             "available_at": _iso(self.available_at),
             "earliest_available_at": _iso(self.earliest_available_at or self.available_at),
+            "zero_spread_authorized": self.zero_spread_authorized,
             "connection_generation": self.connection_generation,
             "sequence": self.sequence,
             "source": "provider.snapshot_quote_state",
@@ -299,6 +302,7 @@ def observe_canary_economics(  # noqa: C901 - one bounded read-only projection g
     exit_slippage_pips: Decimal | int | str | None = None,
     exit_slippage_approved: bool | None = None,
     exit_slippage_approval_source: str | None = None,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
     proto: Any | None = None,
 ) -> CanaryEconomicsProjection:
     """Build one read-only EUR/USD canary economics projection.
@@ -347,7 +351,16 @@ def observe_canary_economics(  # noqa: C901 - one bounded read-only projection g
     if spec_id != symbol_id:
         raise CanaryEconomicsError("catalog symbol_id no coincide con provider.spec")
 
-    quote = _quote_evidence(provider, symbol, symbol_id, session["generation"], catalog)
+    quote = _quote_evidence(
+        provider,
+        symbol,
+        symbol_id,
+        session["generation"],
+        catalog,
+        zero_spread_authorization=zero_spread_authorization,
+        session=session,
+        now=start_now,
+    )
     volume_protocol = _protocol_volume(quantity_value)
     volume_grid = _validate_volume(catalog, volume_protocol, quantity_value)
     trader, trader_response = _read_trader(proto_module, session, max_age)
@@ -676,12 +689,16 @@ def _read_expected_margin(
     )
 
 
-def _quote_evidence(
+def _quote_evidence(  # noqa: C901
     provider: Any,
     symbol: str,
     symbol_id: int,
     generation: str,
     catalog: Mapping[str, Any],
+    *,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
+    session: Mapping[str, Any] | None = None,
+    now: datetime | None = None,
 ) -> CanaryQuoteEvidence:
     snapshotter = getattr(provider, "snapshot_quote_state", None)
     if not callable(snapshotter):
@@ -704,8 +721,23 @@ def _quote_evidence(
     earliest_available_at = min(bid["available_at"], ask["available_at"])
     bid_price = cast(Decimal, bid["price"])
     ask_price = cast(Decimal, ask["price"])
-    if bid_price >= ask_price:
+    if bid_price > ask_price:
         raise CanaryEconomicsError("BBO cruzado o de spread cero")
+    if bid_price == ask_price and (
+        zero_spread_authorization is None
+        or session is None
+        or now is None
+        or not zero_spread_authorization.matches(
+            account_id=session["account_id"],
+            symbol=symbol,
+            session_id=session["session_id"],
+            connection_generation=generation,
+            endpoint=session["endpoint"],
+            now=now,
+            require_order_window=False,
+        )
+    ):
+        raise CanaryEconomicsError("BBO cruzado o spread cero")
     digits = _positive_int(_field(catalog, "digits"), "symbol.digits")
     pip_position = _positive_int(_field(catalog, "pipPosition", "pip_position"), "symbol.pipPosition")
     if pip_position > digits:
@@ -730,6 +762,7 @@ def _quote_evidence(
         generation,
         bid["sequence"] if bid["sequence"] is not None else ask["sequence"],
         earliest_available_at,
+        bid_price == ask_price and zero_spread_authorization is not None,
     )
 
 

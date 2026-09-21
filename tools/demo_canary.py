@@ -37,6 +37,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mtf_lab.configuration import ConfigError, EffectiveConfig, load_config
+from mtf_lab.core.canary_quote import CanaryZeroSpreadAuthorization
 from mtf_lab.core.canonical import canonical_json
 from mtf_lab.core.numeric import decimal_context
 from mtf_lab.core.risk_exit import CanaryTrialRiskBoundary, RiskExitPolicy
@@ -100,6 +101,8 @@ class CanaryApproval:
     exit_slippage_approval_source: str | None = None
     canary_trial_anchor_authorized: bool = False
     canary_trial_anchor_authorization_source: str | None = None
+    canary_zero_spread_authorized: bool = False
+    canary_zero_spread_authorization_source: str | None = None
 
     def __post_init__(self) -> None:  # noqa: C901
         approval_id = str(self.approval_id).strip()
@@ -151,6 +154,13 @@ class CanaryApproval:
             raise ValueError("canary_trial_anchor_authorized requiere fuente humana")
         if not self.canary_trial_anchor_authorized and trial_source is not None:
             raise ValueError("fuente de canary_trial_anchor requiere autorización explícita")
+        if not isinstance(self.canary_zero_spread_authorized, bool):
+            raise ValueError("canary_zero_spread_authorized debe ser booleano")
+        zero_source = str(self.canary_zero_spread_authorization_source or "").strip() or None
+        if self.canary_zero_spread_authorized and not zero_source:
+            raise ValueError("canary_zero_spread_authorized requiere fuente humana")
+        if not self.canary_zero_spread_authorized and zero_source is not None:
+            raise ValueError("fuente de canary_zero_spread requiere autorización explícita")
         object.__setattr__(self, "approval_id", approval_id)
         object.__setattr__(self, "account_id", account)
         object.__setattr__(self, "symbol", symbol)
@@ -167,6 +177,7 @@ class CanaryApproval:
             self, "exit_slippage_approval_source", str(self.exit_slippage_approval_source or "").strip() or None
         )
         object.__setattr__(self, "canary_trial_anchor_authorization_source", trial_source)
+        object.__setattr__(self, "canary_zero_spread_authorization_source", zero_source)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> CanaryApproval:
@@ -235,6 +246,8 @@ class CanaryApproval:
                     "trial_anchor_authorization_source",
                     "human_authorization_source",
                 ),
+                canary_zero_spread_authorized=pick("canary_zero_spread_authorized") is True,
+                canary_zero_spread_authorization_source=pick("canary_zero_spread_authorization_source"),
             )
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise CanaryGateError("approval privada con esquema inválido") from exc
@@ -253,6 +266,45 @@ def _approval_document_digest(approval: CanaryApproval) -> str:
     """Fingerprint the normalized approval document, not only its ID."""
 
     return hashlib.sha256(canonical_json(approval).encode("utf-8")).hexdigest()
+
+
+def _zero_spread_authorization(
+    approval: CanaryApproval,
+    observation: Any,
+    *,
+    preparation_start: datetime | None = None,
+) -> CanaryZeroSpreadAuthorization | None:
+    """Bind the explicit quote exception to an already verified DEMO session."""
+
+    if approval.canary_zero_spread_authorized is not True:
+        return None
+    if approval.approved is not True:
+        raise CanaryGateError("spread cero requiere aprobación humana")
+    account = str(getattr(observation, "account_id", "") or "").strip()
+    if account != approval.account_id or str(getattr(observation, "environment", "")).upper() != "DEMO":
+        raise CanaryGateError("spread cero requiere la misma cuenta DEMO observada")
+    try:
+        return CanaryZeroSpreadAuthorization(
+            approval_digest=_approval_document_digest(approval),
+            authorization_source=str(approval.canary_zero_spread_authorization_source or ""),
+            account_id=account,
+            symbol=approval.symbol,
+            session_id=str(getattr(observation, "session_id", "") or ""),
+            connection_generation=str(getattr(observation, "connection_generation", "") or ""),
+            endpoint=str(getattr(observation, "endpoint", "") or ""),
+            preparation_start=preparation_start or approval.window_start - timedelta(minutes=5),
+            window_start=approval.window_start,
+            window_end=approval.window_end,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CanaryGateError("contexto de spread cero inválido") from exc
+
+
+def _set_provider_zero_spread(provider: Any, context: CanaryZeroSpreadAuthorization) -> None:
+    setter = getattr(provider, "set_canary_zero_spread_authorization", None)
+    if not callable(setter):
+        raise CanaryGateError("provider no admite el contexto tipado de spread cero")
+    setter(context)
 
 
 def _trial_ledger_context(
@@ -280,6 +332,8 @@ def _trial_ledger_context(
         "approval_digest": _approval_document_digest(approval),
         "canary_trial_anchor_authorized": approval.canary_trial_anchor_authorized,
         "canary_trial_anchor_authorization_source": approval.canary_trial_anchor_authorization_source,
+        "canary_zero_spread_authorized": approval.canary_zero_spread_authorized,
+        "canary_zero_spread_authorization_source": approval.canary_zero_spread_authorization_source,
         "account_id": account_id,
         "session_id": session_id,
         "connection_generation": generation,
@@ -357,6 +411,8 @@ class _ApprovalLedger:
             "approval_digest",
             "canary_trial_anchor_authorized",
             "canary_trial_anchor_authorization_source",
+            "canary_zero_spread_authorized",
+            "canary_zero_spread_authorization_source",
             "account_id",
             "session_id",
             "connection_generation",
@@ -608,6 +664,7 @@ class PreparedCanarySession:
     preparation: Any
     writer_store: SupervisorStateStore
     defer_activation: bool = False
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
 
     def close(self) -> None:
         if self.binding is not None:
@@ -632,6 +689,7 @@ class PreparedCanarySession:
             canary_economics=canary_economics,
             account_key=None,
             defer_activation=self.defer_activation,
+            zero_spread_authorization=self.zero_spread_authorization,
         )
 
     def arm(self, canary_economics: CanaryEconomicsProjection) -> None:
@@ -1104,8 +1162,21 @@ def _require_fresh_risk(binding: Any, risk: Mapping[str, Any], now: datetime) ->
         raise CanaryGateError("posición/exposición DEMO no tiene snapshot fresco y VALID")
 
 
-def _quote(provider: Any, observation: Any, signal: Mapping[str, Any]) -> Quote:
-    return _quote_from_provider(provider, observation, signal)
+def _quote(
+    provider: Any,
+    observation: Any,
+    signal: Mapping[str, Any],
+    *,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
+    now: datetime | None = None,
+) -> Quote:
+    return _quote_from_provider(
+        provider,
+        observation,
+        signal,
+        zero_spread_authorization=zero_spread_authorization,
+        now=now,
+    )
 
 
 def _check_window(approval: CanaryApproval, now: datetime) -> None:
@@ -1241,7 +1312,13 @@ def _plan_for(  # noqa: C901
     if (current - last_available).total_seconds() > float(binding.executor.policy.max_price_age_seconds):
         raise CanaryGateError("runtime snapshot está stale")
     try:
-        quote = _quote(provider, binding.observation, signal)
+        quote = _quote(
+            provider,
+            binding.observation,
+            signal,
+            zero_spread_authorization=getattr(binding.executor, "canary_zero_spread_authorization", None),
+            now=current,
+        )
     except CanaryGateError:
         raise
     except Exception as exc:
@@ -1548,6 +1625,34 @@ def run_demo_canary(  # noqa: C901
     lock_context = writer_store.lock()
     with lock_context:
         try:
+            zero_spread: CanaryZeroSpreadAuthorization | None = None
+            if approval.canary_zero_spread_authorized is True:
+                from mtf_lab.ops.ctrader_canary_inputs import CanarySessionEvidence
+
+                zero_evidence = CanarySessionEvidence.from_provider(provider)
+                zero_evidence.validate_current(provider, clock_fn())
+                zero_spread = _zero_spread_authorization(approval, zero_evidence)
+                assert zero_spread is not None
+                if not zero_spread.matches(
+                    account_id=zero_evidence.account_id,
+                    symbol=approval.symbol,
+                    session_id=zero_evidence.session_id,
+                    connection_generation=zero_evidence.connection_generation,
+                    endpoint=zero_evidence.endpoint,
+                    now=clock_fn(),
+                    require_order_window=True,
+                ):
+                    raise CanaryGateError("spread cero fuera de la identidad/ventana de órdenes")
+                if prepared_session is not None:
+                    if prepared_session.zero_spread_authorization != zero_spread:
+                        raise CanaryGateError("spread cero no coincide con la aprobación de preparación")
+                    # Preserve the very capability carried through capture
+                    # and the inactive executor, not merely an equal rebuild.
+                    zero_spread = prepared_session.zero_spread_authorization
+                    assert zero_spread is not None
+                _set_provider_zero_spread(provider, zero_spread)
+            elif getattr(provider, "canary_zero_spread_authorization", None) is not None:
+                raise CanaryGateError("provider conserva un opt-in de spread cero no aprobado para este trial")
             if binding is None:
                 binding = build_demo_execution_binding(
                     provider,
@@ -1559,8 +1664,11 @@ def run_demo_canary(  # noqa: C901
                     proto=proto,
                     clock=clock_fn,
                     defer_activation=bool(execute),
+                    zero_spread_authorization=zero_spread,
                 )
             _validate_binding_identity(binding, provider, provenance, config, approval)
+            if getattr(binding.executor, "canary_zero_spread_authorization", None) != zero_spread:
+                raise CanaryGateError("executor no conserva el contexto de spread cero de esta aprobación")
             if execute and approval.canary_trial_anchor_authorized is True:
                 from mtf_lab.ops.supervision_demo import update_executor_from_canary_observation
 
@@ -2081,6 +2189,14 @@ def network_cli_preflight(  # noqa: C901
                     require_cashflows=True,
                 )
             evidence = CanarySessionEvidence.from_provider(session.provider)
+            zero_spread = _zero_spread_authorization(
+                approved,
+                evidence,
+                preparation_start=preparation_start,
+            )
+            if zero_spread is not None:
+                _set_provider_zero_spread(session.provider, zero_spread)
+                session.zero_spread_authorization = zero_spread
 
             def refresh_quotes_from_same_reader() -> None:
                 """Bound quote refresh through the provider's existing reader."""
@@ -2142,6 +2258,7 @@ def network_cli_preflight(  # noqa: C901
                         basis="IMPLEMENTATION_HYPOTHESIS",
                         source="baseline-0.1pip",
                     ),
+                    zero_spread_authorization=zero_spread,
                 )
 
             def make_projection() -> CanaryEconomicsProjection:
@@ -2283,6 +2400,7 @@ def network_cli_preflight(  # noqa: C901
                 requested_quantity=approved.max_quantity,
                 fetch_warmup=False,
                 technical_only=True,
+                zero_spread_authorization=zero_spread,
                 minimum_execution_margin_seconds=Decimal("300"),
                 market_window_state=observed_market_window_state,
                 isolated_state_dir=state_dir,

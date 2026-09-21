@@ -29,6 +29,7 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 
 from ..configuration import EffectiveConfig
+from ..core.canary_quote import CanaryZeroSpreadAuthorization
 from ..core.canonical import canonical_json, fingerprint
 from ..core.cfd_simulation import CFD_PRODUCT, CFDConfig, CFDSimulationError, CFDSimulator, CFDTrade
 from ..data.ctrader_market import CTraderProvider
@@ -141,6 +142,10 @@ class CTraderWatchContext:
     # live SpotEvents; it never performs history I/O itself.
     bootstrap_bars: Mapping[str, tuple[Bar, ...]] = field(default_factory=dict)
     bootstrap_metadata: Mapping[str, Any] = field(default_factory=dict)
+    # A typed scope is required before the bounded technical canary may accept
+    # a genuinely observed bid == ask quote.  Generic watch/PAPER paths keep
+    # this None and therefore retain the strict bid < ask gate.
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -278,6 +283,15 @@ def _mode_value(value: Any) -> str:
 def _connection_value(status: Any) -> str:
     value = getattr(status, "connection", status)
     return str(getattr(value, "value", value)).upper()
+
+
+def _provider_endpoint(provider: Any) -> str:
+    config = getattr(provider, "config", None)
+    host = str(getattr(config, "host", "") or "").strip()
+    port = getattr(config, "port", None)
+    if host and port is not None:
+        return f"{host}:{port}"
+    return ""
 
 
 def _validate_provider_environment(provider: CTraderProvider) -> None:
@@ -454,6 +468,9 @@ def _semantic_record(record: Event | Bar) -> dict[str, Any]:
             "quality_flags",
             "quote_usable",
             "partial_update",
+            "canary_zero_spread_authorized",
+            "canary_zero_spread_approval_digest",
+            "canary_zero_spread_raw_relation",
             "native_price_basis",
             "period_code",
             "relative_scale",
@@ -735,6 +752,10 @@ class CTraderWatchRunner:
         _validate_provider_environment(context.provider)
         self.metadata = _safe_metadata(context.provider, context.config, context.provenance, mode)
         self.mode = self.metadata.mode
+        self.zero_spread_authorization = context.zero_spread_authorization
+        if not isinstance(context.paper_enabled, bool):
+            raise CTraderWatchError("paper_enabled debe ser booleano")
+        self._validate_zero_spread_context()
         # A generation change is not a reconciliation.  The composition root
         # may pass an explicit, independently verified recovery fact after a
         # bounded stop and a newly prepared provider session; the runner never
@@ -755,11 +776,76 @@ class CTraderWatchRunner:
         self._run_messages_start = 0
         self._run_events_start = 0
         self._last_idle_tick_monotonic = 0.0
-        if not isinstance(context.paper_enabled, bool):
-            raise CTraderWatchError("paper_enabled debe ser booleano")
         self._paper: _WatchPaper | None = None
         self._last_record_signals: tuple[Any, ...] = ()
         self._last_decorated_record: Event | Bar | None = None
+
+    def _zero_spread_identity(self) -> tuple[str, str, str, str, str]:
+        provenance = self.context.provenance
+        account_id = str(provenance.get("account_id") or "").strip()
+        session_id = str(provenance.get("session_id") or "").strip()
+        generation = str(provenance.get("connection_generation") or "").strip()
+        endpoint = str(provenance.get("endpoint") or _provider_endpoint(self.context.provider)).strip()
+        symbol = str(self.context.config.instrument).strip().upper().replace("-", "/")
+        return account_id, session_id, generation, endpoint, symbol
+
+    def _validate_zero_spread_context(self) -> None:
+        authorization = self.zero_spread_authorization
+        if authorization is None:
+            return
+        if not isinstance(authorization, CanaryZeroSpreadAuthorization):
+            raise CTraderWatchError("zero-spread authorization debe ser tipada")
+        if self.mode != "LIVE" or self.context.paper_enabled:
+            raise CTraderWatchError("zero-spread sólo admite el runner LIVE técnico sin PAPER")
+        if self.context.provenance.get("manual_technical") is not True:
+            raise CTraderWatchError("zero-spread requiere manual_technical=true")
+        account_id, session_id, generation, endpoint, symbol = self._zero_spread_identity()
+        if not authorization.matches(
+            account_id=account_id,
+            session_id=session_id,
+            connection_generation=generation,
+            endpoint=endpoint,
+            symbol=symbol,
+            now=self._clock(),
+            require_order_window=False,
+        ):
+            raise CTraderWatchError("zero-spread authorization no coincide con el contexto LIVE")
+        setter = getattr(self.context.provider, "set_canary_zero_spread_authorization", None)
+        if not callable(setter):
+            raise CTraderWatchError("provider no expone scope zero-spread canary")
+        try:
+            setter(authorization)
+        except Exception as exc:
+            raise CTraderWatchError("provider rechazó el scope zero-spread canary") from exc
+
+    def _zero_spread_event_usable(self, event: Event) -> bool:
+        authorization = self.zero_spread_authorization
+        if event.bid is None or event.ask is None or event.bid != event.ask:
+            return False
+        if not isinstance(authorization, CanaryZeroSpreadAuthorization):
+            return False
+        metadata = _record_metadata(event)
+        if (
+            metadata.get("quality_state") != "VALID"
+            or metadata.get("quote_usable") is not True
+            or bool(metadata.get("partial_update", False))
+            or metadata.get("canary_zero_spread_authorized") is not True
+            or metadata.get("canary_zero_spread_approval_digest") != authorization.approval_digest
+            or str(metadata.get("canary_zero_spread_raw_relation", "")).upper() != "BID_EQUALS_ASK"
+        ):
+            return False
+        account_id, session_id, generation, endpoint, symbol = self._zero_spread_identity()
+        if str(metadata.get("connection_generation", generation)) != generation:
+            return False
+        return authorization.matches(
+            account_id=account_id,
+            session_id=session_id,
+            connection_generation=generation,
+            endpoint=endpoint,
+            symbol=symbol,
+            now=self._clock(),
+            require_order_window=False,
+        )
 
     @property
     def coordinator(self) -> RuntimeCoordinator:
@@ -790,6 +876,9 @@ class CTraderWatchRunner:
             "network_performed": self.metadata.network_performed,
             "data_identity": self.metadata.data_identity,
             "spec": spec_dict,
+            "zero_spread_authorization": (
+                self.zero_spread_authorization.to_dict() if self.zero_spread_authorization is not None else None
+            ),
         }
         return fingerprint(identity)
 
@@ -1342,11 +1431,7 @@ class CTraderWatchRunner:
             return
         if record.is_snapshot:
             return
-        metadata = _record_metadata(record)
-        if bool(metadata.get("partial_update", False)):
-            return
-        quality = metadata.get("quote_usable")
-        if quality is not True or record.bid is None or record.ask is None:
+        if not self._live_event_usable(record):
             return
         self._generation_recovery_pending = False
         self._recovery_verified = False
@@ -1371,6 +1456,21 @@ class CTraderWatchRunner:
         )
         self._last_decorated_record = decorated
         self._recover_after_quote(decorated)
+        if (
+            isinstance(decorated, Event)
+            and decorated.bid is not None
+            and decorated.ask is not None
+            and (
+                decorated.bid > decorated.ask
+                or (decorated.bid == decorated.ask and not self._zero_spread_event_usable(decorated))
+            )
+        ):
+            self._record_normalization_issues(("quote_invalid",))
+            self.coordinator.capture_only(decorated)
+            self._update_live_freshness(decorated)
+            self._chain = _append_chain(self._chain, _semantic_record(decorated))
+            self.stats.events += 1
+            return False
         basis = str(self.context.config.price_base).strip().lower()
         analysis_record = (isinstance(decorated, Event) and basis in {"mid", "bid", "ask"}) or (
             isinstance(decorated, Bar) and basis == "native"
@@ -1409,14 +1509,16 @@ class CTraderWatchRunner:
         if self._paper is not None:
             self._paper.advance(watermark)
 
-    @staticmethod
-    def _live_event_usable(event: Event) -> bool:
+    def _live_event_usable(self, event: Event) -> bool:
         metadata = event.metadata if isinstance(event.metadata, Mapping) else {}
+        if event.bid is None or event.ask is None:
+            return False
+        price_relation_valid = event.bid < event.ask or (
+            event.bid == event.ask and self._zero_spread_event_usable(event)
+        )
         return (
             not event.is_snapshot
-            and event.bid is not None
-            and event.ask is not None
-            and event.bid < event.ask
+            and price_relation_valid
             and metadata.get("quality_state") == "VALID"
             and metadata.get("quote_usable") is True
             and not bool(metadata.get("partial_update", False))
@@ -1491,6 +1593,43 @@ class CTraderWatchRunner:
             return
         self._process_spot_message(message, sequence)
 
+    def _scoped_zero_spread_normalization(
+        self,
+        records: Iterable[Event | Bar],
+        issues: Iterable[Any],
+        raw_synthetic: bool,
+    ) -> bool:
+        """Keep default crossed diagnostics without blocking valid canary data."""
+
+        issue_values = tuple(str(item).lower() for item in issues)
+        if not issue_values or any("cruzad" not in item and "spread cero" not in item for item in issue_values):
+            return False
+        events = tuple(item for item in records if isinstance(item, Event))
+        if not events:
+            return False
+        for event in events:
+            decorated = _decorate_record(
+                event,
+                self.metadata,
+                raw_synthetic,
+                technical_quote_mode=(
+                    self.context.provenance.get("manual_technical") is True
+                    and self.options.technical_canary_quote_gap_seconds is not None
+                ),
+            )
+            if not isinstance(decorated, Event) or not self._zero_spread_event_usable(decorated):
+                return False
+            metadata = _record_metadata(decorated)
+            default_reasons = metadata.get("default_quality_reasons", ())
+            if (
+                str(metadata.get("default_quality_state", "")).upper() != "INVALID"
+                or not isinstance(default_reasons, (list, tuple))
+                or not default_reasons
+                or any(str(reason).upper() != "CROSSED" for reason in default_reasons)
+            ):
+                return False
+        return True
+
     def _process_spot_message(self, message: WireMessage, sequence: int | None) -> None:
         raw_payload = message.payload
         normalized = self.context.provider.normalize_spot(
@@ -1504,10 +1643,18 @@ class CTraderWatchRunner:
             generation=_parse_generation(message.connection_generation),
         )
         if normalized.issues:
-            # Preserve the malformed payload in the capture ledger, but do
-            # not allow a partially normalized record to emit a signal or
-            # PAPER fill.  The issue text is bounded and contains no tokens.
-            self._record_normalization_issues(normalized.issues)
+            # An authorized zero-spread observation retains the default
+            # crossed classification in metadata, but its effective typed
+            # quality is valid.  That data-only exception must not become a
+            # socket/reconciliation failure; any other normalization issue
+            # remains a hard operational block.
+            raw_synthetic = self._raw_synthetic(message)
+            if not self._scoped_zero_spread_normalization(
+                normalized.records,
+                normalized.issues,
+                raw_synthetic,
+            ):
+                self._record_normalization_issues(normalized.issues)
         raw_synthetic = self._raw_synthetic(message)
         paper_events: list[Event] = []
         for record in normalized.records:
@@ -1676,7 +1823,12 @@ class CTraderWatchRunner:
             clean_stop,
             self._resumed,
             self._status_mapping(),
-            self.metadata.to_dict(),
+            {
+                **self.metadata.to_dict(),
+                "zero_spread_authorization": (
+                    self.zero_spread_authorization.to_dict() if self.zero_spread_authorization is not None else None
+                ),
+            },
             self._paper.analysis_id if self._paper is not None else None,
             paper,
         )

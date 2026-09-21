@@ -1452,7 +1452,10 @@ class AccountRiskObserver:
         reported_realized_costs = deals["costs"] if fresh else None
         reported_unrealized = unrealized_value if fresh else None
         reported_unrealized_gross = gross_unrealized_value if fresh else None
-        reported_drawdown = drawdown if fresh and complete else None
+        # The high-water drawdown is an account metric independent of the
+        # UTC-day anchor.  Preserve it for the canary trial when the current
+        # account observation is complete even if daily loss remains UNKNOWN.
+        reported_drawdown = drawdown if account_complete else None
         reported_peak_equity = peak_equity if fresh else None
         return AccountRiskSnapshot(
             identity.account_id,

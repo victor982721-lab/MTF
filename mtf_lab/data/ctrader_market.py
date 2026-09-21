@@ -18,6 +18,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from enum import StrEnum
 from typing import Any, Literal, TypeAlias
 
+from ..core.canary_quote import CanaryZeroSpreadAuthorization
 from .ctrader_accounts import normalize_account_payload
 from .ctrader_config import CTraderConfig, normalize_symbol_name
 from .ctrader_diagnostics import CTraderSpotDiagnostic, build_spot_diagnostic
@@ -120,6 +121,12 @@ class QuoteQuality:
     bid: QuoteLegQuality
     ask: QuoteLegQuality
     max_age_seconds: float | None = None
+    default_quality_state: QuoteQualityState | None = None
+    default_quality_reasons: tuple[QuoteQualityReason, ...] = ()
+    canary_zero_spread_authorized: bool = False
+    canary_zero_spread_provenance: Mapping[str, Any] | None = None
+    canary_zero_spread_approval_digest: str | None = None
+    canary_zero_spread_raw_relation: str | None = None
 
     @property
     def usable(self) -> bool:
@@ -133,6 +140,16 @@ class QuoteQuality:
             "usable": self.usable,
             "bid": self.bid.to_dict(),
             "ask": self.ask.to_dict(),
+            "default_quality_state": (
+                self.default_quality_state.value if self.default_quality_state is not None else None
+            ),
+            "default_quality_reasons": [reason.value for reason in self.default_quality_reasons],
+            "canary_zero_spread_authorized": self.canary_zero_spread_authorized,
+            "canary_zero_spread_provenance": (
+                dict(self.canary_zero_spread_provenance) if self.canary_zero_spread_provenance is not None else None
+            ),
+            "canary_zero_spread_approval_digest": self.canary_zero_spread_approval_digest,
+            "canary_zero_spread_raw_relation": self.canary_zero_spread_raw_relation,
         }
 
     def metadata(self) -> dict[str, Any]:
@@ -150,6 +167,16 @@ class QuoteQuality:
             "ask_age_seconds": self.ask.age_seconds,
             "max_quote_age_seconds": self.max_age_seconds,
             "quote_usable": self.usable,
+            "default_quality_state": (
+                self.default_quality_state.value if self.default_quality_state is not None else None
+            ),
+            "default_quality_reasons": [reason.value for reason in self.default_quality_reasons],
+            "canary_zero_spread_authorized": self.canary_zero_spread_authorized,
+            "canary_zero_spread_provenance": (
+                dict(self.canary_zero_spread_provenance) if self.canary_zero_spread_provenance is not None else None
+            ),
+            "canary_zero_spread_approval_digest": self.canary_zero_spread_approval_digest,
+            "canary_zero_spread_raw_relation": self.canary_zero_spread_raw_relation,
         }
 
 
@@ -587,6 +614,7 @@ class CTraderProvider:
         self._quote_state: dict[int, dict[str, dict[str, Any]]] = {}
         self._generation = 0
         self._discontinuity_reason: str | None = None
+        self._canary_zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
         if (
             isinstance(max_quote_age_seconds, bool)
             or not math.isfinite(float(max_quote_age_seconds))
@@ -611,6 +639,120 @@ class CTraderProvider:
     @property
     def generation(self) -> int:
         return self._generation
+
+    @property
+    def canary_zero_spread_authorization(self) -> CanaryZeroSpreadAuthorization | None:
+        """Return the scoped zero-spread authorization for this provider only."""
+
+        return self._canary_zero_spread_authorization
+
+    def set_canary_zero_spread_authorization(
+        self,
+        authorization: CanaryZeroSpreadAuthorization,
+    ) -> None:
+        """Bind one typed approval to the currently authenticated DEMO session."""
+
+        if not isinstance(authorization, CanaryZeroSpreadAuthorization):
+            raise CTraderDataError("canary zero-spread authorization debe ser tipada")
+        if self.config.environment.upper() != "DEMO":
+            raise CTraderDataError("zero-spread sólo puede vincularse a una sesión DEMO")
+        try:
+            proof = self.client.authenticated_session_evidence()
+            if not self.client.validate_session_evidence(proof):
+                raise CTraderDataError("la evidencia DEMO no se pudo revalidar")
+        except CTraderAuthError as exc:
+            raise CTraderDataError("no hay evidencia DEMO vigente para vincular zero-spread") from exc
+        if not self._canary_authorization_matches(authorization, proof, now=self._clock()):
+            raise CTraderDataError("authorization no coincide con la sesión DEMO actual")
+        self._canary_zero_spread_authorization = authorization
+
+    def _canary_authorization_matches(
+        self,
+        authorization: CanaryZeroSpreadAuthorization,
+        proof: Any,
+        *,
+        now: datetime,
+    ) -> bool:
+        endpoint = str(getattr(proof, "endpoint", ""))
+        if (
+            str(getattr(proof, "environment", "")).upper() != "DEMO"
+            or str(getattr(proof, "connection_generation", "")) != str(self._generation)
+            or endpoint != authorization.endpoint
+            or endpoint.lower() != f"{self.config.host}:{self.config.port}".lower()
+            or normalize_symbol_name(self.spec.symbol) != authorization.symbol
+        ):
+            return False
+        return authorization.matches(
+            account_id=str(getattr(proof, "account_id", "")),
+            session_id=str(getattr(proof, "session_id", "")),
+            connection_generation=str(getattr(proof, "connection_generation", "")),
+            endpoint=endpoint,
+            symbol=normalize_symbol_name(self.spec.symbol),
+            now=now,
+            require_order_window=False,
+        )
+
+    def _canary_zero_spread_is_fresh_causal(
+        self,
+        state: Mapping[str, Mapping[str, Any]],
+        *,
+        available_at: datetime | None,
+        max_age_seconds: float,
+    ) -> bool:
+        """Keep the scoped override behind the ordinary quote gates."""
+
+        if available_at is None or set(state) != {"bid", "ask"}:
+            return False
+        available_now = ensure_utc(available_at, field_name="available_at")
+        for side in ("bid", "ask"):
+            leg = state[side]
+            if (
+                leg.get("timestamp_missing")
+                or leg.get("received_at") is None
+                or leg.get("available_at") is None
+                or str(leg.get("generation")) != str(self._generation)
+            ):
+                return False
+            source_time = leg.get("source_time", leg.get("event_time"))
+            leg_available = leg.get("available_at")
+            if source_time is None or leg_available is None:
+                return False
+            source = ensure_utc(source_time, field_name=f"{side}.source_time")
+            leg_available_utc = ensure_utc(leg_available, field_name=f"{side}.available_at")
+            if leg_available_utc < source or available_now < source:
+                return False
+            if (available_now - source).total_seconds() > max_age_seconds:
+                return False
+        return True
+
+    def _canary_zero_spread_is_authorized(
+        self,
+        state: Mapping[str, Mapping[str, Any]],
+        *,
+        available_at: datetime | None,
+        max_age_seconds: float,
+        now: datetime,
+        rejected: Sequence[QuoteQualityReason] = (),
+    ) -> bool:
+        authorization = self._canary_zero_spread_authorization
+        if (
+            authorization is None
+            or self._discontinuity_reason is not None
+            or rejected
+            or not self._canary_zero_spread_is_fresh_causal(
+                state,
+                available_at=available_at,
+                max_age_seconds=max_age_seconds,
+            )
+        ):
+            return False
+        try:
+            proof = self.client.authenticated_session_evidence()
+            if not self.client.validate_session_evidence(proof):
+                return False
+        except CTraderAuthError:
+            return False
+        return self._canary_authorization_matches(authorization, proof, now=now)
 
     def connect(self) -> CTraderStatus:
         status = self.client.connect()
@@ -1205,6 +1347,14 @@ class CTraderProvider:
             max_age_seconds=max_age,
             rejected=rejected,
             discontinuity=self._discontinuity_reason,
+            canary_zero_spread_authorization=self._canary_zero_spread_authorization,
+            canary_zero_spread_authorized=self._canary_zero_spread_is_authorized(
+                state,
+                available_at=availability,
+                max_age_seconds=max_age,
+                now=self._clock(),
+                rejected=rejected,
+            ),
         )
         events = _decorate_book_events(
             combined.quote_events,
@@ -1921,6 +2071,8 @@ def _book_quality(
     max_age_seconds: float,
     rejected: Sequence[QuoteQualityReason] = (),
     discontinuity: str | None = None,
+    canary_zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
+    canary_zero_spread_authorized: bool = False,
 ) -> QuoteQuality:
     bid = _leg_quality(
         state.get("bid"),
@@ -1937,6 +2089,11 @@ def _book_quality(
         side="ask",
     )
     reasons = list(_unique_reasons((*bid.reasons, *ask.reasons, *rejected)))
+    default_quality_state: QuoteQualityState | None = None
+    default_quality_reasons: tuple[QuoteQualityReason, ...] = ()
+    effective_zero_spread = (
+        canary_zero_spread_authorized and bid.price is not None and ask.price is not None and bid.price == ask.price
+    )
     if discontinuity:
         reasons.append(QuoteQualityReason.DISCONNECTED)
     if bid.price is None or ask.price is None:
@@ -1944,7 +2101,24 @@ def _book_quality(
     elif QuoteQualityReason.CROSSED in reasons or bid.price >= ask.price:
         if QuoteQualityReason.CROSSED not in reasons:
             reasons.append(QuoteQualityReason.CROSSED)
-        overall = QuoteQualityState.INVALID
+        default_quality_state = QuoteQualityState.INVALID if effective_zero_spread else None
+        default_quality_reasons = tuple(_unique_reasons(reasons)) if effective_zero_spread else ()
+        if effective_zero_spread:
+            reasons = [reason for reason in reasons if reason is not QuoteQualityReason.CROSSED]
+            overall = (
+                QuoteQualityState.UNKNOWN
+                if any(
+                    reason in reasons
+                    for reason in (QuoteQualityReason.MISSING_SOURCE_TIMESTAMP, QuoteQualityReason.AVAILABILITY_UNKNOWN)
+                )
+                else QuoteQualityState.STALE
+                if any(reason in reasons for reason in (QuoteQualityReason.STALE_BID, QuoteQualityReason.STALE_ASK))
+                else QuoteQualityState.UNKNOWN
+                if rejected
+                else QuoteQualityState.VALID
+            )
+        else:
+            overall = QuoteQualityState.INVALID
     elif any(
         reason in reasons
         for reason in (QuoteQualityReason.MISSING_SOURCE_TIMESTAMP, QuoteQualityReason.AVAILABILITY_UNKNOWN)
@@ -1956,7 +2130,26 @@ def _book_quality(
         overall = QuoteQualityState.UNKNOWN
     else:
         overall = QuoteQualityState.VALID
-    return QuoteQuality(overall, tuple(_unique_reasons(reasons)), bid, ask, max_age_seconds)
+    provenance = (
+        canary_zero_spread_authorization.to_dict()
+        if effective_zero_spread and canary_zero_spread_authorization is not None
+        else None
+    )
+    return QuoteQuality(
+        overall,
+        tuple(_unique_reasons(reasons)),
+        bid,
+        ask,
+        max_age_seconds,
+        default_quality_state,
+        default_quality_reasons,
+        effective_zero_spread,
+        provenance,
+        canary_zero_spread_authorization.approval_digest
+        if effective_zero_spread and canary_zero_spread_authorization is not None
+        else None,
+        "BID_EQUALS_ASK" if effective_zero_spread else None,
+    )
 
 
 def _stateless_quality(

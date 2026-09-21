@@ -33,6 +33,7 @@ from typing import Any, Protocol
 
 from ..configuration import EffectiveConfig
 from ..core import parse_timeframe
+from ..core.canary_quote import CanaryZeroSpreadAuthorization
 from ..core.canonical import fingerprint
 from ..data.models import Bar, Event
 from ..ops.ctrader_executor import DecimalValue, Quote
@@ -185,7 +186,7 @@ class CanarySessionEvidence:
     evidence_source: str
     expires_at: datetime | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - one normalized BBO/authentication gate
         provider = str(self.provider).strip()
         session_id = str(self.session_id).strip()
         account_id = str(self.account_id).strip()
@@ -300,11 +301,13 @@ class CanarySessionEvidence:
             "session_id": self.session_id,
             "connection_generation": self.connection_generation,
             "account_id": self.account_id,
+            "endpoint": self.endpoint,
             "data_identity": {
                 "provider": self.provider,
                 "session_id": self.session_id,
                 "connection_generation": self.connection_generation,
                 "account_id": self.account_id,
+                "endpoint": self.endpoint,
             },
         }
 
@@ -369,18 +372,25 @@ class ObservedBBO:
     quality_state: str = "VALID"
     quote_usable: bool = True
     synthetic: bool = False
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
+    zero_spread_evidence: CanarySessionEvidence | None = None
+    zero_spread_observed_at: datetime | None = None
+    earliest_available_at: datetime | None = None
 
-    def __post_init__(self) -> None:
+    def __post_init__(self) -> None:  # noqa: C901 - one normalized BBO/authentication gate
         symbol = str(self.symbol).strip().upper().replace("-", "/")
         if not symbol or isinstance(self.symbol_id, bool) or int(self.symbol_id) <= 0:
             raise ValueError("BBO sin identidad de instrumento")
         bid = _decimal(self.bid, "bid", positive=True)
         ask = _decimal(self.ask, "ask", positive=True)
-        if bid >= ask:
+        if bid > ask:
             raise ValueError("BBO cruzado o spread cero")
         event_time = _aware(self.event_time, "event_time")
         available_at = _aware(self.available_at, "available_at")
         received_at = _aware(self.received_at, "received_at") if self.received_at is not None else None
+        earliest_available_at = _aware(self.earliest_available_at or available_at, "earliest_available_at")
+        if earliest_available_at > available_at:
+            raise ValueError("earliest_available_at no puede ser posterior a available_at")
         if available_at < event_time or (received_at is not None and received_at < event_time):
             raise ValueError("BBO con disponibilidad no causal")
         generation = str(self.connection_generation).strip()
@@ -390,6 +400,25 @@ class ObservedBBO:
             raise ValueError("BBO sin procedencia")
         if str(self.quality_state).upper() != "VALID" or self.quote_usable is not True or self.synthetic:
             raise ValueError("BBO no es observado VALID")
+        authorization = self.zero_spread_authorization
+        evidence = self.zero_spread_evidence
+        observed_at = self.zero_spread_observed_at
+        if bid == ask:
+            if not isinstance(authorization, CanaryZeroSpreadAuthorization):
+                raise ValueError("BBO cruzado o spread cero")
+            if not isinstance(evidence, CanarySessionEvidence) or observed_at is None:
+                raise ValueError("BBO zero-spread sin contexto DEMO tipado")
+            observed_at = _aware(observed_at, "zero_spread_observed_at")
+            if not authorization.matches(
+                account_id=evidence.account_id,
+                session_id=evidence.session_id,
+                connection_generation=generation,
+                endpoint=evidence.endpoint,
+                symbol=symbol,
+                now=observed_at,
+                require_order_window=False,
+            ):
+                raise ValueError("BBO zero-spread fuera del contexto autorizado")
         object.__setattr__(self, "symbol", symbol)
         object.__setattr__(self, "symbol_id", int(self.symbol_id))
         object.__setattr__(self, "bid", bid)
@@ -401,6 +430,72 @@ class ObservedBBO:
         object.__setattr__(self, "source_event_id", source_event_id)
         object.__setattr__(self, "source", source)
         object.__setattr__(self, "quality_state", "VALID")
+        object.__setattr__(self, "zero_spread_observed_at", observed_at)
+        object.__setattr__(self, "earliest_available_at", earliest_available_at)
+
+    @staticmethod
+    def _zero_spread_metadata_allowed(
+        metadata: Mapping[str, Any],
+        authorization: CanaryZeroSpreadAuthorization | None,
+        *,
+        evidence: CanarySessionEvidence,
+        symbol: str,
+        now: datetime,
+    ) -> bool:
+        """Require provider evidence plus the typed authorization scope."""
+
+        if not isinstance(authorization, CanaryZeroSpreadAuthorization):
+            return False
+        if metadata.get("canary_zero_spread_authorized") is not True:
+            return False
+        if metadata.get("canary_zero_spread_approval_digest") != authorization.approval_digest:
+            return False
+        if str(metadata.get("canary_zero_spread_raw_relation", "")).upper() != "BID_EQUALS_ASK":
+            return False
+        return authorization.matches(
+            account_id=evidence.account_id,
+            session_id=evidence.session_id,
+            connection_generation=evidence.connection_generation,
+            endpoint=evidence.endpoint,
+            symbol=symbol,
+            now=now,
+            require_order_window=False,
+        )
+
+    @staticmethod
+    def _provider_earliest_available_at(metadata: Mapping[str, Any], event: Event, available_at: datetime) -> datetime:
+        """Keep the older observed leg; never infer freshness from one leg."""
+
+        bid_raw = metadata.get("bid_available_at")
+        ask_raw = metadata.get("ask_available_at")
+        shared_generation = metadata.get("connection_generation")
+        bid_generation = metadata.get("bid_connection_generation", metadata.get("bid_generation"))
+        ask_generation = metadata.get("ask_connection_generation", metadata.get("ask_generation"))
+        if bid_generation is not None or ask_generation is not None:
+            if bid_generation is None or ask_generation is None or shared_generation is None:
+                raise CanaryInputError("BBO sin generación por pierna completa")
+            if str(bid_generation) != str(ask_generation) or str(bid_generation) != str(shared_generation):
+                raise CanaryInputError("BBO con generaciones por pierna incompatibles")
+        bid_sequence = metadata.get("bid_source_sequence", metadata.get("bid_sequence"))
+        ask_sequence = metadata.get("ask_source_sequence", metadata.get("ask_sequence"))
+        if (bid_sequence is not None or ask_sequence is not None) and (
+            bid_sequence is None or ask_sequence is None or str(bid_sequence) != str(ask_sequence)
+        ):
+            raise CanaryInputError("BBO con secuencias por pierna incompatibles")
+        if bid_raw is not None or ask_raw is not None:
+            if bid_raw is None or ask_raw is None:
+                raise CanaryInputError("BBO sin disponibilidad observada para ambas piernas")
+            bid_available = _parse_time(bid_raw, "bid_available_at")
+            ask_available = _parse_time(ask_raw, "ask_available_at")
+            if bid_available > available_at or ask_available > available_at:
+                raise CanaryInputError("BBO tiene disponibilidad por pierna inconsistente")
+            return min(bid_available, ask_available)
+        if metadata.get("partial_update") is False and event.available_at is not None:
+            # Both legs were updated in the same provider frame.  The shared
+            # availability is then an explicit source fact, not an async-book
+            # freshness fallback.
+            return available_at
+        raise CanaryInputError("BBO sin disponibilidad por pierna verificable")
 
     @classmethod
     def from_event(  # noqa: C901 - one normalized-BBO quality gate
@@ -412,13 +507,14 @@ class ObservedBBO:
         window_start: datetime,
         window_end: datetime,
         max_age_seconds: Decimal,
+        zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
     ) -> ObservedBBO:
         if not isinstance(event, Event):
             raise CanaryInputError("BBO no proviene de Event normalizado")
         metadata = dict(event.metadata) if isinstance(event.metadata, Mapping) else {}
         if event.synthetic or event.is_snapshot:
             raise CanaryInputError("BBO sintético/snapshot no es elegible")
-        if event.bid is None or event.ask is None or event.bid >= event.ask:
+        if event.bid is None or event.ask is None or event.bid > event.ask:
             raise CanaryInputError("BBO incompleto o cruzado")
         if str(metadata.get("quality_state", "")).upper() != "VALID":
             raise CanaryInputError("BBO sin quality_state=VALID")
@@ -446,6 +542,14 @@ class ObservedBBO:
         symbol = str(metadata.get("symbol", event.instrument)).strip().upper().replace("-", "/")
         if isinstance(symbol_id, bool) or not isinstance(symbol_id, int) or symbol_id <= 0:
             raise CanaryInputError("BBO requiere la identidad tipada del provider")
+        if event.bid == event.ask and not cls._zero_spread_metadata_allowed(
+            metadata,
+            zero_spread_authorization,
+            evidence=evidence,
+            symbol=symbol,
+            now=current,
+        ):
+            raise CanaryInputError("BBO spread cero requiere contexto DEMO tipado y metadata efectiva")
         return cls(
             symbol=symbol,
             symbol_id=symbol_id,
@@ -458,6 +562,10 @@ class ObservedBBO:
             connection_generation=str(generation),
             source_event_id=event.source_event_id or event.data_id,
             source=event.source,
+            zero_spread_authorization=zero_spread_authorization,
+            zero_spread_evidence=evidence,
+            zero_spread_observed_at=current,
+            earliest_available_at=available_at,
         )
 
     @classmethod
@@ -471,6 +579,7 @@ class ObservedBBO:
         window_start: datetime,
         window_end: datetime,
         max_age_seconds: Decimal,
+        zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
     ) -> ObservedBBO:
         if not isinstance(event, Event):
             raise CanaryInputError("BBO no proviene de Event normalizado")
@@ -484,7 +593,7 @@ class ObservedBBO:
             raise CanaryInputError("BBO de otro instrumento")
         if event.synthetic or event.is_snapshot:
             raise CanaryInputError("BBO sintético/snapshot no es elegible")
-        if event.bid is None or event.ask is None or event.bid >= event.ask:
+        if event.bid is None or event.ask is None or event.bid > event.ask:
             raise CanaryInputError("BBO incompleto o cruzado")
         if str(metadata.get("quality_state", "")).upper() != "VALID":
             raise CanaryInputError("BBO sin quality_state=VALID")
@@ -497,6 +606,7 @@ class ObservedBBO:
         start = _aware(window_start, "window_start")
         end = _aware(window_end, "window_end")
         available_at = _aware(available_at, "available_at")
+        earliest_available_at = cls._provider_earliest_available_at(metadata, event, available_at)
         if available_at < start or available_at >= end:
             raise CanaryInputError("BBO fuera de la ventana aprobada")
         age = (current - available_at).total_seconds()
@@ -504,10 +614,25 @@ class ObservedBBO:
             raise CanaryInputError("BBO tiene disponibilidad futura")
         if age > float(max_age_seconds):
             raise CanaryInputError("BBO DEMO stale")
+        earliest_age = (current - earliest_available_at).total_seconds()
+        if earliest_age < 0:
+            raise CanaryInputError("BBO tiene disponibilidad futura en una pierna")
+        if earliest_age > float(max_age_seconds):
+            raise CanaryInputError("BBO DEMO stale en la pierna más antigua")
+        if earliest_available_at < start or earliest_available_at >= end:
+            raise CanaryInputError("BBO fuera de ventana por la pierna más antigua")
         generation = metadata.get("connection_generation")
         if generation is None or str(generation) != evidence.connection_generation:
             raise CanaryInputError("BBO pertenece a otra generación")
         source_event_id = event.source_event_id or event.data_id
+        if event.bid == event.ask and not cls._zero_spread_metadata_allowed(
+            metadata,
+            zero_spread_authorization,
+            evidence=evidence,
+            symbol=symbol,
+            now=current,
+        ):
+            raise CanaryInputError("BBO spread cero requiere contexto DEMO tipado y metadata efectiva")
         observed = cls(
             symbol=symbol,
             symbol_id=symbol_id,
@@ -520,6 +645,10 @@ class ObservedBBO:
             connection_generation=str(generation),
             source_event_id=source_event_id,
             source=event.source,
+            zero_spread_authorization=zero_spread_authorization,
+            zero_spread_evidence=evidence,
+            zero_spread_observed_at=current,
+            earliest_available_at=earliest_available_at,
         )
         return observed
 
@@ -530,6 +659,7 @@ class ObservedBBO:
             DecimalValue(self.ask),
             self.event_time,
             self.available_at,
+            earliest_available_at=self.earliest_available_at,
             quality="VALID",
             source=self.source,
             base_price="bid_ask",
@@ -538,6 +668,7 @@ class ObservedBBO:
             connection_generation=self.connection_generation,
             data_mode="LIVE",
             synthetic=False,
+            zero_spread_authorization=self.zero_spread_authorization,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -548,6 +679,7 @@ class ObservedBBO:
             "ask": str(self.ask),
             "event_time": _iso(self.event_time),
             "available_at": _iso(self.available_at),
+            "earliest_available_at": _iso(self.earliest_available_at or self.available_at),
             "received_at": _iso(self.received_at) if self.received_at is not None else None,
             "sequence": self.sequence,
             "connection_generation": self.connection_generation,
@@ -556,6 +688,10 @@ class ObservedBBO:
             "quality_state": self.quality_state,
             "quote_usable": self.quote_usable,
             "synthetic": self.synthetic,
+            "zero_spread_effective": self.bid == self.ask and self.zero_spread_authorization is not None,
+            "zero_spread_authorization": (
+                self.zero_spread_authorization.to_dict() if self.zero_spread_authorization is not None else None
+            ),
         }
 
 
@@ -616,6 +752,7 @@ class CanaryInputContext:
     strategy_ready: bool = True
     missing_warmups: tuple[str, ...] = ()
     runtime_provenance: Mapping[str, Any] = field(default_factory=dict)
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.provenance, CanarySessionEvidence):
@@ -624,6 +761,8 @@ class CanaryInputContext:
             raise ValueError("contexto sin BBO/Quote tipados")
         if self.buy.direction != "BUY" or self.sell.direction != "SELL":
             raise ValueError("contexto manual requiere BUY y SELL")
+        if self.bbo.bid == self.bbo.ask and self.bbo.zero_spread_authorization != self.zero_spread_authorization:
+            raise ValueError("contexto zero-spread no coincide con el BBO observado")
         object.__setattr__(self, "runtime_snapshot", MappingProxyType(dict(self.runtime_snapshot)))
         object.__setattr__(self, "missing_warmups", tuple(str(item) for item in self.missing_warmups))
         object.__setattr__(self, "runtime_provenance", MappingProxyType(dict(self.runtime_provenance)))
@@ -682,6 +821,9 @@ class CanaryInputContext:
             "strategy_ready": self.strategy_ready,
             "missing_warmups": list(self.missing_warmups),
             "runtime_provenance": dict(self.runtime_provenance),
+            "zero_spread_authorization": (
+                self.zero_spread_authorization.to_dict() if self.zero_spread_authorization is not None else None
+            ),
             "watch": self.watch_result.to_dict(),
             "warmup": self.warmup.to_dict() if self.warmup is not None else None,
         }
@@ -899,6 +1041,7 @@ class _InputWatchRunner(CTraderWatchRunner):
         technical_only: bool = False,
         runtime_observer: RuntimeObserver | None = None,
         expected_candidate: str | None = None,
+        zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -908,6 +1051,7 @@ class _InputWatchRunner(CTraderWatchRunner):
         self.technical_only = technical_only
         self.runtime_observer = runtime_observer
         self.expected_candidate = expected_candidate
+        self.zero_spread_authorization = zero_spread_authorization
         self.latest_bbo: ObservedBBO | None = None
         self.bbo_rejections: list[str] = []
         self.technical_runtime_snapshot: Mapping[str, Any] | None = None
@@ -926,6 +1070,7 @@ class _InputWatchRunner(CTraderWatchRunner):
                     window_start=self.input_bounds.order_window_start or self.input_bounds.window_start,
                     window_end=self.input_bounds.order_window_end or self.input_bounds.window_end,
                     max_age_seconds=self.input_max_age,
+                    zero_spread_authorization=self.zero_spread_authorization,
                 )
             except (CanaryInputError, TypeError, ValueError) as exc:
                 reason = str(exc) or type(exc).__name__
@@ -1028,6 +1173,7 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
     warmup: CTraderWarmupResult | None = None,
     fetch_warmup: bool = True,
     technical_only: bool = False,
+    zero_spread_authorization: CanaryZeroSpreadAuthorization | None = None,
     minimum_execution_margin_seconds: Decimal | int | float = Decimal("300"),
     warmup_cutoff: datetime | None = None,
     market_window_state: MarketWindowObserver | None = None,
@@ -1052,7 +1198,14 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
         "isolated_state": True,
         "manual_technical": bool(technical_only),
         "strategy_ready": None,
+        "zero_spread_authorization_bound": False,
     }
+    if zero_spread_authorization is not None and not isinstance(
+        zero_spread_authorization, CanaryZeroSpreadAuthorization
+    ):
+        return _blocked("TYPED_ZERO_SPREAD_AUTHORIZATION_REQUIRED", gates=gates)
+    if zero_spread_authorization is not None and technical_only is not True:
+        return _blocked("ZERO_SPREAD_REQUIRES_TECHNICAL_CANARY", gates=gates)
     if network is not True:
         return _blocked("EXPLICIT_NETWORK_GATE_REQUIRED", gates=gates)
     if isinstance(provider, Mapping) or provider is None:
@@ -1104,6 +1257,31 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
         if not isinstance(evidence, CanarySessionEvidence):
             return _blocked("TYPED_SESSION_EVIDENCE_REQUIRED", gates=gates)
         evidence.validate_current(provider, start_now)
+        if zero_spread_authorization is not None:
+            if (
+                zero_spread_authorization.preparation_start != bounds.window_start
+                or zero_spread_authorization.window_start != bounds.order_window_start
+                or zero_spread_authorization.window_end != bounds.order_window_end
+                or not zero_spread_authorization.matches(
+                    account_id=evidence.account_id,
+                    session_id=evidence.session_id,
+                    connection_generation=evidence.connection_generation,
+                    endpoint=evidence.endpoint,
+                    symbol=instrument,
+                    now=start_now,
+                    require_order_window=False,
+                )
+            ):
+                return _blocked("ZERO_SPREAD_AUTHORIZATION_CONTEXT_MISMATCH", gates=gates)
+            setter = getattr(provider, "set_canary_zero_spread_authorization", None)
+            if not callable(setter):
+                return _blocked("ZERO_SPREAD_PROVIDER_SCOPE_UNAVAILABLE", gates=gates)
+            try:
+                setter(zero_spread_authorization)
+            except Exception as exc:
+                return _blocked(f"ZERO_SPREAD_PROVIDER_SCOPE_BLOCKED:{type(exc).__name__}", gates=gates)
+            gates["zero_spread_authorization_bound"] = True
+            gates["zero_spread_authorization"] = zero_spread_authorization.to_dict()
         gates.update(
             {
                 "session_observed": True,
@@ -1189,6 +1367,7 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
                     ),
                     clock=clock_fn,
                     monotonic=monotonic,
+                    zero_spread_authorization=zero_spread_authorization,
                 )
                 capture_now = _aware(clock_fn(), "clock")
                 if capture_now >= bounds.deadline:
@@ -1229,10 +1408,18 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
                     technical_only=technical_only,
                     runtime_observer=observer,
                     expected_candidate=_config_candidate(config),
+                    zero_spread_authorization=zero_spread_authorization,
                 )
                 try:
                     watch_result = runner.run()
+                    gates.update(
+                        {
+                            "watch_stop_reason": watch_result.stop_reason,
+                            "watch_reconciliation_state": watch_result.status.get("reconciliation_state"),
+                        }
+                    )
                 except (CTraderWatchError, RuntimeError) as exc:
+                    gates["watch_stop_reason"] = "ERROR"
                     if warmup is not None and str(getattr(config, "price_base", "")).lower() in {
                         "mid",
                         "bid",
@@ -1251,6 +1438,16 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
                             gates={**gates, "capture_now": _iso(final_now)},
                         )
                     evidence.validate_current(provider, final_now)
+                    if zero_spread_authorization is not None and not zero_spread_authorization.matches(
+                        account_id=evidence.account_id,
+                        session_id=evidence.session_id,
+                        connection_generation=evidence.connection_generation,
+                        endpoint=evidence.endpoint,
+                        symbol=instrument,
+                        now=final_now,
+                        require_order_window=False,
+                    ):
+                        return _blocked("ZERO_SPREAD_AUTHORIZATION_EXPIRED", gates=gates)
                     final_state = market_window_state(provider, bounds.window_start, bounds.window_end)
                     if str(getattr(final_state, "value", final_state)).strip().upper() != "OPEN":
                         return _blocked("MARKET_WINDOW_CLOSED_DURING_CAPTURE", gates=gates)
@@ -1375,6 +1572,7 @@ def collect_canary_inputs(  # noqa: C901 - one bounded observed-input orchestrat
                         strategy_ready,
                         missing_warmups,
                         producer_metadata,
+                        zero_spread_authorization,
                     )
                     gates.update(
                         {
