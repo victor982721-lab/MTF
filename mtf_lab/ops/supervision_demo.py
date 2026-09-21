@@ -601,6 +601,7 @@ def _observed_risk_contract_spec(provider: Any, observed_at: datetime, volume_gr
     }
     for target, value_names in (
         ("pip_size", ("pip_size", "pipSize")),
+        ("price_quantum", ("price_quantum", "priceQuantum")),
         ("unit_value", ("unit_value", "unitValue")),
         (
             "minimum_stop_distance",

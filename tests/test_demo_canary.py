@@ -161,6 +161,7 @@ class _CanonicalGatewayClient:
         self.positions: list[Any] = []
         self.order_count = 0
         self.calls: list[str] = []
+        self.filled_events: list[Any] = []
 
     def authenticated_session_evidence(self) -> AuthenticatedSession:
         return self.session
@@ -179,30 +180,44 @@ class _CanonicalGatewayClient:
         )
 
     @staticmethod
-    def _filled_event(client_id: str, *, volume: int, position_id: int, close: bool = False) -> Any:
+    def _filled_event(
+        client_id: str,
+        *,
+        volume: int,
+        position_id: int,
+        close: bool = False,
+        trade_side: int = 1,
+        execution_price: float = 1.1002,
+    ) -> Any:
         assert proto is not None
         event = proto.ProtoOAExecutionEvent(ctidTraderAccountId=5097, executionType=3)
         event.order.orderId = 7 + position_id
         event.order.clientOrderId = client_id
         event.order.orderStatus = 2
         event.order.executedVolume = volume
-        event.order.executionPrice = 1.1002
+        event.order.executionPrice = execution_price
+        event.order.tradeData.symbolId = 11
+        event.order.tradeData.volume = volume
+        event.order.tradeData.tradeSide = trade_side
+        event.order.tradeData.label = client_id
         event.deal.dealId = 8 + position_id
         event.deal.orderId = 7 + position_id
         event.deal.positionId = position_id
         event.deal.volume = volume
         event.deal.filledVolume = volume
         event.deal.executionTimestamp = int(NOW.timestamp() * 1000)
-        event.deal.executionPrice = 1.1002
-        event.deal.tradeSide = 1
+        event.deal.executionPrice = execution_price
+        event.deal.tradeSide = trade_side
         event.deal.dealStatus = 2
         event.position.positionId = position_id
         event.position.positionStatus = 2 if close else 1
-        event.position.price = 1.1002
+        event.position.price = execution_price
         event.position.tradeData.symbolId = 11
         event.position.tradeData.volume = volume
-        event.position.tradeData.tradeSide = 1
+        event.position.tradeData.tradeSide = trade_side
         event.position.tradeData.label = client_id
+        if not close:
+            event.position.tradeData.openTimestamp = int(NOW.timestamp() * 1000)
         if close:
             event.order.closingOrder = True
             event.order.ClearField("clientOrderId")
@@ -222,17 +237,52 @@ class _CanonicalGatewayClient:
         if name == "ProtoOANewOrderReq":
             self.order_count += 1
             position_id = 100 + self.order_count
-            event = self._filled_event(client_msg_id, volume=int(message.volume), position_id=position_id)
-            event.order.stopLoss = message.stopLoss
-            event.order.takeProfit = message.takeProfit
-            event.position.stopLoss = message.stopLoss
-            event.position.takeProfit = message.takeProfit
+            if int(message.orderType) == 1:
+                if message.HasField("stopLoss") or message.HasField("takeProfit"):
+                    raise AssertionError("el servidor MARKET no acepta stopLoss/takeProfit absolutos")
+                if not message.HasField("relativeStopLoss") or not message.HasField("relativeTakeProfit"):
+                    raise AssertionError("el servidor MARKET requiere protecciones relativas")
+                relative_stop_loss = int(message.relativeStopLoss)
+                relative_take_profit = int(message.relativeTakeProfit)
+                if relative_stop_loss <= 0 or relative_take_profit <= 0:
+                    raise AssertionError("el servidor MARKET requiere distancias relativas positivas")
+                trade_side = int(message.tradeSide)
+                execution_price = 1.1002 if trade_side == 1 else 1.1000
+                event = self._filled_event(
+                    client_msg_id,
+                    volume=int(message.volume),
+                    position_id=position_id,
+                    trade_side=trade_side,
+                    execution_price=execution_price,
+                )
+                # The server reports the protections as absolute prices on the
+                # filled order/position, derived from the observed fill, not
+                # from the caller's theoretical entry quote.
+                fill_price = Decimal(str(event.order.executionPrice))
+                stop_delta = Decimal(relative_stop_loss) / Decimal(100_000)
+                target_delta = Decimal(relative_take_profit) / Decimal(100_000)
+                if trade_side == 1:
+                    stop_loss = fill_price - stop_delta
+                    take_profit = fill_price + target_delta
+                else:
+                    stop_loss = fill_price + stop_delta
+                    take_profit = fill_price - target_delta
+                event.order.relativeStopLoss = relative_stop_loss
+                event.order.relativeTakeProfit = relative_take_profit
+                event.order.stopLoss = float(stop_loss)
+                event.order.takeProfit = float(take_profit)
+                event.position.stopLoss = float(stop_loss)
+                event.position.takeProfit = float(take_profit)
+            else:
+                event = self._filled_event(client_msg_id, volume=int(message.volume), position_id=position_id)
             self.positions = [event.position]
+            self.filled_events.append(event)
             return self._wire("ProtoOAExecutionEvent", event, client_msg_id)
         if name == "ProtoOAClosePositionReq":
             position_id = int(message.positionId)
             event = self._filled_event(client_msg_id, volume=int(message.volume), position_id=position_id, close=True)
             self.positions = []
+            self.filled_events.append(event)
             return self._wire("ProtoOAExecutionEvent", event, client_msg_id)
         raise AssertionError(f"gateway E2E recibió mensaje inesperado: {name}")
 
@@ -325,6 +375,7 @@ class _CanonicalEconomics:
             "expected_cost_source": "IMPLEMENTATION_HYPOTHESIS:baseline-0.1pip",
             "executable_bid": "1.1000",
             "executable_ask": "1.1002",
+            "price_quantum": "0.00001",
         }
 
 

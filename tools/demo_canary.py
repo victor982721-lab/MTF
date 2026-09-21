@@ -41,7 +41,14 @@ from mtf_lab.core.canary_quote import CanaryZeroSpreadAuthorization
 from mtf_lab.core.canonical import canonical_json
 from mtf_lab.core.numeric import decimal_context
 from mtf_lab.core.risk_exit import CanaryTrialRiskBoundary, RiskExitPolicy
-from mtf_lab.ops.ctrader_executor import CTraderDemoExecutor, OrderResult, OrderState, Quote, _as_mapping
+from mtf_lab.ops.ctrader_executor import (
+    CTraderDemoExecutor,
+    OrderResult,
+    OrderState,
+    Quote,
+    RiskLimitRejected,
+    _as_mapping,
+)
 from mtf_lab.ops.supervision_demo import (
     DemoExecutionBinding,
     _quote_from_provider,
@@ -1415,6 +1422,8 @@ def _plan_for(  # noqa: C901
         plan = binding.executor.risk_entry_plan(signal, quote, requested_quantity=quantity)
     except CanaryGateError:
         raise
+    except RiskLimitRejected as exc:
+        raise CanaryGateError(f"RiskExit plan bloqueado: {exc}") from exc
     except Exception as exc:
         raise CanaryGateError(f"RiskExit plan bloqueado: {type(exc).__name__}") from exc
     if plan is None:

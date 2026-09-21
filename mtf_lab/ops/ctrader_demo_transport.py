@@ -754,6 +754,9 @@ class CTraderDemoTransport:
     def build_new_order(self, intent: ExecutionIntent) -> Any:
         if intent.account_id != self.account_id or intent.kind != "OPEN":
             raise OfficialCorrelationError("new order requires an OPEN intent for the selected DEMO account")
+        raw_options = _validated_order_options(intent.metadata)
+        if raw_options.get("stop_loss") is not None or raw_options.get("take_profit") is not None:
+            raise OfficialMessageError("MARKET orders require relative protection; absolute SL/TP is unsupported")
         symbol_id = self.symbol_ids.get(intent.symbol.upper())
         if symbol_id is None:
             raise OfficialMessageError(f"symbol id not configured for DEMO transport: {intent.symbol}")
@@ -1619,6 +1622,10 @@ def _set_numeric_order_option(message: Any, raw: Mapping[str, Any], source: str,
     if source not in raw:
         return
     value = raw[source]
+    if target in {"relativeStopLoss", "relativeTakeProfit"}:
+        # Explicit protection must never disappear on an incompatible codec.
+        _set(message, target, _relative_protection_integer(value, source))
+        return
     if target in {"trailingStopLoss", "guaranteedStopLoss"}:
         if not isinstance(value, bool):
             raise OfficialMessageError(f"{source} must be boolean")
@@ -1634,6 +1641,18 @@ def _set_numeric_order_option(message: Any, raw: Mapping[str, Any], source: str,
         if value < 0:
             raise OfficialMessageError(f"{source} must be non-negative")
     _set_optional_field(message, target, value)
+
+
+def _relative_protection_integer(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise OfficialMessageError(f"{name} must be an integer protocol distance")
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise OfficialMessageError(f"{name} must be an integer protocol distance") from exc
+    if not parsed.is_finite() or parsed != parsed.to_integral_value() or not 0 < parsed <= (2**63 - 1):
+        raise OfficialMessageError(f"{name} must be a positive int64 protocol distance")
+    return int(parsed)
 
 
 def _set_price_order_option(message: Any, raw: Mapping[str, Any], source: str, target: str) -> None:

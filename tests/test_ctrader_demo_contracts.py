@@ -492,7 +492,9 @@ class CTraderDemoContractTests(unittest.TestCase):
                 "instrument": "EUR/USD",
                 "direction": "UP",
                 "mode": "DEMO",
-                "order_options": {"stop_loss": "1.09", "take_profit": "1.12"},
+                # MARKET requests use relative protocol distances; this test
+                # still models a server fill that omits requested protection.
+                "order_options": {"relative_stop_loss": 1100, "relative_take_profit": 1900},
             },
             Quote(
                 "EUR/USD",

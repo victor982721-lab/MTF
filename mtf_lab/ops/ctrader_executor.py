@@ -51,6 +51,7 @@ from ..core.risk_exit import (
     plan_entry,
 )
 from ..core.risk_exit import serialize as serialize_risk_exit
+from .ctrader_protection import MarketProtection, MarketProtectionError, project_market_protection
 
 # ---------------------------------------------------------------------------
 # Errors and normalized records
@@ -2962,7 +2963,7 @@ class CTraderDemoExecutor:
         if mode is None:
             mode = "DEMO_GATED"
         try:
-            return plan_entry(
+            plan = plan_entry(
                 policy,
                 direction=data.get("side", data.get("direction")),
                 entry_price=quote_obj.price_for(Side.parse(data.get("side", data.get("direction")))),
@@ -2979,8 +2980,37 @@ class CTraderDemoExecutor:
                 executable_ask=quote_obj.ask,
                 canary_trial=self._canary_trial,
             )
+            return self._validated_execution_entry_plan(plan, quote_obj)
         except ValueError as exc:
             raise RiskLimitRejected(f"RiskExit entry evidence is invalid: {exc}") from exc
+
+    def _validated_execution_entry_plan(self, plan: EntryPlan, quote: Quote) -> EntryPlan:
+        if plan.allowed and not self._fixture_mode:
+            # Validate the actual wire representation during preflight,
+            # before the canary reserves approval or journals an intent.
+            projection = self._market_protection_for_plan(plan, quote)
+            _validate_relative_options(dict(projection.to_order_options()), self.policy)
+        return plan
+
+    def _market_protection_for_plan(self, plan: EntryPlan, quote: Quote) -> MarketProtection:
+        contract = self._risk_contract_spec_for_entry(quote)
+        if not isinstance(contract, Mapping):
+            raise RiskLimitRejected("MARKET protection requires an observed contract")
+        if plan.entry_price != quote.price_for(Side.parse(plan.direction)):
+            raise RiskLimitRejected("MARKET protection entry does not match the executable quote side")
+        try:
+            return project_market_protection(
+                direction=plan.direction,
+                entry_price=plan.entry_price,
+                stop_loss=plan.initial_stop,
+                take_profit=plan.take_profit,
+                price_quantum=contract.get("price_quantum"),
+                executable_bid=quote.bid,
+                executable_ask=quote.ask,
+                minimum_stop_distance=contract.get("minimum_stop_distance", contract.get("min_stop_distance")),
+            )
+        except MarketProtectionError as exc:
+            raise RiskLimitRejected(f"MARKET protection cannot preserve the RiskExit envelope: {exc}") from exc
 
     @staticmethod
     def _risk_exit_order_options(options: Mapping[str, Any], plan: EntryPlan) -> dict[str, Any]:
@@ -3626,7 +3656,17 @@ class CTraderDemoExecutor:
         metadata["entry_trigger_start"] = runtime.get("latest_trigger_start")
         metadata["entry_trigger_end"] = runtime.get("latest_trigger_end")
         metadata["entry_trigger_available_at"] = runtime.get("latest_trigger_available_at")
-        metadata["order_options"] = self._risk_exit_order_options(options, risk_plan)
+        order_options = self._risk_exit_order_options(options, risk_plan)
+        if not self._fixture_mode:
+            protection = self._market_protection_for_plan(risk_plan, quote)
+            # Keep the immutable theoretical ATR levels in risk_exit_plan;
+            # MARKET opens must encode relative integer distances instead.
+            order_options.pop("stop_loss", None)
+            order_options.pop("take_profit", None)
+            order_options.update(protection.to_order_options())
+            _validate_relative_options(order_options, self.policy)
+            metadata["market_protection"] = protection.to_dict()
+        metadata["order_options"] = order_options
         return metadata
 
     def _make_intent(

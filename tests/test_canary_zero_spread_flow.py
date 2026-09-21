@@ -89,11 +89,28 @@ class _AccountGatewayClient(_CanonicalGatewayClient):
             connection_generation=int(self.session.connection_generation),
         )
 
-    def _filled_event(self, client_id: str, *, volume: int, position_id: int, close: bool = False) -> object:
-        event = super()._filled_event(client_id, volume=volume, position_id=position_id, close=close)
+    def _filled_event(
+        self,
+        client_id: str,
+        *,
+        volume: int,
+        position_id: int,
+        close: bool = False,
+        trade_side: int = 1,
+        execution_price: float = 1.1002,
+    ) -> object:
+        event = super()._filled_event(
+            client_id,
+            volume=volume,
+            position_id=position_id,
+            close=close,
+            trade_side=trade_side,
+            execution_price=execution_price,
+        )
         event.position.usedMargin = 0
         event.position.moneyDigits = 2
-        event.position.tradeData.openTimestamp = int(self.session.authenticated_at.timestamp() * 1000)
+        if not close:
+            event.position.tradeData.openTimestamp = int(self.session.authenticated_at.timestamp() * 1000)
         event.order.executionPrice = 1.1
         event.deal.executionPrice = 1.1
         event.position.price = 1.1
@@ -421,13 +438,44 @@ class CanaryZeroSpreadFlowTests(unittest.TestCase):
                     for request in provider.client.open_requests:
                         self.assertEqual(request.volume, 100_000)
                         self.assertTrue(request.clientOrderId)
-                        if request.tradeSide == 1:
-                            self.assertLess(request.stopLoss, 1.1)
-                            self.assertGreater(request.takeProfit, 1.1)
-                        else:
-                            self.assertGreater(request.stopLoss, 1.1)
-                            self.assertLess(request.takeProfit, 1.1)
+                        self.assertFalse(request.HasField("stopLoss"))
+                        self.assertFalse(request.HasField("takeProfit"))
+                        self.assertTrue(request.HasField("relativeStopLoss"))
+                        self.assertTrue(request.HasField("relativeTakeProfit"))
+                        self.assertGreater(request.relativeStopLoss, 0)
+                        self.assertGreater(request.relativeTakeProfit, 0)
                     self.assertEqual(len({request.clientOrderId for request in provider.client.open_requests}), 2)
+                    self.assertEqual([request.volume for request in provider.client.open_requests], [100_000, 100_000])
+                    self.assertEqual(
+                        [
+                            (request.relativeStopLoss, request.relativeTakeProfit)
+                            for request in provider.client.open_requests
+                        ],
+                        [
+                            (
+                                provider.client.open_requests[0].relativeStopLoss,
+                                provider.client.open_requests[0].relativeTakeProfit,
+                            )
+                        ]
+                        * 2,
+                    )
+                    open_events = [event for event in provider.client.filled_events if not event.order.closingOrder]
+                    self.assertEqual(len(open_events), 2)
+                    self.assertEqual([event.deal.tradeSide for event in open_events], [1, 2])
+                    events_by_client_id = {event.order.clientOrderId: event for event in open_events}
+                    for request in provider.client.open_requests:
+                        event = events_by_client_id[request.clientOrderId]
+                        fill_price = Decimal(str(event.order.executionPrice))
+                        stop_delta = Decimal(request.relativeStopLoss) / Decimal(100_000)
+                        target_delta = Decimal(request.relativeTakeProfit) / Decimal(100_000)
+                        if event.deal.tradeSide == 1:
+                            self.assertEqual(Decimal(str(event.order.stopLoss)), fill_price - stop_delta)
+                            self.assertEqual(Decimal(str(event.order.takeProfit)), fill_price + target_delta)
+                        else:
+                            self.assertEqual(Decimal(str(event.order.stopLoss)), fill_price + stop_delta)
+                            self.assertEqual(Decimal(str(event.order.takeProfit)), fill_price - target_delta)
+                        self.assertEqual(event.position.stopLoss, event.order.stopLoss)
+                        self.assertEqual(event.position.takeProfit, event.order.takeProfit)
                     self.assertEqual(len(provider.client.positions), 0)
                     self.assertIs(binding.executor.canary_zero_spread_authorization, authorization)
                     self.assertFalse(binding.risk_observer.last_observation.complete)
