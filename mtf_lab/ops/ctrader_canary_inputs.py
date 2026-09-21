@@ -22,7 +22,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import tempfile
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -1134,6 +1134,22 @@ class _InputWatchRunner(CTraderWatchRunner):
         except (CanaryInputError, TypeError, ValueError):
             return record
         return effective
+
+    def _scoped_zero_spread_normalization(
+        self,
+        records: Iterable[Event | Bar],
+        issues: Iterable[Any],
+        raw_synthetic: bool,
+    ) -> bool:
+        # The source issue gate runs before _process_record. Apply the same
+        # observed complete-book proof here, not a separate partial/zero waiver.
+        # The parent still requires the typed authorization and only CROSSED
+        # source diagnostics; all other issues remain blocking.
+        return super()._scoped_zero_spread_normalization(
+            (self._complete_technical_book_event(record, raw_synthetic) for record in records),
+            issues,
+            raw_synthetic,
+        )
 
     def _process_record(self, record: Event | Bar, raw_synthetic: bool) -> bool:
         record = self._complete_technical_book_event(record, raw_synthetic)
