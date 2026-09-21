@@ -37,8 +37,9 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from mtf_lab.configuration import ConfigError, EffectiveConfig, load_config
+from mtf_lab.core.canonical import canonical_json
 from mtf_lab.core.numeric import decimal_context
-from mtf_lab.core.risk_exit import RiskExitPolicy
+from mtf_lab.core.risk_exit import CanaryTrialRiskBoundary, RiskExitPolicy
 from mtf_lab.ops.ctrader_executor import CTraderDemoExecutor, OrderResult, OrderState, Quote, _as_mapping
 from mtf_lab.ops.supervision_demo import (
     DemoExecutionBinding,
@@ -97,6 +98,8 @@ class CanaryApproval:
     exit_slippage_pips: Decimal | None = None
     exit_slippage_approved: bool = False
     exit_slippage_approval_source: str | None = None
+    canary_trial_anchor_authorized: bool = False
+    canary_trial_anchor_authorization_source: str | None = None
 
     def __post_init__(self) -> None:  # noqa: C901
         approval_id = str(self.approval_id).strip()
@@ -141,6 +144,13 @@ class CanaryApproval:
             slippage != Decimal("0.1") or not str(self.exit_slippage_approval_source or "").strip()
         ):
             raise ValueError("exit_slippage aprobado requiere 0.1 pip y procedencia")
+        if not isinstance(self.canary_trial_anchor_authorized, bool):
+            raise ValueError("canary_trial_anchor_authorized debe ser booleano")
+        trial_source = str(self.canary_trial_anchor_authorization_source or "").strip() or None
+        if self.canary_trial_anchor_authorized and not trial_source:
+            raise ValueError("canary_trial_anchor_authorized requiere fuente humana")
+        if not self.canary_trial_anchor_authorized and trial_source is not None:
+            raise ValueError("fuente de canary_trial_anchor requiere autorización explícita")
         object.__setattr__(self, "approval_id", approval_id)
         object.__setattr__(self, "account_id", account)
         object.__setattr__(self, "symbol", symbol)
@@ -156,6 +166,7 @@ class CanaryApproval:
         object.__setattr__(
             self, "exit_slippage_approval_source", str(self.exit_slippage_approval_source or "").strip() or None
         )
+        object.__setattr__(self, "canary_trial_anchor_authorization_source", trial_source)
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> CanaryApproval:
@@ -185,13 +196,23 @@ class CanaryApproval:
                 max_risk_fraction=Decimal(
                     str(pick("max_risk_fraction", "risk_fraction", "max_planned_risk_fraction_per_cycle"))
                 ),
-                max_trial_loss_fraction=Decimal(
-                    str(
-                        pick(
-                            "max_trial_loss_fraction",
-                            "stop_trial_loss_fraction",
-                            "trial_loss_fraction",
-                            "loss_budget_fraction",
+                max_trial_loss_fraction=(
+                    Decimal("0.001")
+                    if pick(
+                        "max_trial_loss_fraction",
+                        "stop_trial_loss_fraction",
+                        "trial_loss_fraction",
+                        "loss_budget_fraction",
+                    )
+                    is None
+                    else Decimal(
+                        str(
+                            pick(
+                                "max_trial_loss_fraction",
+                                "stop_trial_loss_fraction",
+                                "trial_loss_fraction",
+                                "loss_budget_fraction",
+                            )
                         )
                     )
                 ),
@@ -207,6 +228,13 @@ class CanaryApproval:
                 ),
                 exit_slippage_approved=pick("exit_slippage_approved", "slippage_approved") is True,
                 exit_slippage_approval_source=pick("exit_slippage_approval_source", "slippage_approval_source"),
+                canary_trial_anchor_authorized=pick("canary_trial_anchor_authorized") is True,
+                canary_trial_anchor_authorization_source=pick(
+                    "canary_trial_anchor_authorization_source",
+                    "canary_trial_anchor_authorized_by",
+                    "trial_anchor_authorization_source",
+                    "human_authorization_source",
+                ),
             )
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise CanaryGateError("approval privada con esquema inválido") from exc
@@ -219,6 +247,50 @@ def load_approval_file(path: str | Path) -> CanaryApproval:
 
     value = _json_file(Path(path).expanduser(), label="aprobación DEMO")
     return CanaryApproval.from_mapping(value)
+
+
+def _approval_document_digest(approval: CanaryApproval) -> str:
+    """Fingerprint the normalized approval document, not only its ID."""
+
+    return hashlib.sha256(canonical_json(approval).encode("utf-8")).hexdigest()
+
+
+def _trial_ledger_context(
+    approval: CanaryApproval,
+    binding: Any,
+    *,
+    trial_equity: Decimal,
+    trial_loss_budget: Decimal,
+    trial_cashflow_total: Decimal | None,
+) -> dict[str, Any]:
+    observation = getattr(binding, "observation", None)
+    if observation is None:
+        raise CanaryGateError("trial ledger requiere observación server")
+    account_id = str(getattr(observation, "account_id", "")).strip()
+    session_id = str(getattr(observation, "session_id", "") or "").strip()
+    generation = str(getattr(observation, "connection_generation", "") or "").strip()
+    endpoint = str(getattr(observation, "endpoint", "") or "").strip().lower()
+    if not account_id or not session_id or not generation or not endpoint:
+        raise CanaryGateError("trial ledger requiere account/session/generation/endpoint")
+    if account_id != approval.account_id:
+        raise CanaryGateError("trial ledger account_id no coincide con approval")
+    if approval.canary_trial_anchor_authorized is True and trial_cashflow_total is None:
+        raise CanaryGateError("trial ledger requiere cashflow_total observado")
+    return {
+        "approval_digest": _approval_document_digest(approval),
+        "canary_trial_anchor_authorized": approval.canary_trial_anchor_authorized,
+        "canary_trial_anchor_authorization_source": approval.canary_trial_anchor_authorization_source,
+        "account_id": account_id,
+        "session_id": session_id,
+        "connection_generation": generation,
+        "endpoint": endpoint,
+        "window_start": approval.window_start.isoformat(),
+        "window_end": approval.window_end.isoformat(),
+        "trial_equity": str(trial_equity),
+        "trial_cashflow_total": None if trial_cashflow_total is None else str(trial_cashflow_total),
+        "trial_loss_fraction": str(approval.max_trial_loss_fraction),
+        "trial_loss_budget": str(trial_loss_budget),
+    }
 
 
 class _ApprovalLedger:
@@ -279,18 +351,54 @@ class _ApprovalLedger:
     def _digest(approval_id: str) -> str:
         return hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
 
-    def reserve(self, approval: CanaryApproval, *, trial_equity: Decimal, trial_loss_budget: Decimal) -> str:
+    @staticmethod
+    def _validate_context_record(record: Mapping[str, Any], context: Mapping[str, Any]) -> None:
+        keys = (
+            "approval_digest",
+            "canary_trial_anchor_authorized",
+            "canary_trial_anchor_authorization_source",
+            "account_id",
+            "session_id",
+            "connection_generation",
+            "endpoint",
+            "window_start",
+            "window_end",
+            "trial_equity",
+            "trial_cashflow_total",
+            "trial_loss_fraction",
+            "trial_loss_budget",
+        )
+        for key in keys:
+            expected = context.get(key)
+            if key not in record or record.get(key) != expected:
+                raise CanaryGateError(f"trial ledger context mismatch: {key}")
+
+    def reserve(
+        self,
+        approval: CanaryApproval,
+        *,
+        trial_equity: Decimal,
+        trial_loss_budget: Decimal,
+        context: Mapping[str, Any],
+    ) -> str:
         raw = self._read()
         digest = self._digest(approval.approval_id)
         if digest in raw["approvals"]:
             raise CanaryGateError("approval DEMO ya consumida o quedó en estado incierto")
+        if context.get("approval_digest") != _approval_document_digest(approval):
+            raise CanaryGateError("trial ledger approval_digest no coincide con approval")
+        if context.get("trial_equity") != str(trial_equity) or context.get("trial_loss_budget") != str(
+            trial_loss_budget
+        ):
+            raise CanaryGateError("trial ledger equity/budget no coincide con la reserva")
         run_id = uuid.uuid4().hex
         raw["approvals"][digest] = {
             "state": "STARTED",
             "run_id": run_id,
             "mutation_budget": approval.max_mutation_messages,
-            "trial_equity": str(trial_equity),
-            "trial_loss_budget": str(trial_loss_budget),
+            "canary_trial_anchor_authorized": approval.canary_trial_anchor_authorized,
+            "canary_trial_anchor_authorization_source": approval.canary_trial_anchor_authorization_source,
+            **dict(context),
             "trial_loss_committed": "0",
             "trial_loss_observed": None,
             "mutation_history": [],
@@ -298,13 +406,14 @@ class _ApprovalLedger:
         self._write(raw)
         return digest
 
-    def update_trial(
+    def update_trial(  # noqa: C901
         self,
         digest: str,
         *,
         mutation_messages: int,
         trial_loss_committed: Decimal,
         trial_loss_observed: Decimal | None = None,
+        context: Mapping[str, Any],
         operation: str | None = None,
         status: str = "PENDING",
         error: str | None = None,
@@ -313,15 +422,31 @@ class _ApprovalLedger:
         record = raw["approvals"].get(digest)
         if not isinstance(record, dict) or record.get("state") != "STARTED":
             raise CanaryGateError("reserva de approval no está STARTED")
+        self._validate_context_record(record, context)
         prior_mutations = int(record.get("mutation_messages", 0) or 0)
         record["mutation_messages"] = max(prior_mutations, int(mutation_messages))
         try:
             prior_loss = Decimal(str(record.get("trial_loss_committed", "0")))
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise CanaryGateError("trial_loss_committed corrupto") from exc
-        record["trial_loss_committed"] = str(max(prior_loss, trial_loss_committed))
+        try:
+            incoming_loss = Decimal(str(trial_loss_committed))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise CanaryGateError("trial_loss_committed inválido") from exc
+        if not incoming_loss.is_finite() or incoming_loss < 0:
+            raise CanaryGateError("trial_loss_committed inválido")
+        observed_prior_raw = record.get("trial_loss_observed")
+        try:
+            observed_prior = Decimal(str(observed_prior_raw)) if observed_prior_raw is not None else Decimal("0")
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise CanaryGateError("trial_loss_observed corrupto") from exc
+        observed_current = observed_prior if trial_loss_observed is None else Decimal(str(trial_loss_observed))
+        if not observed_current.is_finite() or observed_current < 0:
+            raise CanaryGateError("trial_loss_observed inválido")
+        committed = max(prior_loss, incoming_loss, observed_current)
+        record["trial_loss_committed"] = str(committed)
         if trial_loss_observed is not None:
-            record["trial_loss_observed"] = str(trial_loss_observed)
+            record["trial_loss_observed"] = str(max(observed_prior, Decimal(str(trial_loss_observed))))
         history = record.setdefault("mutation_history", [])
         if not isinstance(history, list):
             raise CanaryGateError("mutation_history corrupto")
@@ -341,11 +466,20 @@ class _ApprovalLedger:
                 )
         self._write(raw)
 
-    def finish(self, digest: str, *, state: str, mutation_messages: int, error: str | None = None) -> None:
+    def finish(
+        self,
+        digest: str,
+        *,
+        state: str,
+        mutation_messages: int,
+        context: Mapping[str, Any],
+        error: str | None = None,
+    ) -> None:
         raw = self._read()
         record = raw["approvals"].get(digest)
         if not isinstance(record, dict):
             raise CanaryGateError("reserva de approval desapareció")
+        self._validate_context_record(record, context)
         record["state"] = str(state)
         prior_mutations = int(record.get("mutation_messages", 0) or 0)
         record["mutation_messages"] = max(prior_mutations, int(mutation_messages))
@@ -473,6 +607,7 @@ class PreparedCanarySession:
     binding: DemoExecutionBinding | None
     preparation: Any
     writer_store: SupervisorStateStore
+    defer_activation: bool = False
 
     def close(self) -> None:
         if self.binding is not None:
@@ -496,6 +631,7 @@ class PreparedCanarySession:
             resume=True,
             canary_economics=canary_economics,
             account_key=None,
+            defer_activation=self.defer_activation,
         )
 
     def arm(self, canary_economics: CanaryEconomicsProjection) -> None:
@@ -798,6 +934,15 @@ def validate_static_config(  # noqa: C901
         if configured_holding != approval.max_holding_seconds:
             raise CanaryGateError("max_holding_seconds no coincide con la ventana aprobada", gates=gates)
     gates.update({"risk_exit_policy": True, "risk_calendar": True, "candidate": candidate})
+    if approval is not None:
+        gates.update(
+            {
+                "canary_trial_anchor_authorized": approval.canary_trial_anchor_authorized is True,
+                "canary_trial_anchor_authorization_source": bool(
+                    str(approval.canary_trial_anchor_authorization_source or "").strip()
+                ),
+            }
+        )
     return gates
 
 
@@ -847,6 +992,16 @@ def _risk_exit_metrics(risk: Mapping[str, Any]) -> Mapping[str, Any]:
     return metrics if isinstance(metrics, Mapping) else {}
 
 
+def _daily_anchor_ready(risk: Mapping[str, Any]) -> bool:
+    metrics = _risk_exit_metrics(risk)
+    return bool(
+        metrics.get("daily_anchor_verified") is True
+        and str(metrics.get("daily_loss_state", "")).upper() == "READY"
+        and metrics.get("daily_anchor_equity") is not None
+        and metrics.get("cashflows_complete") is True
+    )
+
+
 def _trial_cashflow_total(risk: Mapping[str, Any], *, required: bool) -> Decimal | None:
     """Read the current observed net-cashflow total without resetting daily anchors."""
 
@@ -885,6 +1040,44 @@ def _observed_trial_loss(
     # be reset while the observed cashflow delta is still accounted for.
     with decimal_context():
         return max(Decimal("0"), anchor_equity - equity + (current_cashflow - anchor_cashflow_total))
+
+
+def _canary_trial_boundary(
+    approval: CanaryApproval,
+    binding: Any,
+    *,
+    approval_digest: str,
+    trial_equity: Decimal,
+    trial_cashflow_total: Decimal,
+    trial_loss_budget: Decimal,
+) -> CanaryTrialRiskBoundary:
+    """Bind the trial budget to approval, ledger reservation and session proof."""
+
+    if approval.canary_trial_anchor_authorized is not True:
+        raise CanaryGateError("canary trial anchor requiere autorización humana explícita")
+    observation = getattr(binding, "observation", None)
+    if observation is None:
+        raise CanaryGateError("canary trial boundary carece de observación server")
+    session_id = str(getattr(observation, "session_id", "") or "").strip()
+    generation = str(getattr(observation, "connection_generation", "") or "").strip()
+    if not session_id or not generation:
+        raise CanaryGateError("canary trial boundary carece de session_id/generation")
+    try:
+        return CanaryTrialRiskBoundary(
+            approval_digest=approval_digest,
+            authorization_source=str(approval.canary_trial_anchor_authorization_source or ""),
+            account_id=str(getattr(observation, "account_id", approval.account_id)),
+            session_id=session_id,
+            connection_generation=generation,
+            window_start=approval.window_start,
+            window_end=approval.window_end,
+            trial_equity=trial_equity,
+            trial_cashflow_total=trial_cashflow_total,
+            trial_loss_fraction=approval.max_trial_loss_fraction,
+            trial_loss_budget=trial_loss_budget,
+        )
+    except (TypeError, ValueError) as exc:
+        raise CanaryGateError("canary trial boundary inválido") from exc
 
 
 def _risk_metrics_from_risk(risk: Mapping[str, Any]) -> tuple[Mapping[str, Any], Decimal]:
@@ -1145,7 +1338,6 @@ def prepare_cli_session(
     from mtf_lab.ops.supervision import SupervisorStateStore, _network_account_key
     from mtf_lab.ops.supervision_composition import prepare_network_supervision
 
-    del execution
     # Network read-only and execute paths both need the DEMO/trading query
     # profile.  ``defer_binding`` is the separate gate that keeps the
     # read-only path from constructing or activating the executor/journal.
@@ -1174,7 +1366,15 @@ def prepare_cli_session(
         raise CanaryGateError("preparación DEMO no devolvió provider/config/provenance completos")
     account_key = _network_account_key(provenance, config, "fixture", provider)
     store = SupervisorStateStore(Path(state_dir).expanduser(), account_key)
-    return PreparedCanarySession(provider, config, provenance, binding, prepared, store)
+    return PreparedCanarySession(
+        provider,
+        config,
+        provenance,
+        binding,
+        prepared,
+        store,
+        defer_activation=bool(execution),
+    )
 
 
 def _cycle(  # noqa: C901
@@ -1358,8 +1558,25 @@ def run_demo_canary(  # noqa: C901
                     account_key=account_key,
                     proto=proto,
                     clock=clock_fn,
+                    defer_activation=bool(execute),
                 )
             _validate_binding_identity(binding, provider, provenance, config, approval)
+            if execute and approval.canary_trial_anchor_authorized is True:
+                from mtf_lab.ops.supervision_demo import update_executor_from_canary_observation
+
+                canary_observer = getattr(binding, "risk_observer", None)
+                if not callable(getattr(canary_observer, "observe", None)):
+                    raise CanaryGateError("canary trial autorizado requiere observer.observe() y account_complete")
+                if risk_refresh is None:
+
+                    def canary_risk_refresh(executor: Any) -> Mapping[str, Any]:
+                        return update_executor_from_canary_observation(
+                            canary_observer,
+                            executor,
+                            expected_observation=getattr(binding, "observation", None),
+                        )
+
+                    risk_refresh = canary_risk_refresh
             _check_window(approval, clock_fn())
             _check_market_window(provider, approval, clock_fn(), market_window_state)
             _check_positions(binding.executor, empty=True)
@@ -1377,6 +1594,11 @@ def run_demo_canary(  # noqa: C901
             if binding.executor.policy.max_quantity < quantity:
                 raise CanaryGateError("max_quantity configurado es menor que minVolume observado")
             initial_risk, trial_equity = _risk_metrics(binding.executor)
+            if not _daily_anchor_ready(initial_risk) and approval.canary_trial_anchor_authorized is not True:
+                raise CanaryGateError(
+                    "daily anchor UNKNOWN requiere autorización explícita del trial anchor",
+                    gates={"daily_complete": False, "trial_anchor_authorized": False},
+                )
             require_trial_observation = bool(execute and getattr(binding, "risk_observer", None) is not None)
             trial_cashflow_anchor = _trial_cashflow_total(initial_risk, required=require_trial_observation)
             trial_loss_budget = trial_equity * approval.max_trial_loss_fraction
@@ -1385,13 +1607,82 @@ def run_demo_canary(  # noqa: C901
             trial_loss_committed = Decimal("0")
             ledger = _ApprovalLedger(writer_store.root) if execute else None
             reservation: str | None = None
+            ledger_context = (
+                _trial_ledger_context(
+                    approval,
+                    binding,
+                    trial_equity=trial_equity,
+                    trial_loss_budget=trial_loss_budget,
+                    trial_cashflow_total=trial_cashflow_anchor,
+                )
+                if execute
+                else None
+            )
+
+            def publish_trial_loss(
+                *,
+                mutation_messages: int,
+                committed: Decimal,
+                observed: Decimal | None = None,
+                operation: str | None = None,
+                status: str = "PENDING",
+                error: str | None = None,
+            ) -> None:
+                if ledger is None or reservation is None or ledger_context is None:
+                    return
+                ledger.update_trial(
+                    reservation,
+                    mutation_messages=mutation_messages,
+                    trial_loss_committed=committed,
+                    trial_loss_observed=observed,
+                    context=ledger_context,
+                    operation=operation,
+                    status=status,
+                    error=error,
+                )
+                if approval.canary_trial_anchor_authorized is True:
+                    updater = getattr(binding.executor, "update_canary_trial_loss", None)
+                    if not callable(updater):
+                        raise CanaryGateError("executor no expone actualización monotónica del trial")
+                    updater(
+                        committed=committed,
+                        observed=observed,
+                        expected_digest=str(ledger_context["approval_digest"]),
+                    )
+
             try:
                 if ledger is not None:
+                    assert ledger_context is not None
                     reservation = ledger.reserve(
                         approval,
                         trial_equity=trial_equity,
                         trial_loss_budget=trial_loss_budget,
+                        context=ledger_context,
                     )
+                if execute:
+                    if reservation is None or ledger is None or ledger_context is None:
+                        raise CanaryGateError("canary execute requiere reserva durable de aprobación")
+                    if approval.canary_trial_anchor_authorized is True:
+                        if trial_cashflow_anchor is None:
+                            raise CanaryGateError("canary trial requiere cashflow_total observado")
+                        setter = getattr(binding.executor, "set_canary_trial_risk", None)
+                        if not callable(setter):
+                            raise CanaryGateError("executor no expone canary trial risk boundary")
+                        setter(
+                            _canary_trial_boundary(
+                                approval,
+                                binding,
+                                approval_digest=str(ledger_context["approval_digest"]),
+                                trial_equity=trial_equity,
+                                trial_cashflow_total=trial_cashflow_anchor,
+                                trial_loss_budget=trial_loss_budget,
+                            )
+                        )
+                    if not bool(getattr(binding.executor, "active", False)):
+                        activate = getattr(binding.executor, "activate", None)
+                        if not callable(activate):
+                            raise CanaryGateError("canary execute requiere executor.activate()")
+                        activate()
                 cycles_input = (
                     ("BUY", buy_signal, inputs.buy_runtime),
                     ("SELL", sell_signal, inputs.sell_runtime),
@@ -1414,6 +1705,14 @@ def run_demo_canary(  # noqa: C901
                     if observed_trial_loss is not None:
                         trial_loss_committed = max(trial_loss_committed, observed_trial_loss)
                         if trial_loss_committed >= trial_loss_budget:
+                            if reservation is not None and ledger is not None:
+                                publish_trial_loss(
+                                    mutation_messages=mutation_count,
+                                    committed=trial_loss_committed,
+                                    observed=observed_trial_loss,
+                                    operation="TRIAL_BUDGET",
+                                    status="BREACHED",
+                                )
                             raise CanaryGateError("trial loss observado alcanzó 0.001 de equity")
                     _check_window(approval, clock_fn())
                     _check_market_window(provider, approval, clock_fn(), market_window_state)
@@ -1444,10 +1743,9 @@ def run_demo_canary(  # noqa: C901
                     if trial_loss_committed > trial_loss_budget:
                         raise CanaryGateError("trial loss budget de 0.001 de equity excedido")
                     if reservation is not None and ledger is not None:
-                        ledger.update_trial(
-                            reservation,
+                        publish_trial_loss(
                             mutation_messages=mutation_count,
-                            trial_loss_committed=trial_loss_committed,
+                            committed=trial_loss_committed,
                         )
 
                     def announce(
@@ -1459,10 +1757,9 @@ def run_demo_canary(  # noqa: C901
                         base_loss: Decimal = trial_loss_committed,
                     ) -> None:
                         if reservation is not None and ledger is not None:
-                            ledger.update_trial(
-                                reservation,
+                            publish_trial_loss(
                                 mutation_messages=base_mutations + sequence,
-                                trial_loss_committed=base_loss,
+                                committed=base_loss,
                                 operation=operation,
                                 status=status,
                                 error=error,
@@ -1525,11 +1822,10 @@ def run_demo_canary(  # noqa: C901
                                 "positions_closed": True,
                             }
                             if reservation is not None and ledger is not None:
-                                ledger.update_trial(
-                                    reservation,
+                                publish_trial_loss(
                                     mutation_messages=mutation_count,
-                                    trial_loss_committed=trial_loss_committed,
-                                    trial_loss_observed=final_trial_loss,
+                                    committed=trial_loss_committed,
+                                    observed=final_trial_loss,
                                     operation="TRIAL_BUDGET",
                                     status="BREACHED",
                                 )
@@ -1539,15 +1835,21 @@ def run_demo_canary(  # noqa: C901
                                 mutation_messages=mutation_count,
                             )
                     if reservation is not None and ledger is not None:
-                        ledger.update_trial(
-                            reservation,
+                        publish_trial_loss(
                             mutation_messages=mutation_count,
-                            trial_loss_committed=trial_loss_committed,
-                            trial_loss_observed=final_trial_loss,
+                            committed=trial_loss_committed,
+                            observed=final_trial_loss,
                         )
                     cycles.append(cycle)
                 if reservation is not None and ledger is not None:
-                    ledger.finish(reservation, state="COMPLETED", mutation_messages=mutation_count)
+                    if ledger_context is None:
+                        raise CanaryGateError("reserva de canaria sin contexto durable")
+                    ledger.finish(
+                        reservation,
+                        state="COMPLETED",
+                        mutation_messages=mutation_count,
+                        context=ledger_context,
+                    )
                 if not execute:
                     binding.executor.deactivate("preflight_only")
                     return CanaryResult(True, "PREFLIGHT_OK", "preflight", {"quantity": str(quantity)}, tuple(cycles))
@@ -1565,6 +1867,8 @@ def run_demo_canary(  # noqa: C901
                     mutation_count = max(mutation_count, exc.mutation_messages)
                 if reservation is not None and ledger is not None:
                     with contextlib.suppress(Exception):
+                        if ledger_context is None:
+                            raise CanaryGateError("reserva de canaria sin contexto durable") from exc
                         ledger_state = (
                             "RISK_BUDGET_BREACHED"
                             if isinstance(exc, CanaryGateError) and exc.gates.get("state") == "RISK_BUDGET_BREACHED"
@@ -1574,6 +1878,7 @@ def run_demo_canary(  # noqa: C901
                             reservation,
                             state=ledger_state,
                             mutation_messages=mutation_count,
+                            context=ledger_context,
                             error=str(exc),
                         )
                 raise
@@ -1730,7 +2035,10 @@ def network_cli_preflight(  # noqa: C901
             from mtf_lab.ops.ctrader_canary_economics import ExitSlippageHypothesis, observe_canary_economics
             from mtf_lab.ops.ctrader_canary_inputs import CanarySessionEvidence, collect_canary_inputs
             from mtf_lab.ops.market_schedule import observed_market_window_state
-            from mtf_lab.ops.supervision_demo import _journal_path
+            from mtf_lab.ops.supervision_demo import (
+                ensure_demo_journal_parent,
+                update_executor_from_canary_observation,
+            )
 
             def economics_window_start() -> datetime:
                 return approved.window_start if datetime.now(UTC) >= approved.window_start else preparation_start
@@ -1754,22 +2062,24 @@ def network_cli_preflight(  # noqa: C901
                     "orders_attempted": False,
                 }
 
-            journal_path = _journal_path(
-                state_dir,
-                approved.account_id,
-                str(session.provenance.get("endpoint", "demo.ctraderapi.com:5035")),
-                account_key=None,
-            )
-            risk_state_path = journal_path.with_suffix(".risk.json")
-            journal_empty = not journal_path.exists() or journal_path.stat().st_size == 0
-            allow_new_baseline = journal_empty and not risk_state_path.exists()
-            observer = AccountRiskObserver(
-                session.provider,
-                state_path=risk_state_path,
-                journal_path=journal_path,
-                allow_new_baseline=allow_new_baseline,
-                require_cashflows=True,
-            )
+            endpoint = str(session.provenance.get("endpoint", "demo.ctraderapi.com:5035"))
+            with session.writer_store.lock():
+                journal_path = ensure_demo_journal_parent(
+                    state_dir,
+                    approved.account_id,
+                    endpoint,
+                    account_key=None,
+                )
+                risk_state_path = journal_path.with_suffix(".risk.json")
+                journal_empty = not journal_path.exists() or journal_path.stat().st_size == 0
+                allow_new_baseline = journal_empty and not risk_state_path.exists()
+                observer = AccountRiskObserver(
+                    session.provider,
+                    state_path=risk_state_path,
+                    journal_path=journal_path,
+                    allow_new_baseline=allow_new_baseline,
+                    require_cashflows=True,
+                )
             evidence = CanarySessionEvidence.from_provider(session.provider)
 
             def refresh_quotes_from_same_reader() -> None:
@@ -1793,12 +2103,24 @@ def network_cli_preflight(  # noqa: C901
             def _projection_from_snapshot(snapshot: AccountRiskSnapshot | None) -> CanaryEconomicsProjection:
                 if snapshot is None:
                     raise CanaryGateError("account risk snapshot no está disponible")
-                if not snapshot.fresh or not snapshot.complete:
+                if not snapshot.fresh or getattr(snapshot, "account_complete", False) is not True:
                     raise CanaryGateError(
-                        "account risk snapshot no está fresh+complete",
+                        "account risk snapshot no está fresh+account_complete",
                         gates={
                             "fresh": snapshot.fresh,
                             "complete": snapshot.complete,
+                            "account_complete": getattr(snapshot, "account_complete", False),
+                            "reasons": list(snapshot.reasons),
+                        },
+                    )
+                if snapshot.complete is not True and approved.canary_trial_anchor_authorized is not True:
+                    raise CanaryGateError(
+                        "daily anchor UNKNOWN requiere autorización explícita del trial anchor",
+                        gates={
+                            "fresh": snapshot.fresh,
+                            "account_complete": getattr(snapshot, "account_complete", False),
+                            "daily_complete": snapshot.complete,
+                            "trial_anchor_authorized": False,
                             "reasons": list(snapshot.reasons),
                         },
                     )
@@ -1870,7 +2192,29 @@ def network_cli_preflight(  # noqa: C901
             # pre-arm observer here would re-project the initial snapshot
             # after every fresh risk callback.
             bound_observer = session.binding.risk_observer
-            observer_callback = getattr(bound_observer, "update_executor", None)
+            observer_callback: Callable[[Any], Mapping[str, Any]] | None
+            if approved.canary_trial_anchor_authorized is True:
+                if bound_observer is None or not callable(getattr(bound_observer, "observe", None)):
+                    return {
+                        "schema": SCHEMA,
+                        "ok": False,
+                        "state": "RISK_OBSERVER_REQUIRED",
+                        "mode": "canary",
+                        "error": "canary trial autorizado requiere observer.observe() y account_complete",
+                        "network_performed": True,
+                        "orders_attempted": False,
+                    }
+
+                def trial_observer_callback(executor: Any) -> Mapping[str, Any]:
+                    return update_executor_from_canary_observation(
+                        bound_observer,
+                        executor,
+                        expected_observation=getattr(session.binding, "observation", None),
+                    )
+
+                observer_callback = trial_observer_callback
+            else:
+                observer_callback = getattr(bound_observer, "update_executor", None)
             if bound_observer is None or not callable(observer_callback):
                 return {
                     "schema": SCHEMA,
@@ -1885,13 +2229,13 @@ def network_cli_preflight(  # noqa: C901
             def risk_refresh(executor: CTraderDemoExecutor) -> Mapping[str, Any]:
                 refresh_quotes_from_same_reader()
                 observed = observer_callback(executor)
-                return cast(Mapping[str, Any], observed)
+                return observed
 
             def post_close_risk_refresh(executor: CTraderDemoExecutor) -> Mapping[str, Any]:
                 # After a confirmed close, account/cashflow observation is
                 # sufficient for the trial budget.  Do not spend another
                 # five-second quote poll or rebuild forecast economics here.
-                return cast(Mapping[str, Any], observer_callback(executor))
+                return observer_callback(executor)
 
             def economics_refresh(
                 executor: CTraderDemoExecutor, observed: Mapping[str, Any]
@@ -1902,12 +2246,13 @@ def network_cli_preflight(  # noqa: C901
                 return refreshed
 
             try:
-                observed = risk_refresh(session.binding.executor)
-                refreshed = economics_refresh(session.binding.executor, observed)
-                session.binding.canary_economics = refreshed
-                from mtf_lab.ops.supervision_demo import _update_executor_from_canary_economics
+                with session.writer_store.lock():
+                    observed = risk_refresh(session.binding.executor)
+                    refreshed = economics_refresh(session.binding.executor, observed)
+                    session.binding.canary_economics = refreshed
+                    from mtf_lab.ops.supervision_demo import _update_executor_from_canary_economics
 
-                _update_executor_from_canary_economics(session.binding.executor, refreshed, "CONSERVATIVE")
+                    _update_executor_from_canary_economics(session.binding.executor, refreshed, "CONSERVATIVE")
             except Exception as exc:
                 return {
                     "schema": SCHEMA,

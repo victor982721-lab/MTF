@@ -992,6 +992,10 @@ class AccountRiskSnapshot(Mapping[str, Any]):
     cashflows: tuple[Mapping[str, Any], ...] = ()
     cashflows_complete: bool = False
     cashflow_fingerprint: str | None = None
+    # Completeness of the current account/risk inputs before the UTC-day
+    # anchor gate is applied.  This is observational data only; callers must
+    # not treat it as approval to bypass the normal canary gates.
+    account_complete: bool = False
 
     @property
     def generation(self) -> str | None:
@@ -1093,8 +1097,10 @@ class AccountRiskSnapshot(Mapping[str, Any]):
             "freshness_state": self.freshness_state,
             "fresh": self.fresh,
             "complete": self.complete,
+            "account_complete": self.account_complete,
             "completeness": {
                 "complete": self.complete,
+                "account_complete": self.account_complete,
                 "positions": self.positions_complete,
                 "unrealized_pnl": self.unrealized_complete,
                 "deals": self.deals_complete,
@@ -1363,7 +1369,8 @@ class AccountRiskObserver:
             reasons.extend(margin_reasons)
             margin_level = self._margin_level(used_margin, equity_value, reasons)
         fresh = self._is_fresh(reasons)
-        complete = self._is_complete(components, reasons)
+        account_metrics_complete = self._is_complete(components, reasons)
+        complete = account_metrics_complete
         responses = cast(Sequence[_Response], components["responses"])
         observed_at = max((item.observed_at for item in responses if item.observed_at is not None), default=None)
         high_water = self._high_water.observe(
@@ -1374,6 +1381,14 @@ class AccountRiskObserver:
         )
         if high_water["reason"] is not None:
             reasons.append(str(high_water["reason"]))
+        # Keep this separate from ``complete``: the latter also includes the
+        # daily-anchor gate below, while this field describes whether the
+        # current account data itself is complete.  In particular, an
+        # unobserved UTC-day start must not turn a valid account observation
+        # into a synthetic zero baseline or make it appear complete.
+        account_complete = bool(
+            fresh and account_metrics_complete and margin_state != "UNKNOWN" and high_water["complete"] is True
+        )
         drawdown = cast(Decimal | None, high_water["drawdown"])
         peak_equity = cast(Decimal | None, high_water["high_water_equity"])
         daily_anchor = (
@@ -1490,6 +1505,7 @@ class AccountRiskObserver:
             tuple(cast(Mapping[str, Any], item) for item in cashflows.get("records", ())),
             bool(cashflows.get("complete", False)) if self.require_cashflows else False,
             cast(str | None, daily_anchor.get("cashflow_fingerprint")),
+            account_complete=account_complete,
         )
 
     def _margin_level(self, used_margin: Decimal | None, equity: Decimal | None, reasons: list[str]) -> Decimal | None:

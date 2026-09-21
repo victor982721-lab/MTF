@@ -227,6 +227,142 @@ class RiskExitPolicy:
         return data
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class CanaryTrialRiskBoundary:
+    """Explicit, approval-bound loss boundary for the DEMO canary only.
+
+    This is deliberately not a replacement for the account's daily anchor.  A
+    caller must prove the human approval, the single-use ledger reservation,
+    the authenticated session and the approved time window before this
+    context can be attached to an executor.  Generic RiskExit callers never
+    receive this context and continue to require the daily anchor.
+    """
+
+    approval_digest: str
+    authorization_source: str
+    account_id: str
+    session_id: str
+    connection_generation: str
+    window_start: datetime
+    window_end: datetime
+    trial_equity: Decimal
+    trial_cashflow_total: Decimal
+    trial_loss_fraction: Decimal
+    trial_loss_budget: Decimal
+    trial_loss_committed: Decimal = D0
+    trial_loss_observed: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        digest = str(self.approval_digest).strip()
+        source = str(self.authorization_source).strip()
+        account = str(self.account_id).strip()
+        session = str(self.session_id).strip()
+        generation = str(self.connection_generation).strip()
+        if len(digest) != 64 or any(char not in "0123456789abcdefABCDEF" for char in digest):
+            raise RiskExitError("canary trial requiere digest de aprobación")
+        if not source or any(char in source for char in "\x00\r\n"):
+            raise RiskExitError("canary trial requiere fuente humana")
+        if not account or not account.isdigit() or int(account) <= 0:
+            raise RiskExitError("canary trial requiere account_id positivo")
+        if not session or not generation:
+            raise RiskExitError("canary trial requiere session_id y generación")
+        start = _utc(self.window_start, name="canary_trial.window_start")
+        end = _utc(self.window_end, name="canary_trial.window_end")
+        if end <= start:
+            raise RiskExitError("canary trial window_end debe ser posterior a window_start")
+        equity = _decimal(self.trial_equity, name="canary_trial.trial_equity", positive=True)
+        cashflow = _decimal(self.trial_cashflow_total, name="canary_trial.trial_cashflow_total")
+        fraction = _decimal(self.trial_loss_fraction, name="canary_trial.trial_loss_fraction", positive=True)
+        budget = _decimal(self.trial_loss_budget, name="canary_trial.trial_loss_budget", positive=True)
+        committed = _decimal(self.trial_loss_committed, name="canary_trial.trial_loss_committed", minimum=D0)
+        observed = (
+            None
+            if self.trial_loss_observed is None
+            else _decimal(self.trial_loss_observed, name="canary_trial.trial_loss_observed", minimum=D0)
+        )
+        if fraction > Decimal("0.001"):
+            raise RiskExitError("canary trial excede el límite máximo de 0.1%")
+        with decimal_context():
+            expected_budget = equity * fraction
+        if budget != expected_budget:
+            raise RiskExitError("canary trial budget no coincide con equity inicial y fracción aprobada")
+        object.__setattr__(self, "approval_digest", digest)
+        object.__setattr__(self, "authorization_source", source)
+        object.__setattr__(self, "account_id", account)
+        object.__setattr__(self, "session_id", session)
+        object.__setattr__(self, "connection_generation", generation)
+        object.__setattr__(self, "window_start", start)
+        object.__setattr__(self, "window_end", end)
+        object.__setattr__(self, "trial_equity", equity)
+        object.__setattr__(self, "trial_cashflow_total", cashflow)
+        object.__setattr__(self, "trial_loss_fraction", fraction)
+        object.__setattr__(self, "trial_loss_budget", budget)
+        object.__setattr__(self, "trial_loss_committed", committed)
+        object.__setattr__(self, "trial_loss_observed", observed)
+
+    @property
+    def loss_committed(self) -> Decimal:
+        observed = self.trial_loss_observed or D0
+        return max(self.trial_loss_committed, observed)
+
+    def identity_reason(
+        self,
+        *,
+        account_id: Any,
+        session_id: Any,
+        connection_generation: Any,
+        now: datetime,
+    ) -> str | None:
+        """Validate live identity and approved window on every boundary use."""
+
+        if str(account_id).strip() != self.account_id:
+            return "CANARY_TRIAL_ACCOUNT_MISMATCH"
+        if str(session_id).strip() != self.session_id:
+            return "CANARY_TRIAL_SESSION_MISMATCH"
+        if str(connection_generation).strip() != self.connection_generation:
+            return "CANARY_TRIAL_GENERATION_MISMATCH"
+        try:
+            current = _utc(now, name="canary_trial.now")
+        except RiskExitError:
+            return "CANARY_TRIAL_CLOCK_UNKNOWN"
+        if current < self.window_start or current >= self.window_end:
+            return "CANARY_TRIAL_WINDOW_OUTSIDE"
+        return None
+
+    def limit_reason(self, *, equity: Decimal) -> str | None:
+        """Return only the trial-boundary reason; daily state stays separate."""
+
+        try:
+            current = _decimal(equity, name="equity", minimum=D0)
+        except RiskExitError:
+            return "CANARY_TRIAL_EQUITY_UNKNOWN"
+        if self.loss_committed >= self.trial_loss_budget:
+            return "CANARY_TRIAL_LOSS_BUDGET"
+        if current <= 0:
+            return "CANARY_TRIAL_EQUITY_UNKNOWN"
+        return None
+
+    def with_loss(
+        self,
+        *,
+        committed: Decimal,
+        observed: Decimal | None = None,
+    ) -> CanaryTrialRiskBoundary:
+        prior_observed = self.trial_loss_observed or D0
+        next_observed = (
+            prior_observed
+            if observed is None
+            else max(prior_observed, _decimal(observed, name="trial_loss_observed", minimum=D0))
+        )
+        return dataclasses.replace(
+            self,
+            trial_loss_committed=max(
+                self.trial_loss_committed, _decimal(committed, name="trial_loss_committed", minimum=D0)
+            ),
+            trial_loss_observed=next_observed,
+        )
+
+
 def _validate_policy_identity(policy: RiskExitPolicy) -> None:
     if str(policy.version).strip() != POLICY_VERSION:
         raise RiskExitError(f"versión RiskExit no soportada: {policy.version!r}")
@@ -754,6 +890,7 @@ def _risk_reasons(
     risk_state: Mapping[str, Any] | None,
     calendar_state: Mapping[str, Any] | None,
     equity_source: str,
+    canary_trial: CanaryTrialRiskBoundary | None = None,
 ) -> list[str]:
     result = [calendar_reason] if (calendar_reason := _calendar_reason(calendar_state)) else []
     if not isinstance(risk_state, Mapping):
@@ -773,14 +910,20 @@ def _risk_reasons(
             result.append("EQUITY_STATE_INVALID")
     if risk_state.get("bar_clock_known") is not True:
         result.append("RISK_BAR_CLOCK_UNKNOWN")
-    result.extend(_risk_budget_reasons(policy, equity, risk_state))
+    result.extend(_risk_budget_reasons(policy, equity, risk_state, canary_trial=canary_trial))
     result.extend(_risk_capacity_reasons(policy, risk_state))
     if risk_state.get("costs_known") is not True:
         result.append("COSTS_UNKNOWN")
     return result
 
 
-def _risk_budget_reasons(policy: RiskExitPolicy, equity: Decimal, risk_state: Mapping[str, Any]) -> list[str]:
+def _risk_budget_reasons(  # noqa: C901
+    policy: RiskExitPolicy,
+    equity: Decimal,
+    risk_state: Mapping[str, Any],
+    *,
+    canary_trial: CanaryTrialRiskBoundary | None = None,
+) -> list[str]:
     result: list[str] = []
     daily = risk_state.get("daily_pnl")
     drawdown = risk_state.get("drawdown")
@@ -797,15 +940,20 @@ def _risk_budget_reasons(policy: RiskExitPolicy, equity: Decimal, risk_state: Ma
         )
     except RiskExitError:
         return ["RISK_STATE_INVALID"]
-    if daily_value is None:
-        result.append("DAILY_PNL_UNKNOWN")
-    elif daily_anchor_value is None:
-        result.append("DAILY_ANCHOR_UNKNOWN")
+    if canary_trial is None:
+        if daily_value is None:
+            result.append("DAILY_PNL_UNKNOWN")
+        elif daily_anchor_value is None:
+            result.append("DAILY_ANCHOR_UNKNOWN")
+        else:
+            with decimal_context():
+                daily_breached = daily_value <= -(daily_anchor_value * policy.max_daily_loss_fraction)
+            if daily_breached:
+                result.append("MAX_DAILY_LOSS")
     else:
-        with decimal_context():
-            daily_breached = daily_value <= -(daily_anchor_value * policy.max_daily_loss_fraction)
-        if daily_breached:
-            result.append("MAX_DAILY_LOSS")
+        trial_reason = canary_trial.limit_reason(equity=equity)
+        if trial_reason is not None:
+            result.append(trial_reason)
     if high_water_value is None:
         result.append("HIGH_WATER_UNKNOWN")
     elif high_water_value < equity:
@@ -1137,6 +1285,7 @@ def plan_entry(
     mode: str = "DEMO_GATED",
     executable_bid: Any | None = None,
     executable_ask: Any | None = None,
+    canary_trial: CanaryTrialRiskBoundary | None = None,
 ) -> EntryPlan:
     """Plan a sized entry; diagnostics never become an executable approval."""
 
@@ -1162,6 +1311,7 @@ def plan_entry(
             risk_state=risk_state,
             calendar_state=calendar_state,
             equity_source=source,
+            canary_trial=canary_trial,
         )
     )
     calendar_entry_reason = _entry_calendar_reason(policy, when, calendar_state)
@@ -1675,6 +1825,7 @@ RiskDecision = ExitDecision
 
 __all__ = [
     "EntryPlan",
+    "CanaryTrialRiskBoundary",
     "ExitDecision",
     "INTRADAY_PROFILE",
     "MULTIDAY_PROFILE",

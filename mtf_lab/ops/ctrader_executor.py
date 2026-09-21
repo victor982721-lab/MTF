@@ -42,6 +42,7 @@ from ..core.risk_exit import (
     EXIT_TAKE_PROFIT,
     EXIT_TIME,
     EXIT_UNKNOWN,
+    CanaryTrialRiskBoundary,
     EntryPlan,
     ExitDecision,
     RiskExitPolicy,
@@ -2062,6 +2063,7 @@ class CTraderDemoExecutor:
         self._risk_contract_spec = _copy_optional_mapping(risk_contract_spec, "risk_contract_spec")
         self._risk_calendar = _copy_optional_mapping(risk_calendar, "risk_calendar")
         self._market_candidate_id = _optional_text(market_candidate_id)
+        self._canary_trial: CanaryTrialRiskBoundary | None = None
         self._active = False
         self._paused = False
         self._pause_reason: str | None = None
@@ -2134,6 +2136,78 @@ class CTraderDemoExecutor:
     @property
     def recovery_required(self) -> bool:
         return self._recovery_required
+
+    @property
+    def canary_trial_risk(self) -> CanaryTrialRiskBoundary | None:
+        """The explicit approval-bound trial context, when armed."""
+
+        return self._canary_trial
+
+    def set_canary_trial_risk(self, boundary: CanaryTrialRiskBoundary) -> None:
+        """Attach one approval-bound canary boundary before activation.
+
+        Generic execution never calls this seam.  Replacing a boundary while
+        active is forbidden so a running trial cannot change its budget or
+        account/session identity in place.
+        """
+
+        if not isinstance(boundary, CanaryTrialRiskBoundary):
+            raise RiskLimitRejected("canary trial risk boundary debe ser tipado")
+        with self._lock:
+            if self._active:
+                raise RiskLimitRejected("canary trial boundary debe fijarse antes de activar")
+            if boundary.account_id != self.account.account_id:
+                raise RiskLimitRejected("canary trial boundary no coincide con account_id")
+            observation = self.server_observation
+            expected_session = str(getattr(observation, "session_id", "") or "").strip()
+            expected_generation = str(getattr(observation, "connection_generation", "") or "").strip()
+            if not expected_session or not expected_generation:
+                raise RiskLimitRejected("la observación server carece de session_id/generation")
+            if boundary.session_id != expected_session:
+                raise RiskLimitRejected("canary trial boundary no coincide con session_id")
+            if boundary.connection_generation != expected_generation:
+                raise RiskLimitRejected("canary trial boundary no coincide con generación")
+            if self._risk_exit_policy is None:
+                raise RiskLimitRejected("canary trial boundary requiere RiskExit configurado")
+            self._canary_trial = boundary
+            self._risk_halt_reason = None
+
+    def update_canary_trial_loss(
+        self,
+        *,
+        committed: Decimal,
+        observed: Decimal | None = None,
+        expected_digest: str | None = None,
+    ) -> CanaryTrialRiskBoundary:
+        """Monotonically publish the ledger's single trial-loss boundary."""
+
+        with self._lock:
+            boundary = self._canary_trial
+            if boundary is None:
+                raise RiskLimitRejected("canary trial boundary no está armado")
+            if expected_digest is not None and str(expected_digest) != boundary.approval_digest:
+                raise RiskLimitRejected("canary trial digest no coincide con el ledger")
+            reason = self._canary_trial_identity_reason()
+            if reason is not None:
+                raise RiskLimitRejected(reason)
+            self._canary_trial = boundary.with_loss(committed=committed, observed=observed)
+            return self._canary_trial
+
+    def _canary_trial_identity_reason(self) -> str | None:
+        boundary = self._canary_trial
+        if boundary is None:
+            return None
+        observation = self.server_observation
+        try:
+            now = _parse_time(self.clock())
+        except (TypeError, ValueError):
+            return "canary_trial_clock_unknown"
+        return boundary.identity_reason(
+            account_id=self.account.account_id,
+            session_id=getattr(observation, "session_id", None),
+            connection_generation=getattr(observation, "connection_generation", None),
+            now=now,
+        )
 
     def complete_recovery(self) -> None:
         """Release the journal gate after the caller restored all intents."""
@@ -2291,15 +2365,25 @@ class CTraderDemoExecutor:
             self._risk_metrics_generation = None
 
     def _risk_limit_reason(self) -> str | None:
+        identity_reason = self._canary_trial_identity_reason()
+        if identity_reason is not None:
+            return identity_reason
         if not self._fixture_mode:
             freshness_reason, daily = self._external_risk_values()
             if freshness_reason is not None:
                 return freshness_reason
         else:
             daily = self._risk_metrics["daily_pnl"]
-        return self._configured_risk_limit_reason(daily)
+        if self._canary_trial is not None:
+            equity = self._risk_metrics.get("equity")
+            if equity is None:
+                return "canary_trial_equity_unobserved"
+            trial_reason = self._canary_trial.limit_reason(equity=equity)
+            if trial_reason is not None:
+                return trial_reason
+        return self._configured_risk_limit_reason(daily, canary_trial=self._canary_trial)
 
-    def _external_risk_values(self) -> tuple[str | None, DecimalValue | None]:
+    def _external_risk_values(self) -> tuple[str | None, DecimalValue | None]:  # noqa: C901
         observed_at = self._risk_metrics_observed_at
         generation = self._risk_metrics_generation
         if observed_at is None or generation is None:
@@ -2314,6 +2398,11 @@ class CTraderDemoExecutor:
         if current_generation is None or generation != current_generation:
             return "risk_metrics_generation_unobserved", None
         if self._risk_exit_policy is not None:
+            if self._canary_trial is not None:
+                # The canary's bounded trial ledger is the only alternate
+                # budget source.  Daily fields remain UNKNOWN and are never
+                # rewritten as zero or treated as a start-of-day anchor.
+                return None, None
             # The percent daily budget is anchored to observed start-of-day
             # equity.  A realized+unrealized pair is not an equivalent
             # substitute: it loses floating exposure and cash-flow effects.
@@ -2561,8 +2650,10 @@ class CTraderDemoExecutor:
             self._risk_exit_close_if_due(position, intent, decision, results)
         return tuple(results)
 
-    def _configured_risk_limit_reason(self, daily: DecimalValue | None) -> str | None:
-        if self.policy.max_daily_loss is not None:
+    def _configured_risk_limit_reason(
+        self, daily: DecimalValue | None, *, canary_trial: CanaryTrialRiskBoundary | None = None
+    ) -> str | None:
+        if self.policy.max_daily_loss is not None and canary_trial is None:
             if daily is None:
                 return "daily_pnl_unobserved"
             if daily <= -self.policy.max_daily_loss:
@@ -2801,6 +2892,9 @@ class CTraderDemoExecutor:
         policy = self._risk_exit_policy
         if policy is None:
             return None
+        identity_reason = self._canary_trial_identity_reason()
+        if identity_reason is not None:
+            raise RiskLimitRejected(identity_reason)
         quote_obj = quote if isinstance(quote, Quote) else Quote.from_mapping(quote)
         data = _as_mapping(signal)
         runtime = self._runtime_entry_state(data)
@@ -2842,6 +2936,7 @@ class CTraderDemoExecutor:
                 mode=str(mode),
                 executable_bid=quote_obj.bid,
                 executable_ask=quote_obj.ask,
+                canary_trial=self._canary_trial,
             )
         except ValueError as exc:
             raise RiskLimitRejected(f"RiskExit entry evidence is invalid: {exc}") from exc

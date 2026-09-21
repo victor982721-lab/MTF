@@ -417,6 +417,8 @@ def observe_canary_economics(  # noqa: C901 - one bounded read-only projection g
             "observed_at": _iso(account_snapshot.observed_at),
             "fresh": account_snapshot.fresh,
             "complete": account_snapshot.complete,
+            "account_complete": getattr(account_snapshot, "account_complete", False),
+            "daily_complete": account_snapshot.complete,
         },
         "freshness_checked_at": _iso(terminal_now),
         "evidence_observed_at": _iso(evidence_observed_at),
@@ -940,8 +942,8 @@ def _financing_calendar(
 
 
 def _validate_snapshot_fresh(snapshot: AccountRiskSnapshot, now: datetime, max_age: Decimal, generation: str) -> None:
-    if snapshot.fresh is not True or snapshot.complete is not True:
-        raise CanaryEconomicsError("account risk snapshot debe ser fresh y complete")
+    if snapshot.fresh is not True or getattr(snapshot, "account_complete", False) is not True:
+        raise CanaryEconomicsError("account risk snapshot debe ser fresh y account_complete")
     if snapshot.connection_generation != generation:
         raise CanaryEconomicsError("account risk snapshot pertenece a otra generación")
     if snapshot.observed_at is None:

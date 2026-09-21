@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -90,6 +92,7 @@ def build_demo_execution_binding(  # noqa: C901
     canary_economics: Any | None = None,
     proto: Any | None = None,
     clock: Callable[[], datetime] | None = None,
+    defer_activation: bool = False,
 ) -> DemoExecutionBinding:
     """Build callbacks on top of one already authenticated DEMO provider.
 
@@ -183,7 +186,8 @@ def build_demo_execution_binding(  # noqa: C901
             from .ctrader_demo_composition import recover_execution_intents
 
             recover_execution_intents(journal_path, executor)
-        executor.activate()
+        if not defer_activation:
+            executor.activate()
         observer = AccountRiskObserver(
             provider,
             proto=proto,
@@ -642,6 +646,167 @@ def _journal_path(
     return root / "execution-intents" / f"{key}.jsonl"
 
 
+def ensure_demo_journal_parent(
+    state_dir: str | Path,
+    account_id: str,
+    endpoint: str,
+    *,
+    account_key: str | None = None,
+) -> Path:
+    """Create the canonical parent and one empty journal only when absent.
+
+    The canary's pre-arm account observer validates private paths before the
+    deferred binding creates ``JsonlIntentStore``.  This helper is called only
+    by the execute path while the account writer lock is held.  Read-only
+    preparation must not call it.
+    """
+
+    journal = _journal_path(state_dir, account_id, endpoint, account_key=account_key)
+    parent = journal.parent
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        info = parent.lstat()
+    except OSError as exc:
+        raise DemoCompositionError("no se pudo inspeccionar el padre del journal DEMO") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise DemoCompositionError("el padre del journal DEMO no es un directorio regular")
+    if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise DemoCompositionError("el padre del journal DEMO debe ser privado 0700")
+    if not journal.exists():
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(journal, flags, 0o600)
+        except FileExistsError:
+            # A concurrent/account-locked creator won the race.  Do not
+            # replace or chmod its bytes; the observer will validate it.
+            pass
+        except OSError as exc:
+            raise DemoCompositionError("no se pudo crear el journal DEMO vacío") from exc
+        else:
+            try:
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            directory_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    return journal
+
+
+def update_executor_from_canary_observation(  # noqa: C901
+    observer: Any,
+    executor: Any,
+    *,
+    expected_observation: Any | None = None,
+) -> Mapping[str, Any]:
+    """Feed current account facts without promoting an unknown daily anchor.
+
+    ``AccountRiskObserver.update_executor`` intentionally requires the full
+    global snapshot, including the daily anchor.  The explicit canary seam
+    instead consumes the owner-provided ``account_complete`` bit and leaves
+    daily fields UNKNOWN when the UTC anchor is not proven.
+    """
+
+    observe = getattr(observer, "observe", None)
+    if not callable(observe):
+        raise RiskLimitRejected("el observador DEMO no expone observe()")
+    snapshot = observe()
+    if not bool(getattr(snapshot, "fresh", False)):
+        raise RiskLimitRejected("la observación DEMO no es fresh")
+    if getattr(snapshot, "account_complete", False) is not True:
+        raise RiskLimitRejected("la completitud de cuenta actual no está probada")
+    expected = expected_observation or getattr(executor, "server_observation", None)
+    current = getattr(executor, "server_observation", None)
+    identity_fields = ("account_id", "session_id", "connection_generation")
+    for field in identity_fields:
+        snapshot_value = str(getattr(snapshot, field, "") or "").strip()
+        expected_value = str(getattr(expected, field, "") or "").strip()
+        current_value = str(getattr(current, field, "") or "").strip()
+        if not snapshot_value or not expected_value or not current_value:
+            raise RiskLimitRejected(f"observación DEMO carece de identidad {field}")
+        if snapshot_value != expected_value or snapshot_value != current_value:
+            raise RiskLimitRejected(f"observación DEMO no coincide en {field}")
+    boundary = getattr(executor, "canary_trial_risk", None)
+    if boundary is not None:
+        clock = getattr(executor, "clock", None)
+        try:
+            now = _parse_time(clock()) if callable(clock) else datetime.now(UTC)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitRejected("reloj DEMO no es utilizable para trial") from exc
+        reason = boundary.identity_reason(
+            account_id=getattr(snapshot, "account_id", None),
+            session_id=getattr(snapshot, "session_id", None),
+            connection_generation=getattr(snapshot, "connection_generation", None),
+            now=now,
+        )
+        if reason is not None:
+            raise RiskLimitRejected(reason)
+    equity_raw = getattr(snapshot, "equity", None)
+    if equity_raw is None:
+        raise RiskLimitRejected("equity DEMO actual desconocida")
+
+    def decimal_or_none(value: Any) -> Decimal | None:
+        if value is None:
+            return None
+        try:
+            parsed = Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise RiskLimitRejected("métrica DEMO inválida") from exc
+        if not parsed.is_finite():
+            raise RiskLimitRejected("métrica DEMO no finita")
+        return parsed
+
+    daily_ready = (
+        bool(getattr(snapshot, "complete", False))
+        and str(getattr(snapshot, "daily_loss_state", "UNKNOWN")).upper() == "READY"
+    )
+    kwargs: dict[str, Any] = {
+        "equity": decimal_or_none(equity_raw),
+        "realized_daily_pnl": decimal_or_none(getattr(snapshot, "realized_daily_pnl", None)),
+        "unrealized_daily_pnl": decimal_or_none(getattr(snapshot, "unrealized_daily_pnl", None)),
+        "daily_pnl": decimal_or_none(getattr(snapshot, "daily_pnl", None)) if daily_ready else None,
+        "drawdown": decimal_or_none(getattr(snapshot, "drawdown", None)),
+        "high_water_equity": decimal_or_none(getattr(snapshot, "high_water_equity", None)),
+        "used_margin": decimal_or_none(getattr(snapshot, "used_margin", None)),
+        "margin_level": decimal_or_none(getattr(snapshot, "margin_level", None)),
+        "observed_at": getattr(snapshot, "observed_at", None),
+        "connection_generation": getattr(snapshot, "connection_generation", None),
+        # Keep the daily anchor UNKNOWN unless the owner snapshot proves it.
+        "daily_loss": decimal_or_none(getattr(snapshot, "daily_loss", None)) if daily_ready else None,
+        "daily_anchor_equity": decimal_or_none(getattr(snapshot, "daily_anchor_equity", None)) if daily_ready else None,
+        "daily_anchor_cashflow_total": decimal_or_none(getattr(snapshot, "daily_anchor_cashflow_total", None))
+        if daily_ready
+        else None,
+        "daily_cashflow_total": decimal_or_none(getattr(snapshot, "daily_cashflow_total", None)),
+        "daily_anchor_day": getattr(snapshot, "daily_anchor_day", None) if daily_ready else None,
+        "daily_anchor_observed_at": getattr(snapshot, "daily_anchor_observed_at", None) if daily_ready else None,
+        "daily_anchor_verified": bool(getattr(snapshot, "daily_anchor_verified", False)) if daily_ready else False,
+        "daily_loss_state": str(getattr(snapshot, "daily_loss_state", "UNKNOWN")) if daily_ready else "UNKNOWN",
+        "daily_loss_reason": getattr(snapshot, "daily_loss_reason", None)
+        if daily_ready
+        else (getattr(snapshot, "daily_loss_reason", None) or "daily_anchor_unknown"),
+        "cashflows_complete": bool(getattr(snapshot, "cashflows_complete", False)),
+        "cashflow_fingerprint": getattr(snapshot, "cashflow_fingerprint", None),
+    }
+    update = getattr(executor, "update_risk_metrics", None)
+    if not callable(update):
+        raise RiskLimitRejected("executor no expone update_risk_metrics()")
+    result = update(**kwargs)
+    export_snapshot = getattr(snapshot, "to_dict", None)
+    raw_projection = export_snapshot() if callable(export_snapshot) else {}
+    if not isinstance(raw_projection, Mapping):
+        raise RiskLimitRejected("el observador DEMO no devuelve una proyección mapping")
+    projection: dict[str, Any] = dict(raw_projection)
+    projection["account_complete"] = True
+    projection["daily_complete"] = daily_ready
+    projection["executor"] = result
+    return projection
+
+
 def _refresh_observed_risk(
     observer: AccountRiskObserver | None,
     executor: CTraderDemoExecutor,
@@ -873,4 +1038,10 @@ def _signal_instrument(signal: Any) -> str | None:
     return str(value).strip().upper().replace("-", "/") if value is not None and str(value).strip() else None
 
 
-__all__ = ["DemoCompositionError", "DemoExecutionBinding", "build_demo_execution_binding"]
+__all__ = [
+    "DemoCompositionError",
+    "DemoExecutionBinding",
+    "build_demo_execution_binding",
+    "ensure_demo_journal_parent",
+    "update_executor_from_canary_observation",
+]

@@ -48,6 +48,7 @@ class _Snapshot:
     name: str
     fresh: bool = True
     complete: bool = True
+    account_complete: bool = True
     reasons: tuple[str, ...] = ()
 
 
@@ -96,6 +97,16 @@ class _Executor:
         return snapshot
 
 
+class _WriterStore:
+    """Minimal account-lock seam for the composition-only fake session."""
+
+    root = Path(".")
+
+    @contextmanager
+    def lock(self) -> Any:
+        yield
+
+
 @dataclasses.dataclass
 class _Binding:
     executor: _Executor
@@ -110,6 +121,7 @@ class _Session:
     provenance: Mapping[str, Any]
     binding: _Binding | None
     binding_observer: _Observer | None
+    writer_store: _WriterStore = dataclasses.field(default_factory=_WriterStore)
     closed: bool = False
     projections: list[_Projection] = dataclasses.field(default_factory=list)
 

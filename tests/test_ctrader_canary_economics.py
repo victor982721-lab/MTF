@@ -48,6 +48,7 @@ def _snapshot(
         freshness_state="FRESH",
         fresh=True,
         complete=True,
+        account_complete=True,
         margin_state="NO_MARGIN_USED",
         positions_complete=True,
         unrealized_complete=True,

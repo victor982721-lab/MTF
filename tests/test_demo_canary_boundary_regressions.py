@@ -126,6 +126,7 @@ class _BoundaryExecutor:
         self.mutation_hook: Callable[[str], None] | None = None
         self.mutation_snapshots: list[tuple[str, int]] = []
         self.deactivated = False
+        self.active = True
 
     def status(self, *, refresh: bool = False) -> dict[str, Any]:
         del refresh
@@ -136,6 +137,15 @@ class _BoundaryExecutor:
                 "metrics_observed_at": self.clock().isoformat(),
                 "metrics_connection_generation": GENERATION,
                 "metrics": {"equity": str(self.equity)},
+                "risk_exit": {
+                    "metrics": {
+                        "daily_anchor_verified": True,
+                        "daily_loss_state": "READY",
+                        "daily_anchor_equity": "10000",
+                        "daily_cashflow_total": "0",
+                        "cashflows_complete": True,
+                    }
+                },
             }
         }
 
@@ -222,6 +232,7 @@ class _BoundaryExecutor:
     def deactivate(self, reason: str) -> None:
         del reason
         self.deactivated = True
+        self.active = False
 
 
 def _inputs(clock: _FakeClock) -> CanaryInputs:

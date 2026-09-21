@@ -336,6 +336,7 @@ def _binding() -> SimpleNamespace:  # noqa: C901
             self.close_calls = 0
             self.open_position: str | None = None
             self.deactivated = False
+            self.active = True
 
         def status(self, *, refresh: bool = False):
             del refresh
@@ -346,6 +347,15 @@ def _binding() -> SimpleNamespace:  # noqa: C901
                     "metrics_observed_at": NOW.isoformat(),
                     "metrics_connection_generation": "g1",
                     "metrics": {"equity": "10000"},
+                    "risk_exit": {
+                        "metrics": {
+                            "daily_anchor_verified": True,
+                            "daily_loss_state": "READY",
+                            "daily_anchor_equity": "10000",
+                            "daily_cashflow_total": "0",
+                            "cashflows_complete": True,
+                        }
+                    },
                 }
             }
 
@@ -405,6 +415,7 @@ def _binding() -> SimpleNamespace:  # noqa: C901
         def deactivate(self, reason):
             del reason
             self.deactivated = True
+            self.active = False
 
     return SimpleNamespace(
         executor=Executor(),
@@ -643,6 +654,9 @@ class DemoCanaryTests(unittest.TestCase):
                     "metrics": {"equity": str(equity)},
                     "risk_exit": {
                         "metrics": {
+                            "daily_anchor_verified": True,
+                            "daily_loss_state": "READY",
+                            "daily_anchor_equity": "10000",
                             "daily_cashflow_total": "0",
                             "cashflows_complete": True,
                         }
@@ -704,6 +718,9 @@ class DemoCanaryTests(unittest.TestCase):
                     "metrics": {"equity": str(equity)},
                     "risk_exit": {
                         "metrics": {
+                            "daily_anchor_verified": True,
+                            "daily_loss_state": "READY",
+                            "daily_anchor_equity": "10000",
                             "daily_cashflow_total": "0",
                             "cashflows_complete": True,
                         }

@@ -132,3 +132,26 @@ secretos ni se inicia autenticación como parte de la reproducción offline.
   evidencia de sesión, identidad, generación, entorno y permisos observados.
 - Los fixtures no demuestran rentabilidad, rendimiento futuro, tarifas vigentes
   ni permisos de redistribución de cotizaciones reales.
+
+### Referencia de pérdida de una canaria técnica autorizada
+
+La referencia diaria UTC y la referencia inicial de un trial no son la misma
+evidencia. El modo normal conserva el rechazo cuando el ancla diaria no fue
+observada; no se inventa `daily_loss=0` ni se rearma su historial para ejecutar.
+
+Una aprobación privada puede autorizar explícitamente, sólo para una canaria
+técnica DEMO, `canary_trial_anchor_authorized=true` con procedencia humana
+no vacía en `canary_trial_anchor_authorization_source`. Esa aprobación no
+basta por sí sola: el controlador debe vincular el contexto tipado con el
+ledger durable del trial, cuenta/sesión/generación observadas y ventana vigente.
+El límite de pérdida sigue acotado a 0.1% del equity realmente observado al
+iniciar el trial, con ajuste por cashflows y reserva de riesgo antes de actuar.
+
+La cuenta actual debe estar completa y fresca, incluido high-water; el
+`account_complete` separado no convierte el diario desconocido en completo.
+Se preservan capitales/anclas/journals existentes, límites por ciclo, costes,
+margen, cotización, ATR, stops, número de posiciones/mutaciones y conciliación.
+Ningún contexto de riesgo de trial se habilita mediante una bandera general
+de CLI, un mapping sin validar, ni un cambio de `execution.enabled` persistente.
+El journal canónico ausente se inicializa de forma privada antes del observador;
+un journal existente nunca se vacía para hacer pasar el preflight.
