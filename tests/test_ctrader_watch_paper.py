@@ -20,6 +20,7 @@ from mtf_lab.data.ctrader import (
     WireMessage,
 )
 from mtf_lab.data.paper_fixture import synthetic_ctrader_payloads
+from mtf_lab.ops.ctrader_demo_transport import ServerAccountObservation
 from mtf_lab.ops.ctrader_executor import RiskLimitRejected
 from mtf_lab.ops.ctrader_watch import (
     CTraderWatchContext,
@@ -234,6 +235,17 @@ class CTraderWatchPaperTests(unittest.TestCase):
             self.assertTrue(all(row["product"] == "FOREX_CFD_LOCAL_PAPER" for row in rows))
 
     def test_demo_quote_projection_rejects_nonordered_or_nonvalid_legs(self) -> None:
+        observation = ServerAccountObservation(
+            "123",
+            "DEMO",
+            "demo.ctraderapi.com:5035",
+            frozenset({"trading"}),
+            BASE,
+            source="fixture-server",
+            session_id="fixture-session",
+            connection_generation="fixture-generation",
+        )
+
         def snapshot(bid: str, ask: str, *, state: str | None = None) -> dict[str, object]:
             def leg(price: str) -> dict[str, object]:
                 return {
@@ -247,11 +259,11 @@ class CTraderWatchPaperTests(unittest.TestCase):
             return {"symbols": {"99": {"bid": leg(bid), "ask": leg(ask)}}}
 
         with self.assertRaisesRegex(RiskLimitRejected, "cruzada"):
-            _book_legs(snapshot("1.1000", "1.1000"), 99)
+            _book_legs(snapshot("1.1000", "1.1000"), 99, symbol="EUR/USD", observation=observation)
         with self.assertRaisesRegex(RiskLimitRejected, "cruzada"):
-            _book_legs(snapshot("1.1002", "1.1000"), 99)
+            _book_legs(snapshot("1.1002", "1.1000"), 99, symbol="EUR/USD", observation=observation)
         with self.assertRaisesRegex(RiskLimitRejected, "calidad"):
-            _book_legs(snapshot("1.1000", "1.1002", state="STALE"), 99)
+            _book_legs(snapshot("1.1000", "1.1002", state="STALE"), 99, symbol="EUR/USD", observation=observation)
 
     def test_live_freshness_does_not_promote_an_invalid_spot_event(self) -> None:
         config = replace(load_config(Path("config/fixture_cfd.toml")), mode="LIVE")
