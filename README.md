@@ -18,23 +18,20 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 
 ### Canaria técnica DEMO — 2026-09-21
 
-El código `ccd5563` está publicado e instalado: **1,244/1,244 pruebas**, sin
-fallos ni omisiones, y 130 archivos del paquete byte-equivalentes. El runtime
-`20260921T174132Z-b0e0306e` conserva rollback verificado. El
-[estado operativo](docs/operational_status.md) reúne la evidencia vigente;
-los apartados del 19 y 20 de septiembre son antecedentes.
+El código validado, publicado e instalado es
+`0a6adfb5b9bf1915edb43399495ae10e08ae9707`: **1,315/1,315 pruebas**, cero
+fallos/omisiones, 80.463% de líneas y 64.290% de ramas. La instalación usa
+`run_id=20260921T231515Z-61e48a36` y 132 archivos/RECORD byte-equivalentes en
+ambos entornos, con tres launchers verificados.
 
-**Canaria: `CURRENT_REVIEW`, cero ciclos y cero órdenes intentadas.** La última
-preparación terminó `ECONOMICS_BLOCKED` antes de reservar la aprobación.
-La lectura posterior confirmó `bid == ask`, todavía rechazado por el control
-de spread. Aceptar igualdad sólo en esta canaria fue consultado y no está
-autorizado ni implementado. No se creó otra automatización ni se programó otro día.
+La canaria permanece `CURRENT_REVIEW`/`NO_EJECUTADA`: el controlador terminó
+`OBSERVED_INPUTS_BLOCKED` por falta de ATR válido para el timeframe trigger,
+sin órdenes ni ciclos. El detalle y los receipts están en el [estado operativo vigente](docs/operational_status.md#estado-vigente--2026-09-21).
 
-La referencia de pérdida de 0.1% desde el equity inicial del trial sí fue
-autorizada; el ancla diaria sigue desconocida. También quedaron corregidos
-el alias EURUSD/EUR/USD y la disponibilidad conjunta del BBO, conservando
-la frescura de ambas piernas. No se habilitó estrategia, operación continua,
-REAL ni fondeo.
+Las dos excepciones humanas siguen acotadas a esta canaria: `bid == ask`
+genuinamente observado y ancla de equity inicial del trial. La regla predeterminada estricta
+permanece fuera de ellas; no se habilitan REAL, estrategia, 72 horas ni otra
+fecha/automatización.
 
 ### Desarrollo aislado — 2026-09-20
 
@@ -312,10 +309,14 @@ preflight readonly del 19 de septiembre verificó identidad, `TRADING` y
 catálogo; las preparaciones del 21 ya observaron riesgo y mercado, sin llegar
 a órdenes. El heartbeat de la oportunidad original fue eliminado.
 La continuación autorizada del mismo día mantiene los límites anteriores y
-permite la referencia inicial de pérdida sólo para el trial. El ancla diaria
-sigue desconocida, el journal está vacío y la aprobación no está reservada.
-Aceptar spread cero es una excepción distinta, consultada pero no autorizada
-ni implementada. No hay otra programación ni afirmación de ejecución.
+permite la referencia inicial de pérdida sólo para el trial. La autorización
+específica de esta misma canaria también permite aceptar un `bid == ask`
+genuinamente observado, únicamente dentro de la cuenta, sesión, generación,
+ventana y límites tipados anteriores. La regla predeterminada estricta
+permanece sin cambios fuera de esta canaria y `bid > ask` continúa rechazado.
+La aprobación y el ledger impiden extender o repetir un trial reservado. El
+estado operativo vigente conserva el resultado terminal sin órdenes y la
+evidencia de instalación.
 
 ### Antecedente: validación conectada DEMO de sólo lectura — 2026-09-14
 
@@ -423,8 +424,11 @@ La lista queda limitada a hechos, decisiones y autorizaciones externas:
 4. Satisfacer los gates de mercado y riesgo frescos y ejecutar los dos ciclos
    técnicos dentro de una ventana aprobada. El software está instalado; la
    oportunidad 09:00–09:20 terminó sin lanzamiento y su heartbeat fue eliminado.
-   Spread cero sigue bloqueado y su excepción acotada requiere respuesta expresa.
-   No se extiende un trial reservado ni se reintenta una orden ambigua.
+   La autorización acotada para `bid == ask` ya existe sólo para esta canaria;
+   conserva todos los gates de frescura, continuidad, causalidad, costes,
+   margen, ATR, stops, límites y conciliación. La aprobación y el ledger
+   impiden extender o repetir un trial reservado; una orden ambigua nunca se
+   reintenta. El estado actual y el resultado terminal se conservan en el [estado operativo vigente](docs/operational_status.md#estado-vigente--2026-09-21).
 5. Resolver las condiciones contractuales de Pepperstone relevantes para
    México, almacenamiento/redistribución de datos y costes. Una especificación
    de costes no equivale a cargos observados.

@@ -4,14 +4,19 @@
 
 ### Frontera vigente de la canaria — 2026-09-21
 
-Código `ccd5563` publicado e instalado, 1,244/1,244 pruebas y runtime
-`20260921T174132Z-b0e0306e` verificado. La canaria permanece `CURRENT_REVIEW`:
-cero ciclos y órdenes intentadas, sin reserva de su aprobación. La referencia
-de pérdida desde el equity inicial sí está autorizada sólo para esta prueba;
-el diario desconocido no se convierte en cero. El permiso adicional para
-aceptar `bid == ask` sigue pendiente y la regla estricta no cambió.
-El [estado operativo](operational_status.md#estado-vigente--2026-09-21) distingue
-instalación, preparaciones detenidas y cotizaciones observadas.
+Código validado, publicado e instalado `0a6adfb5b9bf1915edb43399495ae10e08ae9707`:
+1,315/1,315 pruebas, 80.463% de líneas, 64.290% de ramas, runtime
+`20260921T231515Z-61e48a36` y 132 archivos/RECORD byte-equivalentes en ambos
+entornos. La canaria permanece `CURRENT_REVIEW`/`NO_EJECUTADA`: el controlador
+terminó `OBSERVED_INPUTS_BLOCKED` por falta de ATR válido para el timeframe
+trigger, sin órdenes ni ciclos.
+
+Las dos excepciones humanas siguen limitadas a esta canaria: aceptar un
+`bid == ask` genuinamente observado y usar el equity inicial observado como
+ancla del trial. La regla predeterminada estricta permanece fuera de ellas; no se amplía a
+PAPER, estrategia, watch, REAL/LIVE, 72 horas, otra fecha ni automatización.
+Consulta el [estado operativo vigente](operational_status.md#estado-vigente--2026-09-21)
+para el resultado terminal y la evidencia.
 
 ### Entrega técnica vigente — 2026-09-20
 
@@ -113,8 +118,11 @@ gates que permanecen son:
    una ventana acotada del mismo día solicitada por Víctor. La oportunidad
    09:00–09:20 no se lanzó y su heartbeat fue eliminado; no hay reprogramación
    automática. La aprobación y el ledger impiden extender o repetir un trial
-   reservado. Spread cero sigue rechazado mientras no exista autorización
-   específica y una implementación validada para esa excepción.
+   reservado. Para esta canaria, la autorización específica permite
+   `bid == ask` genuinamente observado, sin cambiar la regla predeterminada
+   fuera de ella; `bid > ask` sigue rechazado. Continuidad, frescura,
+   causalidad, costes, margen y demás límites siguen siendo obligatorios. El
+   resultado terminal de la canaria está en el [estado operativo](operational_status.md#estado-vigente--2026-09-21).
 2. Verificar catálogo, límites y condiciones reales del bróker para la
    cuenta/símbolo, sin convertir una plantilla local en autorización.
 3. Ejecutar y reconciliar dos ciclos independientes contra el servidor **DEMO**:

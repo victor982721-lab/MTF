@@ -12,16 +12,18 @@ producir un servidor autenticado.
 
 ### Canaria técnica vigente — 2026-09-21
 
-Código `ccd5563` publicado e instalado, 1,244/1,244 pruebas y 130 archivos
-equivalentes; runtime `20260921T174132Z-b0e0306e` y rollback verificados.
-El [estado operativo](operational_status.md#estado-vigente--2026-09-21) separa
-instalación y resultado externo. La última preparación terminó
-`ECONOMICS_BLOCKED` antes de órdenes: cero ciclos, journal vacío y aprobación
-no reservada. La cuenta está fresca y `account_complete=true`, pero el ancla
-diaria permanece desconocida. Su referencia inicial de pérdida sólo para el
-trial sí está autorizada; aceptar spread cero no está autorizado ni implementado.
-La cotización observada `bid == ask` sigue bloqueada. No hay otra automatización
-ni programación para otro día; estrategia, 72 h y REAL permanecen fuera del alcance.
+Código validado, publicado e instalado `0a6adfb5b9bf1915edb43399495ae10e08ae9707`:
+1,315/1,315 pruebas, runtime `20260921T231515Z-61e48a36` y 132
+archivos/RECORD byte-equivalentes en ambos entornos. La canaria permanece
+`CURRENT_REVIEW`/`NO_EJECUTADA`: el controlador terminó
+`OBSERVED_INPUTS_BLOCKED` por falta de ATR válido para el timeframe trigger,
+sin órdenes ni ciclos.
+
+Las dos excepciones humanas están acotadas a esta canaria: `bid == ask`
+genuinamente observado y ancla de equity inicial del trial. La regla predeterminada estricta
+permanece fuera de ellas; no se amplía a PAPER, estrategia, watch, REAL/LIVE,
+72 horas, otra fecha ni automatización. Consulta el [estado operativo vigente](operational_status.md#estado-vigente--2026-09-21)
+para el resultado terminal y la evidencia.
 
 ### Entrega técnica vigente — 2026-09-20
 
@@ -90,10 +92,9 @@ cada conexión debe completar discovery fresco de lectura y verificar esa cuenta
 
 La canaria está instalada como `~/.local/bin/mtf-lab-demo-canary`, modo `0700`.
 El preflight readonly del 19 de septiembre verificó identidad, `TRADING` y
-catálogo, pero no representó ejecución. Las preparaciones del 21 de septiembre
-observan riesgo y mercado, conservando high-water y ancla diaria; el journal
-de órdenes sigue vacío. El heartbeat original fue eliminado tras no lanzarse
-la oportunidad 09:00–09:20. No se repite ni extiende automáticamente.
+catálogo, pero no representó ejecución. La aprobación y el ledger impiden
+extender o repetir un trial reservado. El resultado terminal sin órdenes se
+documenta en el [estado operativo](operational_status.md#estado-vigente--2026-09-21).
 
 ### Antecedente: validación DEMO conectada de sólo lectura — 2026-09-14
 
@@ -407,9 +408,11 @@ no hay órdenes y esa autorización no se extiende a REAL/LIVE.
 2. Verificar límites y condiciones efectivas del bróker para la cuenta/símbolo.
 3. Satisfacer los gates de mercado y riesgo y ejecutar los dos ciclos técnicos
    dentro de una ventana aprobada. El heartbeat de la oportunidad original fue
-   eliminado. Spread cero sigue bloqueado; su excepción sólo para esta canaria
-   está consultada, no autorizada ni implementada. No se extiende un trial
-   reservado ni se reintenta una orden ambigua.
+   eliminado. `bid == ask` está autorizado sólo para esta canaria y no relaja
+   la regla predeterminada ni los gates de frescura, continuidad, causalidad,
+   costes, margen y riesgo. La aprobación y el ledger impiden extender o
+   repetir un trial reservado; una orden ambigua nunca se reintenta. El resultado
+   terminal está en el [estado operativo](operational_status.md#estado-vigente--2026-09-21).
 4. Verificar ejecución y reconciliación de esa canaria sin convertirla en
    estrategia, operación continua ni forward.
 5. Confirmar las condiciones contractuales de Pepperstone aplicables a México,
