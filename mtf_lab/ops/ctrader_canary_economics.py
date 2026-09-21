@@ -26,6 +26,7 @@ from typing import Any, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..core.numeric import decimal_context
+from ..data.ctrader_config import normalize_symbol_name
 from ..data.ctrader_protocol import WireMessage, message_to_mapping, read_field, read_repeated
 from .ctrader_account_risk import AccountRiskSnapshot
 from .ctrader_demo_transport import load_official_proto
@@ -102,6 +103,7 @@ class CanaryQuoteEvidence:
     available_at: datetime
     connection_generation: str
     sequence: str | None
+    earliest_available_at: datetime | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -113,6 +115,7 @@ class CanaryQuoteEvidence:
             "spread_pips": _text(self.spread_pips),
             "event_time": _iso(self.event_time),
             "available_at": _iso(self.available_at),
+            "earliest_available_at": _iso(self.earliest_available_at or self.available_at),
             "connection_generation": self.connection_generation,
             "sequence": self.sequence,
             "source": "provider.snapshot_quote_state",
@@ -694,9 +697,11 @@ def _quote_evidence(
     if bid["generation"] != ask["generation"] or bid["generation"] != generation:
         raise CanaryEconomicsError("BBO no comparte la generación DEMO observada")
     event_time = max(bid["event_time"], ask["event_time"])
-    available_at = min(bid["available_at"], ask["available_at"])
-    if available_at < event_time:
-        raise CanaryEconomicsError("BBO no es causal: available_at precede event_time")
+    # A single BBO is usable only once both asynchronous legs are available;
+    # retain the older receipt separately so freshness cannot be masked by
+    # taking only the newer leg.
+    available_at = max(bid["available_at"], ask["available_at"])
+    earliest_available_at = min(bid["available_at"], ask["available_at"])
     bid_price = cast(Decimal, bid["price"])
     ask_price = cast(Decimal, ask["price"])
     if bid_price >= ask_price:
@@ -724,6 +729,7 @@ def _quote_evidence(
         available_at,
         generation,
         bid["sequence"] if bid["sequence"] is not None else ask["sequence"],
+        earliest_available_at,
     )
 
 
@@ -964,9 +970,15 @@ def _validate_response_freshness(responses: Sequence[WireMessage], now: datetime
 
 
 def _validate_quote_freshness(quote: CanaryQuoteEvidence, now: datetime, max_age: Decimal) -> None:
-    age = (now - quote.available_at).total_seconds()
-    if age < 0 or Decimal(str(age)) > max_age:
-        raise CanaryEconomicsError(f"BBO fuera de frescura: age={age:.3f}")
+    latest_age = (now - quote.available_at).total_seconds()
+    earliest = quote.earliest_available_at or quote.available_at
+    earliest_age = (now - earliest).total_seconds()
+    if latest_age < 0:
+        raise CanaryEconomicsError(f"BBO disponible en el futuro: age={latest_age:.3f}")
+    if earliest_age < 0:
+        raise CanaryEconomicsError(f"BBO timestamp antiguo en el futuro: age={earliest_age:.3f}")
+    if Decimal(str(earliest_age)) > max_age:
+        raise CanaryEconomicsError(f"BBO fuera de frescura: oldest_age={earliest_age:.3f}")
 
 
 def _validate_asset_mapping(assets: Mapping[int, str], base_id: int, quote_id: int, deposit_id: int) -> None:
@@ -1104,7 +1116,7 @@ def _normalise_endpoint(value: Any) -> str | None:
 
 
 def _normalise_symbol(value: Any) -> str:
-    return str(value or "").strip().upper().replace("-", "/")
+    return normalize_symbol_name(str(value or ""))
 
 
 def _enum_catalog(value: Any, numbers: Mapping[int, str]) -> str:

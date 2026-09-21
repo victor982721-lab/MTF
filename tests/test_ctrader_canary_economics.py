@@ -187,6 +187,102 @@ def _observe(provider: FakeProvider, **kwargs: Any) -> CanaryEconomicsProjection
 
 
 class CanaryEconomicsTests(unittest.TestCase):
+    def test_compact_selected_symbol_preserves_canonical_eurusd_identity(self) -> None:
+        provider = FakeProvider()
+        selected = SimpleNamespace(
+            name="EURUSD",
+            symbol_id=11,
+            metadata=provider.catalog.selected.metadata,
+        )
+        provider.catalog.selected = selected
+        provider.catalog.symbols = (selected,)
+
+        projection = _observe(provider)
+
+        self.assertEqual(projection.symbol, "EUR/USD")
+        self.assertEqual(projection.symbol_id, 11)
+        self.assertEqual(projection.quote.symbol, "EUR/USD")
+        self.assertEqual(provider.spec.symbol, "EUR/USD")
+        self.assertEqual(provider.catalog.requested_symbol, "EUR/USD")
+        self.assertEqual(projection.provenance["raw_catalog_fields"]["symbol_id"], 11)
+
+    def test_other_pair_suffix_identity_and_catalog_list_fail_closed(self) -> None:
+        cases = (
+            ("other_pair", "GBPUSD", "GBPUSD", 11, True),
+            ("suffix", "EUR/USD.pro", "EUR/USD.pro", 11, True),
+            ("identity", "EURUSD", "EUR/USD", 12, True),
+            ("catalog_list", "EURUSD", "EUR/USD", 11, False),
+        )
+        for label, selected_name, requested_symbol, selected_id, listed in cases:
+            with self.subTest(label=label):
+                provider = FakeProvider()
+                selected = SimpleNamespace(
+                    name=selected_name,
+                    symbol_id=selected_id,
+                    metadata=provider.catalog.selected.metadata,
+                )
+                provider.catalog.selected = selected
+                provider.catalog.requested_symbol = requested_symbol
+                provider.catalog.symbols = (selected,) if listed else ()
+                with self.assertRaises(CanaryEconomicsError):
+                    _observe(provider)
+
+    def test_asymmetric_quote_uses_joint_availability_and_retains_oldest_leg(self) -> None:
+        provider = FakeProvider()
+        quote_state = provider.snapshot_quote_state()
+        bid = quote_state["symbols"]["11"]["bid"]
+        ask = quote_state["symbols"]["11"]["ask"]
+        bid["event_time"] = (NOW - timedelta(seconds=0.2)).isoformat()
+        bid["available_at"] = (NOW - timedelta(seconds=0.1)).isoformat()
+        ask["event_time"] = (NOW - timedelta(seconds=2)).isoformat()
+        ask["available_at"] = (NOW - timedelta(seconds=1.9)).isoformat()
+        provider.snapshot_quote_state = lambda: quote_state  # type: ignore[method-assign]
+
+        projection = _observe(provider)
+
+        self.assertEqual(projection.quote.event_time, NOW - timedelta(seconds=0.2))
+        self.assertEqual(projection.quote.available_at, NOW - timedelta(seconds=0.1))
+        self.assertEqual(projection.quote.earliest_available_at, NOW - timedelta(seconds=1.9))
+        self.assertEqual(
+            projection.quote.to_dict()["available_at"],
+            (NOW - timedelta(seconds=0.1)).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        )
+        self.assertEqual(
+            projection.quote.to_dict()["earliest_available_at"],
+            (NOW - timedelta(seconds=1.9)).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        )
+        self.assertEqual(projection.symbol, "EUR/USD")
+        self.assertEqual(projection.symbol_id, 11)
+
+    def test_asymmetric_quote_stale_future_causal_generation_and_spread_gates_fail_closed(self) -> None:
+        cases = ("stale_old_leg", "future_leg", "available_before_event", "generation", "zero_spread", "crossed")
+        for case in cases:
+            with self.subTest(case=case):
+                provider = FakeProvider()
+                quote_state = provider.snapshot_quote_state()
+                bid = quote_state["symbols"]["11"]["bid"]
+                ask = quote_state["symbols"]["11"]["ask"]
+                if case == "stale_old_leg":
+                    ask["event_time"] = (NOW - timedelta(seconds=11.2)).isoformat()
+                    ask["available_at"] = (NOW - timedelta(seconds=11)).isoformat()
+                    bid["event_time"] = (NOW - timedelta(seconds=0.2)).isoformat()
+                    bid["available_at"] = (NOW - timedelta(seconds=0.1)).isoformat()
+                elif case == "future_leg":
+                    bid["event_time"] = (NOW + timedelta(seconds=1)).isoformat()
+                    bid["available_at"] = (NOW + timedelta(seconds=1.1)).isoformat()
+                elif case == "available_before_event":
+                    bid["event_time"] = (NOW - timedelta(seconds=0.2)).isoformat()
+                    bid["available_at"] = (NOW - timedelta(seconds=0.3)).isoformat()
+                elif case == "generation":
+                    ask["generation"] = "generation-2"
+                elif case == "zero_spread":
+                    ask["price"] = bid["price"]
+                else:
+                    ask["price"] = "1.09990"
+                provider.snapshot_quote_state = lambda state=quote_state: state  # type: ignore[method-assign]
+                with self.assertRaises(CanaryEconomicsError):
+                    _observe(provider)
+
     def test_typed_slippage_hypothesis_is_not_human_approval_or_observation(self) -> None:
         projection = _observe(FakeProvider(), exit_slippage_hypothesis=ExitSlippageHypothesis())
 
