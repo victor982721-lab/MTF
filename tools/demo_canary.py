@@ -307,6 +307,91 @@ def _set_provider_zero_spread(provider: Any, context: CanaryZeroSpreadAuthorizat
     setter(context)
 
 
+def _canary_quote_book_is_fresh(provider: Any, now: datetime, generation: str) -> bool:
+    """Readiness only: later economics/execution guards still authorize BBO."""
+
+    snapshot = provider.snapshot_quote_state()
+    symbols = snapshot.get("symbols") if isinstance(snapshot, Mapping) else None
+    symbol_id = getattr(getattr(provider, "spec", None), "symbol_id", None)
+    book = symbols.get(str(symbol_id), symbols.get(symbol_id)) if isinstance(symbols, Mapping) else None
+    if not isinstance(book, Mapping):
+        return False
+    for side in ("bid", "ask"):
+        leg = book.get(side)
+        if not isinstance(leg, Mapping):
+            return False
+        state = leg.get("state")
+        if str(leg.get("generation", "")) != generation or (state is not None and str(state).upper() != "VALID"):
+            return False
+        if leg.get("timestamp_missing") is True or leg.get("synthetic") is True or leg.get("reasons", ()):
+            return False
+        try:
+            event = _timestamp(leg.get("event_time"), f"{side} event_time")
+            available = _timestamp(leg.get("available_at"), f"{side} available_at")
+        except (CanaryGateError, TypeError, ValueError):
+            return False
+        # Leave room for account/economics RPCs without widening their own
+        # ten-second freshness limit or rewriting either receive timestamp.
+        if not event <= available <= now or (now - available).total_seconds() > 1.0:
+            return False
+    return True
+
+
+def _canary_quote_wait_ready(
+    provider: Any,
+    clock: Callable[[], datetime],
+    started: datetime,
+    end: datetime,
+    generation: str,
+) -> bool:
+    current = _aware(clock(), "clock")
+    if current < started or current >= end:
+        raise CanaryGateError("el reloj o la ventana invalidó la espera BBO")
+    if str(getattr(provider, "generation", "") or "") != generation:
+        raise CanaryGateError("la generación cambió durante el refresco BBO")
+    return _canary_quote_book_is_fresh(provider, current, generation)
+
+
+def _refresh_canary_quotes(
+    provider: Any,
+    *,
+    deadline: datetime,
+    max_events: int,
+    clock: Callable[[], datetime] | None = None,
+) -> None:
+    """Wait boundedly for fresh legs through the one existing market reader."""
+
+    clock_fn = clock or (lambda: datetime.now(UTC))
+    started = _aware(clock_fn(), "clock")
+    end = min(_aware(deadline, "quote refresh deadline"), started + timedelta(seconds=30))
+    if started >= end:
+        raise CanaryGateError("la ventana restante no permite refrescar BBO")
+    if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events <= 0:
+        raise CanaryGateError("refresco BBO requiere un límite positivo de eventos")
+    stream = getattr(provider, "stream", None)
+    if not callable(stream) or not callable(getattr(provider, "snapshot_quote_state", None)):
+        raise CanaryGateError("provider no expone lector y libro BBO observables")
+    generation = str(getattr(provider, "generation", "") or "")
+    if not generation:
+        raise CanaryGateError("provider no acredita generación para refrescar BBO")
+
+    if _canary_quote_wait_ready(provider, clock_fn, started, end, generation):
+        return
+    duration = min(30.0, (end - started).total_seconds())
+    for _record in cast(
+        Iterable[Any],
+        stream(max_events=max_events, duration_seconds=duration, timeout_seconds=0.25),
+    ):
+        del _record
+        if _canary_quote_wait_ready(provider, clock_fn, started, end, generation):
+            return
+    if not _canary_quote_wait_ready(provider, clock_fn, started, end, generation):
+        raise CanaryGateError(
+            "no se observó una pareja BBO fresca tras la espera acotada",
+            gates={"quote_refresh_wait_seconds": duration, "quote_refresh_event_limit": max_events},
+        )
+
+
 def _trial_ledger_context(
     approval: CanaryApproval,
     binding: Any,
@@ -2140,7 +2225,11 @@ def network_cli_preflight(  # noqa: C901
         if execute:
             assert approved is not None and event_limit is not None and preparation_start is not None
             from mtf_lab.ops.ctrader_account_risk import AccountRiskObserver
-            from mtf_lab.ops.ctrader_canary_economics import ExitSlippageHypothesis, observe_canary_economics
+            from mtf_lab.ops.ctrader_canary_economics import (
+                CanaryEconomicsError,
+                ExitSlippageHypothesis,
+                observe_canary_economics,
+            )
             from mtf_lab.ops.ctrader_canary_inputs import CanarySessionEvidence, collect_canary_inputs
             from mtf_lab.ops.market_schedule import observed_market_window_state
             from mtf_lab.ops.supervision_demo import (
@@ -2199,22 +2288,11 @@ def network_cli_preflight(  # noqa: C901
                 session.zero_spread_authorization = zero_spread
 
             def refresh_quotes_from_same_reader() -> None:
-                """Bound quote refresh through the provider's existing reader."""
-
-                stream = getattr(session.provider, "stream", None)
-                if callable(stream):
-                    # A live provider may enter this path without a preloaded
-                    # BBO.  Poll only the existing authenticated reader; do
-                    # not create a client, reconnect, or synthesize prices.
-                    for _record in cast(
-                        Iterable[Any],
-                        stream(
-                            max_events=max(1, min(int(event_limit), 4)),
-                            duration_seconds=5.0,
-                            timeout_seconds=0.25,
-                        ),
-                    ):
-                        del _record
+                _refresh_canary_quotes(
+                    session.provider,
+                    deadline=approved.window_end - timedelta(seconds=float(approved.max_holding_seconds)),
+                    max_events=int(event_limit),
+                )
 
             def _projection_from_snapshot(snapshot: AccountRiskSnapshot | None) -> CanaryEconomicsProjection:
                 if snapshot is None:
@@ -2292,6 +2370,7 @@ def network_cli_preflight(  # noqa: C901
                     "state": "ECONOMICS_BLOCKED",
                     "mode": "canary",
                     "error": type(exc).__name__,
+                    **({"error_detail": str(exc)} if isinstance(exc, CanaryEconomicsError) else {}),
                     "network_performed": True,
                     "orders_attempted": False,
                 }
@@ -2377,6 +2456,7 @@ def network_cli_preflight(  # noqa: C901
                     "state": "RISK_REFRESH_BLOCKED",
                     "mode": "canary",
                     "error": type(exc).__name__,
+                    **({"error_detail": str(exc)} if isinstance(exc, (CanaryEconomicsError, CanaryGateError)) else {}),
                     "network_performed": True,
                     "orders_attempted": False,
                 }

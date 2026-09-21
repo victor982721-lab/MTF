@@ -92,6 +92,13 @@ class _Provider:
         return ()
 
 
+def _refresh_composition_quotes(provider: _Provider, *, deadline: datetime, max_events: int) -> None:
+    """Mock only the quote waiter; dedicated tests cover its BBO/freshness."""
+
+    assert deadline.tzinfo is not None
+    provider.stream(max_events=max_events)
+
+
 class _Executor:
     def observe_runtime(self, snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
         return snapshot
@@ -235,6 +242,7 @@ class DemoCanaryFinancialObservationTests(unittest.TestCase):
             journal = root / "journal.jsonl"
             with (
                 patch("tools.demo_canary.prepare_cli_session", return_value=session),
+                patch("tools.demo_canary._refresh_canary_quotes", side_effect=_refresh_composition_quotes),
                 patch(
                     "mtf_lab.ops.ctrader_account_risk.AccountRiskObserver",
                     return_value=initial,
@@ -321,6 +329,7 @@ class DemoCanaryFinancialObservationTests(unittest.TestCase):
 
             with (
                 patch("tools.demo_canary.prepare_cli_session", return_value=session),
+                patch("tools.demo_canary._refresh_canary_quotes", side_effect=_refresh_composition_quotes),
                 patch(
                     "mtf_lab.ops.ctrader_account_risk.AccountRiskObserver",
                     return_value=initial,
