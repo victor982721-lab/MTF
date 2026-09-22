@@ -19,19 +19,19 @@ Este README y los documentos enlazados son la fuente persistente del proyecto. L
 ### Canaria técnica DEMO — 2026-09-21
 
 El código validado, publicado e instalado es
-`0a6adfb5b9bf1915edb43399495ae10e08ae9707`: **1,315/1,315 pruebas**, cero
-fallos/omisiones, 80.463% de líneas y 64.290% de ramas. La instalación usa
-`run_id=20260921T231515Z-61e48a36` y 132 archivos/RECORD byte-equivalentes en
+`c92d605c657450d06e59fa6d8b90c38c3bdc7e55`: **1,320/1,320 pruebas**, cero
+fallos/omisiones, 80.462% de líneas y 64.296% de ramas. La instalación usa
+`run_id=20260922T012203Z-b7d5308d` y 132 archivos/RECORD byte-equivalentes en
 ambos entornos, con tres launchers verificados.
 
-La canaria permanece `CURRENT_REVIEW`/`NO_EJECUTADA`: el controlador terminó
-`OBSERVED_INPUTS_BLOCKED` por falta de ATR válido para el timeframe trigger,
-sin órdenes ni ciclos. El detalle y los receipts están en el [estado operativo vigente](docs/operational_status.md#estado-vigente--2026-09-21).
+La canaria permanece `CURRENT_REVIEW`/`NO_COMPLETADA`; el controlador conserva
+`CANARY_EXECUTION_UNKNOWN`, pero la reconciliación readonly observó la cuenta
+plana y cero fills. El detalle y los receipts están en el [estado operativo vigente](docs/operational_status.md#estado-vigente--2026-09-21).
 
 Las dos excepciones humanas siguen acotadas a esta canaria: `bid == ask`
-genuinamente observado y ancla de equity inicial del trial. La regla predeterminada estricta
-permanece fuera de ellas; no se habilitan REAL, estrategia, 72 horas ni otra
-fecha/automatización.
+genuinamente observado y ancla de equity inicial del trial. La regla
+predeterminada estricta permanece fuera de ellas; no se habilitan REAL,
+estrategia, 72 horas ni otra fecha/automatización.
 
 ### Desarrollo aislado — 2026-09-20
 
@@ -284,9 +284,10 @@ usan una referencia privada de credenciales; el launcher de consulta no habilita
 trading. La canaria de software está instalada como
 `~/.local/bin/mtf-lab-demo-canary`; su preflight de sólo lectura contra el servidor
 real del 19 de septiembre pasó identidad, `TRADING` y catálogo, y cerró con
-`NETWORK_PREFLIGHT_INPUTS_REQUIRED`. Las preparaciones del 21 de septiembre
-ya observaron riesgo y mercado, pero se detuvieron antes de órdenes; conservan
-high-water y ancla diaria no verificada, con journal vacío.
+`NETWORK_PREFLIGHT_INPUTS_REQUIRED`. Las primeras preparaciones del 21 de septiembre observaron riesgo y mercado
+y terminaron sin reservar el trial. El intento posterior quedó `UNKNOWN`,
+con ledger reservado y eventos de activación/desactivación en el journal;
+high-water y ancla diaria no verificada permanecen conservados.
 
 ### Autorización de canaria técnica DEMO — 2026-09-21
 
@@ -315,8 +316,8 @@ genuinamente observado, únicamente dentro de la cuenta, sesión, generación,
 ventana y límites tipados anteriores. La regla predeterminada estricta
 permanece sin cambios fuera de esta canaria y `bid > ask` continúa rechazado.
 La aprobación y el ledger impiden extender o repetir un trial reservado. El
-estado operativo vigente conserva el resultado terminal sin órdenes y la
-evidencia de instalación.
+ledger se conserva para revisión; el estado operativo vigente conserva
+el resultado `CANARY_EXECUTION_UNKNOWN` y la evidencia de instalación.
 
 ### Antecedente: validación conectada DEMO de sólo lectura — 2026-09-14
 
@@ -413,8 +414,9 @@ La lista queda limitada a hechos, decisiones y autorizaciones externas:
 
 1. La observación administrativa del 2026-09-19 muestra `Active` y el callback
    local correcto, sustituyendo `Submitted` como estado vigente. El servidor DEMO
-   concedió `TRADING` sólo para la cuenta aprobada (sufijo `5097`), sin órdenes;
-   esto no autoriza REAL ni amplía el alcance de la canaria manual.
+   concedió `TRADING` sólo para la cuenta aprobada (sufijo `5097`); la
+   reconciliación no observó posiciones, pendientes ni fills. Esto no autoriza
+   REAL ni amplía el alcance de la canaria manual.
 2. Verificar frescura, continuidad y calentamiento en una sesión de mercado
    abierta; la ventana bounded 60/60 y la consulta fuente `has_more=true` no
    acreditan por sí mismas una serie completa ni frescura live.

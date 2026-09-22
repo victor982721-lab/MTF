@@ -12,12 +12,12 @@ producir un servidor autenticado.
 
 ### Canaria técnica vigente — 2026-09-21
 
-Código validado, publicado e instalado `0a6adfb5b9bf1915edb43399495ae10e08ae9707`:
-1,315/1,315 pruebas, runtime `20260921T231515Z-61e48a36` y 132
+Código validado, publicado e instalado `c92d605c657450d06e59fa6d8b90c38c3bdc7e55`:
+1,320/1,320 pruebas, runtime `20260922T012203Z-b7d5308d` y 132
 archivos/RECORD byte-equivalentes en ambos entornos. La canaria permanece
-`CURRENT_REVIEW`/`NO_EJECUTADA`: el controlador terminó
-`OBSERVED_INPUTS_BLOCKED` por falta de ATR válido para el timeframe trigger,
-sin órdenes ni ciclos.
+`CURRENT_REVIEW`/`NO_COMPLETADA`: el controlador conserva
+`CANARY_EXECUTION_UNKNOWN` tras `RiskLimitRejected`; la reconciliación readonly
+observó la cuenta plana y cero fills.
 
 Las dos excepciones humanas están acotadas a esta canaria: `bid == ask`
 genuinamente observado y ancla de equity inicial del trial. La regla predeterminada estricta
@@ -93,8 +93,8 @@ cada conexión debe completar discovery fresco de lectura y verificar esa cuenta
 La canaria está instalada como `~/.local/bin/mtf-lab-demo-canary`, modo `0700`.
 El preflight readonly del 19 de septiembre verificó identidad, `TRADING` y
 catálogo, pero no representó ejecución. La aprobación y el ledger impiden
-extender o repetir un trial reservado. El resultado terminal sin órdenes se
-documenta en el [estado operativo](operational_status.md#estado-vigente--2026-09-21).
+extender o repetir un trial reservado; el ledger se conserva para revisión. El resultado `CANARY_EXECUTION_UNKNOWN` y la reconciliación
+readonly se documentan en el [estado operativo](operational_status.md#estado-vigente--2026-09-21).
 
 ### Antecedente: validación DEMO conectada de sólo lectura — 2026-09-14
 
@@ -390,9 +390,10 @@ orden.
 
 El alcance `TRADING` DEMO está concedido sólo para la cuenta aprobada y la
 canaria está instalada en `~/.local/bin/mtf-lab-demo-canary`. El preflight readonly
-del 19 de septiembre pasó identidad, `TRADING` y catálogo. Las preparaciones
-del 21 de septiembre observaron riesgo y cotizaciones, sin órdenes ni reserva
-del trial. **REAL/LIVE se rechaza fail-closed** y ningún fixture prueba que una
+del 19 de septiembre pasó identidad, `TRADING` y catálogo. Las primeras
+preparaciones del 21 de septiembre no reservaron el trial. El intento posterior
+quedó `UNKNOWN` con ledger reservado; la reconciliación readonly observó cuenta
+plana y cero fills en la ventana consultada. **REAL/LIVE se rechaza fail-closed** y ningún fixture prueba que una
 orden haya llegado a un servidor.
 
 ### Pendientes externos vigentes — 2026-09-21
@@ -400,7 +401,8 @@ orden haya llegado a un servidor.
 La aplicación `Active`, la autorización `accounts`, la cuenta DEMO seleccionada,
 el discovery de 1,940 símbolos y la lectura bounded 60/60 ya fueron observados.
 El servidor DEMO concedió `TRADING` sólo para la cuenta aprobada (sufijo `5097`);
-no hay órdenes y esa autorización no se extiende a REAL/LIVE.
+la reconciliación no observó posiciones, pendientes ni fills y esa autorización
+no se extiende a REAL/LIVE.
 
 1. Observar frescura, continuidad y calentamiento en una sesión de mercado
    abierta; la consulta fuente mantiene `has_more=true` y la ventana bounded no

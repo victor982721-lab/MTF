@@ -9,36 +9,44 @@ abajo y permanece fuera de Git.
 ## Estado vigente — 2026-09-21
 
 **Release validada e instalada; canaria `CURRENT_REVIEW`.** El código
-`0a6adfb5b9bf1915edb43399495ae10e08ae9707` pasó **1,315/1,315 pruebas**, cero
-fallos/omisiones, 80.463% de líneas y 64.290% de ramas. La instalación usa
-`run_id=20260921T231515Z-61e48a36`, 132 archivos/RECORD byte-equivalentes en
+`c92d605c657450d06e59fa6d8b90c38c3bdc7e55` pasó **1,320/1,320 pruebas**, cero
+fallos/omisiones, 80.462% de líneas y 64.296% de ramas. La instalación usa
+`run_id=20260922T012203Z-b7d5308d`, 132 archivos/RECORD byte-equivalentes en
 ambos entornos y tres launchers verificados. El rollback conserva
-`37b30cd908588baa57d2d003ea0e488dee3d3991` con 132 archivos. Esta identidad de
-código es independiente del cierre documental posterior, que conserva el
-mismo árbol ejecutable validado.
+`0a6adfb5b9bf1915edb43399495ae10e08ae9707` en
+`runtime-rollback-20260922-013044-7f3184a0`, con 132 archivos. La identidad del
+código instalado se separa del cierre documental posterior.
 
-El launcher ejecuta `/home/winterboss/MTF/tools/demo_canary.py` desde
-el checkout con Python instalado; los smokes acreditan la biblioteca/runtime
-empaquetados, no imports del controlador fuera del checkout.
-La canaria queda **`CURRENT_REVIEW`/`NO_EJECUTADA`**. La ejecución
-`execution-20260921T233107Z` terminó a las 23:37:36.570 UTC, tras 372.825 s,
-con exit 2 y `OBSERVED_INPUTS_BLOCKED`; su razón fue
-`producer aún no tiene ATR válido para el timeframe trigger`.
+El controlador es el entrypoint del checkout `/home/winterboss/MTF/tools/demo_canary.py`
+con Python instalado; los smokes acreditan la biblioteca/runtime empaquetados,
+no imports del controlador fuera del checkout.
 
-Capturó 101 eventos. El watcher terminó por `IDLE_TIMEOUT` con límite de 30 s
-antes de disponer de ATR14; al detenerse reportó continuidad `CONTINUOUS`,
-frescura `VALID`, reconciliación `NOT_APPLICABLE`, `block_details={}` y sólo
-calentamientos/señales técnicas deshabilitadas. El único rechazo BBO registrado
-fue histórico y preventana (`BBO fuera de la ventana aprobada`); no es la causa
-final. Los datos fueron aceptados sin bloqueos internos de continuidad o
-normalización; no se atribuye la pausa exclusivamente al feed o al bróker.
+La canaria queda **`CURRENT_REVIEW`/`NO_COMPLETADA`** y el controlador conserva
+`CANARY_EXECUTION_UNKNOWN`. La ejecución
+`execution-20260922T013248Z` terminó a las 01:48:14.847 UTC
+(21 de septiembre, 19:48:14.847, America/Mexico_City), tras 920.725 s, con exit 2,
+`orders_attempted=true`, una mutación, cero ciclos y razón
+`RiskLimitRejected`; requiere revisión humana. La reconciliación readonly quedó
+completa, pero no relabela ni reinicia el estado y no hay reintento automático.
 
-El receipt final conserva `orders_attempted=false`, `cycles_completed=0`,
-ledger ausente, aprobación no reservada y journal de 0 bytes. Los PID/PGID
-quedaron terminales; no se afirma cgroup vacío. No se inventan precios ni ATR,
-no se amplía el límite de frescura ni se baja el periodo. El objetivo de dos
-ciclos no se cumplió y la validación económica sigue independiente. No se programó otra
-fecha ni se crearon automatizaciones de esta canaria.
+El ledger existe y permanece reservado. El journal conserva sólo
+`ACTIVATED`/`DEACTIVATED`: no contiene intent ni `SUBMIT`. El conteo conservador
+de 1 queda en la frontera anterior a `SUBMIT`; no es evidencia de una orden
+enviada al broker. La inspección de la ruta canónica ubica
+`RiskLimitRejected` antes de `record_intent` y `transport.submit`; el wrapper
+descartó el mensaje exacto y no se atribuye a un spread/guard particular. Los
+PID/PGID quedaron terminales; no se afirma cgroup vacío.
+El objetivo de dos ciclos no se cumplió y la validación económica sigue
+independiente.
+
+La reconciliación readonly de la misma cuenta DEMO (sufijo `5097`) observó a
+las 01:53:47.478 UTC (21 de septiembre, 19:53:47.478 local) cuenta plana,
+0 posiciones y 0 pendientes. El historial de fills de 19:37:48 a 19:53:47 local
+fue completo, sin más páginas y con 0 fills. El executor no fue
+creado, `orders_sent=0` en esa reconciliación y no se cambió ni renovó la aprobación.
+Los hashes de ledger, journal, risk y day-anchor permanecieron idénticos antes y
+después. Esta evidencia no convierte el controlador `UNKNOWN` en éxito ni
+completa los dos ciclos solicitados.
 
 Víctor autorizó dos excepciones humanas sólo para esta canaria DEMO: aceptar un
 `bid == ask` genuinamente observado y usar el equity inicial observado como
@@ -47,26 +55,27 @@ la regla predeterminada `bid >= ask -> CROSSED` permanece estricta y `bid > ask`
 continúa rechazado; no se amplían a PAPER, estrategia, watch, REAL/LIVE, 72 h,
 otra fecha ni automatización.
 
-Una comprobación de sólo lectura documentó 77 eventos en 240 s, continuidad
-`CONTINUOUS` y cero rechazos BBO o de sus piernas. Verificó las correcciones del
-cierre por reloj y la igualdad autorizada con actualizaciones asíncronas, sin
-órdenes ni evidencia de ATR14.
+La comprobación readonly previa documentó 77 eventos en 240 s, continuidad
+`CONTINUOUS` y cero rechazos BBO o de sus piernas; no acredita ciclos ni fills.
 
 Evidencia privada vigente, sin credenciales ni corpus en Git:
 
-- [Gate completo](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/quality/20260921T231507Z/quality-gate.json)
-  y [auditoría terminal](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/quality-terminal-audit-v7.json).
-- [Instalación](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/installed-canary-v7.json),
-  [rollback](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/rollback-verification-v7.json),
-  [promoción](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/runtime-promotion-v7.json)
-  y [publicación](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/code-publication-v7.json).
-- [Comprobación de lectura de cuatro minutos](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/live-quality-confirmation-v7.json).
-- [Resultado terminal final](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/execution-20260921T233107Z/result.json),
-  [controlador](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/execution-20260921T233107Z/controller.stdout.json)
-  y [estado del host](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/execution-20260921T233107Z/host-terminal-state.json).
+- [Current review consolidado](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/current-review-v8.json).
+- [Gate completo](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/quality/20260922T012159Z/quality-gate.json)
+  y [auditoría terminal](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/quality-terminal-audit-v8.json).
+- [Instalación](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/installed-final-verification-v8.json),
+  [rollback](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/rollback-verification-v8.json)
+  y [publicación](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/code-publication-v8.json).
+- [Ejecución terminal](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/execution-20260922T013248Z/result.json),
+  [controlador](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/execution-20260922T013248Z/controller.stdout.json)
+  y [estado del host](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/execution-20260922T013248Z/host-terminal-state.json).
+- [Reconciliación readonly](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/reconciliation-20260922T015339Z/result.json)
+  y [terminalidad de reconciliación](/home/winterboss/.local/state/mtf-lab/demo-canary/20260921-now-155034Z/trial-anchor-implementation/zero-spread-implementation/reconciliation-20260922T015339Z/terminal.json).
 
-No se acredita ejecución DEMO, fills, rentabilidad, validación económica,
-72 h/30 sesiones, apertura de WF/holdout, operación continua ni REAL.
+No se acreditan ciclos completados, fills, rentabilidad, validación económica,
+72 h/30 sesiones, apertura de WF/holdout, operación continua ni REAL. El trial
+permanece reservado; no se inicia otro trial, no se borra el ledger y una nueva
+canaria exige revisión humana y autorización explícita.
 
 ## Próxima ejecución DEMO
 
@@ -175,9 +184,9 @@ RiskExit evaluables; 2017–2019 sólo tienen QA descriptivo, no resultados de e
 |---|---|---|
 | 1. Cierre de 2019 | 11 meses válidos; el ZIP de octubre original y la nueva descarga oficial son byte-idénticos y fallan orden temporal. | Fuente corregida/versionada de HistData o respuesta oficial que permita resolver la procedencia sin inventar datos. |
 | 2. Desarrollo multianual | No se creó un año incompleto ni se ejecutó como si octubre fuera válido. | Manifiesto 2019 contiguo y válido antes de componer 2016–2019. Costos `UNKNOWN_COSTS`. |
-| 3. Runtime | Código `0a6adfb5b9bf1915edb43399495ae10e08ae9707` validado, publicado e instalado; gate 1,315/1,315, 132 archivos byte-equivalentes, `run_id=20260921T231515Z-61e48a36` y rollback `37b30cd908588baa57d2d003ea0e488dee3d3991` comprobado. | El cierre documental conserva el mismo árbol ejecutable; cualquier cambio de código requiere su propio gate. |
+| 3. Runtime | Código `c92d605c657450d06e59fa6d8b90c38c3bdc7e55` validado, publicado e instalado; gate 1,320/1,320, 132 archivos byte-equivalentes, `run_id=20260922T012203Z-b7d5308d` y rollback `0a6adfb5b9bf1915edb43399495ae10e08ae9707` comprobado. | El cierre documental conserva el mismo árbol ejecutable; cualquier cambio de código requiere su propio gate. |
 | 4. App y contrato | App `Active`; VIEW original intacto y autorización separada `TRADING` observada sólo en la cuenta DEMO aprobada. | Condiciones de REAL/México y cargos realizados siguen separados; la especificación observada no prueba cargos ni costes históricos. |
-| 5. Canaria técnica | Software instalado; las dos excepciones humanas están acotadas a esta canaria: `bid == ask` genuinamente observado y ancla de equity inicial del trial. La ejecución `20260921T233107Z` terminó `NO_EJECUTADA`/`OBSERVED_INPUTS_BLOCKED` por falta de ATR válido, con cero ciclos y órdenes. | El watcher terminó por `IDLE_TIMEOUT` de 30 s antes de ATR14; siguen siendo obligatorios continuidad/frescura, causalidad, ATR, calendario, cuenta plana, margen, riesgo, dos ciclos y conciliación observada. |
+| 5. Canaria técnica | Software instalado; las dos excepciones humanas están acotadas a esta canaria: `bid == ask` genuinamente observado y ancla de equity inicial del trial. La ejecución `20260922T013248Z` terminó `CANARY_EXECUTION_UNKNOWN` tras `RiskLimitRejected`, con `orders_attempted=true`, una mutación y cero ciclos; reconciliación posterior: cuenta plana, 0 fills. | Revisión humana conserva el trial reservado; no se reintenta ni se resetea. Siguen siendo obligatorios continuidad/frescura, causalidad, ATR, calendario, cuenta plana, margen, riesgo, dos ciclos y conciliación observada. |
 | 6. Shadow/forward | No iniciado. Las excepciones están acotadas a esta canaria y no habilitan shadow/forward. | Autorización operativa separada; 72 horas/30 sesiones no se sustituyen por fixtures ni se acelera el reloj. |
 
 ## Correcciones de diagnóstico

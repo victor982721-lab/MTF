@@ -4,12 +4,12 @@
 
 ### Frontera vigente de la canaria — 2026-09-21
 
-Código validado, publicado e instalado `0a6adfb5b9bf1915edb43399495ae10e08ae9707`:
-1,315/1,315 pruebas, 80.463% de líneas, 64.290% de ramas, runtime
-`20260921T231515Z-61e48a36` y 132 archivos/RECORD byte-equivalentes en ambos
-entornos. La canaria permanece `CURRENT_REVIEW`/`NO_EJECUTADA`: el controlador
-terminó `OBSERVED_INPUTS_BLOCKED` por falta de ATR válido para el timeframe
-trigger, sin órdenes ni ciclos.
+Código validado, publicado e instalado `c92d605c657450d06e59fa6d8b90c38c3bdc7e55`:
+1,320/1,320 pruebas, 80.462% de líneas, 64.296% de ramas, runtime
+`20260922T012203Z-b7d5308d` y 132 archivos/RECORD byte-equivalentes en ambos
+entornos. La canaria permanece `CURRENT_REVIEW`/`NO_COMPLETADA`: el controlador
+conserva `CANARY_EXECUTION_UNKNOWN` tras `RiskLimitRejected`; la reconciliación
+readonly observó la cuenta plana y cero fills, sin convertir el estado en éxito.
 
 Las dos excepciones humanas siguen limitadas a esta canaria: aceptar un
 `bid == ask` genuinamente observado y usar el equity inicial observado como
@@ -88,9 +88,11 @@ para la cuenta aprobada (sufijo `5097`) y la ruta VIEW original permanece intact
 Esto prueba el alcance administrativo/técnico observado, no una ejecución: la
 canaria está instalada como `~/.local/bin/mtf-lab-demo-canary` con modo `0700`, su
 preflight readonly del 19 de septiembre pasó identidad, `TRADING` y catálogo
-con `NETWORK_PREFLIGHT_INPUTS_REQUIRED`. Las preparaciones del 21 de septiembre
-observaron riesgo y mercado, pero terminaron antes de órdenes. El journal sigue
-vacío y se conservan high-water y ancla diaria no verificada.
+con `NETWORK_PREFLIGHT_INPUTS_REQUIRED`. Las primeras preparaciones del 21 de
+septiembre terminaron sin reservar el trial. El intento posterior conserva
+`UNKNOWN`, ledger reservado y eventos de activación/desactivación en el journal;
+la reconciliación observó cuenta plana. Se preservan high-water y ancla diaria
+no verificada.
 
 Lo no observado offline es el resultado que debe devolver el servidor real:
 permisos y entorno de la cuenta, símbolos habilitados, escalas, límites de volumen,
