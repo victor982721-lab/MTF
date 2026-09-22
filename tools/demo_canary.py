@@ -2649,6 +2649,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "account_reconciliation_required": execution_unknown and not budget_breached,
                 "human_review_required": execution_unknown,
             }
+            if isinstance(exc, CanaryGateError):
+                payload["reason"] = exc.reason
+                try:
+                    payload["gates"] = json.loads(canonical_json(exc.gates))
+                except (TypeError, ValueError, RecursionError):
+                    # Diagnostics must not mask the original gate or use an
+                    # arbitrary object's repr, which may contain secrets.
+                    payload["gates"] = {"details_unavailable": "non_serializable_gate_details"}
+                if isinstance(exc.__cause__, CanaryGateError):
+                    payload["cause"] = {
+                        "error": type(exc.__cause__).__name__,
+                        "reason": exc.__cause__.reason,
+                    }
         print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
         return 0 if payload.get("ok") else 2
     if args.canary:
@@ -2677,4 +2690,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # Observed input adapters import tools.demo_canary.CanaryInputs. Run the
+    # CLI through that same module identity rather than __main__ classes.
+    from tools.demo_canary import main as _canonical_main
+
+    raise SystemExit(_canonical_main())
